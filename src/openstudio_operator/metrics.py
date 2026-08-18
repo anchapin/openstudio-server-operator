@@ -50,6 +50,12 @@ WORKER_PODS_EVICTED_TOTAL = Counter(
     "increment too, matching SOFT_STOPS_TOTAL)",
 )
 
+WEB_BACKGROUND_RESTARTS_TOTAL = Counter(
+    "openstudio_operator_web_background_restarts_total",
+    "web_background deployment restarts issued after sustained queue stalls "
+    "(incremented by the web_background monitor, #13)",
+)
+
 STORAGE_FREED_BYTES = Counter(
     "openstudio_operator_storage_freed_bytes",
     "NFS bytes reclaimed after archival/pruning",
