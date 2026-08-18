@@ -11,8 +11,11 @@ import copy
 import logging
 
 import kopf
+import kubernetes.client
+import kubernetes.config
 import pytest
-from kubernetes.client import ApiException
+from kubernetes.client import ApiException, CustomObjectsApi
+from kubernetes.config import ConfigException
 
 from openstudio_operator import singleton
 from openstudio_operator.singleton import (
@@ -428,3 +431,164 @@ def test_guard_never_mutates_losing_crs(guard_two_crs):
     guard_two_crs.is_active(make_cr("beta", NEW_TS), NAMESPACE)
     assert not hasattr(api, "patch_calls")  # read-only fake has nothing to mutate with
     assert api.items == before  # losing CR untouched: passive policing (D05)
+
+
+# --- guard construction: k8s config before the client (#79) ----------------------
+
+
+@pytest.fixture
+def default_configuration_restored():
+    """Snapshot/restore client-python's global default ``Configuration``.
+
+    The fake in-cluster loader below mirrors the side effect of the real
+    ``load_incluster_config`` that matters here: installing a default
+    ``Configuration`` carrying a host, which a subsequently constructed
+    ``CustomObjectsApi`` picks up. Without the restore, that global would leak
+    across tests.
+    """
+    prev = kubernetes.client.Configuration._default
+    yield
+    kubernetes.client.Configuration._default = prev
+
+
+def patch_config_loaders(monkeypatch, *, incluster_error: Exception | None = None):
+    """Spy on the k8s config loaders plus the guard's client construction.
+
+    Returns ``(calls, clients, sentinel_host)`` where ``calls`` records the
+    ordered ``load_incluster_config`` / ``load_kube_config`` /
+    ``CustomObjectsApi()`` invocations — that ordering is the #79 contract:
+    config first, client second.
+    """
+    calls: list[str] = []
+    clients: list[CustomObjectsApi] = []
+    sentinel_host = "https://apiserver.incluster.example:6443"
+
+    def fake_incluster() -> None:
+        calls.append("load_incluster_config")
+        if incluster_error is not None:
+            raise incluster_error
+        cfg = kubernetes.client.Configuration()
+        cfg.host = sentinel_host
+        kubernetes.client.Configuration.set_default(cfg)
+
+    def fake_kubeconfig(*args: object, **kwargs: object) -> None:
+        calls.append("load_kube_config")
+
+    def fake_custom_objects_api() -> CustomObjectsApi:
+        calls.append("CustomObjectsApi()")
+        client = CustomObjectsApi()  # the REAL class — picks up the loaded default config
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(kubernetes.config, "load_incluster_config", fake_incluster)
+    monkeypatch.setattr(kubernetes.config, "load_kube_config", fake_kubeconfig)
+    monkeypatch.setattr(singleton, "CustomObjectsApi", fake_custom_objects_api)
+    return calls, clients, sentinel_host
+
+
+def test_get_guard_loads_config_before_building_client(monkeypatch, default_configuration_restored):
+    """The #79 regression: the guard's client is constructed only AFTER a
+    Kubernetes config is loaded. Before the fix, ``_get_guard`` built a bare
+    ``CustomObjectsApi()`` — kr8s-based kopf (1.44+) never initializes
+    client-python's default ``Configuration`` (``host == ''``), so every guard
+    call raised LocationValueError and the kopf ``on.startup`` check never
+    completed: pod Running, operator functionally dead.
+    """
+    calls, clients, sentinel_host = patch_config_loaders(monkeypatch)
+    monkeypatch.setattr(singleton, "_process_guard", None)
+
+    guard = singleton._get_guard()
+
+    assert calls == ["load_incluster_config", "CustomObjectsApi()"]
+    assert guard._custom_api is clients[0]
+    assert guard._custom_api.api_client.configuration.host == sentinel_host
+
+
+def test_get_guard_bare_client_dies_guard_client_does_not(
+    monkeypatch, default_configuration_restored
+):
+    """Paired proof of the failure mode: with no config loaded, a bare
+    ``CustomObjectsApi`` dies with ``LocationValueError('No host specified')``
+    on its very first list call (the live in-pod symptom from #66/#79 — this
+    assert is the pre-fix ``_get_guard`` behavior), while the guard's client,
+    built after ``load_incluster_config``, carries the loaded host.
+    """
+    with pytest.raises(ValueError, match="No host specified"):
+        kubernetes.client.CustomObjectsApi().list_namespaced_custom_object(
+            GROUP, "v1alpha1", NAMESPACE, PLURAL
+        )
+
+    calls, _, sentinel_host = patch_config_loaders(monkeypatch)
+    monkeypatch.setattr(singleton, "_process_guard", None)
+    guard = singleton._get_guard()
+
+    assert calls == ["load_incluster_config", "CustomObjectsApi()"]
+    assert guard._custom_api.api_client.configuration.host == sentinel_host
+
+
+def test_get_guard_falls_back_to_kubeconfig_out_of_cluster(monkeypatch):
+    """In-cluster load fails (bare ``kopf run`` dev session) → kubeconfig path."""
+    calls, clients, _ = patch_config_loaders(
+        monkeypatch, incluster_error=ConfigException("host env not set")
+    )
+    monkeypatch.setattr(singleton, "_process_guard", None)
+
+    guard = singleton._get_guard()
+
+    assert calls == ["load_incluster_config", "load_kube_config", "CustomObjectsApi()"]
+    assert guard._custom_api is clients[0]
+
+
+def test_get_guard_builds_once_per_process(monkeypatch, default_configuration_restored):
+    """The lazy process-wide guard loads config exactly once — later ticks reuse
+    the built client instead of re-loading config on every call."""
+    calls, _, _ = patch_config_loaders(monkeypatch)
+    monkeypatch.setattr(singleton, "_process_guard", None)
+
+    first = singleton._get_guard()
+    again = singleton._get_guard()
+
+    assert again is first
+    assert calls == ["load_incluster_config", "CustomObjectsApi()"]
+
+
+def no_config_loaders(monkeypatch):
+    def no_config(*args: object, **kwargs: object) -> None:
+        raise ConfigException("no kubeconfig anywhere")
+
+    monkeypatch.setattr(kubernetes.config, "load_incluster_config", no_config)
+    monkeypatch.setattr(kubernetes.config, "load_kube_config", no_config)
+    monkeypatch.setattr(singleton, "_process_guard", None)
+
+
+def test_gated_wrapper_skips_tick_when_no_config_loads(monkeypatch, caplog, log):
+    """Fail-closed on total config failure: the gated handler skips the tick
+    (Warning log, handler body never runs) instead of propagating
+    ConfigException — the tick is retried on the next poll."""
+    registry = make_registry_with_handlers()
+    install_singleton_guard(registry=registry)
+    gated = oscm_handlers(registry)[0].fn
+    no_config_loaders(monkeypatch)
+
+    assert (
+        gated(
+            body=make_cr("alpha", OLD_TS),
+            spec={},
+            namespace=NAMESPACE,
+            name="alpha",
+            logger=log,
+        )
+        is None
+    )
+    assert any("singleton guard" in r.getMessage() for r in caplog.records)
+
+
+def test_startup_wrapper_survives_config_failure(caplog, log, monkeypatch):
+    """The #79 symptom class: a guard config failure in the startup path must
+    not prevent kopf from finishing startup — log a Warning and move on."""
+    no_config_loaders(monkeypatch)
+    monkeypatch.setenv("POD_NAMESPACE", NAMESPACE)
+
+    singleton.singleton_guard_startup(logger=log)  # must not raise
+
+    assert any("could not list OSCM CRs" in r.getMessage() for r in caplog.records)

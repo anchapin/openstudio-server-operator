@@ -62,6 +62,7 @@ from typing import Any
 
 import kopf
 from kubernetes.client import ApiException, CustomObjectsApi
+from kubernetes.config import ConfigException
 
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
@@ -233,10 +234,34 @@ def set_guard(guard: SingletonGuard | None) -> None:
     _process_guard = guard
 
 
+def _build_custom_objects_api() -> CustomObjectsApi:
+    """Construct the guard's client against a LOADED configuration (#79).
+
+    kopf >=1.44 drives its own (kr8s) clients and never initializes
+    client-python's global default ``Configuration`` — a bare
+    ``CustomObjectsApi()`` therefore carries an empty host (``host == ''``)
+    and every call raises ``LocationValueError``. The guard check runs as a
+    kopf ``on.startup`` activity, so that failure kept kopf from finishing
+    startup at all: pod Running, operator functionally dead (proven live in
+    #66's kind validation). Mirror ``StatusStore.in_cluster``: load the
+    operator pod's service-account config in-cluster, falling back to
+    kubeconfig for local/dev ``kopf run`` sessions. Pure wiring — no policy
+    values here; if neither config loads, the exception propagates and
+    callers fail closed (skip the tick, retry next poll).
+    """
+    from kubernetes import config as kube_config
+
+    try:
+        kube_config.load_incluster_config()
+    except ConfigException:
+        kube_config.load_kube_config()
+    return CustomObjectsApi()
+
+
 def _get_guard() -> SingletonGuard:
     global _process_guard
     if _process_guard is None:
-        _process_guard = SingletonGuard(CustomObjectsApi())
+        _process_guard = SingletonGuard(_build_custom_objects_api())
     return _process_guard
 
 
@@ -262,7 +287,7 @@ def _gated(fn: Callable) -> Callable:
             return None
         try:
             active = _get_guard().is_active(body, str(namespace))
-        except (ApiException, SingletonGuardError) as exc:
+        except (ApiException, ConfigException, SingletonGuardError) as exc:
             log.warning(
                 "%s skipped this tick, retrying next poll — singleton guard could not "
                 "resolve the active CR (%s: %s)",
@@ -348,10 +373,10 @@ def _check(namespace: str | None, logger: logging.Logger) -> None:
     if not namespace:
         logger.debug("singleton guard: no namespace in context — check skipped")
         return
-    guard = _get_guard()
     try:
+        guard = _get_guard()
         items = guard.list_crs(namespace)
-    except ApiException as exc:
+    except (ApiException, ConfigException) as exc:
         logger.warning(
             "singleton guard: could not list OSCM CRs, will retry on the next "
             "event/tick (%s: %s)",
