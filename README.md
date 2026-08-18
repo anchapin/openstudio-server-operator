@@ -2,13 +2,13 @@
 
 A Kubernetes operator that automates day-2 operations for [OpenStudio Server](https://github.com/NREL/OpenStudio-server) deployments (Ruby/Rails `web` + `web_background` + MongoDB + `worker` pods + NFS-shared volumes). It runs **alongside** the existing [`openstudio-server-helm`](https://github.com/NREL/openstudio-server-helm) chart — it manages that stack; it does not replace it.
 
-**Status: pre-implementation scaffold.** The authoritative spec is [`OpenStudio Server Operator Architecture & Implementation Plan.md`](./OpenStudio%20Server%20Operator%20Architecture%20&%20Implementation%20Plan.md). Code modules are placeholders mapped to plan phases. Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
+**Status: implementation complete (Phases 1–4, issues #2–#21); pre-cluster validation.** The verified API ground truth is [`.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md`](./.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
 
 ## What it will automate
 
 | Module | Plan phase | Purpose |
 |---|---|---|
-| Analysis SLA / soft-stop | 1 | Soft-stop analyses exceeding `maxDurationMinutes`; escalate to `kill`/`hard_stop` after grace period |
+| Analysis SLA / soft-stop | 1 | Soft-stop analyses exceeding `maxDurationMinutes`; after `gracefulStopTimeoutMinutes`, surgically evict worker pods whose IP matches a started datapoint's `ip_address` (gated by `analysisPolicy.forceDeleteOnEscalation`) |
 | Zombie datapoint watchdog | 2 | Auto-requeue datapoints stalled past `maxDatapointRuntimeMinutes` (bounded by `maxAutoRequeues`) |
 | Worker recycler | 2 | Rolling-restart the worker Deployment after analyses / on interval |
 | web_background watchdog | 2 | Detect Resque queue stalls; restart the `web_background` Deployment |
@@ -25,12 +25,26 @@ The operator deliberately does **not** deploy KEDA (or any second autoscaler): t
 .
 ├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (placeholder)
 ├── deploy/                     # CRD, RBAC (namespaced Role only), operator Deployment
+├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md
+├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
-│   ├── config.py               # CRD spec → typed settings
-│   ├── openstudio_client.py    # OpenStudio REST client (action spellings matter)
-│   ├── metrics.py              # Prometheus counters (Phase 4)
+│   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
+│   ├── openstudio_client.py    # OpenStudio REST client (verified against v3.11.0)
+│   ├── status_store.py         # CR .status RMW helper (D04 durable store, 409-safe)
+│   ├── redis_client.py         # read-only Redis client (queue depths + Resque liveness)
+│   ├── archival.py             # rclone archival Job manifest generator (backend-agnostic)
+│   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
+│   ├── metrics.py              # Prometheus counters + /metrics endpoint
 │   └── handlers/               # Kopf handlers, one file per plan module
-├── tests/                      # structural smoke tests
+│       ├── analysis_sla.py
+│       ├── datapoint_watchdog.py
+│       ├── worker_recycler.py
+│       ├── storage_pruner.py
+│       ├── web_background_monitor.py
+│       └── hpa_floor.py
+├── tests/                      # unit tests for every handler + client + status store + fixtures
+│   ├── fixtures/               # contract-shapes.json + samples/ (synthetic) + live/ (captured)
+│   └── golden/                 # snapshot tests for generated rclone Job manifests
 ├── Dockerfile
 └── pyproject.toml
 ```
