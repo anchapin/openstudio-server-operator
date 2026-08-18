@@ -4,7 +4,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: openstudio-operator
-  namespace: openstudio
+  namespace: openstudio-server
 spec:
   replicas: 1
   strategy:
@@ -27,10 +27,9 @@ spec:
             - --module
             - openstudio_operator.handlers
             - --namespace
-            - openstudio
-          env:
-            - name: OPENSTUDIO_SERVER_URL
-              value: "http://web.openstudio.svc.cluster.local" # TODO: match the helm deployment
+            - openstudio-server
+          # Server URL comes from the CR spec.serverUrl (config.py) — single
+          # config path; no OPENSTUDIO_SERVER_URL env fallback.
           resources:
             requests:
               cpu: 100m
