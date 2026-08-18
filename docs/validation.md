@@ -73,8 +73,10 @@ the four that change how you interpret curl output here:
   `python -m venv .venv && pip install -e '.[dev]'`.
 - `curl`, `jq`; port-forward ability to `svc/web`.
 - The operator image (`ghcr.io/anchapin/openstudio-server-operator:dev`) is
-  **unpublished** — run the operator locally (Phase A step 4), or build/push
-  the dev image yourself before using `deploy/operator-deployment.yaml`.
+  published automatically on pushes to `develop`; prefer applying
+  `deploy/operator-deployment.yaml`. If the published image is unavailable,
+  run the operator locally (Phase A step 4), or build/push the dev image
+  yourself before using the Deployment.
 
 ## Phase 0 — pre-flight: fixture drift on the work cluster
 
@@ -142,8 +144,15 @@ means stop and fix the contract/tests first — not the runbook.
 3. **Confirm defaults landed**: `kubectl -n openstudio-server get oscm
    validation -o yaml` — spec defaults (CRD) populated, `.status` empty.
 
-4. **Run the operator** — locally (image is unpublished; kubeconfig points
-   at the work cluster):
+4. **Run the published operator Deployment** — the `:dev` image is published
+   by the release workflow after pushes to `develop`:
+
+   ```bash
+   kubectl apply -f deploy/operator-deployment.yaml
+   kubectl -n openstudio-server rollout status deploy/openstudio-operator
+   ```
+
+   If the image is unavailable, use the local fallback instead:
 
    ```bash
    source .venv/bin/activate

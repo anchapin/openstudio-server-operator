@@ -1,4 +1,4 @@
-# Placeholder operator Deployment — image is not published yet (see Dockerfile).
+# Operator image is published by .github/workflows/release.yml on pushes to develop.
 # TODO(phase 1): verify against a real cluster once handler logic lands.
 apiVersion: apps/v1
 kind: Deployment

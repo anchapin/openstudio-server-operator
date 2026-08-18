@@ -23,7 +23,7 @@ The operator deliberately does **not** deploy KEDA (or any second autoscaler): t
 
 ```
 .
-├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (placeholder)
+├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (GHCR + releases)
 ├── deploy/                     # CRD, RBAC (namespaced Role only), operator Deployment
 ├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
@@ -68,7 +68,8 @@ pip install -e '.[dev]'
 
 ruff check .     # lint
 pytest           # tests
-kopf run --module openstudio_operator.handlers --namespace openstudio   # run (needs cluster + CRD)
+kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
+
 ```
 
 Kubernetes manifests (CRD, least-privilege RBAC, operator Deployment) live in `deploy/`.
@@ -76,4 +77,4 @@ Kubernetes manifests (CRD, least-privilege RBAC, operator Deployment) live in `d
 ## CI
 
 - **ci.yml** — `ruff` + `pytest` on pushes to `develop` and PRs into `develop`/`main`; the `guard-branch-pairing` job enforces the `main` ← `develop` policy.
-- **release.yml** — placeholder for image build/publish on `main` updates.
+- **release.yml** — publishes `ghcr.io/anchapin/openstudio-server-operator:dev` on pushes to `develop`; pushes of `v*` tags publish a versioned image and create a GitHub Release. The workflow currently targets `linux/amd64`; arm64 is a follow-up.
