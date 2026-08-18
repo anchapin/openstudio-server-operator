@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "kopf>=1.37",
     "kubernetes>=29.3.0",
+    "redis>=5.0", # read-only queue-fabric client (#12)
     "requests>=2.32.0",
     "prometheus-client>=0.20.0", # Phase 4: /metrics endpoint
 ]
@@ -16,6 +17,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5.0",
     "responses>=0.25.0", # mock OpenStudio REST API in tests
+    "fakeredis>=2.23", # mock Redis for the read-only client tests (#12)
 ]
 
 [build-system]
