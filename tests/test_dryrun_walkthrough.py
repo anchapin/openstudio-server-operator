@@ -758,7 +758,9 @@ def _stall_redis(at: datetime) -> ReadOnlyRedisClient:
     fake.rpush("simulations", "j2")
     epoch = at.timestamp()
     fake.sadd("resque:workers", "w1")
-    fake.set("resque:workers:w1", str(epoch - 600))  # stale (>300s)
+    # LIVE-VERIFIED v3.11.0 layout (#66): heartbeat HASH with ISO8601 values.
+    stale_iso = datetime.fromtimestamp(epoch - 600, tz=UTC).isoformat()
+    fake.hset("resque:workers:heartbeat", "w1", stale_iso)  # stale (>300s)
     return ReadOnlyRedisClient("redis://:pw@queue.test:6379", connection=fake)
 
 
