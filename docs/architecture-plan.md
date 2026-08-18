@@ -139,6 +139,8 @@ spec:
        3. Wait for spec.analysisPolicy.gracefulStopTimeoutMinutes, anchored on CR .status timestamps (v3.11.0 analysis states are na, init, queued, started, post-processing, completed; there is no stopping or failed state, and stop/soft\_stop only flip the run\_flag boolean without changing status).  
        4. Escalate on the Kubernetes side: delete the worker pods whose pod IP matches a started datapoint's ip\_address (fetched escalation-only from GET /data\_points.json, which ignores query params), gated by analysisPolicy.forceDeleteOnEscalation. No kill or hard\_stop action exists in v3.11.0.
 
+**Reserved surface: ``stop_analysis`` (issue #49).** The waiting-variant stop (``POST /analyses/{id}/action`` with ``analysis_action=stop``) is contract-correct and tested, but has zero call sites: SLA uses the non-waiting ``soft_stop`` (Module 1, step 3) and retention owns the deletion path. It is kept in ``OpenStudioClient`` for contract completeness and is **reserved** for future wiring. Any handler that wires it MUST add ``spec.dryRun`` gating (D11) and a ``.status``-anchored idempotency record (D04), and MUST update ``docs/audit-dryrun-idempotency.md`` §1.1 row R2 (replace DORMANT with GATED) in the same PR.
+
 ### **Module 2: Zombie Datapoint Watchdog & Auto-Requeue**
 
 * **Goal:** Detect individual stalled simulations caused by worker OOM or pod eviction.  
