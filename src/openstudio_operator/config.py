@@ -10,6 +10,16 @@ from dataclasses import dataclass, field
 
 DEFAULT_REDIS_URL = "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
 
+#: Module 5 (#13): heartbeat-staleness threshold (seconds) passed to
+#: ``ReadOnlyRedisClient.stale_workers`` when judging "no worker is
+#: processing". Resque workers heartbeat every ~5 s while alive, so 300 s
+#: with no fresh heartbeat from ANY worker unambiguously means "nobody is
+#: processing" while staying well under the default 10-minute stall window
+#: (the sustained window, not this threshold, dominates reaction time).
+#: NOT a CRD field — the v1alpha1 schema is fixed (#4) — so it lives here as
+#: a documented wiring default (same convention as DEFAULT_REDIS_URL).
+DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0
+
 
 @dataclass(frozen=True)
 class AnalysisPolicy:
