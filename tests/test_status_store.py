@@ -139,6 +139,26 @@ def test_started_since_round_trip_and_wire_format(store, api):
     assert api.obj["status"]["startedSince"]["dp1"] == "2026-08-18T07:15:00+00:00"
 
 
+def test_clear_started_since_deletes_only_that_key(store, api):
+    """Departure prune (#10): removes the clock entry, leaves requeues intact."""
+    when = datetime(2026, 8, 18, 7, 15, 0, tzinfo=UTC)
+    store.set_started_since("dp1", when)
+    store.set_started_since("dp2", when)
+    store.set_requeue("dp1", make_requeue(count=1))
+
+    store.clear_started_since("dp1")
+
+    assert store.get_started_since("dp1") is None
+    assert store.get_started_since_map() == {"dp2": when}
+    assert api.obj["status"]["requeues"]["dp1"]["count"] == 1
+
+
+def test_clear_started_since_is_idempotent(store, api):
+    patches_before = api.patch_calls
+    store.clear_started_since("never-existed")
+    assert api.patch_calls == patches_before  # absent key → no write at all
+
+
 def test_archived_analysis_round_trip_and_wire_format(store, api):
     record = make_archived()
     store.set_archived_analysis("a1", record)
