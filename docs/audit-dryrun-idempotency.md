@@ -199,3 +199,50 @@ delete_namespaced_job|patch_namespaced_horizontalpodautoscaler|\
 patch_namespaced_custom_object_status' src/                    # §1.1 table
 # AST literal sweep for §3.2 (numeric + string constants per file, parent-contexted)
 ```
+
+## Appendix D — Prometheus metrics registry (issue #17; #50 decision)
+
+Counters live in `src/openstudio_operator/metrics.py`, are module-level
+singletons on `prometheus_client`'s default REGISTRY, and are served by
+`start_metrics_server()` on the conventional port `9090` (operator-pod-
+local; the scrape is in-cluster). Every counter below corresponds to a
+mutation or a decision whose dry-run path is documented in §1 and
+increments identically in dry-run (D11-exempt category — in-process
+metrics, not cluster state). Coverage is exhaustive: there is no metric
+declared in code without an incrementer, and there is no incrementer
+without a metric. This invariant is what makes "no permanently-zero
+metric" true.
+
+| Counter | Module | Increments on | Anchor pairing |
+|---|---|---|---|
+| `openstudio_operator_soft_stops_total` | `analysis_sla` (#8) | Soft-stop issued (or dry-run substituted) | `status.softStops[id]` |
+| `openstudio_operator_datapoints_requeued_total` | `datapoint_watchdog` (#10) | Requeue issued (or dry-run) | `status.requeues[dp]` |
+| `openstudio_operator_datapoints_requeue_exhausted_total` | `datapoint_watchdog` (#10) | Requeue budget exceeded (decision counter) | `status.requeues[dp].count` |
+| `openstudio_operator_workers_recycled_total` | `worker_recycler` (#11) | Recycle issued (or dry-run) | `status.lastRecycleAt` |
+| `openstudio_operator_worker_pods_evicted_total` | `analysis_sla` (#9) | Escalation eviction (decision counter; dry-run counts too) | `SoftStopRecord.escalated_at` |
+| `openstudio_operator_web_background_restarts_total` | `web_background_monitor` (#13) | web_background restart issued (or dry-run) | `status.lastWebBackgroundRestart` |
+| `openstudio_operator_analyses_archived_total` | `storage_pruner` (#16) | Archival Job observed Complete (adopted completions included) | `status.archivedAnalyses[id].verified_at` |
+| `openstudio_operator_analyses_deleted_total` | `storage_pruner` (#16) | `DELETE /analyses/{id}` issued post-verification (suppressed by `spec.dryRun`) | `status.archivedAnalyses[id].verified_at` |
+| `openstudio_operator_hpa_floor_adjustments_total` | `hpa_floor` (#18) | HPA-floor adjustment issued (raise + decay; dry-run counts too) | `HpaFloorState` (in-memory, documented D04 deviation) |
+
+### D.1 Removed counter — `STORAGE_FREED_BYTES` (issue #50)
+
+`openstudio_operator_storage_freed_bytes` was declared by #16 alongside
+the archival+prune pipeline as the canonical "NFS bytes reclaimed"
+metric — but #16 deliberately never incremented it: neither the rclone
+archival Job's status nor the OpenStudio API exposes a byte figure at
+delete time, and fabricating one would corrupt the counter. A
+permanently-zero counter is worse than none (it reads as "zero bytes
+ever freed"), so #50 removed it cleanly from `metrics.py`,
+`tests/test_metrics_endpoint.py`'s `EXPECTED_COUNTER_FAMILIES`, and the
+validation runbook's reference in `docs/validation.md` (Module 4 step 3).
+The durable signal of an archived-then-deleted analysis is
+`status.archivedAnalyses[id]`, which is what the runbook now uses.
+
+**Reintroduction gate (when a real source is built):** parse the
+archival Job's rclone copy summary (a small Job wrapper that writes a
+status annotation is the cleanest path), OR a pre/post `du` on the NFS
+tree before/after the verified `DELETE` lands. The increment site is
+the storage-pruner's verified-delete branch (`storage_pruner.py`,
+alongside `ANALYSES_DELETED_TOTAL`). Add the counter back to this
+appendix's table at the same time.

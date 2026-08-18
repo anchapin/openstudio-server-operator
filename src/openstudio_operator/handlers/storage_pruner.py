@@ -73,10 +73,14 @@ the tick after.
 Ordering (D12, same accepted races as #8/#11): Job create → record write —
 a lost record write is healed by the spawn path's read-first adopt logic
 (deterministic name); delete → prune — a lost prune is healed by the
-vanish-reconcile path. ``STORAGE_FREED_BYTES`` is deliberately NOT
-incremented: neither the Job status nor the API exposes a byte figure, and
-fabricating one would corrupt the counter (a future rclone-stats parse
-could supply real numbers).
+vanish-reconcile path. NFS bytes reclaimed are intentionally NOT
+exposed as a Prometheus counter: neither the Job status nor the API
+exposes a byte figure at delete time, and #50 removed the prior
+``STORAGE_FREED_BYTES`` counter (#16's choice to never increment it left
+a permanently-zero metric, which read as 'zero bytes ever freed'). A
+future rclone-stats parse or pre/post ``du`` on the NFS tree could
+reintroduce a real, sourced counter — the audit doc's Appendix D is the
+canonical home for that decision when it lands.
 
 Failure handling (D12): REST/kube/status-store failures raise out of
 :meth:`run_retention_tick`; the kopf wrapper skips the tick and everything
