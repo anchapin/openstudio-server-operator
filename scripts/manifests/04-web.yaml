@@ -1,0 +1,96 @@
+# Web — mirrors the helm chart's `web` Deployment + `web` Service (:80).
+# Image is pinned to nrel/openstudio-server:3.11.0 — the version the operator
+# targets (AGENTS.md; the chart default 3.8.0-1 is NOT the target).
+#
+# Env/command replicated from the chart's web-deploy.yaml (develop branch):
+#   command: bash -c "/usr/local/bin/rails-entrypoint && /usr/local/bin/start-server"
+#   QUEUES=analysis_wrappers  (web also runs one Resque worker for this queue)
+#   REDIS_URL=redis://:openstudio@queue:6379
+#   MONGO_USER/MONGO_PASSWORD=openstudio (mongoid auth_source admin, host db:27017)
+#   SECRET_KEY_BASE — the chart's committed default (upstream public value, not a secret)
+# Scaled-minimal: MAX_REQUESTS/MAX_POOL/OS_SERVER_NUMBER_OF_WORKERS tuned down
+# from the chart's production formulas for a single-node kind cluster.
+#
+# APPENDIX (deltas vs chart, documented in docs/kind-validation.md):
+#   * readinessProbe httpGet / :80 kept; livenessProbe (grep /proc/mounts for
+#     /mnt/openstudio) dropped — the hostPath mount satisfies it, and fewer
+#     probes = fewer failure modes for an API-validation environment.
+#   * No load_balancer / web-hpa (web replicas pinned to 1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: openstudio-server
+  labels:
+    app: web
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nrel/openstudio-server:3.11.0
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-c", "/usr/local/bin/rails-entrypoint && /usr/local/bin/start-server"]
+          ports:
+            - containerPort: 80
+          env:
+            - name: OS_SERVER_NUMBER_OF_WORKERS
+              value: "1"
+            - name: QUEUES
+              value: analysis_wrappers
+            - name: SECRET_KEY_BASE
+              value: c4ab6d293e4bf52ee92e8dda6e16dc9b5448d0c5f7908ee40c66736d515f3c29142d905b283d73e5e9cef6b13cd8e38be6fd3b5e25d00f35b259923a86c7c473
+            - name: REDIS_URL
+              value: redis://:openstudio@queue:6379
+            - name: MONGO_USER
+              value: openstudio
+            - name: MONGO_PASSWORD
+              value: openstudio
+            - name: MAX_REQUESTS
+              value: "50"
+            - name: MAX_POOL
+              value: "4"
+          volumeMounts:
+            - name: nfs
+              mountPath: /mnt/openstudio
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              memory: 4Gi
+      volumes:
+        - name: nfs
+          persistentVolumeClaim:
+            claimName: nfs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: openstudio-server
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80

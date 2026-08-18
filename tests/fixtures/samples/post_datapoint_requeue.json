@@ -1,0 +1,10 @@
+{
+  "source": "synthetic-sample",
+  "notes": "Success shape (head :no_content): HTTP 204, empty body. LIVE-VERIFIED trap (kind, 2026-08-18): requeue on a datapoint with NO Resque job (never queued) returns 500 {status: 500, error: 'Internal Server Error'} — only requeue dps that have a job_id. Requires Accept: application/json.",
+  "endpoint": "/data_points/{id}/requeue",
+  "method": "POST",
+  "http_status": 204,
+  "content_type": null,
+  "location": null,
+  "body": ""
+}

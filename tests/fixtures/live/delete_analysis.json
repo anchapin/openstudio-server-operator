@@ -1,0 +1,8 @@
+{
+  "endpoint": "/analyses/0d95fdb7-999d-4520-adff-0c639220df16",
+  "method": "DELETE",
+  "http_status": 204,
+  "content_type": "",
+  "location": null,
+  "body": ""
+}

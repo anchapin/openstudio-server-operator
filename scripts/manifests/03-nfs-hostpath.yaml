@@ -1,0 +1,43 @@
+# NFS stand-in — hostPath PV + PVC named exactly like the chart's `nfs-pvc`
+# (RWX, mounted only by web/web-background at /mnt/openstudio; worker scratch
+# is an emptyDir per the chart's worker Deployment).
+#
+# APPENDIX (approximation vs production — documented in docs/kind-validation.md):
+#   * The chart's PVC is backed by the nfs-server-provisioner subchart
+#     (NFSv3, RWX across nodes). Here it is a hostPath on the single kind node.
+#     - FINE for: REST API validation, DELETE /analyses/{id} cascade behaviour
+#       (the server rm-rf's asset dirs under /mnt/openstudio/server/assets/...),
+#       web/web-background pod boot (rails-entrypoint provisions those dirs).
+#     - WEAK for: NFS-eviction testing — hostPath never goes away, so scenarios
+#       like stuck NFS mounts / eviction-on-unmount cannot be reproduced.
+#   * Path is inside the kind node container (/tmp/openstudio-kind-nfs), so
+#     contents survive pod restarts but NOT cluster rebuilds, and are not
+#     directly visible on the host filesystem.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-pv
+spec:
+  storageClassName: ""
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /tmp/openstudio-kind-nfs
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-pvc
+  namespace: openstudio-server
+spec:
+  volumeName: nfs-pv
+  storageClassName: ""
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi

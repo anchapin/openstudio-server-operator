@@ -1,0 +1,69 @@
+# Redis — stand-in for the helm chart's `redis` Deployment behind Service
+# `queue` (develop branch). Image, password, args and Service name mirror the
+# chart defaults:
+#   redis.container.image = redis:6.0.9
+#   redis.password        = openstudio
+#   redis_svc.name        = queue   (port 6379)
+#   args                  = redis-server --appendonly yes --requirepass ... --maxclients 10000
+# The operator's read-only Redis client (#12) targets `queue:6379` with this
+# same password.
+# APPENDIX (approximation vs production): chart uses a 100Gi PVC; here an
+# emptyDir — queue state does not survive pod restarts. Fine for API
+# validation.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: openstudio-server
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:6.0.9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6379
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - openstudio
+            - --maxclients
+            - "10000"
+          volumeMounts:
+            - mountPath: /data
+              name: redis
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: redis
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: queue
+  namespace: openstudio-server
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379

@@ -1,0 +1,10 @@
+{
+  "endpoint": "/analyses/ffffffffffffffffffffffff/status.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "analyses": []
+  }
+}

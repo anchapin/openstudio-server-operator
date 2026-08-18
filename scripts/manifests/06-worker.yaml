@@ -1,0 +1,105 @@
+# Worker — mirrors the helm chart's `worker` Deployment, scaled-minimal
+# (replicas: 1 — the chart's worker-hpa runs 2–20 in production).
+# Same 3.11.0 image, QUEUES=requeued,simulations, COUNT=1, command
+# /usr/local/bin/start-workers, and emptyDir scratch at /mnt/openstudio
+# (per the chart: worker scratch is node-local emptyDir, NOT the nfs-pvc).
+#
+# The preStop lifecycle hook and terminationGracePeriodSeconds: 5200 from the
+# chart are kept — the operator's surgical pod-eviction escalation (#9) and
+# the worker recycler (#11) delete worker pods, so the shutdown path matters.
+#
+# worker-hpa: included for TOPOLOGY PARITY ONLY. The chart's HPA is
+# unconditional (2–20, CPU 50%); the operator's Phase-4 HPA-floor adjuster
+# (#18) patches its minReplicas. kind ships no metrics-server, so this HPA
+# will never scale on CPU — it stays at minReplicas, which is exactly what
+# patch-target validation needs (the object exists with the right name).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: openstudio-server
+  labels:
+    app: worker
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: nrel/openstudio-server:3.11.0
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/start-workers"]
+          env:
+            - name: QUEUES
+              value: requeued,simulations
+            - name: COUNT
+              value: "1"
+            - name: SECRET_KEY_BASE
+              value: c4ab6d293e4bf52ee92e8dda6e16dc9b5448d0c5f7908ee40c66736d515f3c29142d905b283d73e5e9cef6b13cd8e38be6fd3b5e25d00f35b259923a86c7c473
+            - name: REDIS_URL
+              value: redis://:openstudio@queue:6379
+            - name: MONGO_USER
+              value: openstudio
+            - name: MONGO_PASSWORD
+              value: openstudio
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    echo "Creating kill.worker file" >&2
+                    touch /opt/openstudio/server/bin/kill.worker
+                    echo "Sending QUIT signal to Resque" >&2
+                    pkill -f -QUIT resque || true
+                    echo "Waiting for Ruby or OpenStudio processes to end (max 50s)" >&2
+                    timeout=50
+                    while [ $timeout -gt 0 ] && ( [ $(eval "pgrep -c ruby") -gt 1 ] || [ $(eval "pgrep -c openstudio") -gt 0 ] ); do
+                      sleep 2
+                      echo "Still waiting... ($timeout seconds remaining)" >&2
+                      timeout=$((timeout-2))
+                    done
+                    echo "Killing remaining processes" >&2
+                    pkill -P 1 || true
+          volumeMounts:
+            - name: osdata-worker
+              mountPath: /mnt/openstudio
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      terminationGracePeriodSeconds: 5200
+      volumes:
+        - name: osdata-worker
+          emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: openstudio-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50

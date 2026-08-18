@@ -1,0 +1,12 @@
+{
+  "source": "synthetic-sample",
+  "notes": "LIVE-VERIFIED not-found shape (kind, 2026-08-18): mongoid.yml raise_not_found_error: false, so Analysis#find returns nil and page_data answers HTTP 200 {analysis: null} — NOT 404. The operator client must treat this as not-found.",
+  "endpoint": "/analyses/ffffffffffffffffffffffff/page_data.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "analysis": null
+  }
+}

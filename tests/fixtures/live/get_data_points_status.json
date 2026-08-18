@@ -1,0 +1,10 @@
+{
+  "endpoint": "/data_points/status?status=1&jobs=started",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "data_points": []
+  }
+}

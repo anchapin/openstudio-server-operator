@@ -1,0 +1,8 @@
+{
+  "endpoint": "/analyses/0d95fdb7-999d-4520-adff-0c639220df16/soft_stop",
+  "method": "GET",
+  "http_status": 302,
+  "content_type": "text/html; charset=utf-8",
+  "location": "http://localhost:8080/analyses/0d95fdb7-999d-4520-adff-0c639220df16",
+  "body": ""
+}

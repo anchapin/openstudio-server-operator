@@ -1,0 +1,38 @@
+{
+  "source": "synthetic-sample",
+  "notes": "Mirrors live-captured single-match shape: {analysis: {...}} with id DUPLICATED as both _id and id, exit_on_guideline_14 as integer. Multiple/zero matches use the {analyses: [...]} plural wrapper instead.",
+  "endpoint": "/analyses/{id}/status.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "analysis": {
+      "_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "status": "started",
+      "analysis_type": "batch_run",
+      "run_flag": true,
+      "exit_on_guideline_14": 0,
+      "total_datapoints": 1,
+      "jobs": [
+        {
+          "index": 0,
+          "analysis_type": "batch_run",
+          "status": "completed",
+          "status_message": "completed normal"
+        }
+      ],
+      "data_points": [
+        {
+          "_id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+          "id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+          "name": "sample-datapoint-0",
+          "analysis_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+          "status": "na",
+          "status_message": ""
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "source": "synthetic-sample",
+  "notes": "LIVE-VERIFIED empty shape (kind, 2026-08-18): status uses where(), never raises — unknown id / no matches answers HTTP 200 with the PLURAL wrapper {analyses: []}. Exactly one match wraps as {analysis: {...}}.",
+  "endpoint": "/analyses/{unknown-or-no-match}/status.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "analyses": []
+  }
+}

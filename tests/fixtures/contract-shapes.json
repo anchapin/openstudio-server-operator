@@ -1,0 +1,113 @@
+{
+  "contract_source": ".agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md",
+  "verified_against": "NREL/OpenStudio-server tag v3.11.0 (server/app/controllers/*.rb, config/mongoid.yml) + NatLabRockies/openstudio-server-helm develop branch + LIVE kind capture 2026-08-18 (docs/kind-validation.md)",
+  "purpose": "Machine-readable distillation of the endpoint RESPONSE SHAPES the operator depends on. scripts/check_fixture_drift.py diffs captured fixtures (tests/fixtures/live/) and committed samples (tests/fixtures/samples/) against these shapes. Key semantics: required_keys/item_required_keys missing = DRIFT (fail); item_forbidden_keys present = DRIFT (fail); item_expected_keys missing = WARN (conditionally-populated key); extra keys = INFO (server richer than contract is normal for raw Mongoid docs).",
+  "live_verified_global_rules": [
+    "mongoid.yml sets raise_not_found_error: false — Analysis#find returns nil instead of raising: unknown ids do NOT 404. page_data answers 200 {analysis: null}; status answers 200 with an empty plural wrapper.",
+    "Raw Mongoid docs (analyses.json, data_points.json) OMIT nil fields — an absent key is not a null key. A fresh analysis has NO status key until the workflow advances. DataPoint docs, in contrast, carry run_start_time/ip_address/job_id as explicit nulls before start.",
+    "Ids are UUID strings (mongoid uuid key), not BSON ObjectIds. Raw docs have _id only; the derived status views additionally duplicate it as id.",
+    "Content negotiation: endpoints with both HTML and JSON variants (action, requeue, DELETE) return the HTML variant (e.g. DELETE -> 302 redirect) unless the client sends Accept: application/json. The operator's JSON client sees the JSON shapes captured here; curl without -H 'Accept: application/json' does not.",
+    "page_data uses as_json(only: [...]) which drops nil fields — start_time is ABSENT (not null) until the first job runs. The SLA anchor must tolerate absence."
+  ],
+  "endpoints": {
+    "get_analyses": {
+      "request": {"method": "GET", "path": "/analyses.json"},
+      "response": {
+        "http_status": [200],
+        "type": "array",
+        "item_required_keys": ["_id", "run_flag", "created_at", "updated_at"],
+        "item_expected_keys": ["status", "status_message", "name"],
+        "item_forbidden_keys": ["start_time"],
+        "notes": "Raw Mongoid docs; no derived methods. start_time is NOT a stored Analysis field - it only exists in page_data.json. status is ABSENT on a fresh analysis (nil field omitted); run_flag serializes even when false."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "get_analysis_status": {
+      "request": {"method": "GET", "path": "/analyses/{id}/status.json"},
+      "response": {
+        "http_status": [200],
+        "any_of_top_keys": [["analysis"], ["analyses"]],
+        "status_view_keys": ["_id", "id", "status", "analysis_type", "run_flag", "exit_on_guideline_14", "total_datapoints", "jobs", "data_points"],
+        "notes": "Wrapping is count-based (live-verified): exactly 1 match -> {analysis: {...}}; 0 or many -> {analyses: [...]}. exit_on_guideline_14 renders as an integer. jobs items: {index, analysis_type, status, status_message}; data_points items: {_id, id, name, analysis_id, status, status_message}. Uses where() (not find): unknown ids never 404, they yield the empty plural wrapper."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "get_analysis_page_data": {
+      "request": {"method": "GET", "path": "/analyses/{id}/page_data.json"},
+      "response": {
+        "http_status": [200],
+        "required_keys": ["analysis"],
+        "nested": {
+          "analysis": {
+            "required_keys": ["name", "data_points", "results", "output_variables"],
+            "item_expected_keys": ["analysis_type", "status", "start_time", "end_time", "seed_zip", "run_start_time", "run_end_time"]
+          }
+        },
+        "notes": "SLA clock anchor: analysis.start_time is derived from the first job and is ABSENT (nil-omitted by as_json) until then. Live-verified minimal analysis serializes as {name, data_points, results, output_variables} only."
+      },
+      "error_shape": {"http_status": [404, 422, 500], "null_key": "analysis"}
+    },
+    "get_data_points_status": {
+      "request": {"method": "GET", "path": "/data_points/status?status=1&jobs=started"},
+      "response": {
+        "http_status": [200],
+        "required_keys": ["data_points"],
+        "nested": {
+          "data_points": {
+            "item_required_keys": ["_id", "id", "analysis_id", "status", "status_message"]
+          }
+        },
+        "notes": "Light watchdog poll. Rails quirk: presence of the status param gates filtering; the filter VALUE is read from jobs. No timestamps in this view - pair with operator-tracked startedSince (Q6). No matches -> {data_points: []} over 200 (where() query, never 404)."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "get_data_points": {
+      "request": {"method": "GET", "path": "/data_points.json"},
+      "response": {
+        "http_status": [200],
+        "type": "array",
+        "item_required_keys": ["_id", "analysis_id", "status", "status_message", "updated_at"],
+        "item_expected_keys": ["run_start_time", "ip_address", "job_id", "internal_ip_address"],
+        "notes": "DataPoint.all - query params ignored (no server-side filter). Heavy; escalation-only. Live-verified: conditional keys are present-but-null before a worker picks the datapoint up; raw docs have _id only (no id duplicate). status starts at 'na' with status_message ''."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "get_analysis_soft_stop": {
+      "request": {"method": "GET", "path": "/analyses/{id}/soft_stop"},
+      "response": {
+        "http_status": [302],
+        "expect_location": true,
+        "body_type": "html-or-empty",
+        "notes": "Cooperative stop; does NOT wait for in-flight runs. HTML-only action (respond_to has no format.json): live-verified 302 with an ABSOLUTE Location URL. The JSON-observable effect is run_flag flipping in later reads. Do NOT follow the redirect when capturing. Unknown ids ALSO 302 (controller nil-check redirects to /analyses)."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "post_analysis_action": {
+      "request": {"method": "POST", "path": "/analyses/{id}/action", "body_param": "analysis_action=start|stop (form-encoded)"},
+      "response": {
+        "http_status": [200],
+        "required_keys": ["code"],
+        "notes": "Body carries the real status: {code: 200, analysis: {...}} on success, {code: 500, error: ...} on failure - both over HTTP 200. Live-verified: start on a seedless analysis STILL returns code 200 (failure surfaces later via the workflow); stop flips run_flag to false. Send Accept: application/json or the HTML variant redirects."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "post_datapoint_requeue": {
+      "request": {"method": "POST", "path": "/data_points/{id}/requeue"},
+      "response": {
+        "http_status": [204],
+        "body_type": "empty",
+        "notes": "Destroys the existing Resque job, re-enqueues on the :requeued queue. Does NOT kill a wedged worker process (K8s-side escalation handles that). Live-verified trap: requeue on a datapoint with NO Resque job (never queued/started) returns 500 {status: 500, error: 'Internal Server Error'} - only requeue dps that have a job_id."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    },
+    "delete_analysis": {
+      "request": {"method": "DELETE", "path": "/analyses/{id}"},
+      "response": {
+        "http_status": [204],
+        "body_type": "empty",
+        "notes": "Cascades: data_points dependent:destroy; each dp after_destroy rm-rf's its NFS asset dir. This IS the NFS cleanup for the asset tree. Live-verified: 204 with Accept: application/json; 302 HTML redirect without it - always delete via a JSON client."
+      },
+      "error_shape": {"http_status": [404, 422, 500]}
+    }
+  }
+}

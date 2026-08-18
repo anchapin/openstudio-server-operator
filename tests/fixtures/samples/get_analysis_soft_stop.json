@@ -1,0 +1,10 @@
+{
+  "source": "synthetic-sample",
+  "notes": "LIVE-VERIFIED (kind, 2026-08-18): HTML-only 302 redirect with an ABSOLUTE Location URL. Unknown ids also 302 (controller nil-check redirects to /analyses). The operator must treat 302 + later run_flag reads as success and never follow the redirect.",
+  "endpoint": "/analyses/{id}/soft_stop",
+  "method": "GET",
+  "http_status": 302,
+  "content_type": "text/html; charset=utf-8",
+  "location": "http://localhost:8080/analyses/0d95fdb7-999d-4520-adff-0c639220df16",
+  "body": "<html><body>You are being <a href=\"/analyses/0d95fdb7-999d-4520-adff-0c639220df16\">redirected</a>.</body></html>"
+}

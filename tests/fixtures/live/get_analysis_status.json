@@ -1,0 +1,29 @@
+{
+  "endpoint": "/analyses/0d95fdb7-999d-4520-adff-0c639220df16/status.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "analysis": {
+      "_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "status": "unknown",
+      "analysis_type": "unknown",
+      "run_flag": false,
+      "exit_on_guideline_14": 0,
+      "total_datapoints": 1,
+      "jobs": [],
+      "data_points": [
+        {
+          "_id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+          "id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+          "name": "fixture-capture-dp",
+          "analysis_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+          "status": "na",
+          "status_message": ""
+        }
+      ]
+    }
+  }
+}
