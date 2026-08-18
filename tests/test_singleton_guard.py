@@ -344,6 +344,35 @@ def test_gated_wrapper_serves_only_oldest(monkeypatch, log, guard_two_crs):
     )
 
 
+def test_gated_wrapper_accepts_non_dict_mapping_body(monkeypatch, log, guard_two_crs):
+    """kopf >=1.4x delivers `body` as Body (a MappingView, NOT a dict subclass).
+
+    Regression (live-found in-cluster during issue #67's walkthrough, the same
+    dead-operator signature class as #79): a dict-only isinstance check made
+    the gate skip EVERY in-cluster tick. The gate must accept any Mapping.
+    types.MappingProxyType reproduces the shape: a Mapping, not a dict.
+    """
+    import types
+
+    registry = make_registry_with_handlers()
+    assert install_singleton_guard(registry=registry) == 1
+    gated = oscm_handlers(registry)[0].fn
+    monkeypatch.setattr(singleton, "_process_guard", guard_two_crs)
+
+    winner_view = types.MappingProxyType(make_cr("alpha", OLD_TS, uid="uid-alpha"))
+    assert not isinstance(winner_view, dict)  # the shape this test exists for
+    assert (
+        gated(
+            body=winner_view,
+            spec={"serverUrl": "http://a.test"},
+            namespace=NAMESPACE,
+            name="alpha",
+            logger=log,
+        )
+        == ("served", "http://a.test")
+    )
+
+
 def test_gated_wrapper_fails_closed_on_api_error(caplog, log, monkeypatch):
     registry = make_registry_with_handlers()
     install_singleton_guard(registry=registry)

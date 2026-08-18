@@ -56,7 +56,7 @@ import dataclasses
 import functools
 import logging
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -105,9 +105,11 @@ def _parse_utc(value: Any, context: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _meta(obj: dict) -> dict:
-    meta = obj.get("metadata")
-    return meta if isinstance(meta, dict) else {}
+def _meta(obj: object) -> Mapping:
+    # Mapping, not dict: kopf >=1.4x delivers body/metadata as MappingView
+    # subclasses (kopf._cogs.structs.bodies.Body/Meta), which are NOT dicts.
+    meta = obj.get("metadata") if isinstance(obj, Mapping) else None
+    return meta if isinstance(meta, Mapping) else {}
 
 
 def _cr_name(obj: dict) -> str:
@@ -278,7 +280,11 @@ def _gated(fn: Callable) -> Callable:
         body = kwargs.get("body") or {}
         namespace = kwargs.get("namespace")
         log = kwargs.get("logger") or logger
-        if not isinstance(body, dict) or not namespace:
+        # Mapping, not dict: kopf >=1.4x timer invocations deliver `body` as
+        # kopf._cogs.structs.bodies.Body (a MappingView, not a dict subclass) —
+        # a dict-only check skips EVERY in-cluster tick (live-found 2026-08-18,
+        # issue #67 walkthrough; CI passes plain dicts, so tests never saw it).
+        if not isinstance(body, Mapping) or not namespace:
             log.warning(
                 "%s skipped: kopf invocation carried no body/namespace — cannot resolve "
                 "the active CR (D05)",

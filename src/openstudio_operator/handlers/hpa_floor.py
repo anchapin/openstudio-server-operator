@@ -142,7 +142,7 @@ _captured_baseline_cache: dict[str, int] = {}
 class HpaApi(Protocol):
     """Structural type of ``AutoscalingV1Api`` as used here — tests fake exactly this."""
 
-    def read_namespaced_horizontalpodautoscaler(
+    def read_namespaced_horizontal_pod_autoscaler(
         self, name: str, namespace: str, **_: object
     ) -> object: ...
 
@@ -235,7 +235,7 @@ def resolve_baseline_min_replicas(
     if cached is not None:
         return cached
     try:
-        hpa = hpa_api.read_namespaced_horizontalpodautoscaler(hpa_name, namespace)
+        hpa = hpa_api.read_namespaced_horizontal_pod_autoscaler(hpa_name, namespace)
         captured = getattr(hpa.spec, "min_replicas", None) or _MIN_REPLICAS_WHEN_UNSPECIFIED
     except ApiException as exc:
         logger.warning(
@@ -291,7 +291,7 @@ def run_hpa_floor_tick(
     if not state.gate_open(now, timedelta(seconds=policy.cooldown_seconds)):
         return False
 
-    hpa = hpa_api.read_namespaced_horizontalpodautoscaler(hpa_name, namespace)
+    hpa = hpa_api.read_namespaced_horizontal_pod_autoscaler(hpa_name, namespace)
     current = getattr(hpa.spec, "min_replicas", None) or _MIN_REPLICAS_WHEN_UNSPECIFIED
     max_replicas = getattr(hpa.spec, "max_replicas", None)
 

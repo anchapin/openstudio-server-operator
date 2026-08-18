@@ -20,6 +20,8 @@ import redis
 from openstudio_operator import redis_client
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
+    REQUEUED_QUEUE,
+    SIMULATIONS_QUEUE,
     OperatorConfigError,
     ReadOnlyRedisClient,
     RedisClientError,
@@ -106,10 +108,10 @@ def seed_workers(fake, heartbeats: dict[str, float | None]) -> None:
 
 
 def test_queue_depth_reads_llen(fake, client):
-    fake.rpush("simulations", "job1", "job2", "job3")
-    fake.rpush("requeued", "job4")
-    assert client.queue_depth("simulations") == 3
-    assert client.queue_depth("requeued") == 1
+    fake.rpush(SIMULATIONS_QUEUE, "job1", "job2", "job3")
+    fake.rpush(REQUEUED_QUEUE, "job4")
+    assert client.queue_depth(SIMULATIONS_QUEUE) == 3
+    assert client.queue_depth(REQUEUED_QUEUE) == 1
 
 
 def test_queue_depth_of_unknown_queue_is_zero(client):
@@ -117,9 +119,9 @@ def test_queue_depth_of_unknown_queue_is_zero(client):
 
 
 def test_queue_depths_returns_both_managed_queues(fake, client):
-    fake.rpush("simulations", "job1")
-    fake.rpush("requeued", "job2", "job3")
-    assert client.queue_depths() == {"simulations": 1, "requeued": 2}
+    fake.rpush(SIMULATIONS_QUEUE, "job1")
+    fake.rpush(REQUEUED_QUEUE, "job2", "job3")
+    assert client.queue_depths() == {SIMULATIONS_QUEUE: 1, REQUEUED_QUEUE: 2}
 
 
 # --- Worker liveness ------------------------------------------------------
@@ -306,13 +308,13 @@ def test_recorded_command_log_of_full_public_api_is_read_only(fake):
         "redis://:pw@queue.test:6379", connection=recorder, now_fn=lambda: NOW
     )
     seed_workers(fake, {"fresh": NOW - 1, "stale": NOW - 600, "silent": None})
-    fake.rpush("simulations", "job1")
+    fake.rpush(SIMULATIONS_QUEUE, "job1")
 
     depths = client.queue_depths()
     heartbeats = client.worker_heartbeats()
     stale = client.stale_workers(threshold_seconds=300)
 
-    assert depths == {"simulations": 1, "requeued": 0}
+    assert depths == {SIMULATIONS_QUEUE: 1, REQUEUED_QUEUE: 0}
     assert heartbeats["fresh"] == NOW - 1
     assert stale == {"stale", "silent"}
     assert set(recorder.commands) <= READ_ONLY_COMMANDS
