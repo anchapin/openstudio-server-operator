@@ -29,7 +29,9 @@ pytest              # tests (CI enforces; 274 cases)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
+- **Namespace is `openstudio-server`, not `openstudio`.** `README.md` and the `Dockerfile` `CMD` default still say `--namespace openstudio` (likely local-dev cruft) — ignore them. The deployed operator (`deploy/operator-deployment.yaml`) and all RBAC bindings use `openstudio-server`. Running with the wrong namespace yields a no-op operator: the CRD/RBAC are namespaced there and the singleton guard needs it to detect boot.
 - Mock the OpenStudio REST API in tests with the `responses` library (in the `dev` extra for exactly this) — don't add another HTTP-mocking dependency. The Redis client is mocked with `fakeredis` for the same reason.
+- `scripts/` is the validation toolkit, not build glue: `capture_fixtures.sh` (capture live v3.11.0 fixtures into `tests/fixtures/live/`), `check_fixture_drift.py` (diff live vs. synthetic samples; CI-friendly exit code), `create-kind-cluster.sh` / `teardown-kind-env.sh` / `kind-config.yaml` (local 3-node kind), `deploy-openstudio-stack.sh` + `scripts/manifests/` (helm chart overlay for kind). `docs/kind-validation.md` and `docs/validation.md` are the runbooks.
 
 ## Layout
 
