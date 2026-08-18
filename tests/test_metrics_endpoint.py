@@ -53,8 +53,9 @@ def test_metrics_http_server_serves_all_declared_counters():
         assert f"# TYPE {name} counter" in response.text
         assert f"\n{name} " in response.text
 
-    # idempotent: a second call must not start another server
-    assert start_metrics_server(port=_free_port(), addr="127.0.0.1") is None
+    # idempotent: a second call must not start another server — it returns
+    # the already-active port instead
+    assert start_metrics_server(port=_free_port(), addr="127.0.0.1") == port
 
 
 def test_handlers_import_starts_metrics_server():

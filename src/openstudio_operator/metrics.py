@@ -52,19 +52,23 @@ DEFAULT_METRICS_PORT = 9090
 
 _start_lock = threading.Lock()
 _started = False
+_active_port: int | None = None
 
 
 def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> int | None:
     """Serve /metrics from a daemon thread (idempotent).
 
-    Returns the bound port, or ``None`` if the server was already started in
-    this process or the port could not be bound (logged as a warning — losing
-    metrics must never take the operator down).
+    Returns the port /metrics is actively served on. If the server is
+    already running in this process, returns the already-active port — a
+    second server is never started (the handlers package import starts it
+    at operator startup, so later calls are reads, not restarts). Returns
+    ``None`` only when the port could not be bound (logged as a warning —
+    losing metrics must never take the operator down).
     """
-    global _started
+    global _started, _active_port
     with _start_lock:
         if _started:
-            return None
+            return _active_port
         bound_port = DEFAULT_METRICS_PORT if port is None else port
         try:
             server, thread = prometheus_client.start_http_server(bound_port, addr=addr)
@@ -72,10 +76,11 @@ def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> int 
             logger.warning("Cannot serve /metrics on %s:%s: %s", addr, bound_port, exc)
             return None
         _started = True
+        _active_port = server.server_address[1]
         logger.info(
             "Serving /metrics on %s:%s (daemon thread: %s)", addr, bound_port, thread.daemon
         )
-        return server.server_address[1]
+        return _active_port
 
 
 def is_metrics_server_started() -> bool:
