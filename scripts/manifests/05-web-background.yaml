@@ -1,0 +1,58 @@
+# web_background — mirrors the helm chart's `web-background` Deployment.
+# Same 3.11.0 image, QUEUES=background,analyses, and the chart's command
+# (resque:workers scaled by COUNT). OS_SERVER_NUMBER_OF_WORKERS is tuned down
+# from the chart's 30 to 2 for kind. Mounts the nfs-pvc stand-in like the
+# chart does.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-background
+  namespace: openstudio-server
+  labels:
+    app: web-background
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: web-background
+  template:
+    metadata:
+      labels:
+        app: web-background
+    spec:
+      containers:
+        - name: web-background
+          image: nrel/openstudio-server:3.11.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - cd /opt/openstudio/server && COUNT=${OS_SERVER_NUMBER_OF_WORKERS} bundle exec rake environment resque:workers
+          env:
+            - name: OS_SERVER_NUMBER_OF_WORKERS
+              value: "2"
+            - name: QUEUES
+              value: background,analyses
+            - name: SECRET_KEY_BASE
+              value: c4ab6d293e4bf52ee92e8dda6e16dc9b5448d0c5f7908ee40c66736d515f3c29142d905b283d73e5e9cef6b13cd8e38be6fd3b5e25d00f35b259923a86c7c473
+            - name: REDIS_URL
+              value: redis://:openstudio@queue:6379
+            - name: MONGO_USER
+              value: openstudio
+            - name: MONGO_PASSWORD
+              value: openstudio
+          volumeMounts:
+            - name: nfs
+              mountPath: /mnt/openstudio
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: nfs
+          persistentVolumeClaim:
+            claimName: nfs-pvc

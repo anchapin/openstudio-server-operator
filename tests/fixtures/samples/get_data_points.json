@@ -1,0 +1,23 @@
+{
+  "source": "synthetic-sample",
+  "notes": "Mirrors live-captured shape: UUID _id only (no id duplicate), status starts at 'na' with status_message '', and run_start_time/ip_address/job_id are PRESENT-AS-NULL before a worker picks the datapoint up.",
+  "endpoint": "/data_points.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": [
+    {
+      "_id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+      "name": "sample-datapoint-0",
+      "analysis_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "status": "na",
+      "status_message": "",
+      "run_start_time": null,
+      "updated_at": "2026-08-18T13:40:12.608Z",
+      "internal_ip_address": null,
+      "ip_address": null,
+      "job_id": null
+    }
+  ]
+}

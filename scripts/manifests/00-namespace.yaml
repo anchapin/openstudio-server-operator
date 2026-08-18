@@ -1,0 +1,7 @@
+# Namespace for the whole validation stack AND the operator (issue #19).
+# Matches the production namespace from the helm chart and AGENTS.md exactly:
+# `openstudio-server` (chart manifests that still say `openstudio` are stale).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openstudio-server

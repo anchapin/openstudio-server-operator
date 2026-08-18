@@ -1,0 +1,34 @@
+{
+  "endpoint": "/data_points.json",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": [
+    {
+      "_id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+      "analysis_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+      "created_at": "2026-08-18T13:35:12.608Z",
+      "da_descriptions": [],
+      "description": "",
+      "internal_ip_address": null,
+      "ip_address": null,
+      "job_id": null,
+      "name": "fixture-capture-dp",
+      "results": {},
+      "run_end_time": null,
+      "run_queue_time": null,
+      "run_start_time": null,
+      "sdp_log_file": [],
+      "seed": "",
+      "set_variable_values": {},
+      "status": "na",
+      "status_message": "",
+      "updated_at": "2026-08-18T13:35:12.608Z",
+      "uuid": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+      "variable_values": null,
+      "weather_file": "",
+      "worker_logs": {}
+    }
+  ]
+}

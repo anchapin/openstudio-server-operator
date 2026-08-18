@@ -1,0 +1,20 @@
+{
+  "source": "synthetic-sample",
+  "notes": "Mirrors live-captured shape: {data_points: [{_id, id, analysis_id, status, status_message}]} — no timestamps (pair with operator-tracked startedSince, Q6). No matches -> {data_points: []} over HTTP 200.",
+  "endpoint": "/data_points/status?status=1&jobs=started",
+  "method": "GET",
+  "http_status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "location": null,
+  "body": {
+    "data_points": [
+      {
+        "_id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+        "id": "e96559d1-79d6-44cf-bdeb-a7ad94cd9d57",
+        "analysis_id": "0d95fdb7-999d-4520-adff-0c639220df16",
+        "status": "started",
+        "status_message": "started worker"
+      }
+    ]
+  }
+}

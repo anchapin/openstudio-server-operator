@@ -1,0 +1,10 @@
+{
+  "source": "synthetic-sample",
+  "notes": "Success shape (head :no_content): HTTP 204, empty body. Server-side cascade rm-rf's the NFS asset dirs (this IS the NFS cleanup). LIVE-VERIFIED (kind, 2026-08-18): returns 302 HTML redirect WITHOUT Accept: application/json — always delete via a JSON client.",
+  "endpoint": "/analyses/{id}",
+  "method": "DELETE",
+  "http_status": 204,
+  "content_type": null,
+  "location": null,
+  "body": ""
+}

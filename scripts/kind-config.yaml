@@ -1,0 +1,13 @@
+# Kind cluster config for operator validation (issue #19, decision D13).
+#
+# Single control-plane node. The OpenStudio Server stack (mongo/redis/web/
+# web-background/worker) runs on this one node; images are pulled from Docker
+# Hub by the kubelet — no `kind load` needed on a networked dev machine.
+#
+# Idempotent: create-kind-cluster.sh skips creation when the cluster already
+# exists.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: os-operator-validation
+nodes:
+  - role: control-plane

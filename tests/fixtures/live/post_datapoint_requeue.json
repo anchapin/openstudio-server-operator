@@ -1,0 +1,11 @@
+{
+  "endpoint": "/data_points/e96559d1-79d6-44cf-bdeb-a7ad94cd9d57/requeue",
+  "method": "POST",
+  "http_status": 500,
+  "content_type": "application/json; charset=UTF-8",
+  "location": null,
+  "body": {
+    "status": 500,
+    "error": "Internal Server Error"
+  }
+}
