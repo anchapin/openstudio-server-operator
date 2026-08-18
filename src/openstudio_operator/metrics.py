@@ -56,6 +56,20 @@ WEB_BACKGROUND_RESTARTS_TOTAL = Counter(
     "(incremented by the web_background monitor, #13)",
 )
 
+ANALYSES_ARCHIVED_TOTAL = Counter(
+    "openstudio_operator_analyses_archived_total",
+    "Analyses whose archival Job passed rclone verification "
+    "(incremented by the storage pruner, #16; counts observed Job completions, "
+    "adopted completions included)",
+)
+
+ANALYSES_DELETED_TOTAL = Counter(
+    "openstudio_operator_analyses_deleted_total",
+    "Analyses deleted by the retention pipeline after verified archival "
+    "(incremented by the storage pruner, #16; spec.dryRun suppresses both the "
+    "delete and the increment)",
+)
+
 STORAGE_FREED_BYTES = Counter(
     "openstudio_operator_storage_freed_bytes",
     "NFS bytes reclaimed after archival/pruning",

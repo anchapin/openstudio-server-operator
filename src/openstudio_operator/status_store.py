@@ -164,28 +164,58 @@ class RequeueRecord:
 
 @dataclass(frozen=True)
 class ArchivedAnalysisRecord:
-    """Value of ``status.archivedAnalyses[analysis_id]`` — a verified upload."""
+    """Value of ``status.archivedAnalyses[analysis_id]`` — retention-pipeline state (#16).
+
+    The map is the retention pipeline's ONLY memory (D04) and carries two
+    record shapes, told apart by the optional fields (the CRD map is
+    ``x-kubernetes-preserve-unknown-fields``, so no schema change is
+    involved):
+
+    * in-flight — ``verified_at is None``: an archival Job is being watched
+      (``job_name``/``spawned_at`` set), OR a dry-run marker (D11 — spawn
+      suppressed, hence ``job_name is None``: nothing to watch; the record
+      exists so the suppression is observable and once-per-analysis).
+    * verified — ``verified_at is not None``: the Job's ``Complete``
+      condition was observed (the verified-upload gate) and the server-side
+      delete may proceed. ``job_name``/``spawned_at`` survive the
+      transition as forensics.
+
+    Records persisted before #7 gained in-flight support (backend/bucket/
+    verifiedAt only) parse as verified records unchanged.
+    """
 
     backend: str
     bucket: str | None
-    verified_at: datetime
+    verified_at: datetime | None = None
+    job_name: str | None = None
+    spawned_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "backend": self.backend,
-            "bucket": self.bucket,
-            "verifiedAt": _to_utc(self.verified_at).isoformat(),
-        }
+        encoded: dict[str, Any] = {"backend": self.backend, "bucket": self.bucket}
+        if self.verified_at is not None:
+            encoded["verifiedAt"] = _to_utc(self.verified_at).isoformat()
+        if self.job_name is not None:
+            encoded["jobName"] = self.job_name
+        if self.spawned_at is not None:
+            encoded["spawnedAt"] = _to_utc(self.spawned_at).isoformat()
+        return encoded
 
     @classmethod
     def from_dict(cls, raw: Any, context: str) -> ArchivedAnalysisRecord:
         if not isinstance(raw, Mapping):
             raise StatusStoreError(f"{context}: expected object, got {type(raw).__name__}")
+        verified_at = raw.get("verifiedAt")
+        spawned_at = raw.get("spawnedAt")
+        job_name = raw.get("jobName")
         return cls(
             backend=str(_required(raw, "backend", context)),
             bucket=raw.get("bucket"),
-            verified_at=_parse_utc(
-                _required(raw, "verifiedAt", context), f"{context}.verifiedAt"
+            verified_at=(
+                None if verified_at is None else _parse_utc(verified_at, f"{context}.verifiedAt")
+            ),
+            job_name=None if job_name is None else str(job_name),
+            spawned_at=(
+                None if spawned_at is None else _parse_utc(spawned_at, f"{context}.spawnedAt")
             ),
         )
 
@@ -431,6 +461,20 @@ class StatusStore:
 
     def set_archived_analysis(self, analysis_id: str, record: ArchivedAnalysisRecord) -> None:
         self._set_map_entry(ARCHIVED_ANALYSES, analysis_id, record.to_dict())
+
+    def clear_archived_analysis(self, analysis_id: str) -> None:
+        """Delete ``status.archivedAnalyses[analysis_id]`` (#16).
+
+        The retention pipeline's three exits all land here: after the
+        server-side delete succeeds (post-deletion prune — the analysis
+        leaving the API would also prune it via :meth:`prune`, but the
+        pipeline prunes eagerly), when a failed archival Job clears the
+        in-flight marker so the deterministic Job name can be reused for a
+        fresh spawn, and when a tracked analysis vanishes from the API
+        (delete-then-failed-prune race, or out-of-band deletion).
+        Idempotent: clearing an absent key writes nothing.
+        """
+        self._set_map_entry(ARCHIVED_ANALYSES, analysis_id, None)
 
     # --- scalars ---------------------------------------------------------------
 
