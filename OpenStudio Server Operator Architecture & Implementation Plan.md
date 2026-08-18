@@ -109,8 +109,16 @@ spec:
                     archiveToS3:  
                       type: boolean  
                       default: false  
-                    s3BucketName:  
+                    backend:  
                       type: string  
+                      enum: [s3, gcs, azure]  
+                    bucket:  
+                      type: string  
+                    secretRef:  
+                      type: string  
+                    retentionDays:  
+                      type: integer  
+                      default: 7  
                     purgeCompletedNFSFiles:  
                       type: boolean  
                       default: true
