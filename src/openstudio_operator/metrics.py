@@ -43,6 +43,13 @@ WORKERS_RECYCLED_TOTAL = Counter(
     "Worker deployment recycles performed",
 )
 
+WORKER_PODS_EVICTED_TOTAL = Counter(
+    "openstudio_operator_worker_pods_evicted_total",
+    "Worker pods surgically evicted by the analysis-SLA escalation "
+    "(incremented by the SLA monitor, #9; counts decisions — dry-run ticks "
+    "increment too, matching SOFT_STOPS_TOTAL)",
+)
+
 STORAGE_FREED_BYTES = Counter(
     "openstudio_operator_storage_freed_bytes",
     "NFS bytes reclaimed after archival/pruning",

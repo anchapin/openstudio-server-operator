@@ -103,21 +103,40 @@ def _required(raw: Mapping[str, Any], key: str, context: str) -> Any:
 
 @dataclass(frozen=True)
 class SoftStopRecord:
-    """Value of ``status.softStops[analysis_id]`` — a soft stop the operator issued."""
+    """Value of ``status.softStops[analysis_id]`` — a soft stop the operator issued.
+
+    The optional escalation fields (#9) are the one-shot marker for the
+    Kubernetes-side grace-wait/eviction escalation: ``escalated_at is not
+    None`` means the analysis was already escalated and must never be
+    escalated again. They stay ``None`` for plain anchors, and anchors
+    persisted before #9 (no such keys) parse unchanged — the softStops map
+    is ``x-kubernetes-preserve-unknown-fields`` in the CRD, so no schema
+    change is involved.
+    """
 
     issued_at: datetime
     outcome: str
+    escalated_at: datetime | None = None
+    escalation_outcome: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"issuedAt": _to_utc(self.issued_at).isoformat(), "outcome": self.outcome}
+        encoded: dict[str, Any] = {"issuedAt": _to_utc(self.issued_at).isoformat(), "outcome": self.outcome}
+        if self.escalated_at is not None:
+            encoded["escalatedAt"] = _to_utc(self.escalated_at).isoformat()
+        if self.escalation_outcome is not None:
+            encoded["escalationOutcome"] = self.escalation_outcome
+        return encoded
 
     @classmethod
     def from_dict(cls, raw: Any, context: str) -> SoftStopRecord:
         if not isinstance(raw, Mapping):
             raise StatusStoreError(f"{context}: expected object, got {type(raw).__name__}")
+        escalated_at = raw.get("escalatedAt")
         return cls(
             issued_at=_parse_utc(_required(raw, "issuedAt", context), f"{context}.issuedAt"),
             outcome=str(_required(raw, "outcome", context)),
+            escalated_at=None if escalated_at is None else _parse_utc(escalated_at, f"{context}.escalatedAt"),
+            escalation_outcome=None if raw.get("escalationOutcome") is None else str(raw["escalationOutcome"]),
         )
 
 
@@ -300,6 +319,48 @@ class StatusStore:
 
     def set_soft_stop(self, analysis_id: str, record: SoftStopRecord) -> None:
         self._set_map_entry(SOFT_STOPS, analysis_id, record.to_dict())
+
+    def mark_soft_stop_escalated(self, analysis_id: str, when: datetime, outcome: str) -> None:
+        """Stamp the one-shot escalation marker onto an existing anchor (#9).
+
+        Merges ``escalatedAt``/``escalationOutcome`` into whatever the anchor
+        currently holds (preserving ``issuedAt``/``outcome`` read fresh inside
+        the conflict-safe cycle) rather than overwriting a whole record the
+        caller snapshotted earlier. A vanished anchor raises: only this
+        operator writes ``softStops``, so its disappearance mid-mutation is
+        corruption, not a race to swallow.
+        """
+        encoded_at = _to_utc(when).isoformat()
+
+        def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            entries = status.get(SOFT_STOPS)
+            current = entries.get(analysis_id) if isinstance(entries, Mapping) else None
+            if not isinstance(current, Mapping):
+                raise StatusStoreError(
+                    f"status.{SOFT_STOPS}[{analysis_id!r}]: anchor vanished before escalation marker"
+                )
+            encoded = dict(current)
+            encoded["escalatedAt"] = encoded_at
+            encoded["escalationOutcome"] = outcome
+            if encoded == current:
+                return None
+            return {"status": {SOFT_STOPS: {analysis_id: encoded}}}
+
+        self._mutate(build_patch)
+
+    def clear_soft_stop(self, analysis_id: str) -> None:
+        """Delete ``status.softStops[analysis_id]`` — anchor-retirement prune.
+
+        Counterpart to :meth:`set_soft_stop` for the SLA monitor's grace
+        phase (#9): an anchored analysis that left ``started`` (completed,
+        post-processing, …) or vanished from the API has no further
+        soft-stop/escalation business, so its anchor — escalation marker
+        included — is dropped. Called only while the whole SLA module is
+        active; with ``analysisPolicy.autoSoftStop`` false the module is
+        passive and anchors persist untouched. Idempotent: clearing an
+        absent key writes nothing.
+        """
+        self._set_map_entry(SOFT_STOPS, analysis_id, None)
 
     # --- requeues ------------------------------------------------------------
 
