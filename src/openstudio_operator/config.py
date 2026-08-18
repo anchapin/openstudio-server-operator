@@ -122,18 +122,36 @@ class OperatorConfig:
 # schema is fixed (#4); CRD fields are a follow-up if tuning demands (same
 # convention as DEFAULT_REDIS_URL / DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS).
 #
-# ``DEFAULT_HPA_BASELINE_MIN_REPLICAS`` matches the kind-cluster manifest
-# (#19, scripts/manifests/06-worker.yaml ``minReplicas: 1``); production
-# chart baseline is 2 — tune here when moving off kind. Chart production
-# HPA bounds are 2–20, so the deepest default floor (10) stays inside them;
-# the handler additionally never raises a floor above the HPA's own
-# maxReplicas (read-only respect — maxReplicas is never patched).
+# Decision D10a (issue #46 — chart-derived baseline): the runtime decay
+# floor is the HPA's ``spec.minReplicas`` captured at operator startup,
+# NOT a hardcoded constant. The chart already encodes the designed floor
+# for the worker fleet (NatLabRockies production: 2; #19 kind manifest:
+# 1); a hardcoded ``DEFAULT_HPA_BASELINE_MIN_REPLICAS = 1`` would let
+# decay undercut the production chart's intentional floor — quietly
+# fighting the deployment. ``DEFAULT_HPA_BASELINE_MIN_REPLICAS`` therefore
+# is the FALLBACK only — used when the HPA isn't observable at startup
+# (early boot, RBAC denied, transient API error). The handler captures
+# the HPA's current value once per namespace and caches it for the
+# lifetime of the operator process (handlers/hpa_floor.py
+# ``resolve_baseline_min_replicas``) — re-reading on every tick would
+# defeat the safety property by allowing a concurrent chart edit to
+# silently lower the decay floor. Chart production HPA bounds are 2–20,
+# so the deepest default floor (10) stays inside them; the handler
+# additionally never raises a floor above the HPA's own maxReplicas
+# (read-only respect — maxReplicas is never patched).
 #
 # Tier semantics: a backlog (simulations + requeued depths, summed) at or
 # above a tier's threshold maps to that tier's floor; below every tier maps
 # to the baseline. Highest matching tier wins.
 
-#: Floor when the backlog matches no tier — also the decay target on clear.
+#: Fallback floor when the HPA is not observable at operator startup.
+#: The runtime decay floor is the chart's HPA ``minReplicas`` captured at
+#: startup (issue #46, see module-level decision note above) — this
+#: constant is only consulted if the HPA read fails. Matches the #19
+#: kind-cluster manifest (scripts/manifests/06-worker.yaml
+#: ``minReplicas: 1``); production chart baseline is 2, which is
+#: captured live and therefore wins over this fallback when the HPA is
+#: observable.
 DEFAULT_HPA_BASELINE_MIN_REPLICAS = 1
 
 #: Minimum time between ANY two adjustments (anti-flap), seconds.
@@ -177,12 +195,18 @@ class HpaFloorPolicy:
         if self.cooldown_seconds <= 0:
             raise ValueError(f"cooldown {self.cooldown_seconds} must be > 0")
 
-    def floor_for(self, backlog: int) -> int:
-        """Floor for a backlog: highest tier whose threshold it meets, else baseline."""
+    def floor_for(self, backlog: int, *, baseline: int | None = None) -> int:
+        """Floor for a backlog: highest tier whose threshold it meets, else baseline.
+
+        ``baseline`` overrides :attr:`baseline_min_replicas` for this single
+        lookup when supplied — used by the handler to substitute the
+        chart-derived baseline (issue #46, ``resolve_baseline_min_replicas``)
+        without rebuilding the frozen policy object on every tick.
+        """
         for threshold, min_replicas in sorted(self.tiers, reverse=True):
             if backlog >= threshold:
                 return min_replicas
-        return self.baseline_min_replicas
+        return self.baseline_min_replicas if baseline is None else baseline
 
 
 DEFAULT_HPA_FLOOR_POLICY = HpaFloorPolicy()

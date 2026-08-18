@@ -21,8 +21,15 @@ Mapping: :class:`~openstudio_operator.config.HpaFloorPolicy` — the
 module-level tier table in ``config.py`` (policy as config, AGENTS.md; CRD
 fields are a follow-up if tuning demands — the v1alpha1 schema is fixed).
 A backlog at or above a tier's threshold maps to that tier's floor; below
-every tier maps to the baseline (the #19 kind manifest's ``minReplicas:
-1``; chart production baseline is 2 — tune in config.py).
+every tier maps to the baseline. **The runtime baseline is the HPA's
+``spec.minReplicas`` captured at operator startup** (issue #46,
+:func:`resolve_baseline_min_replicas`); ``DEFAULT_HPA_BASELINE_MIN_REPLICAS``
+in ``config.py`` is the FALLBACK consulted only when the HPA isn't
+observable at startup. This is the chart-derived-baseline decision: the
+chart already encodes the designed worker floor (NatLabRockies production
+chart: 2; #19 kind manifest: 1), and the adjuster respects what's
+deployed — hardcoding a different default would let decay undercut the
+production chart's intent.
 
 Adjustment semantics (symmetric reconciliation — the adjuster owns the
 floor):
@@ -32,12 +39,14 @@ floor):
   a kind manifest with max 2 clamps deep-backlog floors to 2). ``current
   >= target`` with a deep backlog is a no-op (no upward churn).
 * DECAY when ``current > target`` — IMMEDIATE-on-clear down to the target
-  (which is the baseline when the backlog is fully drained, or a mid tier
-  when it merely shrank), not a step-down ladder: the CPU HPA remains
-  free to sit anywhere at or above the floor, and a lower floor only
-  PERMITS scale-down — so decay cannot kill running datapoints, and
-  waiting would just delay cost recovery. Both directions share the
-  cooldown below, which is what actually prevents flapping.
+  (which is the chart-derived baseline when the backlog is fully drained,
+  or a mid tier when it merely shrank), not a step-down ladder: the CPU
+  HPA remains free to sit anywhere at or above the floor, and a lower
+  floor only PERMITS scale-down — so decay cannot kill running
+  datapoints, and waiting would just delay cost recovery. Both directions
+  share the cooldown below, which is what actually prevents flapping.
+  Decay BELOW the chart-derived baseline is impossible without an
+  explicit override (issue #46).
 
 Cooldown — anti-flap gate, one interval between ANY two adjustments
 (default 300 s, ``HpaFloorPolicy.cooldown_seconds``): an adjustment
@@ -86,7 +95,12 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException, AutoscalingV1Api
 
-from openstudio_operator.config import DEFAULT_HPA_FLOOR_POLICY, HpaFloorPolicy, OperatorConfig
+from openstudio_operator.config import (
+    DEFAULT_HPA_BASELINE_MIN_REPLICAS,
+    DEFAULT_HPA_FLOOR_POLICY,
+    HpaFloorPolicy,
+    OperatorConfig,
+)
 from openstudio_operator.handlers.analysis_sla import EventEmitter
 from openstudio_operator.metrics import HPA_FLOOR_ADJUSTMENTS_TOTAL
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
@@ -115,6 +129,14 @@ _MIN_REPLICAS_WHEN_UNSPECIFIED = 1
 # Cache-only (D04): one Redis client session per redis URL, never operator
 # state — mirrors the client caches of the sibling handlers.
 _redis_client_cache: dict[str, ReadOnlyRedisClient] = {}
+
+#: Issue #46 — chart-derived baseline. Captured at the FIRST call to
+#: :func:`resolve_baseline_min_replicas` per namespace and held stable for
+#: the lifetime of the operator process. Re-reading on every tick would
+#: defeat the safety property: a concurrent chart edit (or a transient
+#: API inconsistency) could silently lower the decay floor. Module-level
+#: (NOT per-CR) cache: the HPA is chart-fixed, one per namespace.
+_captured_baseline_cache: dict[str, int] = {}
 
 
 class HpaApi(Protocol):
@@ -180,6 +202,61 @@ def _get_redis_client(redis_url: str) -> ReadOnlyRedisClient:
     return client
 
 
+def resolve_baseline_min_replicas(
+    hpa_api: HpaApi,
+    *,
+    namespace: str,
+    hpa_name: str = WORKER_HPA_NAME,
+    fallback: int = DEFAULT_HPA_BASELINE_MIN_REPLICAS,
+) -> int:
+    """Return the runtime decay floor for ``namespace`` (issue #46).
+
+    The chart's ``worker-hpa.spec.minReplicas`` IS the designed floor
+    for the worker fleet — NatLabRockies production chart sets 2, the
+    #19 kind manifest sets 1. A hardcoded decay floor of 1 would let
+    decay on a production cluster drop ``minReplicas`` 2 → 1, undercutting
+    the chart's intent (the original #46 bug).
+
+    This function captures the HPA's current ``spec.minReplicas`` ONCE per
+    namespace, at the first call, and returns the cached value for the
+    lifetime of the operator process. Stability is the safety property:
+    re-reading on every tick would let a concurrent chart edit (or a
+    transient API inconsistency) silently lower the decay floor mid-run.
+
+    Fallback semantics: if the HPA cannot be read at startup (NotFound,
+    RBAC denied, transient API error, cluster not yet ready), the
+    documented fallback (``DEFAULT_HPA_BASELINE_MIN_REPLICAS``) is
+    cached in place of the captured value — a later successful read
+    would be a different (newer) chart state, but process-lifetime
+    stability is the invariant we trade for. A warning is logged once
+    per capture event.
+    """
+    cached = _captured_baseline_cache.get(namespace)
+    if cached is not None:
+        return cached
+    try:
+        hpa = hpa_api.read_namespaced_horizontalpodautoscaler(hpa_name, namespace)
+        captured = getattr(hpa.spec, "min_replicas", None) or _MIN_REPLICAS_WHEN_UNSPECIFIED
+    except ApiException as exc:
+        logger.warning(
+            "HPA-floor baseline capture failed for %s/%s (%s: %s); "
+            "using fallback baseline %d (chart not yet observable at startup)",
+            namespace,
+            hpa_name,
+            type(exc).__name__,
+            exc,
+            fallback,
+        )
+        captured = fallback
+    _captured_baseline_cache[namespace] = captured
+    return captured
+
+
+def reset_captured_baseline_cache() -> None:
+    """Test-only: clear the process-lifetime baseline cache."""
+    _captured_baseline_cache.clear()
+
+
 def run_hpa_floor_tick(
     redis_client: ReadOnlyRedisClient,
     hpa_api: HpaApi,
@@ -191,8 +268,16 @@ def run_hpa_floor_tick(
     state: HpaFloorState,
     dry_run: bool,
     hpa_name: str = WORKER_HPA_NAME,
+    effective_baseline_min_replicas: int | None = None,
 ) -> bool:
     """One floor evaluation. Returns whether an adjustment fired this tick.
+
+    ``effective_baseline_min_replicas`` is the chart-derived decay floor
+    (issue #46, :func:`resolve_baseline_min_replicas`); when supplied, it
+    OVERRIDES ``policy.baseline_min_replicas`` for the target computation
+    so decay never undercuts the chart's designed ``minReplicas``. When
+    ``None``, the policy's own baseline is used (pre-#46 semantics;
+    useful for tests that want to exercise the policy in isolation).
 
     Sense FIRST (two LLENs), then check the cooldown gate — the anchor must
     reflect a successful observation, and a closed gate suppressing only
@@ -210,7 +295,15 @@ def run_hpa_floor_tick(
     current = getattr(hpa.spec, "min_replicas", None) or _MIN_REPLICAS_WHEN_UNSPECIFIED
     max_replicas = getattr(hpa.spec, "max_replicas", None)
 
-    target = policy.floor_for(backlog)
+    policy_baseline = policy.baseline_min_replicas
+    if effective_baseline_min_replicas is not None:
+        # Chart-derived baseline (issue #46): the HPA's ``minReplicas``
+        # captured at startup is the designed floor; decay must never
+        # undercut it. ``max`` lets a policy baseline > chart baseline
+        # (e.g. an explicit, future CR override) still win, but the
+        # default safety direction is chart-derived >= policy default.
+        policy_baseline = max(policy_baseline, effective_baseline_min_replicas)
+    target = policy.floor_for(backlog, baseline=policy_baseline)
     if current < target and max_replicas is not None:
         # Never raise the floor above the chart's own ceiling — read-only
         # respect; the HPA controller clamps behavior, we avoid writing an
@@ -265,6 +358,9 @@ def hpa_floor_adjuster(
     redis_client = _get_redis_client(config.redis_url)
     hpa_api = AutoscalingV1Api()
     state = _get_state(namespace, name)
+    # Issue #46 — chart-derived baseline. Captured at the first call per
+    # namespace, held stable for the lifetime of the operator process.
+    effective_baseline = resolve_baseline_min_replicas(hpa_api, namespace=namespace)
 
     def emit(event_type: str, reason: str, message: str) -> None:
         kopf.event(body, type=event_type, reason=reason, message=message)
@@ -279,6 +375,7 @@ def hpa_floor_adjuster(
             emit=emit,
             state=state,
             dry_run=config.dry_run,
+            effective_baseline_min_replicas=effective_baseline,
         )
     except (RedisClientError, ApiException) as exc:
         logger.warning(

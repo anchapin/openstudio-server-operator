@@ -108,6 +108,7 @@ def tick(
     policy: HpaFloorPolicy = POLICY,
     dry_run: bool = False,
     redis: ReadOnlyRedisClient | None = None,
+    effective_baseline_min_replicas: int | None = None,
 ):
     events, emit = make_emit()
     fired = run_hpa_floor_tick(
@@ -119,6 +120,7 @@ def tick(
         emit=emit,
         state=state,
         dry_run=dry_run,
+        effective_baseline_min_replicas=effective_baseline_min_replicas,
     )
     return fired, events
 
@@ -368,3 +370,160 @@ def test_every_patch_payload_touches_only_min_replicas():
         assert set(patch["body"]["spec"]) == {"minReplicas"}  # never maxReplicas/metrics
         assert isinstance(patch["body"]["spec"]["minReplicas"], int)
         assert patch["kwargs"]["_content_type"] == MERGE_PATCH_CONTENT_TYPE
+
+
+# --- Chart-derived baseline (issue #46) -----------------------------------------
+
+
+class CountingAutoscalingV1Api(FakeAutoscalingV1Api):
+    """FakeAutoscalingV1Api that counts HPA reads — used to assert the
+    baseline capture happens exactly once per namespace across the
+    operator process lifetime."""
+
+    def __init__(self, min_replicas: int = 1, max_replicas: int = 20) -> None:
+        super().__init__(min_replicas=min_replicas, max_replicas=max_replicas)
+        self.read_calls: list[tuple[str, str]] = []
+
+    def read_namespaced_horizontalpodautoscaler(self, name, namespace, **kwargs):
+        self.read_calls.append((name, namespace))
+        return super().read_namespaced_horizontalpodautoscaler(name, namespace, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _clear_baseline_cache():
+    """The capture cache is module-level and process-lifetime — reset it
+    around every test so each scenario sees a fresh capture."""
+    from openstudio_operator.handlers.hpa_floor import reset_captured_baseline_cache
+
+    reset_captured_baseline_cache()
+    yield
+    reset_captured_baseline_cache()
+
+
+def test_resolve_baseline_captures_chart_min_replicas():
+    """Production chart has minReplicas=2; the captured baseline must be 2,
+    not the kind-manifest-shaped fallback 1."""
+    from openstudio_operator.handlers.hpa_floor import resolve_baseline_min_replicas
+
+    api = FakeAutoscalingV1Api(min_replicas=2, max_replicas=20)
+    captured = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
+    assert captured == 2
+
+
+def test_resolve_baseline_falls_back_on_hpa_not_found():
+    """A 404 at startup (HPA not yet created) must NOT crash — the
+    documented fallback is cached in place."""
+    from openstudio_operator.handlers.hpa_floor import resolve_baseline_min_replicas
+
+    api = FakeAutoscalingV1Api(min_replicas=1)
+
+    def raise_not_found(name, namespace, **kwargs):
+        raise ApiException(status=404, reason="NotFound")
+
+    api.read_namespaced_horizontalpodautoscaler = raise_not_found
+
+    captured = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
+    assert captured == 1  # DEFAULT_HPA_BASELINE_MIN_REPLICAS
+
+
+def test_resolve_baseline_caches_first_capture_for_process_lifetime():
+    """The captured baseline is process-lifetime stable — the second call
+    returns the cached value WITHOUT re-reading the HPA. This is the
+    safety property: a concurrent chart edit cannot silently lower the
+    decay floor mid-run."""
+    from openstudio_operator.handlers.hpa_floor import resolve_baseline_min_replicas
+
+    api = CountingAutoscalingV1Api(min_replicas=2)
+
+    first = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
+    second = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
+    third = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
+
+    assert first == second == third == 2
+    assert len(api.read_calls) == 1  # captured ONCE, cached forever after
+
+
+def test_resolve_baseline_cache_keyed_by_namespace():
+    """Different namespaces capture independently — defensive: the HPA is
+    chart-fixed per namespace in practice, but the cache shape must not
+    cross-contaminate if a future operator ever served multiple namespaces."""
+    from openstudio_operator.handlers.hpa_floor import resolve_baseline_min_replicas
+
+    api_ns1 = CountingAutoscalingV1Api(min_replicas=2)
+    api_ns2 = CountingAutoscalingV1Api(min_replicas=5)
+
+    assert resolve_baseline_min_replicas(api_ns1, namespace="ns-one") == 2
+    assert resolve_baseline_min_replicas(api_ns2, namespace="ns-two") == 5
+    # Re-calling does not re-read in either namespace.
+    assert resolve_baseline_min_replicas(api_ns1, namespace="ns-one") == 2
+    assert resolve_baseline_min_replicas(api_ns2, namespace="ns-two") == 5
+    assert len(api_ns1.read_calls) == 1
+    assert len(api_ns2.read_calls) == 1
+
+
+def test_resolve_baseline_unspecified_min_replicas_defaults_to_one():
+    """API-server default for an omitted ``spec.minReplicas`` is 1 — the
+    capture must mirror that, not the fallback constant (the two happen
+    to coincide here, but the semantics are different)."""
+    from openstudio_operator.handlers.hpa_floor import resolve_baseline_min_replicas
+
+    api = FakeAutoscalingV1Api(min_replicas=1)
+    api.spec.min_replicas = None
+    assert resolve_baseline_min_replicas(api, namespace=NAMESPACE) == 1
+
+
+def test_decay_to_chart_baseline_not_fallback_when_chart_is_higher():
+    """The original #46 bug, locked in: on a production chart (minReplicas=2),
+    a drained backlog MUST decay to 2, not to 1. Without the chart-derived
+    baseline, the adjuster would undercut the chart's intent."""
+    api = FakeAutoscalingV1Api(min_replicas=10)  # live HPA — previously raised
+    state = anchored_state()
+
+    # The operator wrapper captured the HPA's startup minReplicas (= the
+    # production chart's designed value, 2) and threads it here as the
+    # effective baseline. With chart-derived baseline=2, a drained backlog
+    # decays to 2, NOT 1.
+    fired, events = tick(
+        api,
+        state,
+        simulations=0,
+        requeued=0,
+        effective_baseline_min_replicas=2,
+    )
+    assert fired is True
+    assert api.patches[0]["body"] == {"spec": {"minReplicas": 2}}
+    assert events[0][:2] == ("Warning", HPA_FLOOR_DECAYED_EVENT)
+
+
+def test_decay_below_chart_baseline_is_impossible_without_override():
+    """Acceptance criterion #2 of #46: even if the policy default baseline
+    is 1 and the chart-derived baseline is 2, the effective floor used for
+    decay is the chart's value. No override → no undercutting."""
+    api = FakeAutoscalingV1Api(min_replicas=10)
+    state = anchored_state()
+
+    # No override supplied: handler-derived baseline is 2 (chart); policy
+    # default is 1. Effective baseline for the target computation is the
+    # MAX, i.e. 2.
+    fired, _ = tick(
+        api,
+        state,
+        simulations=0,
+        effective_baseline_min_replicas=2,  # the chart-derived value
+    )
+    assert fired is True
+    # Decay to 2, never below — the chart's intent is respected.
+    assert api.patches[0]["body"]["spec"]["minReplicas"] == 2
+    # And the policy's lower baseline (1) is NOT used: if it were, target
+    # would have been 1.
+    assert api.patches[0]["body"]["spec"]["minReplicas"] != 1
+
+
+def test_floor_for_accepts_baseline_override():
+    """HpaFloorPolicy.floor_for honors an explicit per-call baseline (the
+    handler's escape hatch for the chart-derived value)."""
+    policy = HpaFloorPolicy()
+    assert policy.floor_for(0) == 1  # policy default baseline
+    assert policy.floor_for(0, baseline=2) == 2  # explicit override
+    # Tier match wins regardless of the override — only the no-tier path uses it.
+    assert policy.floor_for(500, baseline=2) == 10  # tier floor, baseline ignored
