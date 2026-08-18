@@ -43,15 +43,3 @@ def test_metrics_importable():
 
     assert metrics.SOFT_STOPS_TOTAL is not None
     assert metrics.DATAPOINTS_REQUEUED_TOTAL is not None
-
-
-def test_escalation_action_validation():
-    from openstudio_operator.openstudio_client import OpenStudioClient
-
-    client = OpenStudioClient("http://web.openstudio.svc")
-    try:
-        client.escalate_analysis("abc", "soft_stop")  # not an escalation action
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("soft_stop must not be accepted as an escalation action")

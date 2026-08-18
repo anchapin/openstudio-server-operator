@@ -36,8 +36,9 @@ The Operator sits alongside the standard Helm deployment (openstudio-server-helm
 ┌──────────────────────┐                            ┌─────────────────────┐  
 │ OpenStudio REST API  │                            │ Kubernetes API      │  
 │  \- /analyses.json    │                            │  \- Deployments      │  
-│  \- /data\_points.json │                            │  \- Pods             │  
-│  \- /cluster.json     │                            │  \- Events & CRDs    │  
+│  \- /analyses/{id}/…  │                            │  \- Pods             │  
+│  \- /data\_points.json │                            │  \- Events & CRDs    │  
+│  \- /data\_points/…    │                            │                      │  
 └──────────────────────┘                            └─────────────────────┘
 
 ## **3\. Custom Resource Definition (CRD) Specification**
@@ -120,24 +121,25 @@ spec:
 
 * **Goal:** Prevent stuck simulations from clogging worker pods indefinitely.  
 * **Logic Flow:**  
-  1. Poll GET /analyses.json every 30 seconds.  
+  1. Poll GET /analyses.json every 30 seconds (raw Mongoid docs; no derived fields).  
   2. For each analysis with status \== "started":  
+     * Fetch GET /analyses/{id}/page\_data.json and anchor the SLA clock on its derived start\_time (never on created\_at).  
      * Check runtime against spec.analysisPolicy.maxDurationMinutes.  
      * If limit exceeded:  
-       1. Issue PUT /analyses/{id}/action with body {"action": "soft\_stop"}.  
+       1. Issue GET /analyses/{id}/soft\_stop (cooperative stop; does not wait for in-flight runs). The waiting variant is POST /analyses/{id}/action with body param analysis\_action set to stop (the only allowed values are start and stop).  
        2. Log K8s Warning Event: AnalysisSoftStopped.  
-       3. Wait for spec.analysisPolicy.gracefulStopTimeoutMinutes.  
-       4. If status remains stopping, escalate to {"action": "kill"} or {"action": "hard\_stop"}.
+       3. Wait for spec.analysisPolicy.gracefulStopTimeoutMinutes, anchored on CR .status timestamps (v3.11.0 analysis states are na, init, queued, started, post-processing, completed; there is no stopping or failed state, and stop/soft\_stop only flip the run\_flag boolean without changing status).  
+       4. Escalate on the Kubernetes side: delete the worker pods whose pod IP matches a started datapoint's ip\_address (fetched escalation-only from GET /data\_points.json, which ignores query params), gated by analysisPolicy.forceDeleteOnEscalation. No kill or hard\_stop action exists in v3.11.0.
 
 ### **Module 2: Zombie Datapoint Watchdog & Auto-Requeue**
 
 * **Goal:** Detect individual stalled simulations caused by worker OOM or pod eviction.  
 * **Logic Flow:**  
-  1. Poll GET /data\_points.json?status=started.  
-  2. Check updated\_at timestamps for each datapoint.  
-  3. If elapsed time exceeds spec.datapointPolicy.maxDatapointRuntimeMinutes and requeue\_count \< maxAutoRequeues:  
-     * Call POST /data\_points/{id}/requeue.  
-     * Increment internal requeue tracker.  
+  1. Poll GET /data\_points/status?status=1&jobs=started, the light watchdog view ({data\_points: [{\_id, id, analysis\_id, status, status\_message}]}; Rails quirk: the presence of the status param gates filtering and the filter value is read from jobs). It returns no timestamps.  
+  2. Track the runtime clock operator-side: record each datapoint's first-seen time in the CR .status startedSince map. GET /data\_points.json ignores query params (there is no server-side status filter), so it is reserved for escalation, where its full docs supply the datapoint ip\_address.  
+  3. If elapsed time exceeds spec.datapointPolicy.maxDatapointRuntimeMinutes and requeues \< maxAutoRequeues:  
+     * Call POST /data\_points/{id}/requeue (204 No Content; destroys the existing Resque job on the requeue/simulations queues and re-enqueues onto the requeued queue; it does not kill a wedged worker process, Module 1 escalation handles that).  
+     * Increment the requeue tracker in CR .status.  
      * Emit K8s Normal Event: DatapointRequeued.
 
 ### **Module 3: Worker Node Hygiene & Post-Run Recycler**
@@ -162,7 +164,7 @@ spec:
 
 * **Goal:** Ensure the job distribution mechanism hasn't deadlocked.  
 * **Logic Flow:**  
-  1. Read active worker status from /cluster.json or query MongoDB job queues.  
+  1. Read queue state directly from Redis (Service queue:6379; Resque queues simulations and requeued): queue depth via LLEN simulations / LLEN requeued, worker liveness via the Resque worker registry and heartbeat keys. /cluster.json does not exist in v3.11.0, and /compute\_nodes.json is legacy and unpopulated on Kubernetes, so neither is a liveness source.  
   2. If queued data points exist \> 0, but 0 workers are processing for \> 10 minutes while worker pods are Running and healthy:  
      * Assume web\_background scheduler loop is stuck.  
      * Trigger pod restart for web\_background deployment.
@@ -179,9 +181,11 @@ spec:
                      │                                /     \\               │  
                      │                             (Yes)    (No)            │  
                      │                               /        \\             │  
-                     │                       \[ Stopped \]   \[ Hard Kill \]    │  
+                     │                       \[ Completed \]  \[ Evict Pods \]  │  
                      │                            │               │         │  
                      └────────────────────────────┴───────────────┴─────────┴─\> \[ Trigger Worker Recycle & Storage Prune \]
+
+Analysis states (verified v3.11.0): na \-\> init \-\> queued \-\> started \-\> post-processing \-\> completed. There is no stopping, stopped, or failed state; soft\_stop and action stop only flip the run\_flag boolean, so grace-period decisions anchor on CR .status timestamps rather than server state. There is no kill or hard\_stop action: the (No) branch is Kubernetes-side eviction of worker pods whose IP matches a started datapoint's ip\_address (Module 1, step 4).
 
 ## **6\. Implementation Phasing & Roadmap**
 
