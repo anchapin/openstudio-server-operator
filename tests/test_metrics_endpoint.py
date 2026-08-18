@@ -19,6 +19,8 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_workers_recycled_total",
     "openstudio_operator_worker_pods_evicted_total",
     "openstudio_operator_web_background_restarts_total",
+    "openstudio_operator_analyses_archived_total",
+    "openstudio_operator_analyses_deleted_total",
     "openstudio_operator_storage_freed_bytes_total",
 )
 
