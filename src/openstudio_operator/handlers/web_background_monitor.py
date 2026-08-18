@@ -84,8 +84,14 @@ from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
     OperatorConfig,
 )
-from openstudio_operator.handlers.analysis_sla import EventEmitter
-from openstudio_operator.metrics import WEB_BACKGROUND_RESTARTS_TOTAL
+from openstudio_operator.handlers.analysis_sla import (
+    EventEmitter,
+    deployment_label_selector,
+)
+from openstudio_operator.metrics import (
+    RESQUE_WORKERS_SEEN_MAX,
+    WEB_BACKGROUND_RESTARTS_TOTAL,
+)
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
 from openstudio_operator.status_store import (
     GROUP,
@@ -119,11 +125,55 @@ RESTARTED_AT_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
 
 WEB_BACKGROUND_RESTARTED_EVENT = "WebBackgroundRestarted"
 
+#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Emitted ONCE
+#: per operator process when an empty worker registry has been observed for
+#: at least :data:`_LAYOUT_WARNING_GRACE_SECONDS` without any worker
+#: heartbeat ever being seen — the signature of the centralized Resque key
+#: constants not matching the live v3.11.0 layout. The stall condition's
+#: "nobody is processing" branch is then vacuously true (the dangerous
+#: silent misbehavior #13 design note).
+RESQUE_KEY_LAYOUT_UNKNOWN_EVENT = "ResqueKeyLayoutUnknown"
+
+#: How long the operator tolerates an empty worker registry with no prior
+#: heartbeat observation before concluding the Resque layout is wrong and
+#: emitting :data:`RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`. 60 s — comfortably
+#: more than one Resque heartbeat (5 s) but short enough that a misconfig
+#: surfaces well within the first stall window.
+_LAYOUT_WARNING_GRACE_SECONDS = timedelta(seconds=60)
+
+#: Module-level cache (D04-clean): one Redis client session per redis URL,
+#: never operator state — mirrors the REST client caches of the sibling
+#: handlers. Plus three process-lifetime flags for the leg-2 safeguard:
+#: the high-water mark of distinct workers ever observed (drives the
+#: monotonic gauge), the first tick the empty-registry state began (for
+#: the grace-period check), and a one-shot warning emission flag.
+_redis_client_cache: dict[str, ReadOnlyRedisClient] = {}
+_max_workers_seen: int = 0
+_empty_registry_since: datetime | None = None
+_resque_layout_warning_emitted: bool = False
+
+
+def reset_leg2_safeguard_state() -> None:
+    """Test-only: clear the process-lifetime leg-2 safeguard state.
+
+    Also resets the monotonic :data:`RESQUE_WORKERS_SEEN_MAX` gauge so each
+    test starts at zero — the Gauge is process-level (Prometheus client
+    module-level singleton) and would otherwise bleed across tests.
+    """
+    global _max_workers_seen, _empty_registry_since, _resque_layout_warning_emitted
+    _max_workers_seen = 0
+    _empty_registry_since = None
+    _resque_layout_warning_emitted = False
+    RESQUE_WORKERS_SEEN_MAX.set(0)
+
+
 _RUNNING = "Running"
 
-# Cache-only (D04): one Redis client session per redis URL, never operator
-# state — mirrors the REST client caches of the sibling handlers.
-_redis_client_cache: dict[str, ReadOnlyRedisClient] = {}
+# Note: ``_redis_client_cache``, ``_max_workers_seen``,
+# ``_empty_registry_since``, and ``_resque_layout_warning_emitted`` live at
+# the top of this module alongside ``RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`` —
+# colocating the issue #44 safeguard state with the constants it gates
+# keeps the leg-2 fix auditable in one place.
 
 
 class WorkerDeploymentApi(Protocol):
@@ -194,23 +244,23 @@ def _worker_pods_healthy(
     """Leg C: the worker fleet looks fine to Kubernetes.
 
     Discovers pods via the worker Deployment's own selector (no hardcoded
-    chart labels), then requires at least one pod, all ``Running``, all
+    chart labels; honors both ``matchLabels`` and ``matchExpressions`` —
+    issue #44), then requires at least one pod, all ``Running``, all
     with ``Ready=True`` — read-only signals. Unreadable/absent fleet ⇒
     False (conservative: the "queue is lying" inference needs K8s vouching
     for the fleet). Raises ``ApiException`` so transport failures skip the
     tick (D12) instead of masquerading as an unhealthy fleet.
     """
-    deployment_obj = apps_api.read_namespaced_deployment(deployment, namespace)
-    match_labels = deployment_obj.spec.selector.match_labels
-    if not match_labels:
+    selector = deployment_label_selector(apps_api, deployment, namespace)
+    if not selector:
         logger.warning(
-            "worker Deployment %s/%s exposes no spec.selector.matchLabels — "
-            "cannot corroborate pod health, stall condition leg C fails",
+            "worker Deployment %s/%s exposes neither matchLabels nor "
+            "supported matchExpressions — cannot corroborate pod health, "
+            "stall condition leg C fails",
             namespace,
             deployment,
         )
         return False
-    selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
     pods = pods_api.list_namespaced_pod(namespace, label_selector=selector).items or []
     if not pods:
         return False
@@ -232,8 +282,28 @@ def _stall_condition_holds(
     namespace: str,
     worker_deployment: str,
     stale_seconds: float,
+    now: datetime,
 ) -> bool:
-    """The full D07 condition, cheapest leg first with fail-fast. Pure read."""
+    """The full D07 condition, cheapest leg first with fail-fast. Pure read.
+
+    The leg-2 safeguard (#44): tracks distinct workers observed in
+    process lifetime and the first tick an empty registry began. If an
+    empty registry persists for :data:`_LAYOUT_WARNING_GRACE_SECONDS` with
+    no prior heartbeat observation, the empty-registry branch of leg B is
+    vacuously true — the most dangerous silent misbehavior this operator
+    has (per the issue #13 design note). The safeguard makes that visible:
+
+    * ``RESQUE_WORKERS_SEEN_MAX`` (Prometheus Gauge, monotonic) stays at 0;
+    * once the grace window elapses, a one-shot Warning Event
+      :data:`RESQUE_KEY_LAYOUT_UNKNOWN_EVENT` is emitted with diagnostics
+      naming the empty-registry observation and pointing at the runbook.
+
+    The original "treat empty as nobody processing" semantics are
+    PRESERVED — the safeguard is purely additive (observability +
+    one-shot warning). If a real worker heartbeat appears at any point
+    during the grace window, the timer resets and no warning fires.
+    """
+    global _max_workers_seen, _empty_registry_since
     # Leg A: work is queued (either managed Resque queue).
     depths = redis_client.queue_depths()
     if not any(depth > 0 for depth in depths.values()):
@@ -241,6 +311,18 @@ def _stall_condition_holds(
     # Leg B: nobody is processing — every registered heartbeat is stale
     # (vacuously true for an empty registry: no worker is processing either).
     registered = redis_client.worker_heartbeats()
+    # Track the high-water mark of distinct workers seen (#44 safeguard).
+    if len(registered) > _max_workers_seen:
+        _max_workers_seen = len(registered)
+        RESQUE_WORKERS_SEEN_MAX.set(_max_workers_seen)
+    if not registered:
+        if _empty_registry_since is None:
+            _empty_registry_since = now
+        # An empty registry holds vacuously: the stall can still hold.
+    else:
+        # A worker appeared — clear the grace window so the safeguard
+        # doesn't false-fire on a later transient empty period.
+        _empty_registry_since = None
     stale = redis_client.stale_workers(threshold_seconds=stale_seconds)
     if len(stale) < len(registered):
         return False
@@ -248,6 +330,43 @@ def _stall_condition_holds(
     return _worker_pods_healthy(
         apps_api, pods_api, namespace=namespace, deployment=worker_deployment
     )
+
+
+def _maybe_warn_resque_layout_unknown(
+    *, now: datetime, emit: EventEmitter, logger: logging.Logger
+) -> None:
+    """Emit :data:`RESQUE_KEY_LAYOUT_UNKNOWN_EVENT` once if the safeguard triggers.
+
+    Trigger: empty registry has held for :data:`_LAYOUT_WARNING_GRACE_SECONDS`
+    AND ``_max_workers_seen == 0`` (never saw a worker heartbeat at all in
+    this process) AND the operator is in a real load (leg A held this tick
+    — the warn is gated on that so it doesn't fire on an idle cluster).
+    Once fired, never fires again in this process (gate flag below).
+    """
+    global _resque_layout_warning_emitted
+    if _resque_layout_warning_emitted:
+        return
+    if _max_workers_seen > 0:
+        return  # we've seen workers before — empty registry is a transient cold start
+    if _empty_registry_since is None:
+        return
+    if now - _empty_registry_since < _LAYOUT_WARNING_GRACE_SECONDS:
+        return
+    _resque_layout_warning_emitted = True
+    elapsed = int((now - _empty_registry_since).total_seconds())
+    message = (
+        f"Resque worker registry has been empty for {elapsed}s while a "
+        f"non-zero queue depth is observed. The centralized Resque key "
+        f"constants (WORKER_REGISTRY_KEY='resque:workers') may not match "
+        f"the live v3.11.0 Redis layout; the stall condition's "
+        f"'nobody is processing' leg is vacuously true and could periodic-"
+        f"restart web_background. Run docs/kind-validation.md Resque layout "
+        f"checklist (#44). RESQUE_WORKERS_SEEN_MAX is 0 — alert on "
+        f"`openstudio_operator_resque_workers_seen_max == 0 AND "
+        f"queue depth > 0`."
+    )
+    logger.warning("Resque key layout unknown: %s", message)
+    emit("Warning", RESQUE_KEY_LAYOUT_UNKNOWN_EVENT, message)
 
 
 def run_stall_tick(
@@ -285,12 +404,21 @@ def run_stall_tick(
             namespace=namespace,
             worker_deployment=config.target_worker_deployment or DEFAULT_WORKER_DEPLOYMENT,
             stale_seconds=DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
+            now=now,
         )
     except (RedisClientError, ApiException):
         # Blind gap: a failed read is no evidence the condition held —
         # restart the window so skip-and-retry cannot stitch across it.
         tracker.reset()
         raise
+
+    # Issue #44 — leg-2 non-vacuity safeguard. Best-effort: a failure to
+    # emit the warning must not skip the tick (it's diagnostic, not load-
+    # bearing on the stall evaluation).
+    try:
+        _maybe_warn_resque_layout_unknown(now=now, emit=emit, logger=logger)
+    except Exception as exc:  # noqa: BLE001 — defensive only (diagnostic emit)
+        logger.debug("leg-2 safeguard emit failed: %s", exc)
 
     if not tracker.observe(holds, now, window):
         return False

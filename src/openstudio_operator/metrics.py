@@ -18,7 +18,7 @@ import logging
 import threading
 
 import prometheus_client
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,24 @@ HPA_FLOOR_ADJUSTMENTS_TOTAL = Counter(
     "worker-hpa minReplicas adjustments issued by the HPA-floor adjuster "
     "(raises and decays; incremented by #18; counts decisions — dry-run ticks "
     "increment too, matching SOFT_STOPS_TOTAL)",
+)
+
+#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Monotonic max
+#: of distinct Resque worker ids the operator has EVER observed in process
+#: lifetime (web_background_monitor, #13). If this stays at 0 after the
+#: operator has been running for >1 minute under a real workload, the
+#: centralized Resque key constants likely do not match the live v3.11.0
+#: layout — the empty-registry branch of the stall-condition leg 2 is
+#: vacuously true, and the operator will periodic-restart web_background
+#: while everything looks healthy. Surface this as a Prometheus signal so
+#: an SRE can alert on ``openstudio_operator_resque_workers_seen_max == 0``
+#: AND a non-zero queue depth.
+RESQUE_WORKERS_SEEN_MAX = Gauge(
+    "openstudio_operator_resque_workers_seen_max",
+    "Maximum distinct Resque worker ids observed in process lifetime "
+    "(monotonic — survives worker disappearance; 0 = the operator has "
+    "never seen a worker heartbeat, which combined with non-zero queue "
+    "depth is the issue #44 silent-misbehavior signature)",
 )
 
 DEFAULT_METRICS_PORT = 9090

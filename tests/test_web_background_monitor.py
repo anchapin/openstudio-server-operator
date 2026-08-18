@@ -237,7 +237,11 @@ def test_full_stall_sustained_fires_restart_once():
 
     for offset in (0, 3, 6, 9):  # condition holds, window not yet sustained
         fired, events = tick(
-            api, apps, pods, now=NOW + minute(offset), tracker=tracker,
+            api,
+            apps,
+            pods,
+            now=NOW + minute(offset),
+            tracker=tracker,
             redis=stall_redis(NOW + minute(offset)),
         )
         assert fired is False
@@ -245,7 +249,11 @@ def test_full_stall_sustained_fires_restart_once():
     assert apps.patches == []
 
     fired, events = tick(
-        api, apps, pods, now=NOW + minute(10), tracker=tracker,  # exactly the window
+        api,
+        apps,
+        pods,
+        now=NOW + minute(10),
+        tracker=tracker,  # exactly the window
         redis=stall_redis(NOW + minute(10)),
     )
 
@@ -276,7 +284,11 @@ def test_empty_webbg_target_falls_back_to_chart_deployment_name():
 
     tick(api, apps, spec=spec, now=NOW, tracker=tracker, redis=stall_redis(NOW))
     fired, _ = tick(
-        api, apps, spec=spec, now=NOW + minute(10), tracker=tracker,
+        api,
+        apps,
+        spec=spec,
+        now=NOW + minute(10),
+        tracker=tracker,
         redis=stall_redis(NOW + minute(10)),
     )
 
@@ -294,18 +306,33 @@ def test_transient_blip_below_window_never_triggers():
 
     # Hold the condition for 4 minutes (below the 10-minute window)…
     for offset in (0, 1, 2, 3, 4):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
     # …then it clears (queue drained) for two ticks…
     for offset in (5, 6):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset), queued=False))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset), queued=False),
+        )
     # …and comes back. Total elapsed since first observation now far exceeds
     # the window, but NEITHER episode was sustained for a full window, so
     # the restart must never fire.
     for offset in (7, 8, 9, 10, 11, 13):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
 
     assert apps.patches == []
     assert "lastWebBackgroundRestart" not in api.obj["status"]
@@ -318,15 +345,25 @@ def test_heartbeat_recovery_mid_window_resets_the_clock():
 
     # Stale for 8 minutes, then one worker heartbeats fresh (leg B breaks)…
     for offset in (0, 2, 4, 6, 8):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
     epoch = (NOW + minute(9)).timestamp()
-    tick(api, apps, now=NOW + minute(9), tracker=tracker,
-         redis=make_redis(NOW + minute(9), simulations=2,
-                          heartbeats={"w1": epoch - 5, "w2": epoch - 900}))
+    tick(
+        api,
+        apps,
+        now=NOW + minute(9),
+        tracker=tracker,
+        redis=make_redis(
+            NOW + minute(9), simulations=2, heartbeats={"w1": epoch - 5, "w2": epoch - 900}
+        ),
+    )
     # …stale again: only 1 minute of re-observed stall — no restart at +10.
-    tick(api, apps, now=NOW + minute(10), tracker=tracker,
-         redis=stall_redis(NOW + minute(10)))
+    tick(api, apps, now=NOW + minute(10), tracker=tracker, redis=stall_redis(NOW + minute(10)))
 
     assert apps.patches == []
 
@@ -340,8 +377,13 @@ def test_empty_queues_no_trigger_even_sustained():
     tracker = StallWindowTracker()
 
     for offset in (0, 5, 10, 15):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset), queued=False))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset), queued=False),
+        )
 
     assert apps.patches == []
     assert "lastWebBackgroundRestart" not in api.obj["status"]
@@ -354,9 +396,13 @@ def test_requeued_queue_alone_counts_as_queued_work():
 
     for offset in (0, 5, 10):
         epoch = (NOW + minute(offset)).timestamp()
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=make_redis(NOW + minute(offset), requeued=3,
-                              heartbeats={"w1": epoch - 3600}))  # simulations stays 0
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=make_redis(NOW + minute(offset), requeued=3, heartbeats={"w1": epoch - 3600}),
+        )  # simulations stays 0
 
     assert len(apps.patches) == 1
 
@@ -368,9 +414,17 @@ def test_fresh_heartbeat_no_trigger_even_sustained():
 
     for offset in (0, 5, 10, 15):
         epoch = (NOW + minute(offset)).timestamp()
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=make_redis(NOW + minute(offset), simulations=2,
-                              heartbeats={"w1": epoch - 600, "w2": epoch - 10}))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=make_redis(
+                NOW + minute(offset),
+                simulations=2,
+                heartbeats={"w1": epoch - 600, "w2": epoch - 10},
+            ),
+        )
 
     assert apps.patches == []
 
@@ -382,9 +436,14 @@ def test_unhealthy_worker_pods_no_trigger_even_sustained():
 
     # A NotReady pod (readiness failing): K8s no longer vouches for the fleet.
     for offset in (0, 5, 10, 15):
-        tick(api, apps, pods=FakeCoreV1Api([make_pod(ready=False), make_pod()]),
-             now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            pods=FakeCoreV1Api([make_pod(ready=False), make_pod()]),
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
 
     assert apps.patches == []
 
@@ -396,8 +455,14 @@ def test_pending_worker_pod_no_trigger():
     pods = FakeCoreV1Api([make_pod(phase="Pending")])
 
     for offset in (0, 5, 10, 15):
-        tick(api, apps, pods=pods, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            pods=pods,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
 
     assert apps.patches == []
 
@@ -409,8 +474,14 @@ def test_zero_worker_pods_no_trigger():
     pods = FakeCoreV1Api([])
 
     for offset in (0, 5, 10, 15):
-        tick(api, apps, pods=pods, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            pods=pods,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
 
     assert apps.patches == []
 
@@ -422,8 +493,13 @@ def test_empty_worker_registry_counts_as_nobody_processing():
     tracker = StallWindowTracker()
 
     for offset in (0, 5, 10):
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=make_redis(NOW + minute(offset), simulations=1))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=make_redis(NOW + minute(offset), simulations=1),
+        )
 
     assert len(apps.patches) == 1
 
@@ -433,8 +509,13 @@ def test_empty_worker_registry_counts_as_nobody_processing():
 
 def stall_ticks(api, apps, tracker, *offsets: int) -> None:
     for offset in offsets:
-        tick(api, apps, now=NOW + minute(offset), tracker=tracker,
-             redis=stall_redis(NOW + minute(offset)))
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
 
 
 def test_cooldown_blocks_second_restart_even_if_stall_persists():
@@ -531,10 +612,12 @@ def test_operator_restart_after_cooldown_needs_fresh_sustained_window():
     tracker = StallWindowTracker()  # fresh process: first_observed is None
 
     fired1, _ = tick(api, apps, now=NOW, tracker=tracker, redis=stall_redis(NOW))
-    fired2, _ = tick(api, apps, now=NOW + minute(9), tracker=tracker,
-                     redis=stall_redis(NOW + minute(9)))
-    fired3, _ = tick(api, apps, now=NOW + minute(10), tracker=tracker,
-                     redis=stall_redis(NOW + minute(10)))
+    fired2, _ = tick(
+        api, apps, now=NOW + minute(9), tracker=tracker, redis=stall_redis(NOW + minute(9))
+    )
+    fired3, _ = tick(
+        api, apps, now=NOW + minute(10), tracker=tracker, redis=stall_redis(NOW + minute(10))
+    )
 
     assert (fired1, fired2, fired3) == (False, False, True)
     assert len(apps.patches) == 1
@@ -577,12 +660,23 @@ def test_dry_run_suppresses_patch_marks_event_and_advances_anchor():
     tracker = StallWindowTracker()
     metric_before = restarts_total()
 
-    fired1, events1 = tick(api, apps, spec=spec, now=NOW, tracker=tracker,
-                           redis=stall_redis(NOW))
-    fired2, events2 = tick(api, apps, spec=spec, now=NOW + minute(10), tracker=tracker,
-                           redis=stall_redis(NOW + minute(10)))
-    fired3, events3 = tick(api, apps, spec=spec, now=NOW + minute(12), tracker=tracker,
-                           redis=stall_redis(NOW + minute(12)))
+    fired1, events1 = tick(api, apps, spec=spec, now=NOW, tracker=tracker, redis=stall_redis(NOW))
+    fired2, events2 = tick(
+        api,
+        apps,
+        spec=spec,
+        now=NOW + minute(10),
+        tracker=tracker,
+        redis=stall_redis(NOW + minute(10)),
+    )
+    fired3, events3 = tick(
+        api,
+        apps,
+        spec=spec,
+        now=NOW + minute(12),
+        tracker=tracker,
+        redis=stall_redis(NOW + minute(12)),
+    )
 
     assert fired1 is False
     assert fired2 is True
@@ -616,3 +710,235 @@ def test_tracker_observes_resets_and_sustains():
     tracker.reset()
     assert tracker.first_observed is None
     assert tracker.observe(True, NOW + minute(30), window) is False  # fresh clock
+
+
+# --- Issue #44 leg-2 non-vacuity safeguard -------------------------------------
+
+
+from openstudio_operator.handlers import web_background_monitor as wbm_module
+from openstudio_operator.handlers.web_background_monitor import (
+    RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
+)
+
+
+def workers_seen_max() -> float:
+    return REGISTRY.get_sample_value("openstudio_operator_resque_workers_seen_max") or 0.0
+
+
+def test_empty_registry_with_no_prior_heartbeats_warns_once_after_grace():
+    """Issue #44: empty registry + never-seen-worker + sustained wait → warning.
+
+    Reproduces the silent-misbehavior signature: the stall condition's
+    "nobody is processing" leg is vacuously true. The safeguard must emit
+    exactly one Warning Event named ResqueKeyLayoutUnknown after the
+    60-second grace, AND keep the gauge at 0 (so an SRE can alert on it).
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+    baseline_gauge = workers_seen_max()
+    metric_before = restarts_total()
+
+    # Two ticks under 60 s: empty registry seen, but no warning yet.
+    for offset in (0, 30):
+        _fired, events = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + timedelta(seconds=offset),
+            tracker=tracker,
+            redis=make_redis(NOW + timedelta(seconds=offset), simulations=1),
+        )
+        assert _fired is False  # leg B vacuously holds but tracker is fresh
+        assert events == []
+    assert RESQUE_KEY_LAYOUT_UNKNOWN_EVENT not in [e[1] for e in events]
+
+    # At 60 s the empty registry has been held for the full grace period.
+    fired, events = tick(
+        api,
+        apps,
+        pods,
+        now=NOW + timedelta(seconds=60),
+        tracker=tracker,
+        redis=make_redis(NOW + timedelta(seconds=60), simulations=1),
+    )
+    assert fired is False  # tracker.observe(... 60s) hasn't crossed 10m window
+    assert len(events) == 1
+    event_type, reason, message = events[0]
+    assert event_type == "Warning"
+    assert reason == RESQUE_KEY_LAYOUT_UNKNOWN_EVENT
+    assert "WORKER_REGISTRY_KEY" in message
+    assert "docs/kind-validation.md" in message
+    assert workers_seen_max() == baseline_gauge  # still 0 — never saw a worker
+
+    # Subsequent ticks re-firing the empty registry do NOT re-emit the event
+    # (one-shot per process).
+    fired2, events2 = tick(
+        api,
+        apps,
+        pods,
+        now=NOW + timedelta(seconds=120),
+        tracker=tracker,
+        redis=make_redis(NOW + timedelta(seconds=120), simulations=1),
+    )
+    assert fired2 is False
+    assert events2 == []
+    assert restarts_total() - metric_before == 0  # safeguard is diagnostic only
+
+
+def test_warning_does_not_fire_when_heartbeats_ever_observed():
+    """If a heartbeat appears at any point, the safeguard clears the grace."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # Tick 0: one worker heartbeat present.
+    epoch_0 = NOW.timestamp()
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(NOW, simulations=1, heartbeats={"w1": epoch_0 - 1}),
+    )
+    assert workers_seen_max() == 1.0
+
+    # 90 s later: registry empty, but we saw a worker earlier — grace never
+    # accumulates. NO warning.
+    fired, events = tick(
+        api,
+        apps,
+        pods,
+        now=NOW + timedelta(seconds=90),
+        tracker=tracker,
+        redis=make_redis(NOW + timedelta(seconds=90), simulations=1),
+    )
+    assert fired is False
+    assert events == []
+    assert RESQUE_KEY_LAYOUT_UNKNOWN_EVENT not in [e[1] for e in events]
+
+
+def test_warning_does_not_fire_during_grace_period():
+    """Empty registry seen for less than the grace period → no warning."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # Only 30 s of empty registry.
+    for offset in (0, 30):
+        _fired, events = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + timedelta(seconds=offset),
+            tracker=tracker,
+            redis=make_redis(NOW + timedelta(seconds=offset), simulations=1),
+        )
+        assert events == []
+    assert workers_seen_max() == 0.0
+
+
+def test_gauge_tracks_high_water_mark_of_workers_seen():
+    """The gauge is monotonic: once workers seen, never drops."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    epoch = NOW.timestamp()
+    # Three workers present.
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(
+            NOW,
+            simulations=1,
+            heartbeats={"w1": epoch - 1, "w2": epoch - 2, "w3": epoch - 3},
+        ),
+    )
+    assert workers_seen_max() == 3.0
+
+    # Now only one — gauge stays at 3 (high-water mark).
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW + minute(1),
+        tracker=tracker,
+        redis=make_redis(NOW + minute(1), simulations=1, heartbeats={"w1": epoch}),
+    )
+    assert workers_seen_max() == 3.0
+
+    # Empty — gauge stays at 3.
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW + minute(2),
+        tracker=tracker,
+        redis=make_redis(NOW + minute(2), simulations=1),
+    )
+    assert workers_seen_max() == 3.0
+
+
+def test_gauge_observable_via_metrics_endpoint():
+    """The gauge is exported via /metrics (issue #17 contract).
+
+    The full exposition-format check lives in
+    ``tests/test_metrics_endpoint.py::test_every_declared_counter_family_in_registry_exposition``
+    (now extended for the gauge). This test only asserts the gauge is
+    settable and readable from the operator process — i.e. the safeguard
+    machinery can drive it.
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+    epoch = NOW.timestamp()
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(NOW, simulations=1, heartbeats={"w1": epoch}),
+    )
+    assert workers_seen_max() == 1.0
+
+
+def test_warning_does_not_fire_when_idle_no_queue_work():
+    """No leg-A (queue empty) → no warning, even with empty registry forever.
+
+    The safeguard is gated on the same load condition as the stall
+    evaluation — false-firing on an idle cluster would be noise.
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # 5 minutes of empty registry, zero queue depth — leg A never holds.
+    for offset in (0, 60, 120, 300):
+        _fired, events = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + timedelta(seconds=offset),
+            tracker=tracker,
+            redis=make_redis(NOW + timedelta(seconds=offset)),
+        )
+        assert events == []
+    assert RESQUE_KEY_LAYOUT_UNKNOWN_EVENT not in [e[1] for e in events]

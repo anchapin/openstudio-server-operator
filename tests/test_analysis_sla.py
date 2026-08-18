@@ -56,7 +56,9 @@ def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
     }
 
 
-def anchored_status(analysis_id: str, issued_at: datetime, *, escalated_at: datetime | None = None) -> dict:
+def anchored_status(
+    analysis_id: str, issued_at: datetime, *, escalated_at: datetime | None = None
+) -> dict:
     """A CR status carrying a persisted softStops anchor (operator restart state)."""
     record = {"issuedAt": issued_at.isoformat(), "outcome": "issued"}
     if escalated_at is not None:
@@ -125,23 +127,62 @@ def register_started_analysis(
         f"{BASE}/analyses/{analysis_id}/page_data.json",
         json={"analysis": {"status": "started", "start_time": start_time.isoformat()}},
     )
-    responses.get(f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"})
+    responses.get(
+        f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"}
+    )
 
 
 def make_pod(name: str, ip: str | None, labels: dict | None = None):
     """Generated-client pod shape, attribute-style (V1Pod duck type)."""
     return SimpleNamespace(
-        metadata=SimpleNamespace(name=name, labels=dict(labels if labels is not None else WORKER_LABELS)),
+        metadata=SimpleNamespace(
+            name=name, labels=dict(labels if labels is not None else WORKER_LABELS)
+        ),
         status=SimpleNamespace(pod_ip=ip),
     )
+
+
+def _label_selector_term_matches(labels: dict, term: str) -> bool:
+    """AND-intersection of every term in the label selector.
+
+    Honors the subset of the Kubernetes label-selector grammar that the
+    issue #44 ``deployment_label_selector`` helper emits: ``k=v``,
+    ``k in (v1,v2)``, ``k notin (v1,v2)``, bare ``k`` (Exists), and
+    ``!k`` (DoesNotExist). Other terms (e.g. ``Gt``, ``Lt``) silently drop
+    in the fake — the helper falls back to matchLabels-only in that case
+    anyway, so the test surface stays small.
+    """
+    term = term.strip()
+    if not term:
+        return True
+    if term.startswith("!"):
+        return term[1:] not in labels
+    if " notin " in term:
+        # Grammar: "k notin (v1,v2)" → split on " notin "
+        key, _, rest = term.partition(" notin ")
+        vs = rest.strip().strip("()").split(",")
+        return labels.get(key) not in vs
+    if " in " in term:
+        # Grammar: "k in (v1,v2)" → split on " in " (substring, not space)
+        key, _, rest = term.partition(" in ")
+        vs = rest.strip().strip("()").split(",")
+        return labels.get(key) in vs
+    if "=" in term:
+        key, _, value = term.partition("=")
+        return labels.get(key) == value
+    return term in labels
 
 
 class FakeCoreV1Api:
     """CoreV1Api stand-in: label-filtered pod list + recorded deletes.
 
     Honors ``label_selector`` exactly like the real API so tests can prove
-    non-worker pods are never even candidates. The ``delete`` exercised via
-    this fake is the ``pods`` delete verb from deploy/rbac.yaml (#3).
+    non-worker pods are never even candidates. Supports the full label-
+    selector grammar the operator emits (matchLabels terms + the four
+    matchExpressions operators ``In``/``NotIn``/``Exists``/``DoesNotExist``)
+    so the issue #44 matchExpressions path is exercised end-to-end. The
+    ``delete`` exercised via this fake is the ``pods`` delete verb from
+    deploy/rbac.yaml (#3).
     """
 
     def __init__(self, pods: list) -> None:
@@ -157,7 +198,7 @@ class FakeCoreV1Api:
         items = [
             pod
             for pod in self.pods
-            if all(f"{key}={value}" in wanted for key, value in pod.metadata.labels.items())
+            if all(_label_selector_term_matches(pod.metadata.labels, t) for t in wanted)
         ]
         return SimpleNamespace(items=items)
 
@@ -167,17 +208,35 @@ class FakeCoreV1Api:
 
 
 class FakeAppsV1Api:
-    """AppsV1Api stand-in serving one Deployment's pod-template selector."""
+    """AppsV1Api stand-in serving one Deployment's pod-template selector.
 
-    def __init__(self, match_labels: dict | None = None, name: str = "worker") -> None:
+    Honors both ``matchLabels`` AND ``matchExpressions`` (issue #44 gap fix).
+    Pass either or both via the constructor; the helper under test must
+    translate both into the Kubernetes label-selector grammar and intersect
+    them when both are set.
+    """
+
+    def __init__(
+        self,
+        match_labels: dict | None = None,
+        *,
+        match_expressions: list[SimpleNamespace] | None = None,
+        name: str = "worker",
+    ) -> None:
         self.match_labels = dict(match_labels if match_labels is not None else WORKER_LABELS)
+        self.match_expressions = list(match_expressions if match_expressions is not None else [])
         self.reads: list[dict] = []
         self.name = name
 
     def read_namespaced_deployment(self, name, namespace, **kwargs):
         self.reads.append({"name": name, "namespace": namespace, "kwargs": kwargs})
         return SimpleNamespace(
-            spec=SimpleNamespace(selector=SimpleNamespace(match_labels=self.match_labels))
+            spec=SimpleNamespace(
+                selector=SimpleNamespace(
+                    match_labels=self.match_labels,
+                    match_expressions=self.match_expressions,
+                )
+            )
         )
 
 
@@ -259,11 +318,18 @@ def test_clock_is_page_data_start_time_not_created_at():
     )
     responses.get(
         f"{BASE}/analyses/a-recent/page_data.json",
-        json={"analysis": {"status": "started", "start_time": (NOW - timedelta(minutes=5)).isoformat()}},
+        json={
+            "analysis": {
+                "status": "started",
+                "start_time": (NOW - timedelta(minutes=5)).isoformat(),
+            }
+        },
     )
     responses.get(
         f"{BASE}/analyses/a-long/page_data.json",
-        json={"analysis": {"status": "started", "start_time": (NOW - timedelta(hours=4)).isoformat()}},
+        json={
+            "analysis": {"status": "started", "start_time": (NOW - timedelta(hours=4)).isoformat()}
+        },
     )
     responses.get(f"{BASE}/analyses/a-long/soft_stop", status=200, json={"result": "accepted"})
 
@@ -283,7 +349,12 @@ def test_runtime_exactly_at_max_does_not_trip():
     )
     responses.get(
         f"{BASE}/analyses/a-edge/page_data.json",
-        json={"analysis": {"status": "started", "start_time": (NOW - timedelta(minutes=180)).isoformat()}},
+        json={
+            "analysis": {
+                "status": "started",
+                "start_time": (NOW - timedelta(minutes=180)).isoformat(),
+            }
+        },
     )
     api = FakeCustomObjectsApi(make_cr())
 
@@ -390,11 +461,30 @@ def register_datapoints(docs: list[dict]) -> None:
 def started_dps_payload(analysis_id: str, *ips: str) -> list[dict]:
     """Full-doc datapoints: started dps with ips + decoys (completed dp, other analysis)."""
     docs = [
-        {"_id": f"dp-{analysis_id}-{ip}", "analysis_id": analysis_id, "status": "started", "ip_address": ip}
+        {
+            "_id": f"dp-{analysis_id}-{ip}",
+            "analysis_id": analysis_id,
+            "status": "started",
+            "ip_address": ip,
+        }
         for ip in ips
     ]
-    docs.append({"_id": "dp-done", "analysis_id": analysis_id, "status": "completed", "ip_address": "10.9.9.9"})
-    docs.append({"_id": "dp-other", "analysis_id": "someone-else", "status": "started", "ip_address": "10.8.8.8"})
+    docs.append(
+        {
+            "_id": "dp-done",
+            "analysis_id": analysis_id,
+            "status": "completed",
+            "ip_address": "10.9.9.9",
+        }
+    )
+    docs.append(
+        {
+            "_id": "dp-other",
+            "analysis_id": "someone-else",
+            "status": "started",
+            "ip_address": "10.8.8.8",
+        }
+    )
     return docs
 
 
@@ -446,7 +536,9 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
     metric_before = pods_evicted_total()
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api(), client=OpenStudioClient(BASE))
+    result, events = tick(
+        api, pod_api=pod_api, apps_api=FakeAppsV1Api(), client=OpenStudioClient(BASE)
+    )
 
     assert result.escalated == ["a1"]
     assert [d["name"] for d in pod_api.deletes] == ["worker-1"]
@@ -574,7 +666,12 @@ def test_analysis_vanished_from_api_prunes_anchor():
     # a-other is a young, unanchored live analysis: polled for page_data, not tripped.
     responses.get(
         f"{BASE}/analyses/a-other/page_data.json",
-        json={"analysis": {"status": "started", "start_time": (NOW - timedelta(minutes=5)).isoformat()}},
+        json={
+            "analysis": {
+                "status": "started",
+                "start_time": (NOW - timedelta(minutes=5)).isoformat(),
+            }
+        },
     )
     pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
 
@@ -660,3 +757,142 @@ def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
     assert calls_to("/data_points.json") == 0
     assert pod_api.deletes == []
     assert api.obj["status"]["softStops"]["a1"].get("escalatedAt") is None  # untouched
+
+
+# --- Issue #44: pod discovery with matchExpressions -------------------------
+
+
+from openstudio_operator.handlers.analysis_sla import deployment_label_selector
+
+
+def _exp(key, operator, values=None):
+    """Helper: build a matchExpressions entry as the generated client does."""
+    return SimpleNamespace(key=key, operator=operator, values=values or [])
+
+
+def test_deployment_label_selector_match_labels_only():
+    apps = FakeAppsV1Api(match_labels=WORKER_LABELS)
+    assert deployment_label_selector(apps, "worker", NAMESPACE) == (
+        "app.kubernetes.io/name=openstudio-server,component=worker"
+    )
+
+
+def test_deployment_label_selector_match_expressions_in_operator():
+    """A matchExpressions-only selector with ``In`` builds the (,) grammar term."""
+    apps = FakeAppsV1Api(
+        match_labels={},
+        match_expressions=[_exp("tier", "In", ["worker", "background"])],
+    )
+    assert deployment_label_selector(apps, "worker", NAMESPACE) == "tier in (worker,background)"
+
+
+def test_deployment_label_selector_match_expressions_exists_and_notexists():
+    """``Exists`` → bare key, ``DoesNotExist`` → ``!key``."""
+    apps = FakeAppsV1Api(
+        match_labels={},
+        match_expressions=[
+            _exp("app", "Exists"),
+            _exp("deprecated", "DoesNotExist"),
+        ],
+    )
+    selector = deployment_label_selector(apps, "worker", NAMESPACE)
+    assert "app" in selector.split(",") and "!deprecated" in selector.split(",")
+
+
+def test_deployment_label_selector_intersects_match_labels_and_match_expressions():
+    """When BOTH are set, the helper produces an intersection (AND)."""
+    apps = FakeAppsV1Api(
+        match_labels={"app": "worker"},
+        match_expressions=[_exp("tier", "In", ["worker"])],
+    )
+    selector = deployment_label_selector(apps, "worker", NAMESPACE)
+    # The kubernetes label_selector= param is a comma-separated AND.
+    assert "app=worker" in selector.split(",")
+    assert "tier in (worker)" in selector.split(",")
+
+
+def test_deployment_label_selector_falls_back_to_matchlabels_on_unsupported_operator(caplog):
+    """An exotic operator (e.g. ``Gt``) → matchLabels only + warn.
+
+    Narrower selector = conservative direction (a missed-eviction, never
+    a false-eviction; matches the issue #13 design note).
+    """
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="openstudio_operator.handlers.analysis_sla")
+    apps = FakeAppsV1Api(
+        match_labels={"app": "worker"},
+        match_expressions=[_exp("priority", "Gt", ["0"])],
+    )
+    selector = deployment_label_selector(apps, "worker", NAMESPACE)
+    assert selector == "app=worker"  # narrow, no `priority` term
+    # Warning logged
+    assert any("matchExpressions operator" in rec.message for rec in caplog.records)
+
+
+def test_deployment_label_selector_returns_none_when_neither_set():
+    """No selector at all → None (the caller must decide what to do)."""
+    apps = FakeAppsV1Api(match_labels={}, match_expressions=[])
+    assert deployment_label_selector(apps, "worker", NAMESPACE) is None
+
+
+@responses.activate
+def test_escalation_with_match_expressions_only_selector_finds_worker_pods():
+    """End-to-end: a Deployment with matchExpressions-only still finds the pods.
+
+    Reproduces the issue #44 gap: the old helper returned ``None`` (or empty)
+    for a matchExpressions-only selector, which silently broadened the
+    pod set to the whole namespace (or narrowed it to nothing). Either way
+    the escalation missed real victims. With the fix, both the escalation
+    (#9, this test) and the stall detector (#13) find the right pods.
+    """
+    apps = FakeAppsV1Api(
+        match_labels={},
+        match_expressions=[_exp("tier", "In", ["worker"])],
+    )
+    worker_pod = make_pod("worker-x", "10.0.0.5", labels={"tier": "worker"})
+    decoy_pod = make_pod(
+        "web-y", "10.0.0.5", labels={"tier": "web"}
+    )  # same IP, wrong tier — must NOT match
+    pod_api = FakeCoreV1Api([worker_pod, decoy_pod])
+
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.5"))
+
+    result, _ = tick(api, pod_api=pod_api, apps_api=apps)
+
+    assert result.escalated == ["a1"]
+    assert [d["name"] for d in pod_api.deletes] == ["worker-x"]
+
+
+@responses.activate
+def test_escalation_matchlabels_and_matchexpressions_intersection_pods():
+    """Both terms on the selector → only pods matching BOTH are victims."""
+    apps = FakeAppsV1Api(
+        match_labels={"component": "worker"},
+        match_expressions=[_exp("tier", "In", ["worker"])],
+    )
+    pod_api = FakeCoreV1Api(
+        [
+            make_pod("worker-only", "10.0.0.1", labels={"component": "worker", "tier": "worker"}),
+            make_pod("worker-wrongtier", "10.0.0.2", labels={"component": "worker", "tier": "web"}),
+            make_pod("tierless-worker", "10.0.0.3", labels={"component": "worker"}),
+            make_pod("tier-only", "10.0.0.4", labels={"tier": "worker"}),
+        ]
+    )
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis(
+        "a1", started_dps_payload("a1", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4")
+    )
+
+    result, _ = tick(api, pod_api=pod_api, apps_api=apps)
+
+    assert result.escalated == ["a1"]
+    # Real pod (both terms) is the only victim; the pod with wrong tier is
+    # already correctly excluded by the intersection at the LIST step
+    # (FakeCoreV1Api's label selector semantics); IPs not matching are
+    # then excluded by the IP filter (#9 design).
+    assert [d["name"] for d in pod_api.deletes] == ["worker-only"]
+
+
+# Suppress the no-handler warning from the caplog helper used above

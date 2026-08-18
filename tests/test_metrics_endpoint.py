@@ -7,7 +7,7 @@ import textwrap
 from contextlib import closing
 
 import requests
-from prometheus_client import Counter, generate_latest
+from prometheus_client import Counter, Gauge, generate_latest
 
 from openstudio_operator import metrics
 from openstudio_operator.metrics import start_metrics_server
@@ -24,20 +24,42 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_hpa_floor_adjustments_total",
 )
 
+#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Operators
+#: alert on `resque_workers_seen_max == 0 AND queue depth > 0` to catch a
+#: centralized constants / live v3.11.0 layout mismatch.
+EXPECTED_GAUGE_FAMILIES = ("openstudio_operator_resque_workers_seen_max",)
+
 
 def _declared_counter_families():
     """Exposition family name for every Counter declared in metrics.py."""
-    return [f"{value._name}_total" for value in vars(metrics).values() if isinstance(value, Counter)]
+    return [
+        f"{value._name}_total" for value in vars(metrics).values() if isinstance(value, Counter)
+    ]
+
+
+def _declared_gauge_families():
+    """Exposition family name for every Gauge declared in metrics.py (issue #44)."""
+    return [value._name for value in vars(metrics).values() if isinstance(value, Gauge)]
 
 
 def test_declared_counters_match_expected_set():
     assert sorted(_declared_counter_families()) == sorted(EXPECTED_COUNTER_FAMILIES)
 
 
+def test_declared_gauges_match_expected_set():
+    assert sorted(_declared_gauge_families()) == sorted(EXPECTED_GAUGE_FAMILIES)
+
+
 def test_every_declared_counter_family_in_registry_exposition():
     exposition = generate_latest().decode()
     for name in _declared_counter_families():
         assert f"# TYPE {name} counter" in exposition
+
+
+def test_every_declared_gauge_family_in_registry_exposition():
+    exposition = generate_latest().decode()
+    for name in _declared_gauge_families():
+        assert f"# TYPE {name} gauge" in exposition
 
 
 def _free_port():
@@ -55,6 +77,10 @@ def test_metrics_http_server_serves_all_declared_counters():
     assert response.status_code == 200
     for name in _declared_counter_families():
         assert f"# TYPE {name} counter" in response.text
+        assert f"\n{name} " in response.text
+    # Issue #44: gauge exposed alongside counters.
+    for name in _declared_gauge_families():
+        assert f"# TYPE {name} gauge" in response.text
         assert f"\n{name} " in response.text
 
     # idempotent: a second call must not start another server — it returns
