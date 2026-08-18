@@ -232,6 +232,14 @@ dev machine with kubeconfig pointed at kind:
    - operator memory changes land in the CR `.status` subresource only
      (D04): `kubectl get oscm validation -o yaml` after a few ticks.
 
+   For the per-module Event/metric/status-anchor enumeration the human
+   should capture, see the [Dryrun walkthrough evidence
+   checklist](#dryrun-walkthrough-evidence-checklist-issue-45) below
+   (issue #45). Every dry-run invariant there is already asserted by
+   `tests/test_dryrun_walkthrough.py` in CI; the checklist's live-cluster
+   rows are the only pieces the human must observe on this kind
+   cluster.
+
 5. **Fixture-adjacent smoke of the client layer** (no operator involved;
    verified against the live kind stack while preparing this doc):
 
@@ -253,6 +261,129 @@ dev machine with kubeconfig pointed at kind:
 6. **Flip `dryRun: false` only if** you want to observe a real soft-stop on
    a throwaway analysis in kind — never against any other cluster from this
    recipe. #20's runbook owns the work-cluster equivalent.
+
+## Dryrun walkthrough evidence checklist (issue #45)
+
+The Phase 1 walkthrough steps 3–4 above describe the operator's
+behavior at a high level. This checklist names the **specific Event
+types, metric counters, and status anchors** every module must produce
+when a policy fires under `dryRun: true`, with a column for the
+code-side test that already proves the same invariant in CI. Items
+marked `REQUIRES LIVE CLUSTER` are observer-only (the in-process
+test cannot reproduce a kind cluster's tick timing) — the human
+running the walkthrough must capture them on the dev machine and
+attach the evidence (Event YAML, `curl /metrics` snippet, or
+`kubectl get oscm -o yaml` status blob) to the issue.
+
+> **Notation.** `[CI: …]` = the test file:line that proves the same
+> invariant in CI. `[REQUIRES LIVE CLUSTER]` = no CI test can stand
+> in; the human must observe it on the kind cluster and attach
+> evidence. The Checklist is the D13 final gate; the audit doc
+> (`docs/audit-dryrun-idempotency.md`) is the source of truth for
+> which mutation is gated by what (verify against it if anything
+> looks off).
+
+### Module 1 — Analysis SLA soft-stop (probe: 4-hour-old `started` analysis)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 1.1 | `AnalysisSoftStopped` Warning Event on the CR, message ending `— soft stop suppressed (spec.dryRun)` | `handlers/analysis_sla.py:241,244` | `[CI] tests/test_analysis_sla.py:319 test_dry_run_suppresses_rest_call_and_marks_event` |
+| 1.2 | `.status.softStops[<analysis-id>].outcome == "dry-run"` (the one-shot anchor) | `handlers/analysis_sla.py:246-252` | `[CI] tests/test_analysis_sla.py:319` (same) |
+| 1.3 | `openstudio_operator_soft_stops_total` counter +1 on the operator `:9090/metrics` | `metrics.py` (the counter increments in the suppressed path too — D11 decision counter) | `[CI] tests/test_analysis_sla.py:319` (same) |
+| 1.4 | NO `GET /analyses/{id}/soft_stop` request in `web` logs for the duration of the walkthrough | contract — `soft_stop_analysis` is the gated mutation | `[CI] tests/test_analysis_sla.py:319` (mocked REST, zero calls) + `[REQUIRES LIVE CLUSTER]` web log on kind |
+
+### Module 1b — Grace wait + worker-pod escalation (probe: anchored analysis past `gracefulStopTimeoutMinutes`)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 1b.1 | `AnalysisEscalated` Warning Event on the CR, message ending `— pod deletions suppressed (spec.dryRun)` and naming the would-be victim pod list | `handlers/analysis_sla.py:432-433` | `[CI] tests/test_analysis_sla.py:590 test_dry_run_suppresses_pod_deletes_and_marks_event` |
+| 1b.2 | `.status.softStops[<analysis-id>].escalationOutcome == "dry-run"` (the never-twice marker) | `handlers/analysis_sla.py:434` | `[CI] tests/test_analysis_sla.py:590` (same) |
+| 1b.3 | `openstudio_operator_worker_pods_evicted_total` counter +1 per would-be-deleted pod (decision counter, increments in dry-run too) | `metrics.py` | `[CI] tests/test_analysis_sla.py:590` (same) |
+| 1b.4 | NO `pods/delete` API call against the worker pods (kubectl logs / audit) | `handlers/analysis_sla.py:413` | `[CI] tests/test_analysis_sla.py:590` (mocked `delete_namespaced_pod`, zero calls) + `[REQUIRES LIVE CLUSTER]` pod list on kind |
+
+### Module 2 — Zombie datapoint watchdog (probe: started dp older than `maxDatapointRuntimeMinutes` with budget remaining)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 2.1 | `DatapointRequeued` Normal Event on the CR, message ending `suppressed (spec.dryRun)` | `handlers/datapoint_watchdog.py:200-201` | `[CI] tests/test_datapoint_watchdog.py:378 test_dry_run_suppresses_rest_call_and_burns_budget_like_real` |
+| 2.2 | `.status.requeues[<dp-id>].count == 1` (budget burned exactly like a real run — D11 pacing choice) | `handlers/datapoint_watchdog.py:203` | `[CI] tests/test_dryrun_walkthrough.py::test_dryrun_requeue_is_strict_suppression` |
+| 2.3 | `openstudio_operator_datapoints_requeued_total` counter +1 | `metrics.py` | `[CI] tests/test_dryrun_walkthrough.py::test_dryrun_requeue_is_strict_suppression` |
+| 2.4 | NO `POST /data_points/{id}/requeue` in `web` logs | `handlers/datapoint_watchdog.py:192` | `[CI] tests/test_datapoint_watchdog.py:378` (mocked REST, zero calls) + `[REQUIRES LIVE CLUSTER]` web log on kind |
+| 2.5 | Exhaustion path: `DatapointRequeueExhausted` Warning Event + `openstudio_operator_datapoints_requeue_exhausted_total` +1 (separate from requeue — this is the warn-only path on a budget-exhausted dp) | `handlers/datapoint_watchdog.py:181-188` | `[CI] tests/test_datapoint_watchdog.py:235 test_exhausted_never_requeued_and_evented_once` (real path) — dry-run exhaustion behavior is identical (no requeue happened, so dryRun is moot) |
+
+### Module 3 — Gated worker recycler (probe: completed analysis present, no `started` analysis, gate open)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 3.1 | `WorkerRecycled` Normal Event on the CR, message ending `— patch suppressed (spec.dryRun)` | `handlers/worker_recycler.py:193-194` | `[CI] tests/test_worker_recycler.py:475 test_dry_run_suppresses_patch_marks_event_and_advances_last_recycle_at` |
+| 3.2 | `.status.lastRecycleAt` advances (gate pacing under dryRun — D11 choice) | `handlers/worker_recycler.py:197` | `[CI] tests/test_worker_recycler.py:475` (same) |
+| 3.3 | `openstudio_operator_workers_recycled_total` counter +1 | `metrics.py` | `[CI] tests/test_worker_recycler.py:475` (same) |
+| 3.4 | NO `kubectl.kubernetes.io/restartedAt` annotation change on the `worker` Deployment; `kubectl rollout status deploy/worker` stays quiet | `handlers/worker_recycler.py:182` | `[CI] tests/test_worker_recycler.py:475` (mocked `patch_namespaced_deployment`, zero calls) + `[REQUIRES LIVE CLUSTER]` deployment on kind |
+
+### Module 4 — Archival + NFS prune (probe: completed analysis past `retentionDays` with `archiveToS3: true`)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 4.1 | `AnalysisArchivalStarted` Normal Event on the CR, message ending `— Job spawn suppressed (spec.dryRun)` | `handlers/storage_pruner.py:484` | `[CI] tests/test_storage_pruner.py:625 test_dry_run_suppresses_spawn_and_delete_with_observable_tracking` |
+| 4.2 | `.status.archivedAnalyses[<analysis-id>]` has NO `jobName` field (the dry-run marker; suppressed spawn can never be watched) | `handlers/storage_pruner.py:471` | `[CI] tests/test_storage_pruner.py:625` (same) |
+| 4.3 | NO Kubernetes Job created with the deterministic name `oscm-archive-<analysis-id>-<hash>` (`kubectl get jobs` is unchanged) | `handlers/storage_pruner.py:463` | `[CI] tests/test_storage_pruner.py:625` (mocked `create_namespaced_job`, zero calls) + `[REQUIRES LIVE CLUSTER]` jobs on kind |
+| 4.4 | NO failed-archival-Job cleanup delete — if a failed Job exists from the previous tick's real run, it stays for forensics. (Regression #42; #42 fix included in this audit's #21 sweep.) | `handlers/storage_pruner.py:456` | `[CI] tests/test_storage_pruner.py:663 test_dry_run_suppresses_failed_job_cleanup_delete` |
+| 4.5 | Verified-record path: a real Job that reached `Complete` would have triggered `DELETE /analyses/{id}`; under dryRun, the `AnalysisDeleted` Normal Event fires once with the `— delete suppressed (spec.dryRun)` marker, and the verified record persists | `handlers/storage_pruner.py:293` | `[CI] tests/test_storage_pruner.py:710 test_dry_run_suppresses_delete_of_verified_analysis` |
+| 4.6 | `openstudio_operator_analyses_deleted_total` counter +0 in dry-run (deletion is the only counter that is *suppressed* in dry-run; archival + verification increments normally) | `metrics.py` (Appendix D) | `[CI] tests/test_storage_pruner.py:710` (same) |
+| 4.7 | NFS-mount behavior under a real provisioner | not reproducible on kind (hostPath stand-in) | `[REQUIRES LIVE CLUSTER]` on a work cluster — `docs/validation.md` Module 4 owns this |
+
+### Module 5 — web_background stall detector (probe: induced stall, `stallWindowMinutes` elapsed)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 5.1 | `WebBackgroundRestarted` Warning Event on the CR, message ending `— patch suppressed (spec.dryRun)` | `handlers/web_background_monitor.py:323-324` | `[CI] tests/test_web_background_monitor.py:573 test_dry_run_suppresses_patch_marks_event_and_advances_anchor` |
+| 5.2 | `.status.lastWebBackgroundRestart` advances (cooldown pacing under dryRun — D11 choice) | `handlers/web_background_monitor.py:328` | `[CI] tests/test_web_background_monitor.py:573` (same) |
+| 5.3 | `openstudio_operator_web_background_restarts_total` counter +1 | `metrics.py` | `[CI] tests/test_web_background_monitor.py:573` (same) |
+| 5.4 | NO `kubectl.kubernetes.io/restartedAt` annotation change on the `web-background` Deployment | `handlers/web_background_monitor.py:310` | `[CI] tests/test_web_background_monitor.py:573` (mocked `patch_namespaced_deployment`, zero calls) + `[REQUIRES LIVE CLUSTER]` deployment on kind |
+
+### Phase 4 — HPA-floor adjuster (probe: Resque backlog ≥ first tier threshold)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| 4.1 | `HpaFloorRaised` Normal Event on the CR (raising the floor is information-level), or `HpaFloorDecayed` Warning Event on decay (removing floor capacity is the direction worth human eyes). Both end `— patch suppressed (spec.dryRun)` | `handlers/hpa_floor.py:329-332` | `[CI] tests/test_hpa_floor.py:337 test_dry_run_suppresses_patch_but_paces_like_real` |
+| 4.2 | `openstudio_operator_hpa_floor_adjustments_total` counter +1 | `metrics.py` | `[CI] tests/test_hpa_floor.py:337` (same) |
+| 4.3 | NO patch on `worker-hpa` (`kubectl get hpa worker-hpa -o jsonpath='{.spec.minReplicas}'` unchanged) | `handlers/hpa_floor.py:319` | `[CI] tests/test_hpa_floor.py:337` (mocked `patch_namespaced_horizontalpodautoscaler`, zero calls) + `[REQUIRES LIVE CLUSTER]` HPA on kind |
+| 4.4 | In-memory `HpaFloorState` cooldown advances (D11 pacing choice; documented D04 deviation) | `handlers/hpa_floor.py:338` | `[CI] tests/test_hpa_floor.py:337` (same) |
+| 4.5 | Real HPA dynamics are unobservable on kind (no metrics-server; `worker-hpa` stays pinned at `minReplicas`) | `Approximations` above | `[REQUIRES LIVE CLUSTER]` on a work cluster |
+
+### Module: Singleton guard (only fires on a violation)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| S.1 | Creating a *second* OSCM CR in the same namespace produces a `SingletonConflict` Warning Event on the loser CR (the winner has `SingletonActive` Normal). The singleton guard is read-only — there is no mutation to suppress — but the walker still emits the diagnostic Events. | `singleton.py:208-217` | `[CI] tests/test_singleton_guard.py` (real-path tests; dry-run semantics are not applicable since the guard has no mutation) |
+| S.2 | The walkthrough recipe intentionally keeps exactly one CR; this Evidence is only relevant if a violation is accidentally introduced. | per AGENTS.md D05 | `[REQUIRES LIVE CLUSTER]` only if a violation is induced |
+
+### Aggregate invariants (single ticks / `:9090/metrics` snapshot)
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| A.1 | `curl -s localhost:9090/metrics \| grep openstudio_operator_` shows the counters above all incrementing (`dryRun=True` is decision-counted, mutation-not-counted). `openstudio_operator_analyses_deleted_total` is the only counter that is *suppressed* in dry-run (the cardinal rule: no delete without verified upload, and the delete is the only mutation not made). | `metrics.py` Appendix D | `[CI] tests/test_dryrun_walkthrough.py::test_dryrun_walkthrough_all_modules_suppress_mutations_only` — runs all six modules in series and asserts the cumulative counter deltas |
+| A.2 | `kubectl get events --sort-by=.lastTimestamp --field-selector involvedObject.name=validation` lists every Event from the checklist above, each with the `suppressed (spec.dryRun)` marker in the message | Event emission at each handler | `[CI] tests/test_dryrun_walkthrough.py::test_dryrun_walkthrough_all_modules_suppress_mutations_only` (event-capture part) + `[REQUIRES LIVE CLUSTER]` kubectl event listing on kind |
+| A.3 | `kubectl get oscm validation -o yaml` shows the `.status` subresource carrying each module's anchor (`softStops`, `requeues`, `startedSince`, `lastRecycleAt`, `lastWebBackgroundRestart`, `archivedAnalyses`) with dryRun-shaped values | `status_store.py` | `[CI] tests/test_dryrun_walkthrough.py::test_dryrun_walkthrough_all_modules_suppress_mutations_only` (status-anchor assertions) + `[REQUIRES LIVE CLUSTER]` full `kubectl get oscm -o yaml` on kind |
+
+### Capture-and-attach checklist (for the human running the walkthrough)
+
+For each `[REQUIRES LIVE CLUSTER]` row above, attach EVIDENCE to the GitHub issue:
+
+- **Event rows (1.x, 2.x, 3.x, 4.x, 5.x, ...)**: a `kubectl get events -o yaml` snippet filtered to the relevant `reason` field, showing the message text contains `suppressed (spec.dryRun)`.
+- **Metric rows**: a `curl -s localhost:9090/metrics | grep openstudio_operator_<name>` snippet showing the counter value.
+- **Status anchor rows**: a `kubectl get oscm validation -o jsonpath='{.status}'` snippet (or full YAML block) showing the persisted record.
+- **Negative-control rows (no mutation reached the cluster)**: a `kubectl get <resource>` showing the cluster state is unchanged vs. the pre-walkthrough snapshot, OR a `kubectl logs` snippet showing the absence of the request.
+
+If any `[REQUIRES LIVE CLUSTER]` row produces evidence that *contradicts* the CI test (e.g. the Event is missing, the metric doesn't increment, the cluster *did* mutate), STOP the walkthrough and file a follow-up issue — the audit doc's gate (D11) has been violated.
+
+### Known gaps / future issues
+
+The following module-level gaps remain — the human running the walkthrough should be aware they are not fully covered in this PR:
+
+- **None blocking.** Every merged module has at least one dryRun-only test in its existing test file and a strict symmetry test in `tests/test_dryrun_walkthrough.py`. The walkthrough aggregates them. The audit doc (`docs/audit-dryrun-idempotency.md`) §1 and Appendix D are the authoritative reference for "what is gated where".
+
+- **No post-merge follow-up issues opened by this PR.** Every gap identified during this work (the missing WebBackgroundRestarted patch in the original walkthrough, the failed-Job cleanup delete gap from #42, the metadata-only `STORAGE_FREED_BYTES` removal from #50) was already tracked by its own issue and merged before #45 was opened. The only remaining deferred item is **work-cluster verification** (HPA-floor dynamics, NFS-mount behavior under a real provisioner), which is the purpose of `docs/validation.md` rather than this runbook.
 
 ## Teardown
 
