@@ -121,7 +121,7 @@ def _spawning_handlers_list(registry: kopf.OperatorRegistry) -> list[object]:
             "update both the guard and tests/test_singleton_registry_coverage.py."
         )
     if not isinstance(handlers, list):
-        raise AssertionError(
+        raise TypeError(
             f"kopf internal structure changed: SpawningRegistry._handlers is "
             f"no longer a list (got {type(handlers).__name__}). The singleton "
             f"guard (issue #47) cannot wrap OSCM handlers. See "
