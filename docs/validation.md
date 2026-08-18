@@ -289,10 +289,11 @@ scalar: `.status.lastRecycleAt`.
 
 `src/openstudio_operator/archival.py` (#15, merged) is the Job generator;
 the storage-pruner orchestration (retention gate → Job spawn → verified
-upload → `DELETE /analyses/{id}`) is #16. Metric:
-`openstudio_operator_storage_freed_bytes`. Status anchor:
-`.status.archivedAnalyses`. No Event name is defined in code yet — verify
-via objects + status, not Events.
+upload → `DELETE /analyses/{id}`) is #16. Status anchor:
+`.status.archivedAnalyses` (the only durable signal of a verified-then-
+deleted analysis; no Prometheus byte counter — see #50 / audit doc
+Appendix D). No Event name is defined in code yet — verify via objects +
+status, not Events.
 
 1. Configure a throwaway bucket: `storagePolicy.archiveToS3: true`,
    `backend: s3|gcs|azure`, `bucket: …`, `secretRef: <a Secret in this
@@ -307,8 +308,7 @@ via objects + status, not Events.
    **only a Completed Job** (the verified-upload gate) triggers
    `DELETE /analyses/{id}` — send it with `Accept: application/json` and
    expect 204 (quirk 2); then verify absence via `GET /analyses.json`
-   (quirk 1). `.status.archivedAnalyses` gains the record;
-   `…_storage_freed_bytes` grows.
+   (quirk 1). `.status.archivedAnalyses` gains the record.
 4. **Work-cluster-only check (explicit deferral):** the NFS-mount behavior
    kind could not prove — real provisioner mounts inside the archival Job,
    read-only enforcement, and space actually reclaimed on the NFS export
