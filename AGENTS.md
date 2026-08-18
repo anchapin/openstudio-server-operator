@@ -36,6 +36,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - `src/openstudio_operator/handlers/` — one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `storage_pruner`, `web_background_monitor`
 - `src/openstudio_operator/config.py` — CRD spec → typed settings (defaults must stay in sync with `deploy/crd.yaml`)
 - `src/openstudio_operator/openstudio_client.py` — OpenStudio REST client
+- `src/openstudio_operator/archival.py` — pure rclone archival Job manifest generator (backend-agnostic s3|gcs|azure, envFrom-only creds, verified-upload gate via `rclone check`; orchestration lives in `storage_pruner`, #16)
 - `src/openstudio_operator/metrics.py` — Prometheus counters declared up front for Phase 4
 - `deploy/crd.yaml` · `deploy/rbac.yaml` · `deploy/operator-deployment.yaml` — CRD, least-privilege RBAC (namespaced **Role**, never a ClusterRole; verbs enumerated per the plan), operator Deployment
 - `.github/workflows/ci.yml` — lint + test + `guard-branch-pairing`; keep that job name stable — it is a **required status check on `main`**
