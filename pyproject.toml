@@ -22,7 +22,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.5.0",
+    # Minimum keeps local rule sets aligned with CI (see #68): CI installs
+    # latest ruff (0.16.3 at time of writing) and activated rules the old
+    # local floor (0.5.0 / actual 0.14.5) missed — TRY004 (#59) and RUF059
+    # (#64) each cost a CI fix-up cycle. CI pins the same floor in
+    # .github/workflows/ci.yml.
+    "ruff>=0.16",
     "responses>=0.25.0", # mock OpenStudio REST API in tests
     "fakeredis>=2.23", # mock Redis for the read-only client tests (#12)
 ]
