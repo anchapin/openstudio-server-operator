@@ -120,6 +120,79 @@ def test_soft_stop_round_trip_and_wire_format(store, api):
     }
 
 
+# --- softStops escalation marker + prune (#9) ----------------------------------
+
+
+def test_escalation_marker_round_trip_and_wire_format(store, api):
+    when = datetime(2026, 8, 18, 8, 20, 0, tzinfo=UTC)
+    store.set_soft_stop("a1", make_soft_stop())
+    store.mark_soft_stop_escalated("a1", when, "evicted")
+    record = store.get_soft_stop("a1")
+    assert record is not None
+    assert record.escalated_at == when
+    assert record.escalation_outcome == "evicted"
+    assert record.issued_at == make_soft_stop().issued_at  # original anchor preserved
+    assert record.outcome == "issued"
+    assert api.obj["status"]["softStops"]["a1"] == {
+        "issuedAt": "2026-08-18T08:00:00+00:00",
+        "outcome": "issued",
+        "escalatedAt": "2026-08-18T08:20:00+00:00",
+        "escalationOutcome": "evicted",
+    }
+
+
+def test_pre_escalation_anchor_without_keys_parses_unchanged(api, store):
+    """Anchors persisted before #9 (no escalation keys) parse with None fields."""
+    api.obj["status"] = {
+        "softStops": {"a1": {"issuedAt": "2026-08-18T08:00:00+00:00", "outcome": "issued"}}
+    }
+    record = store.get_soft_stop("a1")
+    assert record == make_soft_stop()
+    assert record.escalated_at is None and record.escalation_outcome is None
+
+
+def test_mark_soft_stop_escalated_missing_anchor_raises(store):
+    with pytest.raises(StatusStoreError, match="anchor vanished"):
+        store.mark_soft_stop_escalated("ghost", datetime(2026, 8, 18, 8, 0, 0, tzinfo=UTC), "evicted")
+
+
+def test_mark_soft_stop_escalated_is_idempotent(store, api):
+    when = datetime(2026, 8, 18, 8, 20, 0, tzinfo=UTC)
+    store.set_soft_stop("a1", make_soft_stop())
+    store.mark_soft_stop_escalated("a1", when, "dry-run")
+    patches_after_first = api.patch_calls
+    store.mark_soft_stop_escalated("a1", when, "dry-run")
+    assert api.patch_calls == patches_after_first  # identical marker writes nothing
+
+
+def test_mark_soft_stop_escalated_retries_on_conflict(api, store, sleeps):
+    api.remaining_conflicts = 1
+    store.set_soft_stop("a1", make_soft_stop())
+    when = datetime(2026, 8, 18, 8, 20, 0, tzinfo=UTC)
+    store.mark_soft_stop_escalated("a1", when, "no-matching-pods")
+    assert store.get_soft_stop("a1").escalation_outcome == "no-matching-pods"
+    assert len(sleeps) == 1  # one jittered backoff between the two cycles
+
+
+def test_clear_soft_stop_deletes_only_that_key_and_is_idempotent(store, api):
+    store.set_soft_stop("a1", make_soft_stop())
+    store.set_soft_stop("a2", make_soft_stop(outcome="dry-run"))
+    store.clear_soft_stop("a1")
+    assert set(api.obj["status"]["softStops"]) == {"a2"}
+    patches_after_clear = api.patch_calls
+    store.clear_soft_stop("a1")  # absent key: no write
+    assert api.patch_calls == patches_after_clear
+    assert set(api.obj["status"]["softStops"]) == {"a2"}
+
+
+def test_clear_soft_stop_also_removes_escalation_marker(store, api):
+    store.set_soft_stop("a1", make_soft_stop())
+    store.mark_soft_stop_escalated("a1", datetime(2026, 8, 18, 8, 20, 0, tzinfo=UTC), "evicted")
+    store.clear_soft_stop("a1")
+    assert "softStops" not in api.obj["status"] or "a1" not in api.obj["status"]["softStops"]
+    assert store.get_soft_stop("a1") is None
+
+
 def test_requeue_round_trip_and_wire_format(store, api):
     record = make_requeue(count=2)
     store.set_requeue("dp1", record)

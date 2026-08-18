@@ -17,6 +17,7 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_datapoints_requeued_total",
     "openstudio_operator_datapoints_requeue_exhausted_total",
     "openstudio_operator_workers_recycled_total",
+    "openstudio_operator_worker_pods_evicted_total",
     "openstudio_operator_storage_freed_bytes_total",
 )
 

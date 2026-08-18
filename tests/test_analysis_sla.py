@@ -1,19 +1,28 @@
-"""Unit tests for the analysis SLA monitor core loop (issue #8).
+"""Unit tests for the analysis SLA monitor: soft-stop core (#8) + escalation (#9).
 
 REST is mocked with ``responses`` and the CR ``.status`` subresource with an
 in-memory RFC 7386 merge-patch fake (same approach as test_status_store.py) —
-no dependencies beyond the ``[dev]`` extra. All assertions target
-``run_sla_tick`` directly; the kopf timer wrapper is thin wiring.
+no dependencies beyond the ``[dev]`` extra. The Kubernetes side of the
+escalation is mocked with ``FakeAppsV1Api``/``FakeCoreV1Api`` built on the
+same generated-client shapes the real APIs return (attribute-style models).
+All assertions target ``run_sla_tick`` directly; the kopf timer wrapper is
+thin wiring.
+
+RBAC note: the pod deletes asserted here are covered by the ``pods``
+``get/list/watch/delete`` verbs granted to the operator's namespaced Role in
+``deploy/rbac.yaml`` (added in #3 specifically for this escalation).
 """
 
 import copy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import responses
 from prometheus_client import REGISTRY
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.handlers.analysis_sla import (
+    ANALYSIS_ESCALATED_EVENT,
     ANALYSIS_SOFT_STOPPED_EVENT,
     run_sla_tick,
 )
@@ -25,21 +34,35 @@ NAMESPACE = "openstudio-server"
 NAME = "oscm"
 NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC)
 TEN_DAYS_AGO = (NOW - timedelta(days=10)).isoformat()
+GRACE_MINUTES = 15
+WITHIN_GRACE = NOW - timedelta(minutes=GRACE_MINUTES - 1)
+PAST_GRACE = NOW - timedelta(minutes=GRACE_MINUTES + 1)
 
 SPEC = {
     "serverUrl": BASE,
-    "analysisPolicy": {"maxDurationMinutes": 180},
+    "analysisPolicy": {"maxDurationMinutes": 180, "gracefulStopTimeoutMinutes": GRACE_MINUTES},
 }
 
+WORKER_LABELS = {"app.kubernetes.io/name": "openstudio-server", "component": "worker"}
 
-def make_cr(spec: dict | None = None) -> dict:
+
+def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
     return {
         "apiVersion": "energy.nrel.gov/v1alpha1",
         "kind": "OpenStudioClusterManager",
         "metadata": {"name": NAME, "namespace": NAMESPACE},
         "spec": copy.deepcopy(spec if spec is not None else SPEC),
-        "status": {},
+        "status": copy.deepcopy(status if status is not None else {}),
     }
+
+
+def anchored_status(analysis_id: str, issued_at: datetime, *, escalated_at: datetime | None = None) -> dict:
+    """A CR status carrying a persisted softStops anchor (operator restart state)."""
+    record = {"issuedAt": issued_at.isoformat(), "outcome": "issued"}
+    if escalated_at is not None:
+        record["escalatedAt"] = escalated_at.isoformat()
+        record["escalationOutcome"] = "evicted"
+    return {"softStops": {analysis_id: record}}
 
 
 class FakeCustomObjectsApi:
@@ -87,6 +110,10 @@ def soft_stops_total() -> float:
     return REGISTRY.get_sample_value("openstudio_operator_soft_stops_total") or 0.0
 
 
+def pods_evicted_total() -> float:
+    return REGISTRY.get_sample_value("openstudio_operator_worker_pods_evicted_total") or 0.0
+
+
 def register_started_analysis(
     analysis_id: str, start_time: datetime, *, created_at: str = TEN_DAYS_AGO
 ) -> None:
@@ -101,18 +128,74 @@ def register_started_analysis(
     responses.get(f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"})
 
 
-def tick(api, spec=None, client=None):
+def make_pod(name: str, ip: str | None, labels: dict | None = None):
+    """Generated-client pod shape, attribute-style (V1Pod duck type)."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name, labels=dict(labels if labels is not None else WORKER_LABELS)),
+        status=SimpleNamespace(pod_ip=ip),
+    )
+
+
+class FakeCoreV1Api:
+    """CoreV1Api stand-in: label-filtered pod list + recorded deletes.
+
+    Honors ``label_selector`` exactly like the real API so tests can prove
+    non-worker pods are never even candidates. The ``delete`` exercised via
+    this fake is the ``pods`` delete verb from deploy/rbac.yaml (#3).
+    """
+
+    def __init__(self, pods: list) -> None:
+        self.pods = pods
+        self.list_calls: list[dict] = []
+        self.deletes: list[dict] = []
+
+    def list_namespaced_pod(self, namespace, label_selector=None, **kwargs):
+        self.list_calls.append(
+            {"namespace": namespace, "label_selector": label_selector, "kwargs": kwargs}
+        )
+        wanted = (label_selector or "").split(",") if label_selector else []
+        items = [
+            pod
+            for pod in self.pods
+            if all(f"{key}={value}" in wanted for key, value in pod.metadata.labels.items())
+        ]
+        return SimpleNamespace(items=items)
+
+    def delete_namespaced_pod(self, name, namespace, **kwargs):
+        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
+        return {}
+
+
+class FakeAppsV1Api:
+    """AppsV1Api stand-in serving one Deployment's pod-template selector."""
+
+    def __init__(self, match_labels: dict | None = None, name: str = "worker") -> None:
+        self.match_labels = dict(match_labels if match_labels is not None else WORKER_LABELS)
+        self.reads: list[dict] = []
+        self.name = name
+
+    def read_namespaced_deployment(self, name, namespace, **kwargs):
+        self.reads.append({"name": name, "namespace": namespace, "kwargs": kwargs})
+        return SimpleNamespace(
+            spec=SimpleNamespace(selector=SimpleNamespace(match_labels=self.match_labels))
+        )
+
+
+def tick(api, spec=None, client=None, *, pod_api=None, apps_api=None, now=NOW):
     store = StatusStore(NAMESPACE, NAME, api)
     config = OperatorConfig.from_spec(spec if spec is not None else SPEC)
     events, emit = make_emit()
-    stopped = run_sla_tick(
+    result = run_sla_tick(
         client if client is not None else OpenStudioClient(BASE),
         store,
         config,
-        now=NOW,
+        now=now,
         emit=emit,
+        namespace=NAMESPACE,
+        pod_api=pod_api,
+        apps_api=apps_api,
     )
-    return stopped, events
+    return result, events
 
 
 # --- One-shot semantics ------------------------------------------------------
@@ -125,11 +208,11 @@ def test_soft_stop_fires_exactly_once_across_ticks():
     register_started_analysis("a1", NOW - timedelta(hours=4))  # second tick's poll
     metric_before = soft_stops_total()
 
-    stopped, events = tick(api)
-    stopped2, events2 = tick(api)
+    result, events = tick(api)
+    result2, events2 = tick(api)
 
-    assert stopped == ["a1"]
-    assert stopped2 == []
+    assert result.soft_stopped == ["a1"]
+    assert result2.soft_stopped == []
     assert calls_to("/soft_stop") == 1
     # Second tick skips before even fetching page_data (anchor checked first).
     assert calls_to("/page_data.json") == 1
@@ -152,9 +235,9 @@ def test_anchor_survives_operator_restart():
     register_started_analysis("a1", NOW - timedelta(hours=4))
 
     tick(api, client=OpenStudioClient(BASE))  # "process 1"
-    stopped, events = tick(api, client=OpenStudioClient(BASE))  # "process 2"
+    result, events = tick(api, client=OpenStudioClient(BASE))  # "process 2"
 
-    assert stopped == []
+    assert result.soft_stopped == []
     assert events == []
     assert calls_to("/soft_stop") == 1
     assert calls_to("/page_data.json") == 1
@@ -184,9 +267,9 @@ def test_clock_is_page_data_start_time_not_created_at():
     )
     responses.get(f"{BASE}/analyses/a-long/soft_stop", status=200, json={"result": "accepted"})
 
-    stopped, events = tick(FakeCustomObjectsApi(make_cr()))
+    result, events = tick(FakeCustomObjectsApi(make_cr()))
 
-    assert stopped == ["a-long"]
+    assert result.soft_stopped == ["a-long"]
     assert calls_to("/soft_stop") == 1
     assert len(events) == 1
     assert "a-long" in events[0][2]
@@ -204,9 +287,9 @@ def test_runtime_exactly_at_max_does_not_trip():
     )
     api = FakeCustomObjectsApi(make_cr())
 
-    stopped, events = tick(api)
+    result, events = tick(api)
 
-    assert stopped == []
+    assert result.soft_stopped == []
     assert events == []
     assert calls_to("/soft_stop") == 0
     assert "softStops" not in api.obj["status"]
@@ -221,9 +304,9 @@ def test_page_data_without_start_time_skips_this_tick():
     responses.get(f"{BASE}/analyses/a1/page_data.json", json={"analysis": {"status": "started"}})
     api = FakeCustomObjectsApi(make_cr())
 
-    stopped, events = tick(api)
+    result, events = tick(api)
 
-    assert stopped == []
+    assert result.soft_stopped == []
     assert events == []
     assert calls_to("/soft_stop") == 0
     assert "softStops" not in api.obj["status"]
@@ -239,11 +322,11 @@ def test_dry_run_suppresses_rest_call_and_marks_event():
     register_started_analysis("a1", NOW - timedelta(hours=4))  # second tick's poll
     metric_before = soft_stops_total()
 
-    stopped, events = tick(api, spec={**SPEC, "dryRun": True})
-    stopped2, events2 = tick(api, spec={**SPEC, "dryRun": True})
+    result, events = tick(api, spec={**SPEC, "dryRun": True})
+    result2, events2 = tick(api, spec={**SPEC, "dryRun": True})
 
-    assert stopped == ["a1"]
-    assert stopped2 == []
+    assert result.soft_stopped == ["a1"]
+    assert result2.soft_stopped == []
     # No soft_stop response registered: a real call would raise out of the tick.
     assert calls_to("/soft_stop") == 0
     assert len(events) == 1
@@ -270,9 +353,9 @@ def test_non_started_analyses_never_touched():
     )
     api = FakeCustomObjectsApi(make_cr())
 
-    stopped, events = tick(api)
+    result, events = tick(api)
 
-    assert stopped == []
+    assert result.soft_stopped == []
     assert events == []
     assert calls_to("/page_data.json") == 0
     assert calls_to("/soft_stop") == 0
@@ -288,10 +371,292 @@ def test_auto_soft_stop_disabled_makes_monitor_passive():
     )
     api = FakeCustomObjectsApi(make_cr(spec))
 
-    stopped, events = tick(api, spec=spec)
+    result, events = tick(api, spec=spec)
 
-    assert stopped == []
+    assert result.soft_stopped == []
     assert events == []
     assert calls_to("/page_data.json") == 0
     assert calls_to("/soft_stop") == 0
     assert "softStops" not in api.obj["status"]
+
+
+# --- Grace wait + escalation (#9) -----------------------------------------------
+
+
+def register_datapoints(docs: list[dict]) -> None:
+    responses.get(f"{BASE}/data_points.json", json=docs)
+
+
+def started_dps_payload(analysis_id: str, *ips: str) -> list[dict]:
+    """Full-doc datapoints: started dps with ips + decoys (completed dp, other analysis)."""
+    docs = [
+        {"_id": f"dp-{analysis_id}-{ip}", "analysis_id": analysis_id, "status": "started", "ip_address": ip}
+        for ip in ips
+    ]
+    docs.append({"_id": "dp-done", "analysis_id": analysis_id, "status": "completed", "ip_address": "10.9.9.9"})
+    docs.append({"_id": "dp-other", "analysis_id": "someone-else", "status": "started", "ip_address": "10.8.8.8"})
+    return docs
+
+
+def register_stuck_analysis(analysis_id: str, dps: list[dict] | None = None) -> None:
+    """Analyses poll with the analysis still `started`; anchored, so no page_data needed."""
+    responses.get(
+        f"{BASE}/analyses.json",
+        json=[{"_id": analysis_id, "status": "started", "created_at": TEN_DAYS_AGO}],
+    )
+    if dps is not None:
+        register_datapoints(dps)
+
+
+@responses.activate
+def test_grace_not_yet_elapsed_waits_even_after_restart():
+    """Persisted anchor 14m old (grace 15m), fresh handler objects → no escalation.
+
+    Also the restart-mid-grace clock test for the waiting side: the grace is
+    measured from the ORIGINAL anchor timestamp in the CR, never from
+    operator (re)start time — so a restart never shortens NOR lengthens it.
+    """
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", WITHIN_GRACE)))
+    register_stuck_analysis("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    apps = FakeAppsV1Api()
+    metric_before = pods_evicted_total()
+
+    result, events = tick(api, pod_api=pod_api, apps_api=apps, client=OpenStudioClient(BASE))
+
+    assert result.soft_stopped == [] and result.escalated == []
+    assert events == []
+    assert calls_to("/data_points.json") == 0
+    assert pod_api.deletes == []
+    assert apps.reads == []
+    assert api.patch_calls == 0  # nothing written — the anchor simply waits
+    assert pods_evicted_total() - metric_before == 0
+
+
+@responses.activate
+def test_restart_mid_grace_escalates_from_original_anchor_time():
+    """Anchor 16m old persisted BEFORE the operator restart → escalates NOW.
+
+    A fresh handler (new client/store, no in-memory state) must honor the
+    original issuedAt: had the clock restarted with the process, the grace
+    would run another 15 minutes from boot.
+    """
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    metric_before = pods_evicted_total()
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api(), client=OpenStudioClient(BASE))
+
+    assert result.escalated == ["a1"]
+    assert [d["name"] for d in pod_api.deletes] == ["worker-1"]
+    assert pods_evicted_total() - metric_before == 1
+    anchor = api.obj["status"]["softStops"]["a1"]
+    assert anchor["issuedAt"] == PAST_GRACE.isoformat()  # original clock preserved
+    assert anchor["escalatedAt"] == NOW.isoformat()
+    assert anchor["escalationOutcome"] == "evicted"
+    assert len(events) == 1
+    event_type, reason, message = events[0]
+    assert event_type == "Warning"
+    assert reason == ANALYSIS_ESCALATED_EVENT
+    assert "a1" in message and "16m" in message and "worker-1" in message and "10.0.0.1" in message
+
+
+@responses.activate
+def test_escalation_deletes_only_pods_matching_started_dp_ips():
+    """Decoys: non-worker pod (even with a matching IP), worker with foreign IP, completed dp."""
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1", "10.0.0.2"))
+    web_labels = {"app.kubernetes.io/name": "openstudio-server", "component": "web"}
+    pod_api = FakeCoreV1Api(
+        [
+            make_pod("worker-a", "10.0.0.1"),  # matches dp ip → delete
+            make_pod("worker-b", "10.0.0.7"),  # worker, foreign IP → keep
+            make_pod("worker-c", "10.0.0.2"),  # matches dp ip → delete
+            make_pod("web-1", "10.0.0.1", labels=web_labels),  # matching IP, not a worker → keep
+        ]
+    )
+    metric_before = pods_evicted_total()
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"]
+    assert [d["name"] for d in pod_api.deletes] == ["worker-a", "worker-c"]
+    assert all(d["namespace"] == NAMESPACE for d in pod_api.deletes)
+    # completed dp (10.9.9.9) and other analysis's dp (10.8.8.8) never targeted
+    assert all(d["name"] != "worker-b" and d["name"] != "web-1" for d in pod_api.deletes)
+    assert pods_evicted_total() - metric_before == 2
+    assert len(events) == 1
+    assert "worker-a" in events[0][2] and "worker-c" in events[0][2]
+
+
+@responses.activate
+def test_default_delete_passes_no_grace_seconds():
+    """forceDeleteOnEscalation false (default) → grace_period_seconds None → kubelet
+    honors the pod's own terminationGracePeriodSeconds (workers: 5200s drain window)."""
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"]
+    assert len(pod_api.deletes) == 1
+    assert pod_api.deletes[0]["kwargs"]["grace_period_seconds"] is None
+    assert "default grace (drain)" in events[0][2]
+
+
+@responses.activate
+def test_force_delete_passes_grace_zero():
+    """forceDeleteOnEscalation true → grace_period_seconds=0 → immediate kill, no drain."""
+    force_spec = {
+        **SPEC,
+        "analysisPolicy": {**SPEC["analysisPolicy"], "forceDeleteOnEscalation": True},
+    }
+    api = FakeCustomObjectsApi(make_cr(spec=force_spec, status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, spec=force_spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"]
+    assert pod_api.deletes[0]["kwargs"]["grace_period_seconds"] == 0
+    assert "grace_period_seconds=0 (immediate kill)" in events[0][2]
+
+
+@responses.activate
+def test_double_escalation_impossible():
+    """Second tick after escalation → no-op: no new deletes, events, or REST polls."""
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))  # second tick's poll
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    metric_before = pods_evicted_total()
+
+    result, _ = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result2, events2 = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"]
+    assert result2.escalated == []
+    assert events2 == []  # no second event storm
+    assert len(pod_api.deletes) == 1  # no second delete
+    assert pods_evicted_total() - metric_before == 1
+    assert calls_to("/data_points.json") == 1  # heavy poll not repeated
+
+
+@responses.activate
+def test_analysis_completed_during_grace_prunes_anchor_without_escalating():
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    responses.get(
+        f"{BASE}/analyses.json",
+        json=[{"_id": "a1", "status": "completed", "created_at": TEN_DAYS_AGO}],
+    )
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.soft_stopped == [] and result.escalated == []
+    assert events == []
+    assert calls_to("/data_points.json") == 0
+    assert pod_api.deletes == []
+    # This is where #8's deferred softStops pruning lands (merge patch leaves
+    # the emptied map behind as an empty dict — the anchor itself is gone):
+    assert api.obj["status"].get("softStops", {}) == {}
+
+
+@responses.activate
+def test_analysis_vanished_from_api_prunes_anchor():
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a-gone", PAST_GRACE)))
+    responses.get(
+        f"{BASE}/analyses.json",
+        json=[{"_id": "a-other", "status": "started", "created_at": TEN_DAYS_AGO}],
+    )
+    # a-other is a young, unanchored live analysis: polled for page_data, not tripped.
+    responses.get(
+        f"{BASE}/analyses/a-other/page_data.json",
+        json={"analysis": {"status": "started", "start_time": (NOW - timedelta(minutes=5)).isoformat()}},
+    )
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.soft_stopped == [] and result.escalated == []
+    assert events == []
+    assert calls_to("/data_points.json") == 0
+    assert "a-gone" not in api.obj["status"].get("softStops", {})
+
+
+@responses.activate
+def test_dry_run_suppresses_pod_deletes_and_marks_event():
+    spec = {**SPEC, "dryRun": True}
+    api = FakeCustomObjectsApi(make_cr(spec=spec, status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    metric_before = pods_evicted_total()
+
+    result, events = tick(api, spec=spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"]  # escalation decided, mutation suppressed
+    assert pod_api.deletes == []
+    assert pods_evicted_total() - metric_before == 1  # counts the decision, as #8 does
+    assert len(events) == 1
+    event_type, reason, message = events[0]
+    assert event_type == "Warning"
+    assert reason == ANALYSIS_ESCALATED_EVENT
+    assert "worker-1" in message and "suppressed (spec.dryRun)" in message
+    anchor = api.obj["status"]["softStops"]["a1"]
+    assert anchor["escalatedAt"] == NOW.isoformat()
+    assert anchor["escalationOutcome"] == "dry-run"
+
+
+@responses.activate
+def test_escalation_without_matching_pods_still_anchors_and_events():
+    """No worker pod carries a started dp's IP → nothing deleted, but the escalation
+    still happens exactly once (Warning Event + marker), so it cannot storm per tick."""
+    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
+    pod_api = FakeCoreV1Api([make_pod("worker-far", "10.0.0.7")])
+    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))  # second tick's poll
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result2, events2 = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == ["a1"] and result2.escalated == []
+    assert pod_api.deletes == []
+    assert len(events) == 1 and events2 == []
+    assert "no worker pods matched" in events[0][2]
+    assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "no-matching-pods"
+
+
+@responses.activate
+def test_escalated_anchor_skips_grace_phase_entirely():
+    """A pre-escalated persisted anchor (post-restart) is inert: no polls, no deletes."""
+    api = FakeCustomObjectsApi(
+        make_cr(status=anchored_status("a1", PAST_GRACE, escalated_at=NOW - timedelta(minutes=5)))
+    )
+    register_stuck_analysis("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.escalated == []
+    assert events == []
+    assert calls_to("/data_points.json") == 0
+    assert pod_api.deletes == []
+    assert api.patch_calls == 0
+
+
+@responses.activate
+def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
+    spec = {**SPEC, "analysisPolicy": {**SPEC["analysisPolicy"], "autoSoftStop": False}}
+    api = FakeCustomObjectsApi(make_cr(spec=spec, status=anchored_status("a1", PAST_GRACE)))
+    register_stuck_analysis("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+
+    result, events = tick(api, spec=spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+
+    assert result.soft_stopped == [] and result.escalated == []
+    assert events == []
+    assert calls_to("/data_points.json") == 0
+    assert pod_api.deletes == []
+    assert api.obj["status"]["softStops"]["a1"].get("escalatedAt") is None  # untouched
