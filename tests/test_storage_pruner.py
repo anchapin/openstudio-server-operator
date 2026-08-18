@@ -660,6 +660,53 @@ def test_dry_run_suppresses_spawn_and_delete_with_observable_tracking():
 
 
 @responses.activate
+def test_dry_run_suppresses_failed_job_cleanup_delete():
+    """#42: flipping dryRun on after a real failed Job must not delete the Job.
+
+    The failed-Job cleanup delete (frees the deterministic name for respawn)
+    is a cluster mutation — under spec.dryRun it is suppressed: the failed
+    Job object stays for forensics, the (suppressed) spawn writes the
+    standard dry-run marker, and the real delete + respawn happen on the
+    first tick after dryRun lifts.
+    """
+    dry = {**SPEC, "dryRun": True}
+    job_name = archival_job_name("a1")
+    register_analyses(*([analysis("a1")] * 3))  # dry tick + lift tick + real tick polls
+    register_datapoints([])  # the real respawn needs dp ids
+    register_delete("a1")
+    api = FakeCustomObjectsApi(make_cr(spec=dry))
+    batch = FakeBatchV1Api([make_job(job_name, failed=True, running=False)])
+
+    # Dry tick: no Job delete, no Job create — only the dry-run marker.
+    result, events = tick(api, spec=dry, batch_api=batch)
+    assert result.spawned == ["a1"]
+    assert batch.deletes == [] and batch.creates == []
+    assert job_name in batch.jobs  # failed Job retained for forensics
+    assert [reason for _, reason, _ in events] == [ANALYSIS_ARCHIVAL_STARTED_EVENT]
+    assert "suppressed (spec.dryRun)" in events[0][2]
+    record = api.obj["status"]["archivedAnalyses"]["a1"]
+    assert "jobName" not in record  # dry-run marker shape
+
+    # dryRun lifted (tick 2): the dry-run marker is cleared; the pre-reconcile
+    # tracked snapshot still blocks a spawn this tick (same cadence as every
+    # dry-run-marker lift) — and the failed Job is STILL untouched.
+    register_analyses(analysis("a1"))
+    _, events2 = tick(api, batch_api=batch)
+    assert events2 == []
+    assert batch.deletes == [] and batch.creates == []
+    assert api.obj["status"].get("archivedAnalyses", {}) == {}
+
+    # Tick 3: the retry delete + real respawn proceed as before.
+    register_analyses(analysis("a1"))
+    result3, _ = tick(api, batch_api=batch)
+    assert result3.spawned == ["a1"]
+    assert [d["name"] for d in batch.deletes] == [job_name]
+    assert batch.deletes[0]["kwargs"]["propagation_policy"] == "Foreground"
+    assert len(batch.creates) == 1 and batch.creates[0]["body"]["metadata"]["name"] == job_name
+    assert api.obj["status"]["archivedAnalyses"]["a1"]["jobName"] == job_name
+
+
+@responses.activate
 def test_dry_run_suppresses_delete_of_verified_analysis():
     """Flip dryRun on mid-flight: verification (real Job) proceeds, delete is suppressed."""
     dry = {**SPEC, "dryRun": True}

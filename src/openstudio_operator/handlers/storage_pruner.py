@@ -445,8 +445,12 @@ def _spawn_archival(
             return
         # Failed terminal Job occupying the deterministic name: remove it so a
         # fresh Job can spawn (this IS the next tick after the failure event).
-        batch_api.delete_namespaced_job(job_name, namespace, propagation_policy="Foreground")
-        logger.info("removed failed archival Job %s — respawning (retry)", job_name)
+        # D11 (#42): the cleanup delete is a cluster mutation — suppressed
+        # under spec.dryRun; the failed Job stays for forensics and the
+        # first real spawn tick after dryRun lifts performs the removal.
+        if not config.dry_run:
+            batch_api.delete_namespaced_job(job_name, namespace, propagation_policy="Foreground")
+            logger.info("removed failed archival Job %s — respawning (retry)", job_name)
 
     datapoint_ids = datapoint_ids_for(analysis_id)
     manifest = build_archival_job(analysis_id, policy, namespace, datapoint_ids)
