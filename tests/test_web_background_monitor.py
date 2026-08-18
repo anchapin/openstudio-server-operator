@@ -174,7 +174,8 @@ def make_redis(
     for worker_id, heartbeat in (heartbeats or {}).items():
         fake.sadd("resque:workers", worker_id)
         if heartbeat is not None:
-            fake.set(f"resque:workers:{worker_id}", str(heartbeat))
+            iso = datetime.fromtimestamp(heartbeat, tz=UTC).isoformat()
+            fake.hset("resque:workers:heartbeat", worker_id, iso)
     return ReadOnlyRedisClient(SPEC["redisUrl"], connection=fake, now_fn=lambda: now.timestamp())
 
 

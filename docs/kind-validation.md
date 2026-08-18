@@ -407,16 +407,21 @@ diverges from what the kind cluster reproduces.
 
 ### R1 — Resque key layout matches centralized constants
 
-The constants live in `src/openstudio_operator/redis_client.py`:
+The constants live in `src/openstudio_operator/redis_client.py` (LIVE-VERIFIED
+2026-08-18, issue #66 — see the [live-capture evidence](#live-capture-evidence-2026-08-18-issue-66)
+below; the pre-live Resque-1.x assumption was WRONG and has been fixed):
 
 ```
-WORKER_REGISTRY_KEY = "resque:workers"      # SET of registered worker ids
-def _heartbeat_key(worker_id: str) -> str:
-    return f"{WORKER_REGISTRY_KEY}:{worker_id}"   # heartbeat string, epoch float
+WORKER_REGISTRY_KEY = "resque:workers"              # SET of registered worker ids
+WORKER_HEARTBEAT_HASH_KEY = "resque:workers:heartbeat"   # HASH: field=worker id,
+                                                    # value=ISO8601 UTC timestamp
+                                                    # string (~60s refresh)
 ```
 
-If the live keys differ, edit those two constants — no other code needs to
-change. The validator + safeguard are wired to use the constants directly.
+Note the fix was structural, not just a prefix swap: heartbeats moved from
+hypothetical per-worker STRING keys (`resque:workers:{id}` — do not exist on the
+live server) to a single HASH read via `HGETALL`, with ISO8601→epoch parsing in
+`_parse_heartbeat`. The read-only allowlist changed `GET` → `HGETALL`.
 
 | # | Evidence | Source | CI counterpart |
 |---|---------|--------|----------------|
@@ -472,6 +477,227 @@ despite workers actively heartbeating — meaning the operator is reading the
 wrong Redis DB or the wrong key prefix), STOP and file a follow-up issue with
 the evidence. The validator (`validate_key_layout`) is the fastest diagnostic —
 run it against the live Redis and attach its output.
+
+## Live-capture evidence (2026-08-18, issue #66)
+
+Captured on the dev machine against kind **v0.24.0** (node image
+`kindest/node:v1.31.0`, single control-plane node per `scripts/kind-config.yaml`),
+stack `nrel/openstudio-server:3.11.0` + `mongo:6.0.7` + `redis:6.0.9` deployed
+via `scripts/deploy-openstudio-stack.sh` (all `deploy/web`, `deploy/worker`,
+`deploy/web-background` 1/1 Ready), operator image built locally
+(`docker build -t ghcr.io/anchapin/openstudio-server-operator:dev .`) and
+side-loaded with `kind load docker-image` (GitHub Actions runners were down —
+the `:dev` image was NOT pulled from ghcr). Redis password per the manifest:
+`openstudio`. All `redis-cli` output below is verbatim.
+
+### R1 — verdict: MISMATCH FOUND AND FIXED (the pre-live constants were wrong)
+
+**R1.1 — [MISMATCH → FIXED].** Live SCAN shows the registry SET plus a heartbeat
+HASH plus per-worker `started` STRINGs — NOT the assumed per-worker
+`resque:workers:{id}` heartbeat keys:
+
+```
+$ kubectl -n openstudio-server exec deploy/redis -- redis-cli -a openstudio \
+    --no-auth-warning SCAN 0 MATCH 'resque:*' COUNT 100
+0
+resque:worker:web-7bf87b4594-sp8vm:56:analysis_wrappers:started
+resque:workers:heartbeat
+resque:workers
+resque:worker:worker-5f49c94875-sngm2:35:requeued,simulations:started
+resque:worker:web-background-c974f647f-p2dlp:16:background,analyses:started
+resque:worker:web-background-c974f647f-p2dlp:15:background,analyses:started
+```
+
+Types (verified with `redis-cli TYPE`): `resque:workers` = `set`;
+`resque:workers:heartbeat` = `hash` (NOT string — `GET` on it answers
+`WRONGTYPE`); `resque:worker:{id}:started` = `string`. The operator's assumed
+`GET resque:workers:{id}` keys returned **empty (nil)** for every registered
+worker — the pre-live Resque-1.x layout does not exist on v3.11.0 (Resque 2.x).
+Code adjusted: `redis_client.py` now reads the heartbeat HASH (`HGETALL
+resque:workers:heartbeat`), constants updated (see the R1 block above), tests
+updated in `tests/test_redis_client.py`, `tests/test_web_background_monitor.py`,
+`tests/test_dryrun_walkthrough.py`. Full suite: **318 passed** locally.
+
+**R1.2 — [VERIFIED].** `SMEMBERS resque:workers` returns 4 worker ids
+(`{hostname}:{pid}:{queues}` shape), all in `host:pid:queues` format:
+
+```
+$ kubectl -n openstudio-server exec deploy/redis -- redis-cli -a openstudio \
+    --no-auth-warning SMEMBERS resque:workers
+web-7bf87b4594-sp8vm:56:analysis_wrappers
+web-background-c974f647f-p2dlp:16:background,analyses
+web-background-c974f647f-p2dlp:15:background,analyses
+worker-5f49c94875-sngm2:35:requeued,simulations
+```
+
+**R1.3 — [MISMATCH → FIXED].** Heartbeat values are ISO8601 UTC timestamp
+strings in the HASH fields — not epoch floats. `HGETALL` captured twice ~60 s
+apart (values ADVANCED — live heartbeats, ~60 s Resque refresh cadence, with
+zero jobs queued):
+
+```
+$ ... redis-cli HGETALL resque:workers:heartbeat
+worker-5f49c94875-sngm2:35:requeued,simulations   2026-08-18T20:45:06+00:00
+web-background-c974f647f-p2dlp:15:background,analyses   2026-08-18T20:45:16+00:00
+web-background-c974f647f-p2dlp:16:background,analyses   2026-08-18T20:45:16+00:00
+web-7bf87b4594-sp8vm:56:analysis_wrappers   2026-08-18T20:45:21+00:00
+# ... 60 s later:
+worker-5f49c94875-sngm2:35:requeued,simulations   2026-08-18T20:46:06+00:00
+web-background-c974f647f-p2dlp:15:background,analyses   2026-08-18T20:46:16+00:00
+web-background-c974f647f-p2dlp:16:background,analyses   2026-08-18T20:46:16+00:00
+web-7bf87b4594-sp8vm:56:analysis_wrappers   2026-08-18T20:46:21+00:00
+```
+
+Fixed code parses these to epoch floats (`_parse_heartbeat`; naive strings are
+treated as UTC).
+
+**R1.4 — [VERIFIED, with the fixed code].** `validate_key_layout()` invoked
+one-shot inside the operator pod against the live Redis (the CR default
+`redisUrl`): PASSES (no raise), and `worker_heartbeats()` returns the four live
+workers as fresh epoch floats:
+
+```
+$ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
+from openstudio_operator.redis_client import ReadOnlyRedisClient
+c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+c.validate_key_layout(); print('validate_key_layout: PASS (no raise)')"
+validate_key_layout: PASS (no raise)
+# same exec, worker_heartbeats():
+web-7bf87b4594-sp8vm:56:analysis_wrappers                  -> 1787086461.0 (25s ago)
+web-background-c974f647f-p2dlp:15:background,analyses      -> 1787086457.0 (29s ago)
+web-background-c974f647f-p2dlp:16:background,analyses      -> 1787086456.0 (30s ago)
+worker-5f49c94875-sngm2:35:requeued,simulations            -> 1787086447.0 (39s ago)
+depths: {'simulations': 0, 'requeued': 0}
+```
+
+**R1.5 — [VERIFIED].** Operator-shaped URL (no `/db` suffix → db0) via a
+throwaway `redis:6.0.9` pod against Service `queue` matches the direct
+`redis-cli` DBSIZE, and `INFO keyspace` confirms all keys live in db0:
+
+```
+$ redis-cli -u redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379 DBSIZE
+6
+$ ... INFO keyspace
+# Keyspace
+db0:keys=6,expires=0,avg_ttl=0
+```
+
+### R2 — verdict: [BLOCKED] by a pre-existing operator bug (NOT a Resque finding) + supplemental read-path proof
+
+While deploying the operator for R2, a **pre-existing in-cluster bug** was
+diagnosed (this is new live evidence worth a follow-up issue — it is unrelated
+to the Resque layout, which is correct post-fix):
+
+* `src/openstudio_operator/singleton.py:239` (`_get_guard`) builds a **bare
+  `CustomObjectsApi()`** without ever calling `load_incluster_config()` /
+  `load_kube_config()`. kopf 1.44.6 authenticates via kr8s and never
+  initializes the client-python default `Configuration`, whose `.host` is `''`
+  — so every guard API call raises `LocationValueError: No host specified`.
+* Because the guard check runs as a kopf **`on.startup` activity**
+  (`singleton_guard_startup`), the failure loops every 60 s and kopf never
+  completes its startup phase: no resource watching, no timer handlers, no
+  Events, no gauge updates. The operator pod is Running/Ready but functionally
+  idle. Verified empirically in the pod:
+
+```
+$ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
+from kubernetes import config, client
+try:
+    client.CustomObjectsApi().list_namespaced_custom_object(...)
+except Exception as e: print('BARE CLIENT FAILS: %s: %s' % (type(e).__name__, e))"
+BARE CLIENT FAILS: LocationValueError: No host specified.
+# with config.load_incluster_config() first (the status_store.py pattern):
+INCLUSTER CLIENT OK: 1 OSCM CR(s): ['validation']
+```
+
+```
+# operator log, repeating every 60 s; the only kopf activity — no watch/timer lines:
+[2026-08-18 20:52:28,649] kopf.activities.star [ERROR] Activity 'singleton_guard_startup'
+  failed with an exception and will try again in 60 seconds: No host specified.
+  ...singleton.py, line 383, in singleton_guard_startup -> line 353 _check ->
+  line 165 list_crs -> CustomObjectsApi...
+```
+
+* **R2.1 — [BLOCKED: above]**. The gauge is served but pinned at 0 because the
+  only update site (`web_background_monitor.py` `_stall_condition`) is behind
+  the singleton-gated timer that never runs:
+
+```
+$ kubectl -n openstudio-server port-forward deploy/openstudio-operator 19090:9090
+$ curl -s localhost:19090/metrics | grep openstudio_operator_resque_workers_seen_max
+openstudio_operator_resque_workers_seen_max 0.0
+```
+
+  Supplemental (does NOT substitute for the live row): the read path feeding
+  the gauge is proven live-and-correct by the R1.4 exec above — the operator's
+  own client, running in the operator pod, sees all 4 workers heartbeating
+  fresh. Also note for whoever re-runs R2.1 after the singleton fix: the gauge
+  update sits AFTER leg-A's early return in `_stall_condition`, so
+  `resque_workers_seen_max` only moves on a tick where a queue is NON-EMPTY —
+  "idle-but-alive workers" do NOT populate the gauge; a queued batch (or any
+  enqueued job) is REQUIRED for R2.1.
+* **R2.2 / R2.3 — [BLOCKED: vacuous]**. `kubectl get events
+  --field-selector reason=ResqueKeyLayoutUnknown` returns none
+  ("No resources found") — but with the operator unable to run any handler,
+  absence of the warning proves nothing (it would also be absent if the layout
+  were wrong). Not claimed as verified.
+* **R2.4 — [BLOCKED: subsumed]**. The negative control needs a non-zero gauge
+  to observe monotonicity; the gauge never leaves 0 for the R2.1 reason. The
+  monotonic logic itself stays CI-proven
+  (`test_web_background_monitor.py::test_gauge_tracks_high_water_mark_of_workers_seen`).
+
+### R3 — verdict: VERIFIED (both shapes are `matchLabels`; helper's dual support stands untested-by-live-need)
+
+**R3.1 — [VERIFIED].** Deployed kind Worker Deployment selector (matches
+`scripts/manifests/06-worker.yaml:27-29` exactly):
+
+```
+$ kubectl get deploy worker -n openstudio-server -o jsonpath='{.spec.selector}'
+{"matchLabels":{"app":"worker"}}
+```
+
+**R3.2 — [VERIFIED].** NatLabRockies/NREL helm chart `develop` branch
+(`openstudio-server/templates/worker/worker-deploy.yaml`), clone dated
+2026-08-18 — also `matchLabels` (two labels: `app` + `release`), NO
+`matchExpressions` anywhere in the worker selector:
+
+```yaml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.worker.name }}
+      release: {{ .Release.Name }}
+```
+
+The #65 helper's `matchExpressions` support remains a robustness feature; no
+live deployment currently exercises it.
+
+**R3.3 — [N/A by its own condition].** Conditional on R3.2 showing
+`matchExpressions`; it does not. No live escalation test required by the
+checklist.
+
+### Issue-#66 code deliverable (driven by R1)
+
+`src/openstudio_operator/redis_client.py`: heartbeat read switched from
+per-worker `GET resque:workers:{id}` (Resque 1.x — keys do not exist on
+v3.11.0) to `HGETALL resque:workers:heartbeat` (live layout), ISO8601→epoch
+parsing added, `READ_ONLY_COMMANDS` now `{LLEN, SMEMBERS, HGETALL, SCAN}`,
+`validate_key_layout()` additionally asserts the heartbeat HASH exists.
+Without this fix, every worker mapped to heartbeat `None` → "maximally stale"
+→ the web_background stall condition's leg B ("nobody is processing") would
+fire on a perfectly healthy fleet. Tests updated in the three files that seed
+the fake Redis layout (`test_redis_client.py`,
+`test_web_background_monitor.py`, `test_dryrun_walkthrough.py`); full local
+suite: **318 passed**, `ruff check .` clean.
+
+**ESCALATION (for the orchestrator):** the singleton in-cluster client bug
+above blocks R2 live acceptance and ANY live dryRun walkthrough of the timer
+modules (#45's live-cluster rows). Suggested one-line-class fix (follow-up
+issue): in `singleton.py::_get_guard`, mirror `status_store.StatusStore.in_cluster`
+— call `kubernetes.config.load_incluster_config()` (with a
+`load_kube_config()` fallback for local `kopf run`) before constructing
+`CustomObjectsApi()`.
 
 ```bash
 scripts/teardown-kind-env.sh   # deletes the whole cluster (mongo/redis/NFS stand-in data die with it)

@@ -11,6 +11,7 @@ Layers of read-only proof exercised here:
 
 import inspect
 import re
+from datetime import UTC, datetime
 
 import fakeredis
 import pytest
@@ -92,10 +93,13 @@ def client(fake):
 
 
 def seed_workers(fake, heartbeats: dict[str, float | None]) -> None:
+    """Seed the LIVE-VERIFIED v3.11.0 layout (issue #66): registry SET +
+    heartbeat HASH (field=worker id, value=ISO8601 UTC timestamp string)."""
     for worker_id, heartbeat in heartbeats.items():
         fake.sadd("resque:workers", worker_id)
         if heartbeat is not None:
-            fake.set(f"resque:workers:{worker_id}", str(heartbeat))
+            iso = datetime.fromtimestamp(heartbeat, tz=UTC).isoformat()
+            fake.hset("resque:workers:heartbeat", worker_id, iso)
 
 
 # --- Queue depths --------------------------------------------------------
@@ -137,9 +141,32 @@ def test_worker_heartbeats_empty_registry(fake, client):
 
 def test_worker_heartbeats_garbage_value_raises(fake, client):
     seed_workers(fake, {"w1": NOW})
-    fake.set("resque:workers:w1", "not-a-float")
+    fake.hset("resque:workers:heartbeat", "w1", "not-a-timestamp")
     with pytest.raises(RedisClientError, match="unparseable heartbeat"):
         client.worker_heartbeats()
+
+
+def test_worker_heartbeats_parses_live_iso8601_format(fake, client):
+    """The live v3.11.0 hash value format, byte-for-byte as captured on kind
+    (docs/kind-validation.md, issue #66 evidence): ISO8601 with UTC offset."""
+    fake.sadd("resque:workers", "worker-5f49c94875-sngm2:35:requeued,simulations")
+    fake.hset(
+        "resque:workers:heartbeat",
+        "worker-5f49c94875-sngm2:35:requeued,simulations",
+        "2026-08-18T20:46:06+00:00",
+    )
+    beats = client.worker_heartbeats()
+    (only,) = beats.values()
+    assert only == datetime.fromisoformat("2026-08-18T20:46:06+00:00").timestamp()
+
+
+def test_worker_heartbeats_treats_naive_timestamp_as_utc(fake, client):
+    """A heartbeat string with no offset is interpreted as UTC (the Rails
+    server writes UTC), never as local time."""
+    fake.sadd("resque:workers", "w1")
+    naive = datetime.fromtimestamp(NOW - 5, tz=UTC).replace(tzinfo=None)
+    fake.hset("resque:workers:heartbeat", "w1", naive.isoformat())
+    assert client.worker_heartbeats() == {"w1": NOW - 5}
 
 
 def test_stale_workers_separates_fresh_from_stale(fake, client):
@@ -188,7 +215,7 @@ def test_module_source_contains_no_write_command_call_syntax():
 
 
 def test_allowlist_is_exactly_the_reads_and_intersects_no_write_command():
-    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "GET", "SCAN"}
+    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "HGETALL", "SCAN"}
     assert READ_ONLY_COMMANDS & WRITE_COMMANDS == set()
 
 
@@ -196,17 +223,24 @@ def test_allowlist_is_exactly_the_reads_and_intersects_no_write_command():
 
 
 def test_validate_key_layout_passes_when_registry_and_heartbeats_present(fake, client):
+    """The full LIVE-VERIFIED v3.11.0 layout (issue #66): registry SET +
+    heartbeat HASH + Resque 2.x worker:{id}:started strings."""
     fake.sadd("resque:workers", "w1", "w2")
-    fake.set("resque:workers:w1", "12345.6")
-    fake.set("resque:workers:w2", "12346.6")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    fake.hset("resque:workers:heartbeat", "w2", "2026-08-18T20:46:16+00:00")
+    fake.set("resque:worker:w1:started", "2026-08-18 20:44:16 +0000")
     # Should not raise
     client.validate_key_layout()
 
 
-def test_validate_key_layout_passes_with_only_registry_set(fake, client):
-    """A worker that just registered but hasn't heartbeated yet is still 'live'."""
+def test_validate_key_layout_raises_when_heartbeat_hash_missing(fake, client):
+    """Registry present but no heartbeat HASH — the pre-#66 failure mode: the
+    live layout stores heartbeats in the HASH, so its absence means the
+    centralized constants no longer match the server's Resque version."""
     fake.sadd("resque:workers", "w1")
-    client.validate_key_layout()
+    fake.set("resque:worker:w1:started", "2026-08-18 20:44:16 +0000")
+    with pytest.raises(OperatorConfigError, match="not found"):
+        client.validate_key_layout()
 
 
 def test_validate_key_layout_raises_when_no_resque_keys_present(fake, client):
@@ -222,7 +256,7 @@ def test_validate_key_layout_raises_when_registry_key_missing(fake, client):
     # the per-key check is wired.
     fake.sadd("resque:other_thing", "w1")
     fake.set("resque:other_thing:w1", "12345.6")
-    with pytest.raises(OperatorConfigError, match="Expected Resque worker registry key"):
+    with pytest.raises(OperatorConfigError, match="not found"):
         client.validate_key_layout()
 
 
@@ -250,7 +284,7 @@ def test_validate_key_layout_uses_only_read_only_commands(fake, client):
         now_fn=lambda: NOW,
     )
     fake.sadd("resque:workers", "w1")
-    fake.set("resque:workers:w1", "1.0")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
 
     validating.validate_key_layout()
 
