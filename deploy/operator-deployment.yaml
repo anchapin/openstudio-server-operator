@@ -30,6 +30,12 @@ spec:
             - openstudio-server
           # Server URL comes from the CR spec.serverUrl (config.py) — single
           # config path; no OPENSTUDIO_SERVER_URL env fallback.
+          env:
+            - name: POD_NAMESPACE # singleton guard startup check (issue #14):
+              # the only path that notices a zero-CR namespace at operator boot
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with
