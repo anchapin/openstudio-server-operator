@@ -335,6 +335,21 @@ class StatusStore:
     def set_started_since(self, datapoint_id: str, when: datetime) -> None:
         self._set_map_entry(STARTED_SINCE, datapoint_id, _to_utc(when).isoformat())
 
+    def clear_started_since(self, datapoint_id: str) -> None:
+        """Delete ``status.startedSince[datapoint_id]`` — departure prune.
+
+        Counterpart to :meth:`set_started_since` for the datapoint watchdog
+        (#10): a datapoint that leaves the ``started`` set must lose its
+        operator clock so a later re-entry starts fresh. Deliberately does
+        NOT touch ``status.requeues`` — the requeue budget outlives
+        departure (a requeued datapoint legitimately leaves ``started``
+        while it sits on the ``requeued`` queue; wiping its budget then
+        would unbound the requeue loop), so the coupled :meth:`prune` is
+        the wrong tool here. Idempotent: clearing an absent key writes
+        nothing (merge patch encodes the removal as an explicit ``None``).
+        """
+        self._set_map_entry(STARTED_SINCE, datapoint_id, None)
+
     # --- archivedAnalyses ----------------------------------------------------
 
     def get_archived_analyses(self) -> dict[str, ArchivedAnalysisRecord]:
