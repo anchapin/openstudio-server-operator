@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment / secrets — never commit
+.env
+.env.*
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Agent session artifacts (local only)
+/.agents/

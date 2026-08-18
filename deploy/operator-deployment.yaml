@@ -1,0 +1,40 @@
+# Placeholder operator Deployment — image is not published yet (see Dockerfile).
+# TODO(phase 1): verify against a real cluster once handler logic lands.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openstudio-operator
+  namespace: openstudio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single active poller; avoid two operators racing during rollout
+  selector:
+    matchLabels:
+      app: openstudio-operator
+  template:
+    metadata:
+      labels:
+        app: openstudio-operator
+    spec:
+      serviceAccountName: openstudio-operator-sa
+      containers:
+        - name: operator
+          image: ghcr.io/anchapin/openstudio-server-operator:dev
+          args:
+            - kopf
+            - run
+            - --module
+            - openstudio_operator.handlers
+            - --namespace
+            - openstudio
+          env:
+            - name: OPENSTUDIO_SERVER_URL
+              value: "http://web.openstudio.svc.cluster.local" # TODO: match the helm deployment
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

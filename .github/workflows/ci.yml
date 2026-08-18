@@ -1,0 +1,47 @@
+# CI — lint + tests, plus the branch-pairing guard for the release branch.
+# Placeholders until Phase 1 logic lands; keep the job names stable: the
+# `guard-branch-pairing` check is a required status check on `main` (see
+# repository ruleset "protect-main").
+name: CI
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard-branch-pairing:
+    name: guard-branch-pairing
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: main may only receive PRs from develop
+        run: |
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            echo "::error::Pull requests to 'main' must originate from 'develop' (got '${{ github.head_ref }}')."
+            exit 1
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: pytest

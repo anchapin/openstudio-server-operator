@@ -1,0 +1,21 @@
+# Release — placeholder. Runs when updates reach the protected release
+# branch `main` (via PR from develop only).
+# TODO: build & push the operator image (ghcr.io/anchapin/openstudio-server-operator)
+#       and cut a GitHub Release / chart bump.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder
+        run: echo "Release placeholder — TODO build/publish operator image for ${GITHUB_SHA}"

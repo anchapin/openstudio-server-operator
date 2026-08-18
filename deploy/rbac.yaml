@@ -1,0 +1,43 @@
+# Least-privilege RBAC — namespaced Role only, never a ClusterRole (per plan
+# section 7 / AGENTS.md). Verbs are enumerated; keep it that way.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openstudio-operator-sa
+  namespace: openstudio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openstudio-operator-role
+  namespace: openstudio
+rules:
+  # Manage Custom Resources
+  - apiGroups: ["energy.nrel.gov"]
+    resources: ["openstudioclustermanagers", "openstudioclustermanagers/status"]
+    verbs: ["*"]
+  # Manage Worker Deployments & Pod Restarts
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  # Create Ephemeral Archival Jobs
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openstudio-operator-rb
+  namespace: openstudio
+subjects:
+  - kind: ServiceAccount
+    name: openstudio-operator-sa
+    namespace: openstudio
+roleRef:
+  kind: Role
+  name: openstudio-operator-role
+  apiGroup: rbac.authorization.k8s.io
