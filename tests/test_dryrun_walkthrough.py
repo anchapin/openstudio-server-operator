@@ -71,7 +71,7 @@ from openstudio_operator.handlers.worker_recycler import (
     run_recycler_tick,
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
-from openstudio_operator.redis_client import ReadOnlyRedisClient
+from openstudio_operator.redis_client import SIMULATIONS_QUEUE, ReadOnlyRedisClient
 from openstudio_operator.status_store import (
     MERGE_PATCH_CONTENT_TYPE,
     StatusStore,
@@ -754,8 +754,8 @@ class FakePodsWBM:
 
 def _stall_redis(at: datetime) -> ReadOnlyRedisClient:
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
-    fake.rpush("simulations", "j1")
-    fake.rpush("simulations", "j2")
+    fake.rpush(SIMULATIONS_QUEUE, "j1")
+    fake.rpush(SIMULATIONS_QUEUE, "j2")
     epoch = at.timestamp()
     fake.sadd("resque:workers", "w1")
     # LIVE-VERIFIED v3.11.0 layout (#66): heartbeat HASH with ISO8601 values.
@@ -856,7 +856,7 @@ class FakeAutoscaling:
         self.spec = SimpleNamespace(min_replicas=min_replicas, max_replicas=max_replicas)
         self.patches: list[dict] = []
 
-    def read_namespaced_horizontalpodautoscaler(self, name, namespace, **_kw):
+    def read_namespaced_horizontal_pod_autoscaler(self, name, namespace, **_kw):
         return SimpleNamespace(spec=self.spec)
 
     def patch_namespaced_horizontalpodautoscaler(self, name, namespace, body, **kwargs):
@@ -868,7 +868,7 @@ class FakeAutoscaling:
 def _hpa_redis(simulations: int) -> ReadOnlyRedisClient:
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
     for i in range(simulations):
-        fake.rpush("simulations", f"j{i}")
+        fake.rpush(SIMULATIONS_QUEUE, f"j{i}")
     return ReadOnlyRedisClient("redis://:pw@queue.test:6379", connection=fake)
 
 

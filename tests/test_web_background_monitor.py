@@ -27,7 +27,12 @@ from openstudio_operator.handlers.web_background_monitor import (
     StallWindowTracker,
     run_stall_tick,
 )
-from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
+from openstudio_operator.redis_client import (
+    REQUEUED_QUEUE,
+    SIMULATIONS_QUEUE,
+    ReadOnlyRedisClient,
+    RedisClientError,
+)
 from openstudio_operator.status_store import StatusStore
 
 NAMESPACE = "openstudio-server"
@@ -168,9 +173,9 @@ def make_redis(
     """fakeredis-backed client with its staleness clock pinned to ``now``."""
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
     for job in range(simulations):
-        fake.rpush("simulations", f"sim-job-{job}")
+        fake.rpush(SIMULATIONS_QUEUE, f"sim-job-{job}")
     for job in range(requeued):
-        fake.rpush("requeued", f"req-job-{job}")
+        fake.rpush(REQUEUED_QUEUE, f"req-job-{job}")
     for worker_id, heartbeat in (heartbeats or {}).items():
         fake.sadd("resque:workers", worker_id)
         if heartbeat is not None:

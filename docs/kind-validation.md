@@ -699,8 +699,250 @@ issue): in `singleton.py::_get_guard`, mirror `status_store.StatusStore.in_clust
 `load_kube_config()` fallback for local `kopf run`) before constructing
 `CustomObjectsApi()`.
 
+> **Post-#66 update (2026-08-18, issue #67 session):** the escalation above
+> was fixed as #79 (commit `c5a6f03`) and re-verified live — see the
+> [issue #67 evidence](#live-dryrun-walkthrough-evidence-2026-08-18-issues-67--66-r2--79)
+> below. That same session also found the queue-depth keys were wrong
+> (`simulations` → `resque:queue:simulations`, Resque 2.x layout): the
+> constants block above now understates `SIMULATIONS_QUEUE`/`REQUEUED_QUEUE`,
+> which live in `redis_client.py` (fixed there, live-verified below).
+
+## Live dryRun walkthrough evidence (2026-08-18, issues #67 + #66 R2 + #79)
+
+The D13 final gate: one kind session (cluster up 21:14Z → torn down 22:23Z),
+operator image built locally from this branch (runners down; includes the #79
+fix `c5a6f03` plus three further live-found fixes, below), a **real 12-
+datapoint analysis batch** (NREL `test_model.zip` seed; workflow measure
+`ReduceLightingLoadsByPercentage` with a 12-value discrete variable), a
+**SIGSTOP wedge** of the first datapoint's `openstudio run` child, and a
+**SIGSTOP freeze of all Resque processes** to induce a genuine queue stall.
+CR spec: `dryRun: true`, `maxDurationMinutes: 3`, `gracefulStopTimeoutMinutes: 2`,
+`maxDatapointRuntimeMinutes: 2`, `maxAutoRequeues: 2`, `minRecycleIntervalMinutes: 2`,
+`stallWindowMinutes: 2`, `retentionDays: 0` (+ `archiveToS3: true`,
+`backend: s3`, `bucket`, `secretRef` set).
+
+Timeline (all UTC): 21:24 operator up · 21:42 first WorkerRecycled ·
+21:46–21:47 batch A seeded · 21:51 operator restarted (fix redeploy) ·
+21:56 batch B `batch_run` (T0 21:56:23) · 21:56:49 wedge dp
+`7c7b8783…` (SIGSTOP openstudio+energyplus) · 21:58:44/22:00:44 requeues ·
+22:02:44 exhausted · 22:08:16 Resque fleet frozen (leg B) · 22:08:36 second
+CR created/deleted (singleton probe) · 22:14:45 WebBackgroundRestarted ·
+22:16:15 fleet unfrozen · 22:21 batch B drained 12/12 completed.
+
+### Operator startup — issue #79 re-verification: VERIFIED
+
+Commit `c5a6f03` on this branch. Operator pod completes kopf startup; no
+`LocationValueError`; guard startup activity succeeds; all six OSCM timers
+register, are singleton-gated, and fire:
+
+```
+[21:24:14] openstudio_operator. [INFO] Serving /metrics on 0.0.0.0:9090
+[21:24:14] openstudio_operator. [INFO] singleton guard (D05) gating 6 OSCM handler(s):
+           analysis_sla_monitor, zombie_datapoint_watchdog, hpa_floor_adjuster,
+           storage_pruner, web_background_monitor, worker_recycler
+[21:24:14] kopf.activities.star [INFO] serving OpenStudioClusterManager validation —
+           single CR in namespace (D05)
+[21:24:14] kopf.activities.star [INFO] Activity 'singleton_guard_startup' succeeded.
+[21:25:08] kopf.objects [INFO] [openstudio-server/validation] Handler 'singleton_guard_event' succeeded.
+[21:25:08] kopf.objects [INFO] [openstudio-server/validation] Timer 'analysis_sla_monitor' succeeded.  (all 6 fire)
+```
+
+### Three new in-cluster bugs found by this walkthrough (fixed on this branch)
+
+All three share the #79 signature — operator pod Running but functionally
+idle/degraded in-cluster while CI stays green — and all three are invisible to
+the mocked test suite. Each fix is minimal and covered by updated/added tests;
+full suite **325 passed**, `ruff check .` clean.
+
+* **F1 — singleton gate rejects kopf's `Body` type (dead operator, all 6
+  modules).** `singleton._gated` checked `isinstance(body, dict)`, but kopf
+  1.44.6 delivers timer kwargs `body` as
+  `kopf._cogs.structs.bodies.Body` — a `MappingView`, **not** a dict subclass
+  (`isinstance(b, dict) is False`, verified in-pod). Every in-cluster tick
+  logged `analysis_sla_monitor skipped: kopf invocation carried no
+  body/namespace — cannot resolve the active CR (D05)` while the same code
+  run locally (plain-dict kwargs in the library path) worked. Diagnosed by
+  spy-wrapping `_gated` in-pod: kopf handed the wrapper `body`+`namespace`
+  and it *still* skipped. Fix: accept `collections.abc.Mapping` (also in
+  `_meta`). Regression:
+  `test_singleton_guard.py::test_gated_wrapper_accepts_non_dict_mapping_body`.
+* **F2 — `hpa_floor` calls a non-existent client method.** Live timer error:
+  `'AutoscalingV1Api' object has no attribute
+  'read_namespaced_horizontalpodautoscaler'` — the real generated method is
+  `read_namespaced_horizontal_pod_autoscaler`. CI fakes defined the
+  misspelled name, so tests passed. Fix: rename in `hpa_floor.py` + both
+  test fakes.
+* **F3 — queue-depth keys read 0 forever on Resque 2.x.**
+  `SIMULATIONS_QUEUE = "simulations"` → live key is
+  `resque:queue:simulations` (verified: backlog was 7 while the operator's
+  read returned 0; `redis-cli KEYS 'queue:*'` empty, `resque:queue:*`
+  populated — #66's idle capture couldn't see this). Broke HPA-floor input,
+  web_background leg A, and the #66 R2 gauge update site. Fix: constants now
+  `resque:queue:simulations` / `resque:queue:requeued`; test fixtures now
+  seed via the constants.
+
+### Contract drift found — blocks some rows (follow-ups, not fixed here)
+
+* **D1 — `page_data.json` never carries `status`/`start_time` on v3.11.0.**
+  Live: `page_data` for both a completed and a mid-run analysis serializes
+  only `{name, data_points, results, output_variables}`. Rails cause:
+  `Analysis#status`/`#start_time` are **methods, not Mongoid fields**, and
+  `as_json(only: …)` drops them. Same for `/analyses.json` raw docs (no
+  `status` key ever). The only live endpoint that reports the real analysis
+  status is `GET /analyses/{id}/status.json` (derived view; verified
+  `completed` with `jobs: [… post-processing finished]`). Consequence: the
+  SLA monitor's candidate filter (`status == "started"` from raw docs) and
+  its `page_data.start_time` clock anchor **cannot fire on the live server**
+  → rows 1.1–1.4 and the grace/escalation rows 1b.1–1b.4 are BLOCKED; the
+  Module-1 design needs re-sourcing (status via `status.json`, clock anchor
+  via first job's `start_time` in `status.json`'s `jobs` or dp
+  `run_start_time`). Follow-up issue should own this.
+* **D2 — datapoint `ip_address` is never populated on K8s** (live: `null`
+  while `started` with `job_id` set; pod-eviction escalation can never match
+  victims). Also feedstock for the 1b rows. Same follow-up.
+
+### Module 1 — Analysis SLA soft-stop: [BLOCKED: D1]
+
+| # | Verdict | Evidence |
+|---|---------|----------|
+| 1.1–1.3 | [BLOCKED: D1] | SLA monitor never sees a `started` analysis (no `status` in raw docs; no `start_time` in page_data) — nothing to soft-stop. Timer itself ran clean all session (`Timer 'analysis_sla_monitor' succeeded`, 30 s cadence). |
+| 1.4 | VERIFIED (vacuously + by access log) | See zero-mutation cross-check: **zero** `GET …/soft_stop` from the operator all session (its only requests were `GET /analyses.json` ×93, `GET /data_points/status` ×40). |
+
+### Module 1b — Grace wait + escalation: [BLOCKED: D1+D2]
+
+Depends on Module 1's anchor; additionally `ip_address` is `null` on started
+datapoints (D2) so victim matching could never resolve.
+`openstudio_operator_worker_pods_evicted_total` observed `0.0` (consistent).
+
+### Module 2 — Zombie datapoint watchdog: VERIFIED (wedge probe)
+
+| # | Verdict | Evidence (captured) |
+|---|---------|---------------------|
+| 2.1 | ✓ | `21:58:44Z Normal DatapointRequeued Datapoint 7c7b8783-… runtime 2m exceeds maxDatapointRuntimeMinutes=2 — requeue 1/2 suppressed (spec.dryRun)` (again `22:00:44Z … 2/2`) |
+| 2.2 | ✓ | `.status.requeues["7c7b8783-…"] = {count: 2, lastRequeuedAt: "2026-08-18T22:00:44.937302+00:00"}` — budget burned exactly like a real run |
+| 2.3 | ✓ | `openstudio_operator_datapoints_requeued_total 2.0` (single operator lifetime 21:50:45Z→22:22Z) |
+| 2.4 | ✓ | No `POST /data_points/{id}/requeue` in web logs (only `GET`×133); `LLEN resque:queue:requeued` stayed `0` — a real requeue would have enqueued there |
+| 2.5 | ✓ | `22:02:44Z Warning DatapointRequeueExhausted … budget exhausted (2/2) — no further action`; `openstudio_operator_datapoints_requeue_exhausted_total 1.0`; exactly one event (warn-only path, never re-requeued) |
+
+Probe realism: the wedged dp stayed `started` server-side for 25+ min with
+its `openstudio run`+`energyplus` children in STAT `T` (SIGSTOP 21:56:49Z →
+CONT 22:16:15Z); the other 11 dps drained to `completed` after unfreeze —
+12/12 completed at 22:21Z.
+
+### Module 3 — Gated worker recycler: VERIFIED
+
+| # | Verdict | Evidence (captured) |
+|---|---------|---------------------|
+| 3.1 | ✓ | `21:42:35Z Normal WorkerRecycled Recycled worker Deployment openstudio-server/worker (trigger: interval-elapsed) — rolling restart via kubectl.kubernetes.io/restartedAt patch — patch suppressed (spec.dryRun)`; second fire `22:16:45Z`, third `22:21:45Z` after `recycleWorkerIntervalHours: 0` probe |
+| 3.2 | ✓ | `.status.lastRecycleAt`: `21:42:35.672987+00:00` → `22:21:45.422980+00:00` (advanced; also survived an operator restart 21:51 — D04 durability shown incidentally) |
+| 3.3 | ✓ | `openstudio_operator_workers_recycled_total 2.0` (in the final single-lifetime scrape; +1 later to the 22:21:45 fire — see session metrics) |
+| 3.4 | ✓ | worker Deployment unchanged all session: RV `678`, generation `1`, template annotations `<none>` (baseline = same); original pod `worker-5f49c94875-2d97w` Running since 21:14Z |
+
+### Module 4 — Archival + NFS prune: [BLOCKED: D1]
+
+Eligibility requires `status == "completed"` in `/analyses.json` raw docs —
+never present live (D1), so no `AnalysisArchivalStarted` could fire despite
+`retentionDays: 0` + complete archival spec. Consistent negatives captured:
+`openstudio_operator_analyses_archived_total 0.0`,
+`analyses_deleted_total 0.0` (4.6 holds — deletion suppressed/increment-0),
+`kubectl get jobs` empty all session (4.3), no `DELETE /analyses/{id}` in
+web logs (4.5's mutation never reached the server). Row 4.7 remains
+work-cluster-only per the checklist. The eligibility fix belongs to the D1
+follow-up.
+
+### Module 5 — web_background stall detector: VERIFIED (induced stall)
+
+Probe: 11 dps queued (leg A) + SIGSTOP of every Resque process in
+web/web-background/worker (leg B) at 22:08:16Z; worker pods stayed
+Running/Ready (leg C); last heartbeats 22:07:29–38Z → stale after 300 s;
+`stallWindowMinutes: 2` sustained → fired one minute later than the naive
+bound, as designed:
+
+| # | Verdict | Evidence (captured) |
+|---|---------|---------------------|
+| 5.1 | ✓ | `22:14:45Z Warning WebBackgroundRestarted Queue stall sustained 2m (work queued on simulations/requeued, no fresh Resque worker heartbeat in 300s, worker pods Running) — restarting web_background Deployment … via kubectl.kubernetes.io/restartedAt patch — patch suppressed (spec.dryRun)` |
+| 5.2 | ✓ | `.status.lastWebBackgroundRestart: 2026-08-18T22:14:45.295733+00:00` |
+| 5.3 | ✓ | `openstudio_operator_web_background_restarts_total 1.0` |
+| 5.4 | ✓ | web-background Deployment unchanged: RV `688`, generation `1`, annotations `<none>`; pod Running since 21:14Z |
+
+### Phase 4 — HPA-floor adjuster: VERIFIED (live backlog)
+
+Backlog was genuinely ≥ 10 for ~25 min (11 queued dps; live key
+`resque:queue:simulations` post-F3):
+
+| # | Verdict | Evidence (captured) |
+|---|---------|---------------------|
+| 4.1 | ✓ | `21:56:44Z Normal HpaFloorRaised Resque backlog 11 (simulations + requeued) → floor 2 (was 1) — raising openstudio-server/worker-hpa spec.minReplicas — patch suppressed (spec.dryRun)` — re-fired at 22:01:45Z, 22:06:45Z, 22:11:45Z (300 s cooldown pacing) |
+| 4.2 | ✓ | `openstudio_operator_hpa_floor_adjustments_total 4.0` |
+| 4.3 | ✓ | `worker-hpa` `spec.minReplicas` = `1` before, during, and after (baseline 21:23:53Z = final 22:22Z) |
+| 4.4 | ✓ | Cooldown pacing observable in the event timestamps (4 raises ≈ 300 s apart) |
+| 4.5 | N/A on kind | documented (no metrics-server) |
+
+Note: no `HpaFloorDecayed` post-drain — coherent under dryRun: the suppressed
+patch means the live floor never moved to 2, so each tick still read
+`was 1` and "raised" again (decision-counted, mutation-suppressed). Decay
+semantics remain CI-proven.
+
+### Singleton guard (S.1 induced violation): VERIFIED
+
+Created `validation-2` at 22:08:36Z (deleted at 22:10Z; winner `validation`
+served throughout — guard is read-only):
+
+```
+22:08:36Z Warning SingletonConflict on validation-2: Ignored by the operator: validation is
+         the oldest OpenStudioClusterManager in this namespace (created 21:24:11Z vs
+         22:08:36Z). Exactly one CR may be served per namespace (D05); delete this CR or
+         the other one.
+22:08:36Z Normal SingletonActive   on validation: Served as the oldest of 2 … others are
+         ignored: validation-2.
+```
+
+### Aggregate rows
+
+* **A.1 ✓** final single-lifetime scrape (22:22:31Z):
+  `soft_stops_total 0.0 · datapoints_requeued_total 2.0 ·
+  datapoints_requeue_exhausted_total 1.0 · workers_recycled_total 2.0 ·
+  worker_pods_evicted_total 0.0 · web_background_restarts_total 1.0 ·
+  analyses_archived_total 0.0 · analyses_deleted_total 0.0 ·
+  hpa_floor_adjustments_total 4.0 · resque_workers_seen_max 4.0`
+* **A.2 ✓** full event listing above (13 OSCM events, every one carrying
+  `suppressed (spec.dryRun)` where a mutation was gated).
+* **A.3 ✓** `.status` blob: `lastRecycleAt`, `lastWebBackgroundRestart`,
+  `requeues` populated; `startedSince` populated transiently and **pruned**
+  when the dp completed (D04 pruning observed live);
+  `softStops`/`archivedAnalyses` empty for the BLOCKED-module reasons.
+
+### Issue #66 R2 — non-vacuity: VERIFIED
+
+* **R2.1 ✓** during the live batch (11 queued, 4 workers heartbeating):
+  `openstudio_operator_resque_workers_seen_max 4.0` — first observed
+  21:57:36Z, within 60 s of the tick that saw the non-empty queue, held
+  through the final scrape. The gauge moved only on ticks with a non-empty
+  queue, exactly as #66's postmortem predicted.
+* **R2.2 ✓** zero `ResqueKeyLayoutUnknown` events all session (workers had
+  been observed — grace correctly cleared).
+* **R2.3 ✓ (negative)** same empty listing proves no false warning fired
+  during healthy operation.
+* **R2.4 ✓ (bonus)** after the SIGSTOP freeze the gauge **stayed 4.0**
+  (heartbeats stale, registry frozen) — high-water-mark, not current.
+
+### Zero-mutation cross-check: VERIFIED
+
+* **REST (server-side, web access log, whole session):** operator pod
+  (`10.244.0.13`, UA `python-requests`) issued **93 × `GET /analyses.json` +
+  40 × `GET /data_points/status` and NOTHING else** — zero `soft_stop`,
+  zero `action`, zero `requeue`, zero `DELETE`. (The only POST/PUTs in the
+  log are the author's `curl/8.5.0` seeding calls and the worker pod's own
+  `upload_file` result uploads.)
+* **K8s:** deployments worker/web-background/web/db/redis resourceVersions
+  and generations identical to the pre-walkthrough baseline
+  (678/688/845/563/573, all gen 1); `restartedAt` annotations `<none>`
+  throughout; `worker-hpa` `minReplicas` 1 throughout; `kubectl get jobs`
+  empty throughout; the original 5 stack pods (created 21:14Z) still Running
+  at 22:22Z — no pod deletes, no rollouts.
+
 ```bash
-scripts/teardown-kind-env.sh   # deletes the whole cluster (mongo/redis/NFS stand-in data die with it)
+scripts/teardown-kind-env.sh   # run 22:23Z — cluster deleted, host clean
 ```
 
 ## Troubleshooting

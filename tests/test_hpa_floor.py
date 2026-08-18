@@ -31,7 +31,12 @@ from openstudio_operator.handlers.hpa_floor import (
     HpaFloorState,
     run_hpa_floor_tick,
 )
-from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
+from openstudio_operator.redis_client import (
+    REQUEUED_QUEUE,
+    SIMULATIONS_QUEUE,
+    ReadOnlyRedisClient,
+    RedisClientError,
+)
 from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 NAMESPACE = "openstudio-server"
@@ -50,7 +55,7 @@ class FakeAutoscalingV1Api:
         self.patches: list[dict] = []
         self.reads: list[tuple[str, str]] = []
 
-    def read_namespaced_horizontalpodautoscaler(self, name, namespace, **kwargs):
+    def read_namespaced_horizontal_pod_autoscaler(self, name, namespace, **kwargs):
         self.reads.append((name, namespace))
         return SimpleNamespace(spec=self.spec)
 
@@ -71,9 +76,9 @@ class ExplodingRedis:
 def make_redis(*, simulations: int = 0, requeued: int = 0) -> ReadOnlyRedisClient:
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
     for job in range(simulations):
-        fake.rpush("simulations", f"sim-job-{job}")
+        fake.rpush(SIMULATIONS_QUEUE, f"sim-job-{job}")
     for job in range(requeued):
-        fake.rpush("requeued", f"req-job-{job}")
+        fake.rpush(REQUEUED_QUEUE, f"req-job-{job}")
     return ReadOnlyRedisClient("redis://:pw@queue.test:6379", connection=fake)
 
 
@@ -325,7 +330,7 @@ def test_hpa_read_failure_skips_tick():
     def explode(name, namespace, **kwargs):
         raise ApiException(status=404, reason="NotFound")
 
-    api.read_namespaced_horizontalpodautoscaler = explode
+    api.read_namespaced_horizontal_pod_autoscaler = explode
     with pytest.raises(ApiException):
         tick(api, anchored_state(), simulations=300)
     assert api.patches == []
@@ -384,9 +389,9 @@ class CountingAutoscalingV1Api(FakeAutoscalingV1Api):
         super().__init__(min_replicas=min_replicas, max_replicas=max_replicas)
         self.read_calls: list[tuple[str, str]] = []
 
-    def read_namespaced_horizontalpodautoscaler(self, name, namespace, **kwargs):
+    def read_namespaced_horizontal_pod_autoscaler(self, name, namespace, **kwargs):
         self.read_calls.append((name, namespace))
-        return super().read_namespaced_horizontalpodautoscaler(name, namespace, **kwargs)
+        return super().read_namespaced_horizontal_pod_autoscaler(name, namespace, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -420,7 +425,7 @@ def test_resolve_baseline_falls_back_on_hpa_not_found():
     def raise_not_found(name, namespace, **kwargs):
         raise ApiException(status=404, reason="NotFound")
 
-    api.read_namespaced_horizontalpodautoscaler = raise_not_found
+    api.read_namespaced_horizontal_pod_autoscaler = raise_not_found
 
     captured = resolve_baseline_min_replicas(api, namespace=NAMESPACE)
     assert captured == 1  # DEFAULT_HPA_BASELINE_MIN_REPLICAS

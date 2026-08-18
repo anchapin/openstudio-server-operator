@@ -117,7 +117,7 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
 
 - Redis Service: `queue:6379` in ns `openstudio-server`; URL `redis://:openstudio@queue:6379` (password `openstudio` by default).
 - Workers consume `QUEUES=requeued,simulations` (Resque).
-- Queue depth: `LLEN simulations` / `LLEN requeued`. Worker liveness: Resque worker registry/heartbeats keys.
+- Queue depth: `LLEN resque:queue:simulations` / `LLEN resque:queue:requeued` (Resque 2.x key layout — live-verified 2026-08-18, issue #67; the bare `LLEN simulations` form reads a non-existent key and returns 0 forever). Worker liveness: Resque worker registry/heartbeats keys.
 - ResqueWeb mounted at `/resque` (HTML only).
 - Admin levers (future use): `POST /admin/prune_resque_workers`, `POST /admin/requeue_failed`.
 

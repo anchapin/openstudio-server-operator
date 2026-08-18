@@ -76,8 +76,12 @@ import redis
 
 READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "SCAN"})
 
-SIMULATIONS_QUEUE = "simulations"
-REQUEUED_QUEUE = "requeued"
+#: Queue-depth keys. Live-verified on kind/v3.11.0 (issue #67): Resque 2.x
+#: stores queue payloads at ``resque:queue:<name>`` — the bare names the
+#: pre-live code used (``simulations``) read 0 forever on the live server
+#: (found live: backlog was 7 on the real key while the operator read 0).
+SIMULATIONS_QUEUE = "resque:queue:simulations"
+REQUEUED_QUEUE = "resque:queue:requeued"
 #: Resque worker-id registry (SET). Live-verified on kind/v3.11.0 (issue #66):
 #: the v3.11.0 server (Resque 2.x) keeps the registry at this exact key.
 WORKER_REGISTRY_KEY = "resque:workers"
