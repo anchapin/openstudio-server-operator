@@ -11,3 +11,4 @@ build
 tests
 deploy
 *.md
+!README.md

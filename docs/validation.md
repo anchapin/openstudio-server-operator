@@ -77,6 +77,10 @@ the four that change how you interpret curl output here:
   `deploy/operator-deployment.yaml`. If the published image is unavailable,
   run the operator locally (Phase A step 4), or build/push the dev image
   yourself before using the Deployment.
+- Note (#69): the `:dev` publish pipeline was broken from #57 until the #69
+  fix (README.md was excluded from the Docker build context, failing pip
+  metadata generation). It is live again — future waves can pull the image
+  directly.
 
 ## Phase 0 — pre-flight: fixture drift on the work cluster
 
