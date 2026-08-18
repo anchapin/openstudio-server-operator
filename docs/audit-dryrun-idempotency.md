@@ -45,7 +45,7 @@ patch_namespaced_custom_object_status`):
 | K3 | K8s web-background Deployment `restartedAt` patch — `patch_namespaced_deployment` | `handlers/web_background_monitor.py:310` | `dry_run = config.dry_run` / `if not dry_run:` (web_background_monitor.py:305-306) | message suffix `"— patch suppressed (spec.dryRun)"` + `WebBackgroundRestarted` Warning Event (web_background_monitor.py:322-324); `lastWebBackgroundRestart` advances (pacing choice) | GATED |
 | K4 | K8s archival Job spawn — `create_namespaced_job` | `handlers/storage_pruner.py:459` | `dry_run = config.dry_run` / `if not dry_run:` (storage_pruner.py:457-458) | message suffix `"— Job spawn suppressed (spec.dryRun)"` + `AnalysisArchivalStarted` Normal Event (storage_pruner.py:478-480); dry-run marker record (`jobName=None`) written | GATED |
 | K5 | K8s failed-archival-Job cleanup delete — `delete_namespaced_job` | `handlers/storage_pruner.py:452` | `if not config.dry_run:` (storage_pruner.py:451) | **was un-gated** — see §1.2 | **WAS UNGATED → fixed (#42)** |
-| K6 | K8s HPA `minReplicas` patch — `patch_namespaced_horizontalpodautoscaler` | `handlers/hpa_floor.py:226` | `if not dry_run:` (hpa_floor.py:225); `dry_run=config.dry_run` threaded explicitly through `run_hpa_floor_tick` (hpa_floor.py:192, 281) | message suffix `"— patch suppressed (spec.dryRun)"` + `HpaFloorRaised`/`HpaFloorDecayed` Event (hpa_floor.py:235-241); cooldown advances (pacing choice) | GATED |
+| K6 | K8s HPA `minReplicas` patch — `patch_namespaced_horizontalpodautoscaler` | `handlers/hpa_floor.py:319` | `if not dry_run:` (hpa_floor.py:318); `dry_run=config.dry_run` threaded explicitly through `run_hpa_floor_tick` (hpa_floor.py:269, 377) | message suffix `"— patch suppressed (spec.dryRun)"` + `HpaFloorRaised`/`HpaFloorDecayed` Event (hpa_floor.py:330-333); cooldown advances (pacing choice); decay floor is chart-derived (`resolve_baseline_min_replicas`, hpa_floor.py:205 — issue #46) | GATED |
 
 ### 1.2 Finding: un-gated Job cleanup delete (filed as #42, fixed here)
 
@@ -109,7 +109,7 @@ documented per module).
 | **Archival in-flight dedup** | `status.archivedAnalyses[id]` (`ArchivedAnalysisRecord`) | storage_pruner.py:523, 541-545 — spawn only for ids NOT in the tracked snapshot; adopt paths (:405-449) adopt an existing deterministic-named Job instead of double-spawning | Restart resumes WATCHING the Job named in the persisted record rather than respawning (`test_restart_midflight_resumes_watching_rather_than_respawning`); a lost record write after Job create is healed by read-first adoption. Dry-run marker (`jobName=None`) makes suppression once-per-analysis; the dryRun-lift reconcile clears it. | `test_spawn_creates_deterministic_job_writes_inflight_record_and_events`, `test_orphan_inflight_job_without_record_is_adopted_not_respawned`, `test_restart_midflight_resumes_watching_rather_than_respawning`, `test_dry_run_suppresses_spawn_and_delete_with_observable_tracking` |
 | **Deterministic archival Job names** | `archival_job_name(id)` — pure function (`oscm-archive-<sanitized>-<sha256-8>`) | storage_pruner.py:403 — same id ⇒ same name ⇒ re-create conflicts (409) rather than suffix-littering | Pure function of the analysis id; survives restarts trivially. Failed-Job retry frees the name via the (now dryRun-gated, #42) cleanup delete. | `test_job_name_deterministic_per_analysis` (tests/test_archival.py), `test_job_failure_retains_analysis_warns_and_retries_next_tick`, `test_dry_run_suppresses_failed_job_cleanup_delete` |
 | **Verified-then-delete** (cardinal rule) | `ArchivedAnalysisRecord.verified_at` — written ONLY on observed Job `Complete` | storage_pruner.py:325-331 (retry-delete only for verified), :380, :427; `delete_analysis` unreachable without it | Verification is durable in CR status; a restart re-reads it and retries the delete exactly once per tick. | `test_job_success_verifies_then_deletes_and_prunes_status`, `test_cardinal_never_deleted_without_verified_success`, `test_verified_record_deletion_failure_retries_delete_next_tick`, `test_dry_run_suppresses_delete_of_verified_analysis` |
-| **HPA-floor cooldown** | `HpaFloorState` (in-memory per CR) — **documented deviation: no v1alpha1 status scalar exists for this module** | hpa_floor.py:206 (`gate_open`) — after a successful backlog read; `record_adjustment` at :245 (advances in dry-run too) | Restart-conservative by construction: a fresh process anchors `first_observed_at` on its first SUCCESSFUL read and keeps the gate closed one full cooldown — a restart can only DELAY an adjustment, never accelerate one; a crash-looping operator cannot flap the floor at all. (Tradeoff documented in hpa_floor.py:44-56.) | `test_cooldown_blocks_opposite_signal_until_elapsed`, `test_fresh_process_waits_out_one_cooldown_of_observation`, `test_failed_sensing_never_anchors_the_gate`, `test_dry_run_suppresses_patch_but_paces_like_real` |
+| **HPA-floor cooldown** | `HpaFloorState` (in-memory per CR) — **documented deviation: no v1alpha1 status scalar exists for this module** | hpa_floor.py:191 (`gate_open`) — after a successful backlog read; `record_adjustment` at :338 (advances in dry-run too) | Restart-conservative by construction: a fresh process anchors `first_observed_at` on its first SUCCESSFUL read and keeps the gate closed one full cooldown — a restart can only DELAY an adjustment, never accelerate one; a crash-looping operator cannot flap the floor at all. (Tradeoff documented in hpa_floor.py:51-65.) The chart-derived baseline (issue #46, `resolve_baseline_min_replicas`, hpa_floor.py:205) is process-lifetime stable: a fresh process captures the HPA's `minReplicas` once per namespace and holds it; decay below the captured value is impossible without an explicit per-call override. | `test_cooldown_blocks_opposite_signal_until_elapsed`, `test_fresh_process_waits_out_one_cooldown_of_observation`, `test_failed_sensing_never_anchors_the_gate`, `test_dry_run_suppresses_patch_but_paces_like_real`, `test_decay_to_chart_baseline_not_fallback_when_chart_is_higher`, `test_decay_below_chart_baseline_is_impossible_without_override` |
 | **Singleton guard** (not an action, but gating) | none — stateless | `resolve_active_cr` recomputes oldest from `metadata.creationTimestamp` on EVERY tick/event (singleton.py:171-174, 243-245) | Nothing persisted, nothing in memory decides the winner; the only memory (`_last_state`) is an Event-noise gate. Fail-closed on API errors. | `test_gated_wrapper_serves_only_oldest`, `test_gated_wrapper_fails_closed_on_api_error` |
 | **StatusStore itself** | n/a | read-modify-write with 409-restart, patches recomputed from fresh reads (status_store.py:263-302) | Mutation is a pure function of its arguments; same-value writes are no-ops. | `test_set_same_value_twice_writes_once`, `test_mark_soft_stop_escalated_is_idempotent`, `test_clear_started_since_is_idempotent` |
 
@@ -135,8 +135,12 @@ config.py:24-113, mirroring `deploy/crd.yaml`) and the module-level wiring
 defaults `DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0` (config.py:21,
 imported by web_background_monitor at :84 — not re-declared) and
 `DEFAULT_HPA_FLOOR_POLICY`/`DEFAULT_HPA_FLOOR_TIERS`/`DEFAULT_HPA_BASELINE_MIN_REPLICAS`/
-`DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS` (config.py:137-188, imported by hpa_floor
-at :89 — the handler contains no mapping numbers of its own).
+`DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS` (config.py:155-212, imported by hpa_floor
+at :99-100 — the handler contains no mapping numbers of its own).
+`DEFAULT_HPA_BASELINE_MIN_REPLICAS` is the **fallback** for the chart-derived
+runtime baseline (issue #46) — only consulted when the HPA cannot be read
+at startup; the production chart's `minReplicas` (2) is captured live and
+wins over this fallback when observable.
 
 ### 3.2 Sweep proof (AST scan of every numeric/string literal, all of `src/openstudio_operator/`)
 
@@ -183,10 +187,10 @@ policy knob, and AGENTS.md's fixed-identifiers section sanctions it.
 (`analysis_sla._DEFAULT_WORKER_DEPLOYMENT`, `worker_recycler.DEFAULT_WORKER_DEPLOYMENT`,
 `web_background_monitor.DEFAULT_WORKER_DEPLOYMENT`; the analysis_sla copy
 documents the import-cycle rationale); `web-background` Deployment fallback;
-`worker-hpa` HPA name (hpa_floor.py:107); `nfs-pvc` + `/mnt/openstudio`
+`worker-hpa` HPA name (hpa_floor.py:121); `nfs-pvc` + `/mnt/openstudio`
 (archival.py:58-59); `kubectl.kubernetes.io/restartedAt` annotation key
 (worker_recycler/web_background_monitor); K8s default `minReplicas` when
-unspecified (hpa_floor.py:113). All are AGENTS.md "fixed identifiers" or K8s
+unspecified (hpa_floor.py:127). All are AGENTS.md "fixed identifiers" or K8s
 protocol facts — none tunable policy.
 
 ## Appendix C — verification commands
