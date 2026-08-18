@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+DEFAULT_REDIS_URL = "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
+
 
 @dataclass(frozen=True)
 class AnalysisPolicy:
     max_duration_minutes: int = 180
     graceful_stop_timeout_minutes: int = 15
     auto_soft_stop: bool = True
+    force_delete_on_escalation: bool = False
 
 
 @dataclass(frozen=True)
@@ -26,23 +29,35 @@ class DatapointPolicy:
 class WorkerPolicy:
     recycle_worker_interval_hours: int = 12
     recycle_after_analysis: bool = True
+    min_recycle_interval_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class WebBackgroundPolicy:
+    stall_window_minutes: int = 10
 
 
 @dataclass(frozen=True)
 class StoragePolicy:
     archive_to_s3: bool = False
-    s3_bucket_name: str | None = None
+    backend: str | None = None
+    bucket: str | None = None
+    secret_ref: str | None = None
+    retention_days: int = 7
     purge_completed_nfs_files: bool = True
 
 
 @dataclass(frozen=True)
 class OperatorConfig:
     server_url: str = ""
+    redis_url: str = DEFAULT_REDIS_URL
+    dry_run: bool = False
     target_worker_deployment: str = ""
     target_web_background_deployment: str = ""
     analysis_policy: AnalysisPolicy = field(default_factory=AnalysisPolicy)
     datapoint_policy: DatapointPolicy = field(default_factory=DatapointPolicy)
     worker_policy: WorkerPolicy = field(default_factory=WorkerPolicy)
+    web_background_policy: WebBackgroundPolicy = field(default_factory=WebBackgroundPolicy)
     storage_policy: StoragePolicy = field(default_factory=StoragePolicy)
 
     @classmethod
@@ -51,15 +66,19 @@ class OperatorConfig:
         analysis = spec.get("analysisPolicy", {})
         datapoint = spec.get("datapointPolicy", {})
         worker = spec.get("workerPolicy", {})
+        web_background = spec.get("webBackgroundPolicy", {})
         storage = spec.get("storagePolicy", {})
         return cls(
             server_url=spec.get("serverUrl", ""),
+            redis_url=spec.get("redisUrl", DEFAULT_REDIS_URL),
+            dry_run=spec.get("dryRun", False),
             target_worker_deployment=spec.get("targetWorkerDeployment", ""),
             target_web_background_deployment=spec.get("targetWebBackgroundDeployment", ""),
             analysis_policy=AnalysisPolicy(
                 max_duration_minutes=analysis.get("maxDurationMinutes", 180),
                 graceful_stop_timeout_minutes=analysis.get("gracefulStopTimeoutMinutes", 15),
                 auto_soft_stop=analysis.get("autoSoftStop", True),
+                force_delete_on_escalation=analysis.get("forceDeleteOnEscalation", False),
             ),
             datapoint_policy=DatapointPolicy(
                 max_datapoint_runtime_minutes=datapoint.get("maxDatapointRuntimeMinutes", 45),
@@ -68,10 +87,17 @@ class OperatorConfig:
             worker_policy=WorkerPolicy(
                 recycle_worker_interval_hours=worker.get("recycleWorkerIntervalHours", 12),
                 recycle_after_analysis=worker.get("recycleAfterAnalysis", True),
+                min_recycle_interval_minutes=worker.get("minRecycleIntervalMinutes", 30),
+            ),
+            web_background_policy=WebBackgroundPolicy(
+                stall_window_minutes=web_background.get("stallWindowMinutes", 10),
             ),
             storage_policy=StoragePolicy(
                 archive_to_s3=storage.get("archiveToS3", False),
-                s3_bucket_name=storage.get("s3BucketName"),
+                backend=storage.get("backend"),
+                bucket=storage.get("bucket"),
+                secret_ref=storage.get("secretRef"),
+                retention_days=storage.get("retentionDays", 7),
                 purge_completed_nfs_files=storage.get("purgeCompletedNFSFiles", True),
             ),
         )

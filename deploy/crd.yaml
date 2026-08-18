@@ -1,6 +1,8 @@
 # OpenStudioClusterManager CRD — field names/defaults from the plan doc
-# (section 3). names/scope/status-subresource added to satisfy apiextensions
-# requirements for a namespaced CR with a status.
+# (section 3), extended per issue #4 (grill decisions D03–D11): redisUrl,
+# dryRun mutation gate, policy gates, backend-agnostic storagePolicy, and
+# the .status durable-store schema (D04). names/scope/status-subresource
+# satisfy apiextensions requirements for a namespaced CR with a status.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -30,6 +32,14 @@ spec:
                 serverUrl:
                   type: string
                   description: "Internal K8s DNS URL for OpenStudio web service."
+                redisUrl:
+                  type: string
+                  default: "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
+                  description: "Redis (Resque) URL for read-only queue-depth checks. Default: redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
+                dryRun:
+                  type: boolean
+                  default: false
+                  description: "Gates every mutating action (D11). Default false; when true, mutations are suppressed and emitted as dry-run-marked Events."
                 targetWorkerDeployment:
                   type: string
                   description: "Name of worker Deployment to manage/recycle."
@@ -48,6 +58,10 @@ spec:
                     autoSoftStop:
                       type: boolean
                       default: true
+                    forceDeleteOnEscalation:
+                      type: boolean
+                      default: false
+                      description: "Allow escalating a stuck analysis to worker-pod eviction after the grace period. Default false."
                 datapointPolicy:
                   type: object
                   properties:
@@ -66,14 +80,67 @@ spec:
                     recycleAfterAnalysis:
                       type: boolean
                       default: true
+                    minRecycleIntervalMinutes:
+                      type: integer
+                      default: 30
+                      description: "Minimum spacing between worker recycles. Default 30."
+                webBackgroundPolicy:
+                  type: object
+                  description: "web_background queue-stall detection settings."
+                  properties:
+                    stallWindowMinutes:
+                      type: integer
+                      default: 10
+                      description: "Minutes without queue progress before a web_background restart is considered. Default 10."
                 storagePolicy:
                   type: object
                   properties:
                     archiveToS3:
                       type: boolean
                       default: false
-                    s3BucketName:
+                      description: "Enable archival of completed-analysis assets. Default false."
+                    backend:
                       type: string
+                      enum: [s3, gcs, azure]
+                      description: "Archival backend. One of: s3, gcs, azure. No default; set when archiveToS3 is true."
+                    bucket:
+                      type: string
+                      description: "Destination bucket name (backend-agnostic)."
+                    secretRef:
+                      type: string
+                      description: "Name of a Secret in this namespace; mounted into archival Jobs via envFrom — never read by the operator."
+                    retentionDays:
+                      type: integer
+                      default: 7
+                      description: "Days a completed analysis is retained before archival. Default 7; 0 = archive immediately."
                     purgeCompletedNFSFiles:
                       type: boolean
                       default: true
+            status:
+              type: object
+              description: "Operator durable state (D04); pruned as analyses/datapoints complete. Written via the status subresource."
+              properties:
+                softStops:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "Map keyed by analysis id to soft-stop records (issued-at timestamp, outcome)."
+                requeues:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "Map keyed by datapoint id to auto-requeue records (count, last requeued-at timestamp)."
+                startedSince:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "Map keyed by datapoint id to the ISO-8601 UTC timestamp when the operator first observed it started (operator clock)."
+                archivedAnalyses:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "Map keyed by analysis id to archival records (backend, bucket, verified-upload timestamp)."
+                lastRecycleAt:
+                  type: string
+                  format: date-time
+                  description: "ISO-8601 UTC timestamp of the last worker recycle. No default; unset until the first recycle."
+                lastWebBackgroundRestart:
+                  type: string
+                  format: date-time
+                  description: "ISO-8601 UTC timestamp of the last web_background restart. No default; unset until the first restart."
