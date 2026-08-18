@@ -22,6 +22,7 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_analyses_archived_total",
     "openstudio_operator_analyses_deleted_total",
     "openstudio_operator_storage_freed_bytes_total",
+    "openstudio_operator_hpa_floor_adjustments_total",
 )
 
 
