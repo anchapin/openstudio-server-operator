@@ -1,57 +1,237 @@
-"""Thin REST client for the OpenStudio Server API used by the operator.
+"""REST client for the OpenStudio Server API, verified against NREL/OpenStudio-server v3.11.0.
 
-Endpoint contract (from the plan doc — exact action spellings matter):
+Ground truth: `.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md`.
 
-  GET    /analyses.json                     poll ~every 30s
-  GET    /data_points.json?status=started   zombie datapoint detection
-  GET    /cluster.json                      worker/queue state
-  PUT    /analyses/{id}/action              body {"action": "soft_stop"}; escalation "kill" / "hard_stop"
-  POST   /data_points/{id}/requeue          zombie datapoint requeue
-  DELETE /analyses/{id}                     post-archival cleanup
+Reads:
+    GET    /analyses.json                               raw Mongoid docs (status, run_flag, created_at, updated_at)
+    GET    /analyses/{id}/page_data.json                derived `start_time` — the SLA clock anchor
+    GET    /data_points/status?status=1&jobs=started    light watchdog poll (no timestamps)
+    GET    /data_points.json                            full docs, heavy — escalation-only (ip_address)
+
+Actions:
+    GET    /analyses/{id}/soft_stop                     cooperative stop, does NOT wait for in-flight runs
+    POST   /analyses/{id}/action                        body param `analysis_action` ∈ start|stop (no PUT route)
+    POST   /data_points/{id}/requeue                    204; re-enqueues onto the `requeued` Resque queue
+    DELETE /analyses/{id}                               server-side cascade frees NFS + Mongo
+
+Non-existent / legacy (do NOT use): `GET /cluster.json`, `kill`/`hard_stop` actions,
+`PUT /analyses/{id}/action` (route is POST), `/compute_nodes.json` on K8s.
+
+Client discipline (D12): every timestamp is normalized to timezone-aware UTC at this boundary;
+transient failures (5xx, connection errors, timeouts) are retried with jittered exponential
+backoff (~1s/2s/4s) before `OpenStudioApiError` is raised — callers skip the tick and retry
+naturally on the next poll.
 """
 
 from __future__ import annotations
 
+import random
+import time
+from datetime import UTC, datetime
+from typing import Any
+
+import requests
+
+_TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Normalize an ISO8601 string to a timezone-aware UTC datetime.
+
+    Mongoid emits ISO8601 with zone (e.g. ``2026-08-18T08:00:00-06:00`` or a ``Z`` suffix).
+    A naive input is assumed UTC rather than rejected so a degraded server response still
+    yields an anchorable datetime.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"unparseable timestamp {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_timestamps(obj: Any) -> Any:
+    """Recursively convert string values whose key ends in ``_at``/``_time`` to tz-aware UTC.
+
+    Covers the Mongoid/derived fields the operator reads: ``created_at``, ``updated_at``,
+    ``start_time``, ``end_time``, ``run_start_time``. All other values pass through.
+    """
+    if isinstance(obj, dict):
+        return {
+            key: _parse_timestamp(val)
+            if isinstance(val, str) and key.endswith(("_at", "_time"))
+            else _normalize_timestamps(val)
+            for key, val in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_normalize_timestamps(item) for item in obj]
+    return obj
+
 
 class OpenStudioApiError(RuntimeError):
-    """Raised when the OpenStudio REST API returns an unexpected response."""
+    """Raised when the OpenStudio REST API fails or returns an unexpected response."""
 
 
 class OpenStudioClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 10.0) -> None:
+    """REST client for OpenStudio Server v3.11.0.
+
+    One initial attempt plus up to ``max_retries`` retries on transient failures (HTTP 5xx,
+    connection errors, timeouts) with jittered exponential backoff: sleep before retry N is
+    ``backoff_base_seconds * 2**(N-1) scaled by a random 0.5–1.5 jitter (~1s/2s/4s by
+    default), then ``OpenStudioApiError`` is raised. HTTP 4xx raises immediately (not
+    transient). Timestamps in returned documents are normalized to timezone-aware UTC.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 10.0,
+        max_retries: int = 3,
+        backoff_base_seconds: float = 1.0,
+    ) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout_seconds
+        self._max_retries = max_retries
+        self._backoff_base_seconds = backoff_base_seconds
+        self._session = requests.Session()
+
+    def _jittered_backoff(self, retry: int) -> float:
+        return random.uniform(0.5, 1.5) * self._backoff_base_seconds * 2 ** (retry - 1)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> requests.Response:
+        url = f"{self._base}{path}"
+        last_error = ""
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            if attempt:
+                _sleep(self._jittered_backoff(attempt))
+            try:
+                response = self._session.request(
+                    method, url, params=params, data=data, timeout=self._timeout
+                )
+            except _TRANSIENT_EXCEPTIONS as exc:
+                last_error = f"{exc.__class__.__name__}: {exc}"
+                last_exc = exc
+                continue
+            if response.status_code < 400:
+                return response
+            if response.status_code < 500:
+                raise OpenStudioApiError(
+                    f"{method} {path} returned HTTP {response.status_code}: "
+                    f"{response.text[:200]}"
+                )
+            last_error = f"HTTP {response.status_code}"
+            last_exc = None
+        raise OpenStudioApiError(
+            f"{method} {path} failed after {self._max_retries + 1} attempts: {last_error}"
+        ) from last_exc
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> Any:
+        response = self._request(method, path, params=params, data=data)
+        try:
+            return _normalize_timestamps(response.json())
+        except requests.exceptions.JSONDecodeError as exc:
+            raise OpenStudioApiError(f"{method} {path}: invalid JSON in response") from exc
+        except ValueError as exc:
+            raise OpenStudioApiError(f"{method} {path}: {exc}") from exc
 
     # --- Reads -----------------------------------------------------------
 
     def list_analyses(self) -> list[dict]:
-        """GET /analyses.json — TODO(phase 1): used by the SLA monitor."""
-        raise NotImplementedError
+        """GET /analyses.json — raw Mongoid docs.
+
+        Fields include ``status``, ``run_flag``, ``created_at``, ``updated_at`` (Mongoid
+        timestamps, ISO8601 with zone, normalized to tz-aware UTC at this boundary). No
+        derived methods: ``start_time`` is NOT included — anchor the SLA clock on
+        ``get_analysis_page_data`` instead.
+        """
+        return self._request_json("GET", "/analyses.json")
+
+    def get_analysis_page_data(self, analysis_id: str) -> dict:
+        """GET /analyses/{id}/page_data.json — ``{analysis: {status, start_time, end_time,
+        run_flag?, ...}}``.
+
+        ``start_time`` is derived from the first job and is the SLA clock anchor: poll the
+        analyses index for candidates, fetch page_data for ``status == "started"`` only;
+        never anchor on ``created_at``.
+        """
+        return self._request_json("GET", f"/analyses/{analysis_id}/page_data.json")
 
     def list_started_datapoints(self) -> list[dict]:
-        """GET /data_points.json?status=started — TODO(phase 2): zombie watchdog."""
-        raise NotImplementedError
+        """GET /data_points/status?status=1&jobs=started — light view, returns the inner list.
 
-    def get_cluster(self) -> dict:
-        """GET /cluster.json — TODO(phase 2): web_background stall detection."""
-        raise NotImplementedError
+        Shape: ``{data_points: [{_id, id, analysis_id, status, status_message}]}``. Rails
+        quirk: the presence of the ``status`` param gates filtering; the filter value is
+        read from ``jobs``. No timestamps — pair with the operator-tracked ``startedSince``
+        clock.
+        """
+        payload = self._request_json(
+            "GET", "/data_points/status", params={"status": 1, "jobs": "started"}
+        )
+        return payload.get("data_points", []) if isinstance(payload, dict) else []
+
+    def get_datapoints_full(self) -> list[dict]:
+        """GET /data_points.json — full ``DataPoint.all`` docs; heavy payload, escalation-only.
+
+        Used for the datapoint ``ip_address`` lookup behind Kubernetes-side pod eviction.
+        Query params are ignored server-side (no server-side status filter), so none are
+        sent.
+        """
+        return self._request_json("GET", "/data_points.json")
 
     # --- Actions ---------------------------------------------------------
 
     def soft_stop_analysis(self, analysis_id: str) -> None:
-        """PUT /analyses/{id}/action {"action": "soft_stop"} — TODO(phase 1)."""
-        raise NotImplementedError
+        """GET /analyses/{id}/soft_stop — cooperative stop that does NOT wait for in-flight
+        runs (semantics roughly inverted vs ``stop``).
+        """
+        self._request("GET", f"/analyses/{analysis_id}/soft_stop")
 
-    def escalate_analysis(self, analysis_id: str, action: str) -> None:
-        """PUT /analyses/{id}/action with "kill" or "hard_stop" — TODO(phase 1)."""
-        if action not in ("kill", "hard_stop"):
-            raise ValueError(f"invalid escalation action: {action!r}")
-        raise NotImplementedError
+    def stop_analysis(self, analysis_id: str) -> None:
+        """POST /analyses/{id}/action with body param ``analysis_action=stop``.
+
+        Verified semantics: set ``run_flag`` false and wait for in-flight runs. Chosen over
+        ``GET /analyses/{id}/stop`` ("stop waiting for last submitted run") because the
+        action endpoint carries the explicit run_flag/wait semantics the operator needs.
+        The route is POST only — ``PUT /analyses/{id}/action`` does not exist in v3.11.0,
+        and no ``kill``/``hard_stop`` action exists anywhere; escalation is Kubernetes-side
+        pod eviction.
+        """
+        self._request("POST", f"/analyses/{analysis_id}/action", data={"analysis_action": "stop"})
 
     def requeue_datapoint(self, datapoint_id: str) -> None:
-        """POST /data_points/{id}/requeue — TODO(phase 2)."""
-        raise NotImplementedError
+        """POST /data_points/{id}/requeue — 204 No Content.
+
+        Destroys the existing Resque job on the ``requeued``/``simulations`` queues and
+        re-enqueues on the ``requeued`` queue. Does NOT kill a wedged worker process; that
+        escalation is Kubernetes-side.
+        """
+        self._request("POST", f"/data_points/{datapoint_id}/requeue")
 
     def delete_analysis(self, analysis_id: str) -> None:
-        """DELETE /analyses/{id} — TODO(phase 3): post-archival cleanup."""
-        raise NotImplementedError
+        """DELETE /analyses/{id} — server-side cascade.
+
+        ``data_points dependent: :destroy`` (each dp ``after_destroy`` rm-rf's its NFS
+        asset dir) plus ``before_destroy :queue_delete_files``: this IS the NFS cleanup for
+        the asset tree and frees the Mongo documents.
+        """
+        self._request("DELETE", f"/analyses/{analysis_id}")
