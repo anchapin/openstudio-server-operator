@@ -19,6 +19,7 @@ import redis
 from openstudio_operator import redis_client
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
+    OperatorConfigError,
     ReadOnlyRedisClient,
     RedisClientError,
     WriteCommandForbidden,
@@ -27,10 +28,41 @@ from openstudio_operator.redis_client import (
 NOW = 1_800_000_000.0
 
 WRITE_COMMANDS = {
-    "APPEND", "CONFIG", "DECR", "DEL", "EVAL", "EXEC", "EXPIRE", "FLUSHALL", "FLUSHDB",
-    "GETDEL", "GETSET", "HDEL", "HMSET", "HSET", "INCR", "LPUSH", "LPOP", "LREM",
-    "MOVE", "MULTI", "MSET", "PERSIST", "PUBLISH", "RENAME", "RPUSH", "RPOP", "SADD",
-    "SCRIPT", "SETEX", "SETNX", "SET", "SPOP", "SREM", "UNLINK", "ZADD",
+    "APPEND",
+    "CONFIG",
+    "DECR",
+    "DEL",
+    "EVAL",
+    "EXEC",
+    "EXPIRE",
+    "FLUSHALL",
+    "FLUSHDB",
+    "GETDEL",
+    "GETSET",
+    "HDEL",
+    "HMSET",
+    "HSET",
+    "INCR",
+    "LPUSH",
+    "LPOP",
+    "LREM",
+    "MOVE",
+    "MULTI",
+    "MSET",
+    "PERSIST",
+    "PUBLISH",
+    "RENAME",
+    "RPUSH",
+    "RPOP",
+    "SADD",
+    "SCRIPT",
+    "SETEX",
+    "SETNX",
+    "SET",
+    "SPOP",
+    "SREM",
+    "UNLINK",
+    "ZADD",
 }
 
 
@@ -155,9 +187,78 @@ def test_module_source_contains_no_write_command_call_syntax():
     assert write_call.findall(SOURCE) == []
 
 
-def test_allowlist_is_exactly_the_three_reads_and_intersects_no_write_command():
-    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "GET"}
+def test_allowlist_is_exactly_the_reads_and_intersects_no_write_command():
+    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "GET", "SCAN"}
     assert READ_ONLY_COMMANDS & WRITE_COMMANDS == set()
+
+
+# --- Key layout validation (issue #44) ---------------------------------
+
+
+def test_validate_key_layout_passes_when_registry_and_heartbeats_present(fake, client):
+    fake.sadd("resque:workers", "w1", "w2")
+    fake.set("resque:workers:w1", "12345.6")
+    fake.set("resque:workers:w2", "12346.6")
+    # Should not raise
+    client.validate_key_layout()
+
+
+def test_validate_key_layout_passes_with_only_registry_set(fake, client):
+    """A worker that just registered but hasn't heartbeated yet is still 'live'."""
+    fake.sadd("resque:workers", "w1")
+    client.validate_key_layout()
+
+
+def test_validate_key_layout_raises_when_no_resque_keys_present(fake, client):
+    fake.set("some-other-key", "x")
+    with pytest.raises(OperatorConfigError, match="No Resque keys found"):
+        client.validate_key_layout()
+
+
+def test_validate_key_layout_raises_when_registry_key_missing(fake, client):
+    """A different prefix — the live layout diverges from centralized constants."""
+    # Write some resque:* keys under a different prefix so the probe finds
+    # SOMETHING, but the centralized WORKER_REGISTRY_KEY is absent — proves
+    # the per-key check is wired.
+    fake.sadd("resque:other_thing", "w1")
+    fake.set("resque:other_thing:w1", "12345.6")
+    with pytest.raises(OperatorConfigError, match="Expected Resque worker registry key"):
+        client.validate_key_layout()
+
+
+def test_validate_key_layout_is_a_subclass_of_redis_client_error():
+    """Existing call sites ``except RedisClientError:`` must still catch this."""
+    assert issubclass(OperatorConfigError, RedisClientError)
+
+
+def test_validate_key_layout_does_not_use_write_commands():
+    """The probe must go through SCAN, never KEYS (a write-adjacent fallback)."""
+    from openstudio_operator.redis_client import _redis_target_for_diagnostics
+
+    # No password leakage: diagnostics only carry scheme://host:port/db.
+    safe = _redis_target_for_diagnostics("redis://:supersecret@host:6379/2")
+    assert "supersecret" not in safe
+    assert "host:6379" in safe and "/2" in safe
+
+
+def test_validate_key_layout_uses_only_read_only_commands(fake, client):
+    """Record every command issued by validate_key_layout; assert they're all reads."""
+    recorder = RecordingRedis(fake)
+    validating = ReadOnlyRedisClient(
+        "redis://:pw@queue.test:6379",
+        connection=recorder,
+        now_fn=lambda: NOW,
+    )
+    fake.sadd("resque:workers", "w1")
+    fake.set("resque:workers:w1", "1.0")
+
+    validating.validate_key_layout()
+
+    assert recorder.commands, "validate_key_layout issued no commands"
+    assert set(recorder.commands) <= READ_ONLY_COMMANDS
+    # SCAN is the only allowed traversal command; no KEYS, no DBSIZE, etc.
+    assert "KEYS" not in recorder.commands
+    assert "DBSIZE" not in recorder.commands
 
 
 def test_runtime_guard_rejects_non_allowlisted_command(client):

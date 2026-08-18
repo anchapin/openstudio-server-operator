@@ -385,7 +385,93 @@ The following module-level gaps remain — the human running the walkthrough sho
 
 - **No post-merge follow-up issues opened by this PR.** Every gap identified during this work (the missing WebBackgroundRestarted patch in the original walkthrough, the failed-Job cleanup delete gap from #42, the metadata-only `STORAGE_FREED_BYTES` removal from #50) was already tracked by its own issue and merged before #45 was opened. The only remaining deferred item is **work-cluster verification** (HPA-floor dynamics, NFS-mount behavior under a real provisioner), which is the purpose of `docs/validation.md` rather than this runbook.
 
-## Teardown
+## Resque layout validation checklist (issue #44)
+
+This section names the **exact live-cluster evidence** the issue #44 acceptance
+criteria demand. **Every row is `[REQUIRES LIVE CLUSTER]`** — the in-process
+tests prove the *operator's local behavior* (selector parsing, gauge plumbing,
+warning emission, validation method) but cannot prove the live Redis is actually
+writing `resque:workers` keys. A CI green run is NOT proof that the centralized
+constants match the live v3.11.0 layout. **Capture the evidence below on a kind
+cluster with `3.11.0` and a real running batch; attach to issue #44.**
+
+If any row produces evidence that contradicts the CI test, STOP and file a
+follow-up issue — the centralized constants are wrong or the live layout
+diverges from what the kind cluster reproduces.
+
+> **Notation.** `[CI: …]` = the test file:line that proves the same invariant
+> in CI (operator-local; cannot substitute for live evidence here). `[REQUIRES
+> LIVE CLUSTER]` = a human must observe and attach evidence from the kind
+> cluster with `3.11.0` and a real batch. The runbook is the human-readable
+> companion to the [issue #44 task graph](https://github.com/anchapin/openstudio-server-operator/issues/44).
+
+### R1 — Resque key layout matches centralized constants
+
+The constants live in `src/openstudio_operator/redis_client.py`:
+
+```
+WORKER_REGISTRY_KEY = "resque:workers"      # SET of registered worker ids
+def _heartbeat_key(worker_id: str) -> str:
+    return f"{WORKER_REGISTRY_KEY}:{worker_id}"   # heartbeat string, epoch float
+```
+
+If the live keys differ, edit those two constants — no other code needs to
+change. The validator + safeguard are wired to use the constants directly.
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| R1.1 | `kubectl -n openstudio-server exec deploy/redis -- redis-cli SCAN 0 MATCH 'resque:*' COUNT 100` returns at least the keys `resque:workers` (SET) and one or more `resque:workers:<worker_id>` (STRING) — Resque convention | `redis_client.py:27-30` (constant layout doc) | `[CI] tests/test_redis_client.py::test_validate_key_layout_passes_when_registry_and_heartbeats_present` (constant-shaped fakeredis, validator accepts) |
+| R1.2 | `kubectl -n openstudio-server exec deploy/redis -- redis-cli SMEMBERS resque:workers` returns at least one worker id when a batch is running | contract — `worker_heartbeats()` reads this set | `[CI] tests/test_redis_client.py::test_worker_heartbeats_returns_raw_epoch_floats` + `[REQUIRES LIVE CLUSTER]` kind with live batch |
+| R1.3 | `kubectl -n openstudio-server exec deploy/redis -- redis-cli GET resque:workers:<worker_id>` returns a unix-epoch float string (e.g. `1755521234.5678`) for each member of R1.2 — confirms heartbeat value format | contract — Resque stores `Time.now.to_f` as a string | `[CI] tests/test_redis_client.py::test_worker_heartbeats_returns_raw_epoch_floats` (string-float round-trip) + `[REQUIRES LIVE CLUSTER]` kind with live worker |
+| R1.4 | Operator's `validate_key_layout()` exits without raising when invoked against the live Redis at the operator's `redisUrl` (manual startup probe — one Python call, not wired into boot) | `redis_client.py:194-241` (`validate_key_layout`) | `[CI] tests/test_redis_client.py::test_validate_key_layout_passes_when_registry_and_heartbeats_present` and `::test_validate_key_layout_raises_when_no_resque_keys_present` (loud failure mode proven) + `[REQUIRES LIVE CLUSTER]` one-shot call against the live kind Redis |
+| R1.5 | The operator's `redisUrl` (CRD spec field) selects the SAME logical Redis DB the server writes to — verify with `redis-cli -u $REDIS_URL DBSIZE` matching `kubectl exec deploy/redis -- redis-cli DBSIZE` | `config.py:11` (`DEFAULT_REDIS_URL`); the CRD's `redisUrl` overrides | `[CI] tests/test_redis_client.py::test_credentials_come_only_from_redis_url` (URL parsing) + `[REQUIRES LIVE CLUSTER]` DB match check |
+
+### R2 — Leg-2 (stall condition "nobody is processing") is NON-VACUOUS
+
+The leg-2 safeguard emits one `ResqueKeyLayoutUnknown` Warning Event per process
+if the registry is empty for >60 s while a queue is non-empty AND no worker
+was ever observed. **Proves** the operator's Redis-side read path is reaching
+the same keys the workers write — i the the layout isn't secretly wrong.
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| R2.1 | With a batch running (Resque workers active), `kubectl -n openstudio-server port-forward <operator-pod> 9090:9090` then `curl -s localhost:9090/metrics \| grep openstudio_operator_resque_workers_seen_max` returns a value **>0** within 60 s of operator startup | `metrics.py:80-89` (Gauge); `web_background_monitor.py:303-307` (gauge update) | `[CI] tests/test_web_background_monitor.py::test_gauge_tracks_high_water_mark_of_workers_seen` (monotonic, gauge wiring) + `[REQUIRES LIVE CLUSTER]` live batch on kind |
+| R2.2 | NO `ResqueKeyLayoutUnknown` Warning Event on the CR during normal operation with live workers — proves the safeguard correctly clears the grace window when a worker is seen | `web_background_monitor.py:351-355` (grace reset) | `[CI] tests/test_web_background_monitor.py::test_warning_does_not_fire_when_heartbeats_ever_observed` (grace-reset semantics) |
+| R2.3 | `kubectl get events -n openstudio-server --field-selector reason=ResqueKeyLayoutUnknown` shows the warning only if R2.1 stayed at 0 for >60 s under load — proves the operator LOUDLY surfaces layout divergence | `web_background_monitor.py:120-122` (event name); `web_background_monitor.py:367-369` (one-shot emit) | `[CI] tests/test_web_background_monitor.py::test_empty_registry_with_no_prior_heartbeats_warns_once_after_grace` (one-shot emission) |
+| R2.4 | **Negative control:** with workers stopped (kill the worker Deployment), the gauge STAYS at its last observed value (monotonic) — proves the gauge is high-water-mark, not current | `web_background_monitor.py:307` (only-ever-increment) | `[CI] tests/test_web_background_monitor.py::test_gauge_tracks_high_water_mark_of_workers_seen` (monotonic assertion) + `[REQUIRES LIVE CLUSTER]` killed-worker on kind |
+
+### R3 — Worker Deployment selector honors both `matchLabels` and `matchExpressions`
+
+The operator's pod discovery helper now translates both shapes into the
+Kubernetes label-selector grammar. **Proves** the gap fix end-to-end: a
+`matchExpressions`-only selector doesn't silently broaden the pod set.
+
+| # | Evidence | Source | CI counterpart |
+|---|---------|--------|----------------|
+| R3.1 | `kubectl get deploy worker -n openstudio-server -o jsonpath='{.spec.selector}'` returns `{"matchLabels":{"app":"worker"}}` for the kind manifest (`scripts/manifests/06-worker.yaml:27-29`) — confirms selector shape is matchLabels in the local recipe | `scripts/manifests/06-worker.yaml:27-29` | `[CI] tests/test_analysis_sla.py::test_deployment_label_selector_match_labels_only` |
+| R3.2 | The same command against the **NatLabRockies helm chart `develop` template** (clone https://github.com/NREL/openstudio-server-helm, look in `templates/worker.yaml` or equivalent) returns the chart's selector shape — `matchLabels` AND/OR `matchExpressions`. Attach the JSONPath output to the issue | not reproducible on kind | `[REQUIRES LIVE CLUSTER]` only — kind manifest is `matchLabels`-only by design; the chart may use either |
+| R3.3 | (Conditional on R3.2 showing matchExpressions) An end-to-end escalation test on the kind cluster: induce an anchored `started` analysis past grace, observe the surgical pod-delete targets the correct worker pod and ONLY that pod — proves the operator's selector reaches the worker fleet in practice | `analysis_sla.py:336-393` (selector + matching + delete) | `[CI] tests/test_analysis_sla.py::test_escalation_with_match_expressions_only_selector_finds_worker_pods` and `::test_escalation_matchlabels_and_matchexpressions_intersection_pods` (helper-level proof) + `[REQUIRES LIVE CLUSTER]` live escalation on kind |
+
+### Capture-and-attach checklist (for the human running this)
+
+For each `[REQUIRES LIVE CLUSTER]` row above, attach EVIDENCE to issue #44:
+
+- **R1.1–R1.5 (Redis layout):** the `redis-cli` output (paste plain; redact
+  passwords). If the keys are *not* `resque:workers` / `resque:workers:<id>`,
+  copy the observed layout into the issue — that's the input for editing
+  `redis_client.py` constants.
+- **R2.1–R2.4 (Leg-2 safeguard):** a `curl -s localhost:9090/metrics | grep
+  openstudio_operator_resque_workers_seen_max` snippet and a `kubectl get
+  events --field-selector reason=ResqueKeyLayoutUnknown -o yaml` snippet
+  (empty if the safeguard correctly cleared).
+- **R3.1–R3.3 (selector shape):** the `kubectl get deploy ... -o jsonpath`
+  output for both the kind manifest and the chart template.
+
+If a row produces evidence that *contradicts* the CI test (e.g. the gauge is 0
+despite workers actively heartbeating — meaning the operator is reading the
+wrong Redis DB or the wrong key prefix), STOP and file a follow-up issue with
+the evidence. The validator (`validate_key_layout`) is the fastest diagnostic —
+run it against the live Redis and attach its output.
 
 ```bash
 scripts/teardown-kind-env.sh   # deletes the whole cluster (mongo/redis/NFS stand-in data die with it)
