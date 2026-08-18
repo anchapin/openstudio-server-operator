@@ -61,6 +61,13 @@ STORAGE_FREED_BYTES = Counter(
     "NFS bytes reclaimed after archival/pruning",
 )
 
+HPA_FLOOR_ADJUSTMENTS_TOTAL = Counter(
+    "openstudio_operator_hpa_floor_adjustments_total",
+    "worker-hpa minReplicas adjustments issued by the HPA-floor adjuster "
+    "(raises and decays; incremented by #18; counts decisions — dry-run ticks "
+    "increment too, matching SOFT_STOPS_TOTAL)",
+)
+
 DEFAULT_METRICS_PORT = 9090
 
 _start_lock = threading.Lock()

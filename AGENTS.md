@@ -33,7 +33,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 
 ## Layout
 
-- `src/openstudio_operator/handlers/` — one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `storage_pruner`, `web_background_monitor`
+- `src/openstudio_operator/handlers/` — one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `storage_pruner`, `web_background_monitor`, `hpa_floor`
 - `src/openstudio_operator/config.py` — CRD spec → typed settings (defaults must stay in sync with `deploy/crd.yaml`)
 - `src/openstudio_operator/openstudio_client.py` — OpenStudio REST client
 - `src/openstudio_operator/archival.py` — pure rclone archival Job manifest generator (backend-agnostic s3|gcs|azure, envFrom-only creds, verified-upload gate via `rclone check`; orchestration lives in `storage_pruner`, #16)

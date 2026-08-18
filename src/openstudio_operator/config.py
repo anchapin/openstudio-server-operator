@@ -111,3 +111,78 @@ class OperatorConfig:
                 purge_completed_nfs_files=storage.get("purgeCompletedNFSFiles", True),
             ),
         )
+
+
+# --- HPA-floor adjuster (plan Phase 4, issue #18, decision D10) ----------------
+#
+# D10: no KEDA, no chart fork — the adjuster patches only the chart's
+# existing CPU HPA ``worker-hpa`` ``spec.minReplicas`` from Redis backlog
+# (the chart's HPA is unconditional; two autoscalers on one Deployment
+# would fight). These are wiring defaults, NOT CRD fields — the v1alpha1
+# schema is fixed (#4); CRD fields are a follow-up if tuning demands (same
+# convention as DEFAULT_REDIS_URL / DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS).
+#
+# ``DEFAULT_HPA_BASELINE_MIN_REPLICAS`` matches the kind-cluster manifest
+# (#19, scripts/manifests/06-worker.yaml ``minReplicas: 1``); production
+# chart baseline is 2 — tune here when moving off kind. Chart production
+# HPA bounds are 2–20, so the deepest default floor (10) stays inside them;
+# the handler additionally never raises a floor above the HPA's own
+# maxReplicas (read-only respect — maxReplicas is never patched).
+#
+# Tier semantics: a backlog (simulations + requeued depths, summed) at or
+# above a tier's threshold maps to that tier's floor; below every tier maps
+# to the baseline. Highest matching tier wins.
+
+#: Floor when the backlog matches no tier — also the decay target on clear.
+DEFAULT_HPA_BASELINE_MIN_REPLICAS = 1
+
+#: Minimum time between ANY two adjustments (anti-flap), seconds.
+DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS = 300.0
+
+#: (backlog_threshold, min_replicas) tiers, descending by threshold.
+DEFAULT_HPA_FLOOR_TIERS: tuple[tuple[int, int], ...] = (
+    (500, 10),
+    (250, 8),
+    (120, 6),
+    (60, 4),
+    (25, 3),
+    (10, 2),
+)
+
+
+@dataclass(frozen=True)
+class HpaFloorPolicy:
+    """Backlog-to-floor mapping table plus baseline and cooldown (issue #18).
+
+    Pure policy, held at module level as ``DEFAULT_HPA_FLOOR_POLICY`` so the
+    handler contains no mapping numbers of its own (AGENTS.md: policy is
+    configuration). ``floor_for`` is the single blessed lookup.
+    """
+
+    tiers: tuple[tuple[int, int], ...] = DEFAULT_HPA_FLOOR_TIERS
+    baseline_min_replicas: int = DEFAULT_HPA_BASELINE_MIN_REPLICAS
+    cooldown_seconds: float = DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS
+
+    def __post_init__(self) -> None:
+        thresholds = [threshold for threshold, _ in self.tiers]
+        if len(set(thresholds)) != len(thresholds):
+            raise ValueError(f"duplicate tier thresholds in {self.tiers}")
+        for threshold, min_replicas in self.tiers:
+            if threshold < 1:
+                raise ValueError(f"tier threshold {threshold} must be >= 1")
+            if min_replicas < 1:
+                raise ValueError(f"tier min_replicas {min_replicas} must be >= 1")
+        if self.baseline_min_replicas < 1:
+            raise ValueError(f"baseline {self.baseline_min_replicas} must be >= 1")
+        if self.cooldown_seconds <= 0:
+            raise ValueError(f"cooldown {self.cooldown_seconds} must be > 0")
+
+    def floor_for(self, backlog: int) -> int:
+        """Floor for a backlog: highest tier whose threshold it meets, else baseline."""
+        for threshold, min_replicas in sorted(self.tiers, reverse=True):
+            if backlog >= threshold:
+                return min_replicas
+        return self.baseline_min_replicas
+
+
+DEFAULT_HPA_FLOOR_POLICY = HpaFloorPolicy()

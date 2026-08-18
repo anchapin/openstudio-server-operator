@@ -13,7 +13,11 @@ A Kubernetes operator that automates day-2 operations for [OpenStudio Server](ht
 | Worker recycler | 2 | Rolling-restart the worker Deployment after analyses / on interval |
 | web_background watchdog | 2 | Detect Resque queue stalls; restart the `web_background` Deployment |
 | Storage archiver & NFS pruner | 3 | Ephemeral Jobs on the NFS PV archive results to S3/GCS, then prune |
-| KEDA autoscaling + `/metrics` | 4 | Scale workers on queue depth; expose operator Prometheus metrics |
+| HPA-floor adjuster + `/metrics` | 4 | Raise the chart `worker-hpa` `minReplicas` floor from Redis backlog; expose operator Prometheus metrics |
+
+### Autoscaling approach (D10)
+
+The operator deliberately does **not** deploy KEDA (or any second autoscaler): the helm chart ships an unconditional CPU-based HPA (`worker-hpa`), and two autoscalers fighting over one Deployment oscillate. Instead, the Phase-4 HPA-floor adjuster reads the Resque backlog (`simulations` + `requeued` depths, summed, read-only via Redis), maps it through a tiered policy table in `config.py`, and patches **only** `worker-hpa` `spec.minReplicas` — raising the floor when the backlog is deep, decaying to the baseline floor when it clears — behind a cooldown that prevents flapping and under `spec.dryRun` gating. KEDA remains the documented **future migration path**: a `ScaledObject` driving the `worker` Deployment from the same Redis list-length trigger would replace this adjuster entirely and is the preferred design if the chart ever makes its HPA conditional.
 
 ## Repository layout
 
