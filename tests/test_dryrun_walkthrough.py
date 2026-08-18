@@ -683,7 +683,7 @@ def test_dryrun_archival_delete_is_strict_suppression():
         )
         return batch, events, result, api
 
-    batch_dry, events_dry, result_dry, api_dry = run_one(spec_dry)
+    _batch_dry, events_dry, result_dry, api_dry = run_one(spec_dry)
     assert calls_to(f"/analyses/{analysis_id}") == 0
     assert result_dry.verified == [analysis_id]
     assert result_dry.deleted == []
@@ -696,7 +696,7 @@ def test_dryrun_archival_delete_is_strict_suppression():
     # Verified record STAYS persisted (delete was suppressed).
     assert api_dry.obj["status"]["archivedAnalyses"][analysis_id]["verifiedAt"] == NOW.isoformat()
 
-    batch_real, events_real, result_real, api_real = run_one(spec_real)
+    _batch_real, events_real, result_real, api_real = run_one(spec_real)
     assert calls_to(f"/analyses/{analysis_id}") == 1
     assert result_real.verified == [analysis_id]
     assert result_real.deleted == [analysis_id]
@@ -778,7 +778,7 @@ def _seed_stall(api: FakeCO, *, spec: dict, tracker: StallWindowTracker) -> None
     store = StatusStore(NAMESPACE, NAME, api)
     cfg = OperatorConfig.from_spec(spec)
     for offset in (0, 5):
-        events, emit = make_emit()
+        _events, emit = make_emit()
         run_stall_tick(
             _stall_redis(NOW + timedelta(minutes=offset)),
             store,
