@@ -30,6 +30,10 @@ spec:
             - openstudio-server
           # Server URL comes from the CR spec.serverUrl (config.py) — single
           # config path; no OPENSTUDIO_SERVER_URL env fallback.
+          ports:
+            - name: metrics
+              containerPort: 9090 # conventional Prometheus port; keep in sync with
+              # metrics.DEFAULT_METRICS_PORT (issue #17)
           resources:
             requests:
               cpu: 100m
