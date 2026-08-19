@@ -269,9 +269,16 @@ def test_install_singleton_guard_emits_warning_on_missing_internals(
 EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS: frozenset[str] = frozenset(
     {
         "_redis_key_layout_check",
-        "_drain_redis_key_layout_queue",
     }
 )
+
+
+# After #234 the three module-level drain handlers collapsed into one
+# ``@kopf.on.event`` wrapper (``_drain_queued_warning_events``) that
+# delegates to the shared ``QueuedKopfEventSink``. The drain handler is
+# asserted separately by the consolidated CI gate in
+# ``tests/test_events_sinks.py::test_consolidated_drain_handler_is_registered``.
+_EXPECTED_DRAIN_HANDLER_ID: str = "_drain_queued_warning_events"
 
 
 def _watching_handlers_list(registry: kopf.OperatorRegistry) -> list[object]:
@@ -342,7 +349,7 @@ def test_redis_key_layout_handler_is_registered_at_boot() -> None:
     extra = {
         rid
         for rid in registered_ids
-        if rid.startswith("_redis_key_layout") or rid == "_drain_redis_key_layout_queue"
+        if rid.startswith("_redis_key_layout")
     } - EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS
     assert not extra, (
         f"New Redis-key-layout handler(s) registered but not declared in "

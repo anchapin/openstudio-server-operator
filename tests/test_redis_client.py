@@ -588,7 +588,8 @@ def test_redis_key_layout_check_emits_degraded_log_line(
     points at a Redis with a different prefix entirely. The check must
     emit ``redis_key_layout=degraded`` at WARNING level AND queue a
     ``RedisKeyLayoutDrift`` Warning Event for the next OSCM watch tick
-    (drained by ``_drain_redis_key_layout_queue``). Both invariants are
+    (drained by the consolidated ``_drain_queued_warning_events`` after #234).
+    Both invariants are
     load-bearing: the log line is the operator's alert signal, the
     Warning Event is the user-facing Kubernetes signal.
     """
@@ -600,8 +601,9 @@ def test_redis_key_layout_check_emits_degraded_log_line(
         "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
     }
 
-    # Clear the queue from any prior test in this session.
-    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.clear()
+    # Clear the queue from any prior test in this session (#234 — the
+    # three module-level queues collapsed into one QueuedKopfEventSink).
+    handlers_pkg._sink.clear()
 
     with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
         status = _check_redis_key_layout_for_cr(
@@ -620,9 +622,9 @@ def test_redis_key_layout_check_emits_degraded_log_line(
     assert "namespace=test-ns" in caplog.text
     assert "name=test-osc" in caplog.text
 
-    # Warning Event queued for the next OSCM watch tick (#163).
+    # Warning Event queued for the next OSCM watch tick (#163, #234).
     pending = [
-        msg for msg in handlers_pkg._REDIS_KEY_LAYOUT_QUEUE
+        msg for msg in handlers_pkg._sink.queued
         if msg[0] == "test-ns" and msg[1] == "test-osc"
     ]
     assert len(pending) == 1, (
@@ -681,7 +683,7 @@ def test_redis_key_layout_check_emits_unreachable_log_line(
         "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
     }
 
-    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.clear()
+    handlers_pkg._sink.clear()
 
     with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
         # MUST NOT raise — this is the "operator continues to boot" invariant.
@@ -702,7 +704,7 @@ def test_redis_key_layout_check_emits_unreachable_log_line(
     # drifted; we just couldn't reach the server. Alerting on this would
     # produce noise during outages unrelated to the queue fabric.
     pending = [
-        msg for msg in handlers_pkg._REDIS_KEY_LAYOUT_QUEUE
+        msg for msg in handlers_pkg._sink.queued
         if msg[0] == "test-ns" and msg[1] == "test-osc"
     ]
     assert not pending, (
@@ -767,19 +769,26 @@ def test_redis_key_layout_check_skips_nameless_item(
     )
 
 
-def test_drain_redis_key_layout_queue_emits_event_then_clears(
+def test_consolidated_drain_handler_emits_redis_key_layout_drift_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The drain handler emits the queued Warning Event and clears the queue.
+    """The consolidated drain handler emits the queued Warning Event and clears the queue.
 
-    Mirrors the existing pattern for ``_drain_redis_warning_queue`` and
-    ``_drain_status_map_cap_queue``: the queue is fully drained per
-    matching CR and an empty queue is a no-op. Wiring regression here
-    means the Warning Event is silently dropped — the user-facing
-    Kubernetes signal is lost.
+    After #234 the three module-level queues + drain handlers collapsed
+    into :class:`openstudio_operator.events_sinks.QueuedKopfEventSink`;
+    the drain handler is now a single ``@kopf.on.event`` wrapper that
+    delegates to :meth:`QueuedKopfEventSink.flush_for`. This test pins
+    the invariant that the drain still produces a single ``kopf.event``
+    call per queued entry and an empty queue is a no-op. Wiring
+    regression here means the Warning Event is silently dropped — the
+    user-facing Kubernetes signal is lost.
     """
-    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.append(
-        ("test-ns", "test-osc", "RedisKeyLayoutDrift", "drift detected")
+    import openstudio_operator.events_sinks as sinks_module
+
+    handlers_pkg._sink.clear()
+    handlers_pkg._sink.defer_to_next_tick(
+        namespace="test-ns", name="test-osc",
+        reason="RedisKeyLayoutDrift", message="drift detected",
     )
 
     emitted: list[dict] = []
@@ -787,11 +796,9 @@ def test_drain_redis_key_layout_queue_emits_event_then_clears(
     def _fake_event(*args, **kwargs):
         emitted.append({"args": args, "kwargs": kwargs})
 
-    monkeypatch.setattr(handlers_pkg.kopf, "event", _fake_event)
+    monkeypatch.setattr(sinks_module.kopf, "event", _fake_event)
 
-    handlers_pkg._drain_redis_key_layout_queue(
-        name="test-osc", namespace="test-ns"
-    )
+    handlers_pkg._sink.flush_for(namespace="test-ns", name="test-osc")
 
     assert len(emitted) == 1, (
         f"Expected exactly one kopf.event call; got {len(emitted)}. "
@@ -801,15 +808,13 @@ def test_drain_redis_key_layout_queue_emits_event_then_clears(
     assert event["kwargs"]["type"] == "Warning"
     assert event["kwargs"]["reason"] == "RedisKeyLayoutDrift"
     assert event["kwargs"]["message"] == "drift detected"
-    assert not handlers_pkg._REDIS_KEY_LAYOUT_QUEUE, (
+    assert handlers_pkg._sink.queued == [], (
         f"Queue was not cleared after drain; still has "
-        f"{handlers_pkg._REDIS_KEY_LAYOUT_QUEUE!r}. See issue #163."
+        f"{handlers_pkg._sink.queued!r}. See issue #163 / #234."
     )
 
     # Subsequent drain is a no-op.
-    handlers_pkg._drain_redis_key_layout_queue(
-        name="test-osc", namespace="test-ns"
-    )
+    handlers_pkg._sink.flush_for(namespace="test-ns", name="test-osc")
     assert len(emitted) == 1, (
         f"Second drain emitted another event: {emitted!r}. See issue #163 — "
         f"the drain must be idempotent."
