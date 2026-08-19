@@ -1,0 +1,124 @@
+# Storage-prune CronJob (issue #78) — the retention pipeline as a native Job
+# primitive, out of the operator core process.
+#
+# What runs here: `python -m openstudio_operator.prune_entrypoint` — ONE
+# `openstudio_operator.retention.run_retention_tick` against the OLDEST OSCM
+# CR (D05), honoring that CR's `spec.dryRun` (D11) and anchoring all state in
+# its `.status.archivedAnalyses` (D04). The pipeline ordering is unchanged:
+# retention eligibility → verified archival (`rclone check` gate) →
+# `DELETE /analyses/{id}` (server-side NFS cascade). This is deliberately NOT
+# a disk-watermark deleter — see docs/architecture-plan.md Module 4.
+#
+# Schedule: */10 matches the 600 s cadence of the operator timer this
+# replaces. The schedule is a property of this manifest (kubectl edit here),
+# not a CRD field — nothing in the operator reads it (config purity).
+#
+# Image: reuses the operator image (published on every develop push); the
+# entrypoint ships inside the package. Versioned releases publish v* tags.
+#
+# RBAC: the ServiceAccount below holds ONLY what one tick needs — no
+# Deployments/Pods/HPA/Secrets access, no NFS mounts (the archival Jobs it
+# spawns carry their own envFrom creds and PVC mounts). The operator's Role
+# (deploy/rbac.yaml) lost its entire batch/jobs rule in exchange (#78).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openstudio-storage-pruner-sa
+  namespace: openstudio-server
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openstudio-storage-pruner-role
+  namespace: openstudio-server
+rules:
+  # Resolve the active (oldest) OSCM CR — D05, same rule as the operator guard
+  - apiGroups: ["energy.nrel.gov"]
+    resources: ["openstudioclustermanagers"]
+    verbs: ["list"]
+  # StatusStore read-modify-write on .status.archivedAnalyses (D04 anchors)
+  - apiGroups: ["energy.nrel.gov"]
+    resources: ["openstudioclustermanagers/status"]
+    verbs: ["get", "patch"]
+  # Archival Job spawn (create), watch-by-deterministic-name (get) and
+  # failed-Job cleanup (delete) — the same verbs the operator Role used to hold
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "create", "delete"]
+  # Dry-run markers + archival lifecycle Events on the CR (D11 observability)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openstudio-storage-pruner-rb
+  namespace: openstudio-server
+subjects:
+  - kind: ServiceAccount
+    name: openstudio-storage-pruner-sa
+    namespace: openstudio-server
+roleRef:
+  kind: Role
+  name: openstudio-storage-pruner-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openstudio-storage-pruner
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: storage-pruner
+spec:
+  schedule: "*/10 * * * *"
+  # Single-flight: never two concurrent ticks (the deterministic Job names,
+  # 409-conflict spawn and 409-retried status RMW already make overlap safe,
+  # but Forbid keeps every run's observable history clean).
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # The entrypoint already implements skip-and-retry-next-schedule (D12);
+      # in-place pod retries add nothing.
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/managed-by: openstudio-operator
+            app.kubernetes.io/component: storage-pruner
+        spec:
+          serviceAccountName: openstudio-storage-pruner-sa
+          restartPolicy: Never
+          containers:
+            - name: prune
+              image: ghcr.io/anchapin/openstudio-server-operator:dev
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "openstudio_operator.prune_entrypoint"]
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

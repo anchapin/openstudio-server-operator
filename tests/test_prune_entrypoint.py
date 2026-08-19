@@ -1,0 +1,330 @@
+"""Tests for the prune-CronJob entrypoint (issue #78).
+
+Covers the wiring around :func:`openstudio_operator.retention.run_retention_tick`:
+D05 oldest-CR resolution, idle exits, the D11 dryRun gate flowing from the
+ACTIVE CR's spec through the entrypoint into the tick, K8s Event emission
+parity (the operator's ``kopf.event`` equivalent), and the D12 skip-tick
+exit-code posture. The tick logic itself is covered by test_retention.py.
+"""
+
+import copy
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+import responses
+from kubernetes.client import ApiException
+
+from openstudio_operator.archival import archival_job_name
+from openstudio_operator.openstudio_client import OpenStudioClient
+from openstudio_operator.prune_entrypoint import (
+    EVENT_SOURCE_COMPONENT,
+    main,
+)
+from openstudio_operator.status_store import StatusStore
+
+BASE = "http://web.test"
+NAMESPACE = "openstudio-server"
+NAME = "oscm"
+NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC)
+
+STORAGE = {
+    "archiveToS3": True,
+    "backend": "s3",
+    "bucket": "os-archives",
+    "secretRef": "archive-creds",
+    "retentionDays": 7,
+    "purgeCompletedNFSFiles": True,
+}
+
+
+def make_cr(
+    name: str = NAME,
+    *,
+    created_days_ago: float = 10.0,
+    spec: dict | None = None,
+    status: dict | None = None,
+) -> dict:
+    return {
+        "apiVersion": "energy.nrel.gov/v1alpha1",
+        "kind": "OpenStudioClusterManager",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "uid": f"uid-{name}",
+            "creationTimestamp": (NOW - timedelta(days=created_days_ago)).isoformat().replace(
+                "+00:00", "Z"
+            ),
+        },
+        "spec": copy.deepcopy(spec if spec is not None else {"serverUrl": BASE}),
+        "status": copy.deepcopy(status if status is not None else {}),
+    }
+
+
+def completed_doc(analysis_id: str, *, age_days: float = 10.0) -> dict:
+    return {
+        "_id": analysis_id,
+        "status": "completed",
+        "created_at": (NOW - timedelta(days=age_days + 20)).isoformat(),
+        "updated_at": (NOW - timedelta(days=age_days)).isoformat(),
+    }
+
+
+class FakeCustomObjectsApi:
+    """CR list + status get/patch with RFC 7386 merge-patch (list is what the
+    entrypoint adds over test_retention.py's fake — singleton resolution)."""
+
+    def __init__(self, crs: list[dict], active: dict) -> None:
+        self.crs = crs
+        self.obj = copy.deepcopy(active)  # the CR the StatusStore reads/writes
+        self.patch_calls = 0
+
+    def list_namespaced_custom_object(self, group, version, namespace, plural, **_kw):
+        return {"items": copy.deepcopy(self.crs)}
+
+    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
+        return copy.deepcopy(self.obj)
+
+    def patch_namespaced_custom_object_status(
+        self, group, version, namespace, plural, name, body, _content_type=None
+    ):
+        import copy
+
+        self.patch_calls += 1
+        _merge_patch(self.obj, body)
+        return copy.deepcopy(self.obj)
+
+
+def _merge_patch(target: dict, patch: dict) -> None:
+    for key, value in patch.items():
+        if value is None:
+            target.pop(key, None)
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_patch(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+class FakeCoreV1Api:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def create_namespaced_event(self, namespace, body, **_kw):
+        self.events.append({"namespace": namespace, "body": body})
+        return body
+
+
+class FakeBatchV1Api:
+    def __init__(self, jobs: list | None = None) -> None:
+        self.jobs = {j.metadata.name: j for j in (jobs or [])}
+        self.creates: list[dict] = []
+        self.deletes: list[dict] = []
+
+    def read_namespaced_job(self, name, namespace, **_kw):
+        if name not in self.jobs:
+            raise ApiException(status=404, reason="Not Found")
+        return self.jobs[name]
+
+    def create_namespaced_job(self, namespace, body, **_kw):
+        name = body["metadata"]["name"]
+        if name in self.jobs:
+            raise ApiException(status=409, reason="Conflict")
+        self.jobs[name] = SimpleNamespace(metadata=SimpleNamespace(name=name))
+        self.creates.append({"namespace": namespace, "body": body})
+        return self.jobs[name]
+
+    def delete_namespaced_job(self, name, namespace, **_kw):
+        self.deletes.append({"name": name, "namespace": namespace})
+        self.jobs.pop(name, None)
+        return {}
+
+
+def run_main(custom_api, *, spec=None, batch=None, now=NOW):
+    batch = batch if batch is not None else FakeBatchV1Api()
+    core = FakeCoreV1Api()
+    code = main(
+        NAMESPACE,
+        custom_api=custom_api,
+        batch_api=batch,
+        core_api=core,
+        client_factory=lambda url: OpenStudioClient(BASE, backoff_base_seconds=0.0),
+        now=now,
+    )
+    return code, batch, core
+
+
+# --- D05: which CR is served ------------------------------------------------------
+
+
+def test_zero_crs_idle_exit_zero():
+    code, batch, core = run_main(FakeCustomObjectsApi([], make_cr()))
+    assert code == 0
+    assert batch.creates == [] and core.events == []
+
+
+@responses.activate
+def test_oldest_cr_is_served_not_the_newest():
+    """D05 in the entrypoint: the OLDEST CR's spec drives the tick — the
+    newer CR's different bucket is never honored."""
+    old_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "bucket": "old-bucket"}}
+    new_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "bucket": "new-bucket"}}
+    crs = [
+        make_cr("old-cr", created_days_ago=30, spec=old_spec),
+        make_cr("new-cr", created_days_ago=1, spec=new_spec),
+    ]
+    responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
+    responses.get(f"{BASE}/data_points.json", json=[])
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, batch, _core = run_main(api, spec=old_spec)
+
+    assert code == 0 and len(batch.creates) == 1
+    script = batch.creates[0]["body"]["spec"]["template"]["spec"]["containers"][0]["command"][2]
+    assert "old-bucket" in script and "new-bucket" not in script
+    store = StatusStore(NAMESPACE, "old-cr", api)
+    assert "a1" in store.get_archived_analyses()  # anchors on the ACTIVE CR
+
+
+def test_empty_server_url_idles():
+    crs = [make_cr(spec={"serverUrl": ""})]
+    code, batch, core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+    assert code == 0
+    assert batch.creates == [] and core.events == []
+
+
+def test_missing_namespace_is_a_wiring_error(monkeypatch):
+    monkeypatch.delenv("POD_NAMESPACE", raising=False)
+    assert main(None, custom_api=FakeCustomObjectsApi([], make_cr())) == 2
+
+
+# --- D11: the dryRun gate flows from the ACTIVE CR spec ---------------------------
+
+
+@responses.activate
+def test_dry_run_suppresses_job_spawn_and_deletes_but_records_events():
+    dry_spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE), "dryRun": True}
+    crs = [make_cr(spec=dry_spec)]
+    responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
+    responses.get(f"{BASE}/data_points.json", json=[])
+    responses.delete(f"{BASE}/analyses/a1", status=204)
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, batch, core = run_main(api)
+
+    assert code == 0
+    assert batch.creates == [] and batch.deletes == []  # mutation suppressed
+    assert calls_to("/analyses/a1") == 0
+    # The dry-run marker Event lands on the CR via CoreV1, marked as the
+    # prune CronJob source — the kopf.event parity.
+    assert len(core.events) == 1
+    body = core.events[0]["body"]
+    assert body["type"] == "Normal" and body["reason"] == "AnalysisArchivalStarted"
+    assert "suppressed (spec.dryRun)" in body["message"]
+    assert body["source"] == {"component": EVENT_SOURCE_COMPONENT}
+    assert body["involvedObject"]["name"] == NAME
+    # D04 anchor still written (dry-run marker, no jobName).
+    store = StatusStore(NAMESPACE, NAME, api)
+    record = store.get_archived_analysis("a1")
+    assert record is not None and record.job_name is None
+
+
+@responses.activate
+def test_real_run_spawns_the_archival_job():
+    spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE)}
+    crs = [make_cr(spec=spec)]
+    responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
+    responses.get(f"{BASE}/data_points.json", json=[])
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, batch, core = run_main(api)
+
+    assert code == 0
+    assert len(batch.creates) == 1
+    assert batch.creates[0]["body"]["metadata"]["name"] == archival_job_name("a1")
+    assert core.events[0]["body"]["reason"] == "AnalysisArchivalStarted"
+    assert "suppressed" not in core.events[0]["body"]["message"]
+
+
+# --- D12: skip-tick posture ---------------------------------------------------------
+
+
+@responses.activate
+def test_transient_api_failure_exits_zero_and_retries_next_schedule():
+    spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE)}
+    crs = [make_cr(spec=spec)]
+    responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, batch, core = run_main(api)
+
+    assert code == 0  # skip-tick parity: the next schedule is the retry
+    assert batch.creates == [] and core.events == []
+
+
+@responses.activate
+def test_invalid_storage_policy_exits_zero():
+    bad_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "backend": "ftp"}}
+    crs = [make_cr(spec=bad_spec)]
+    responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, batch, _ = run_main(api)
+
+    assert code == 0
+    assert batch.creates == []
+
+
+def test_cr_list_failure_exits_zero():
+    class FailingApi:
+        def list_namespaced_custom_object(self, *a, **kw):
+            raise ApiException(status=503, reason="Service Unavailable")
+
+    code, batch, core = run_main(FailingApi())
+    assert code == 0
+    assert batch.creates == [] and core.events == []
+
+
+def calls_to(suffix: str) -> int:
+    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
+
+
+def test_event_names_are_unique_per_emission():
+    """client-go convention: repeated reasons never 409 on a live cluster."""
+    from openstudio_operator.prune_entrypoint import build_event_emitter
+
+    core = FakeCoreV1Api()
+    emit = build_event_emitter(core, make_cr(), NAMESPACE)
+    emit("Normal", "AnalysisArchivalStarted", "one")
+    emit("Normal", "AnalysisArchivalStarted", "two")
+    names = [e["body"]["metadata"]["name"] for e in core.events]
+    assert len(set(names)) == 2
+    assert all(n.startswith(f"{NAME}.analysisarchivalstarted.") for n in names)
+
+
+def test_event_emission_failure_never_aborts_the_tick():
+    from openstudio_operator.prune_entrypoint import build_event_emitter
+
+    class FailingCore:
+        def create_namespaced_event(self, namespace, body, **_kw):
+            raise ApiException(status=403, reason="Forbidden")
+
+    emit = build_event_emitter(FailingCore(), make_cr(), NAMESPACE)
+    emit("Normal", "AnalysisArchivalStarted", "message")  # must not raise
+
+
+@pytest.mark.parametrize(
+    "backend", ["s3", "gcs", "azure"]
+)
+def test_entrypoint_serves_every_cloud_backend_spec(backend):
+    """The entrypoint is backend-agnostic: any CRD enum backend wires through."""
+    spec = {
+        "serverUrl": BASE,
+        "storagePolicy": {**STORAGE, "backend": backend, "bucket": f"bucket-{backend}"},
+    }
+    crs = [make_cr(spec=spec)]
+    with responses.RequestsMock() as rsps:
+        rsps.get(f"{BASE}/analyses.json", json=[])
+        api = FakeCustomObjectsApi(crs, crs[0])
+        code, _batch, _ = run_main(api)
+
+    assert code == 0  # empty analyses: nothing due, clean exit per backend

@@ -55,11 +55,6 @@ from openstudio_operator.handlers.hpa_floor import (
     HpaFloorState,
     run_hpa_floor_tick,
 )
-from openstudio_operator.handlers.storage_pruner import (
-    ANALYSIS_ARCHIVAL_STARTED_EVENT,
-    ANALYSIS_DELETED_EVENT,
-    run_retention_tick,
-)
 from openstudio_operator.handlers.web_background_monitor import (
     WEB_BACKGROUND_RESTARTED_EVENT,
     StallWindowTracker,
@@ -72,6 +67,11 @@ from openstudio_operator.handlers.worker_recycler import (
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.redis_client import SIMULATIONS_QUEUE, ReadOnlyRedisClient
+from openstudio_operator.retention import (
+    ANALYSIS_ARCHIVAL_STARTED_EVENT,
+    ANALYSIS_DELETED_EVENT,
+    run_retention_tick,
+)
 from openstudio_operator.status_store import (
     MERGE_PATCH_CONTENT_TYPE,
     StatusStore,
@@ -532,7 +532,7 @@ def test_dryrun_worker_recycle_is_strict_suppression():
     assert metric("openstudio_operator_workers_recycled_total") - cos_before == 2
 
 
-# --- Module 4: archival + storage pruner ---------------------------------------
+# --- Module 4: retention pipeline (runs in the storage-prune CronJob, #78) -----
 
 STORAGE = {
     "archiveToS3": True,

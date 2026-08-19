@@ -163,12 +163,28 @@ spec:
 
 ### **Module 4: Artifact Archiver & NFS Storage Pruner**
 
-* **Goal:** Prevent shared NFS storage (PV) from running out of disk space.  
-* **Logic Flow:**  
-  1. Upon analysis completion:  
-     * Spawn an ephemeral K8s Job mounted to the NFS PV.  
-     * Job streams analysis.zip and structured CSV/JSON results to Amazon S3 or Google Cloud Storage bucket.  
-     * On upload success verification, trigger DELETE /analyses/{id} REST call or delete raw datapoint folders on NFS.
+* **Goal:** Prevent shared NFS storage (PV) from running out of disk space — **without** the operator core process holding any storage polling loop or batch-Job credentials (issue #78 moved the pipeline to native Job primitives).
+* **Architecture (#78):** the retention pipeline runs in a namespaced **CronJob** (`deploy/storage-cronjob.yaml`, `openstudio-storage-pruner`, schedule `*/10 * * * *` — the same 600 s cadence the in-operator timer had) whose container runs `python -m openstudio_operator.prune_entrypoint` from the operator image. One CronJob run = one `run_retention_tick` (library code in `src/openstudio_operator/retention.py`) against the **oldest** OSCM CR (D05), honoring that CR's `spec.dryRun` (D11) and anchoring all state in its `.status.archivedAnalyses` (D04). The operator's only remaining poll loop is the Module 1 SLA watch, which doubles as the completion observer — the server offers no push, so *some* observer must poll; storage completions are now observed by the scheduled prune tick instead.
+* **Logic Flow (ordering unchanged from #16 — this is the invariant):**
+  1. Retention eligibility: analysis `status == "completed"` for ≥ `storagePolicy.retentionDays` (clock = the doc's `updated_at`, falling back to `created_at`; neither usable ⇒ never eligible).
+  2. Spawn an ephemeral K8s Job (the unchanged #15 generator, `archival.py`) mounted to the NFS PV read-only; it streams the analysis + datapoint asset trees to the `storagePolicy.backend` bucket (s3 | gcs | azure) and verifies with `rclone check` (size+hash). A Completed Job IS the verified-upload gate.
+  3. Only on verified upload: `DELETE /analyses/{id}` — the server-side cascade that rm-rf's the NFS asset dirs and MongoDB documents. **This REST delete is the only NFS cleanup; nothing ever rm-rf's NFS paths directly.**
+* **Deliberately NOT a disk-watermark pruner:** the original #78 sketch ("configurable disk high-water marks") was rejected at issue-triage time — a watermark deleter touching NFS contents directly would bypass the MongoDB bookkeeping and could destroy un-archived analyses. The CronJob preserves the bookkeeping-anchored ordering above. Scoping a watermark sweeper to operator-owned scratch paths was also moot: worker scratch is `emptyDir` and archival Jobs are TTL-ephemeral, so the operator owns no persistent NFS paths of its own.
+* **Why CronJob-owned (not operator-emitted prune Jobs):** one actor owns the whole state machine (spawn → watch → verify → delete) with the proven `run_retention_tick` code unchanged, the operator Role loses the entire `batch/jobs` rule, and the completion trigger granularity is one CronJob period (≤ 10 min) — identical latency to the retired 600 s timer. Splitting "operator fires archival on completion, CronJob prunes" would have spread one D04 state machine across two processes for no latency gain.
+* **D11 (dryRun) on the externalized workload:** the entrypoint builds `OperatorConfig.from_spec(active_cr.spec)`, so `spec.dryRun: true` suppresses archival-Job spawn, failed-Job cleanup and the analysis DELETE — emitting the same dry-run-marked Events on the CR via CoreV1 (source `openstudio-storage-pruner`) that `kopf.event` produced before. The CronJob's *schedule* itself is a cluster-admin-owned manifest property (like the operator Deployment's `strategy: Recreate`) — deliberately NOT a CRD field, because nothing in the operator consumes it.
+* **RBAC shift (quantified):** moving the work shifts permissions to the prune workload's ServiceAccount rather than eliminating them — but the long-lived operator credential gets strictly smaller, and the new Role cannot touch anything but CRs/CR-status, Jobs and Events.
+
+| Rule (namespace `openstudio-server`) | Operator Role before #78 | Operator Role after #78 | Prune SA Role (#78, new) |
+|---|---|---|---|
+| `energy.nrel.gov` `openstudioclustermanagers` (+ `/status`) | `*` | `*` (unchanged) | `list`; `/status`: `get, patch` |
+| `apps` `deployments` | get, list, watch, patch, update | unchanged | — |
+| `""` `pods` | get, list, watch, delete | unchanged | — |
+| `""` `events` | get, list, watch, create, patch | unchanged | create |
+| `autoscaling` `horizontalpodautoscalers` | get, list, patch | unchanged | — |
+| `batch` `jobs` | get, list, watch, create, delete | **— (rule removed)** | get, create, delete |
+| **Total** | 6 rules / 22+ enumerated verbs (+CR `*`) | 5 rules / 17+ (+CR `*`) | 4 rules / 8 verbs |
+
+Net: the operator drops one whole rule and 5 verbs; the prune SA adds 8 narrowly-scoped verbs on 4 resources — **no** Secrets, Deployments, Pods, HPA, PVC or NFS access (the archival Jobs it spawns carry their own envFrom credentials and read-only PVC mount). Both Roles stay namespaced; no ClusterRole anywhere.
 
 ### **Module 5: Resque / web\_background Watchdog**
 

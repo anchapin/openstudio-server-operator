@@ -1,7 +1,30 @@
-"""Module 4 (plan Phase 3): retention pipeline — archive, verify, delete (#16, D09).
+"""Retention pipeline — archive, verify, delete (plan Module 4 / #16, D09; #78).
 
 Orchestrates the #15 archival Job generator into the full pipeline:
 eligibility → spawn Job → watch Job → verify → ``DELETE /analyses/{id}``.
+
+**Actor (issue #78):** this pipeline no longer runs inside the operator
+process. It is library code executed by the storage-prune CronJob
+(``deploy/storage-cronjob.yaml``) via the entrypoint
+:mod:`openstudio_operator.prune_entrypoint` — the operator core keeps no
+storage polling loop at all (its only remaining poller is the Module 1 SLA
+watch, which doubles as the completion observer; the server offers no push).
+The tick cadence is the CronJob's ``schedule`` (``*/10 * * * *`` — the same
+600 s cadence the in-operator timer used). Everything below is unchanged
+pipeline logic: the same eligibility ordering, the same dryRun gate (the
+entrypoint builds ``OperatorConfig`` from the CR ``spec``, so ``spec.dryRun``
+suppresses Job spawn / failed-Job cleanup / analysis delete exactly as
+before), and the same CR-``.status`` anchors. The operator and the prune
+CronJob may write the CR status concurrently — safe because
+:class:`~openstudio_operator.status_store.StatusStore` is a 409-retried
+read-modify-write over disjoint status maps.
+
+**NOT a disk-watermark pruner (deliberate, #78 invariant):** deletion stays
+anchored on bookkeeping — retention eligibility → verified archival →
+``DELETE /analyses/{id}`` (the server-side cascade that rm-rf's the NFS asset
+dirs). A watermark-driven deleter that touched NFS contents directly would
+bypass the MongoDB records and could destroy un-archived analyses; it is out
+of scope by design (see docs/architecture-plan.md Module 4).
 
 THE CARDINAL RULE (D09, acceptance): an analysis is NEVER deleted unless
 its archival Job succeeded verification. The only path to
@@ -49,11 +72,11 @@ clears its marker, and leaves the failed Job object in place for forensics;
 the NEXT retention tick's spawn path deletes that Job (freeing the
 deterministic name — this is what makes respawn idempotent: bounded object
 count, never suffix-litter) and spawns a fresh one. Retries are unbounded
-but tick-spaced (default 600 s); in-Job attempts are already capped at 4 by
-``backoffLimit``. Phase B (spawning) consults the tracked-set snapshot from
-BEFORE phase A (reconciliation) mutated anything, so every reconcile
-decision — failure clearing included — takes effect for spawning on the
-next tick.
+but tick-spaced (the CronJob schedule, 600 s by default); in-Job attempts
+are already capped at 4 by ``backoffLimit``. Phase B (spawning) consults
+the tracked-set snapshot from BEFORE phase A (reconciliation) mutated
+anything, so every reconcile decision — failure clearing included — takes
+effect for spawning on the next tick.
 
 Datapoint trees: the Job archives ``data_points/{id}`` trees alongside the
 analysis tree, so their ids come from ``GET /data_points.json`` (heavy —
@@ -83,8 +106,9 @@ reintroduce a real, sourced counter — the audit doc's Appendix D is the
 canonical home for that decision when it lands.
 
 Failure handling (D12): REST/kube/status-store failures raise out of
-:meth:`run_retention_tick`; the kopf wrapper skips the tick and everything
-re-derives from the persisted records on the next poll.
+:meth:`run_retention_tick`; the prune entrypoint logs the skip and exits 0
+(skip-tick parity with the old kopf wrapper) and everything re-derives from
+the persisted records on the next scheduled run.
 """
 
 from __future__ import annotations
@@ -92,34 +116,27 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Protocol
 
-import kopf
-from kubernetes.client import ApiException, BatchV1Api, CustomObjectsApi
+from kubernetes.client import ApiException
 
 from openstudio_operator.archival import archival_job_name, build_archival_job
 from openstudio_operator.config import OperatorConfig
-from openstudio_operator.handlers.analysis_sla import EventEmitter
 from openstudio_operator.metrics import ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL
-from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.status_store import (
-    GROUP,
-    PLURAL,
-    VERSION,
     ArchivedAnalysisRecord,
     StatusStore,
-    StatusStoreError,
 )
 
 logger = logging.getLogger(__name__)
 
-_SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
-
-#: Retention tick cadence (600 s, the scaffold's declared cadence — retention
-#: is a days-scale policy; a faster poll buys nothing). Operator behavior,
-#: not cluster policy — policy values live in the CRD spec/config (AGENTS.md).
-POLL_INTERVAL_SECONDS = 600.0
+#: ``(event_type, reason, message)`` sink — ``kopf.event`` in the operator
+#: handlers, a CoreV1 Events emitter in the prune entrypoint. Declared here
+#: (not imported from ``handlers.analysis_sla``) so this module carries no
+#: dependency on the kopf handler package.
+EventEmitter = Callable[[str, str, str], None]
 
 ANALYSIS_ARCHIVAL_STARTED_EVENT = "AnalysisArchivalStarted"
 ANALYSIS_ARCHIVAL_SUCCEEDED_EVENT = "AnalysisArchivalSucceeded"
@@ -563,55 +580,3 @@ def run_retention_tick(
                 result=result,
             )
     return result
-
-
-@kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
-def storage_pruner(
-    body: dict,
-    spec: dict,
-    namespace: str,
-    name: str,
-    logger: kopf.Logger,
-    **_: object,
-) -> None:
-    """Timer thin wrapper: wire config/client/store/batch/events, run one tick."""
-    config = OperatorConfig.from_spec(spec)
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — storage pruner idle this tick")
-        return
-    client = _get_client(config.server_url)
-    store = StatusStore(namespace, name, CustomObjectsApi())
-    batch_api = BatchV1Api()
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        kopf.event(body, type=event_type, reason=reason, message=message)
-
-    try:
-        result = run_retention_tick(
-            client,
-            store,
-            config,
-            now=datetime.now(UTC),
-            emit=emit,
-            namespace=namespace,
-            batch_api=batch_api,
-        )
-    except (OpenStudioApiError, StatusStoreError, ApiException, ValueError) as exc:
-        # ValueError: an invalid storagePolicy (e.g. bad backend enum) — same
-        # skip-tick posture as misconfiguration, retried naturally (D12).
-        logger.warning(
-            "storage pruner tick skipped, retrying next poll (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-        return
-    if result.deleted:
-        logger.info(
-            "storage pruner verified %d and deleted %d analysis(es) this tick",
-            len(result.verified),
-            len(result.deleted),
-        )
-    elif result.verified:
-        logger.info("storage pruner verified %d archival Job(s) (delete withheld)", len(result.verified))
-    elif result.spawned:
-        logger.info("storage pruner spawned %d archival Job(s)", len(result.spawned))
