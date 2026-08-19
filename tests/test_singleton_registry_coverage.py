@@ -245,3 +245,179 @@ def test_install_singleton_guard_emits_warning_on_missing_internals(
             f"Guard warning must name D05 so the operator on-call sees the "
             f"link to the policy decision. Got: {message!r}. See issue #47."
         )
+
+
+# --- Issue #163 — boot-time validate_key_layout() callsite assertion ----------
+#
+# Issue #163: validate_key_layout() is documented in AGENTS.md as the boot-time
+# assertion that the Redis Service ``queue`` exposes the Resque keyspace the
+# operator reads. The operator's entrypoint (``handlers/__init__.py``) MUST
+# register an on-event handler that runs the assertion at startup (the kopf
+# watch's initial listing IS the boot path) and on every CR change — without
+# it, a layout drift would only be noticed downstream when the worker-registry
+# gauges go silent, which is too late for the boot-time identity the singleton
+# guard polices. The handler MUST be guarded by a try/except so a Redis
+# connectivity failure degrades gracefully (operator continues to boot) — that
+# invariant is enforced by the corresponding tests in ``tests/test_redis_client.py``.
+#
+# The "callsite assertion" extension: the new OSCM @kopf.on.event handler MUST
+# be in the kopf WatchingRegistry after the package is imported. If a
+# maintainer removes the handler from ``handlers/__init__.py`` (or it fails to
+# register for some other reason), this test fails loudly at the CI gate.
+EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS: frozenset[str] = frozenset(
+    {
+        "_redis_key_layout_check",
+        "_drain_redis_key_layout_queue",
+    }
+)
+
+
+def _watching_handlers_list(registry: kopf.OperatorRegistry) -> list[object]:
+    """Return the WatchingRegistry handler list, or raise loudly if internals moved.
+
+    Symmetric to :func:`_spawning_handlers_list` — the same "internals moved,
+    fail loud" contract. The Redis-key-layout handler is registered as a
+    ``@kopf.on.event`` so it lands in ``registry._watching._handlers``. If a
+    kopf upgrade renames or moves that attribute, this test must fail at the
+    boundary — NOT silently pass with an empty list.
+    """
+    watching = getattr(registry, "_watching", None)
+    if watching is None:
+        raise AssertionError(
+            "kopf internal structure changed: OperatorRegistry no longer has "
+            "a ``_watching`` attribute. The Redis-key-layout handler (issue "
+            "#163) cannot be located without it. Update both the handler and "
+            "tests/test_singleton_registry_coverage.py."
+        )
+    handlers = getattr(watching, "_handlers", None)
+    if handlers is None:
+        raise AssertionError(
+            "kopf internal structure changed: WatchingRegistry no longer has "
+            "a ``_handlers`` attribute. The Redis-key-layout handler (issue "
+            "#163) cannot be located without it. Update both the handler and "
+            "tests/test_singleton_registry_coverage.py."
+        )
+    if not isinstance(handlers, list):
+        raise TypeError(
+            f"kopf internal structure changed: WatchingRegistry._handlers is "
+            f"no longer a list (got {type(handlers).__name__}). The "
+            f"Redis-key-layout handler (issue #163) cannot be located."
+        )
+    return handlers
+
+
+def test_redis_key_layout_handler_is_registered_at_boot() -> None:
+    """Issue #163: ``validate_key_layout()`` is called at operator boot per CR.
+
+    Asserts that the new OSCM @kopf.on.event handlers are registered in the
+    kopf WatchingRegistry after the package is imported. If a maintainer
+    removes the handler from ``handlers/__init__.py`` (or it fails to
+    register), this CI gate fails loudly — the operator would otherwise boot
+    silently with no boot-time Redis layout assertion, exactly the
+    "silent-misbehavior risk" the issue set out to fix.
+    """
+    _ensure_handler_modules_loaded()
+
+    registry = kopf.get_default_registry()
+    _watching_handlers_list(registry)  # boundary check: fails loudly if internals moved
+
+    registered_ids = {
+        getattr(h, "id", "?") for h in _watching_handlers_list(registry)
+    }
+    missing = EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS - registered_ids
+    assert not missing, (
+        f"Expected Redis-key-layout handlers are NOT registered in the kopf "
+        f"watching registry: {sorted(missing)}. Did the @kopf.on.event "
+        f"registration in handlers/__init__.py get removed? See issue #163 — "
+        f"the operator boots without a boot-time Redis layout assertion, "
+        f"which is the silent-misbehavior risk the issue set out to fix."
+    )
+
+    # Guard against accidental expansion: a future handler registered with a
+    # similar id (``_redis_key_layout_*``) but not in the expected set would
+    # silently fail this assertion and force the maintainer to add it — the
+    # same "deliberate bump" semantics as the OSCM timer gate above.
+    extra = {
+        rid
+        for rid in registered_ids
+        if rid.startswith("_redis_key_layout") or rid == "_drain_redis_key_layout_queue"
+    } - EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS
+    assert not extra, (
+        f"New Redis-key-layout handler(s) registered but not declared in "
+        f"EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS: {sorted(extra)}. Add the new "
+        f"id to tests/test_singleton_registry_coverage.py:EXPECTED_REDIS_KEY_LAYOUT_HANDLER_IDS "
+        f"AND verify the handler is wired through _check_redis_key_layout_for_cr "
+        f"with try/except protection (see issue #163)."
+    )
+
+
+def _find_watching_handler(
+    registry: kopf.OperatorRegistry, handler_id: str
+) -> object:
+    """Find the WatchingHandler with the given id, or raise loudly."""
+    for handler in _watching_handlers_list(registry):
+        if getattr(handler, "id", None) == handler_id:
+            return handler
+    raise AssertionError(
+        f"WatchingHandler {handler_id!r} not found in the kopf registry. "
+        f"See issue #163 — the boot-time Redis-key-layout handler is not "
+        f"registered. Did handlers/__init__.py lose the @kopf.on.event "
+        f"decorator?"
+    )
+
+
+def test_redis_key_layout_handler_invokes_validate_key_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #163: the new on-event handler MUST call ``validate_key_layout()``.
+
+    Walks the package's registered handler, invokes its ``fn`` with a
+    synthetic CR body, and asserts the per-CR check fired
+    ``validate_key_layout()`` (mocked via :mod:`monkeypatch`). The assertion
+    is the callsite gate: removing the call from the handler — or refactoring
+    it into a no-op — must fail this test.
+    """
+    _ensure_handler_modules_loaded()
+
+    registry = kopf.get_default_registry()
+    handler = _find_watching_handler(registry, "_redis_key_layout_check")
+    fn = getattr(handler, "fn", None)
+    assert fn is not None, "WatchingHandler.fn is None — kopf internals changed"
+
+    calls: list[tuple[str, str]] = []
+
+    class _StubClient:
+        def validate_key_layout(self) -> None:
+            calls.append(("validate_key_layout", "ok"))
+
+    def _stub_factory(redis_url: str, **_kwargs: object) -> _StubClient:
+        calls.append(("ReadOnlyRedisClient", redis_url))
+        return _StubClient()
+
+    # Patch the symbol at the import site of handlers/__init__.py so the
+    # handler's closed-over ReadOnlyRedisClient is redirected to the stub.
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.ReadOnlyRedisClient", _stub_factory
+    )
+
+    body = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        fn(name="test-osc", namespace="test-ns", body=body)
+
+    assert any(name == "ReadOnlyRedisClient" for name, _ in calls), (
+        f"Handler did not construct ReadOnlyRedisClient; calls={calls!r}. "
+        f"See issue #163 — the boot-time validation call is missing."
+    )
+    assert any(name == "validate_key_layout" for name, _ in calls), (
+        f"Handler did not invoke validate_key_layout(); calls={calls!r}. "
+        f"See issue #163 — the boot-time validation call is missing."
+    )
+    assert "redis_key_layout=ok" in caplog.text, (
+        f"Expected structured log line 'redis_key_layout=ok' not found. "
+        f"Captured: {caplog.text!r}. See issue #163."
+    )

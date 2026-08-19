@@ -497,3 +497,320 @@ def test_allowlist_includes_get_for_worker_records():
     allowlist mutation."""
     assert "GET" in READ_ONLY_COMMANDS
     assert "GET" not in WRITE_COMMANDS  # GET is strictly a read command
+
+
+# --- Issue #163 — boot-time validate_key_layout() structured log lines -------
+#
+# The operator's entrypoint (handlers/__init__.py:_check_redis_key_layout_for_cr)
+# runs ``validate_key_layout()`` per CR at boot and emits a structured log
+# line ``redis_key_layout=ok|degraded|unreachable``. This is the loud-fail
+# invariant the issue set out to fix: a Redis layout drift (helm chart
+# upgrade to a Resque-2.x-with-different-prefix layout, or a different queue
+# backend entirely) would otherwise only be noticed downstream when the
+# worker-registry gauges go silent. The tests below pin the log line on each
+# branch so a regression (no log line, wrong status, no try/except) fails
+# the CI gate. They exercise the operator's wiring (not the redis_client
+# itself), but live here because the underlying contract is the redis
+# layout's behavior and the surrounding log fixture is keyed off
+# ``ReadOnlyRedisClient``.
+import logging
+
+import openstudio_operator.handlers as handlers_pkg
+from openstudio_operator.handlers import _check_redis_key_layout_for_cr
+
+
+def _patched_client_factory(fake, monkeypatch):
+    """Return a factory that bypasses the live Redis URL and uses ``fake``.
+
+    ``_check_redis_key_layout_for_cr`` closes over ``ReadOnlyRedisClient`` at
+    import time. Patching the symbol at ``openstudio_operator.handlers`` (the
+    import site) redirects the construction to a stub that uses the test
+    ``fake`` fakeredis client — the same pattern kopf tests use in the
+    wider codebase.
+    """
+
+    def _factory(redis_url: str, **_kwargs: object) -> ReadOnlyRedisClient:
+        return ReadOnlyRedisClient(
+            redis_url, connection=fake, now_fn=lambda: NOW
+        )
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.ReadOnlyRedisClient", _factory
+    )
+    return _factory
+
+
+def test_redis_key_layout_check_emits_ok_log_line(
+    fake, client, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot-time check emits ``redis_key_layout=ok`` when the layout matches.
+
+    Seeds the live-verified v3.11.0 layout (registry SET + heartbeat HASH,
+    issue #66) and asserts the ``_check_redis_key_layout_for_cr`` helper
+    logs ``redis_key_layout=ok namespace=... name=...`` at INFO level. The
+    status string is the operator's contract for downstream log/alert
+    pipelines — a regression in the message format breaks observability.
+    """
+    fake.sadd("resque:workers", "w1", "w2")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    fake.hset("resque:workers:heartbeat", "w2", "2026-08-18T20:46:16+00:00")
+
+    _patched_client_factory(fake, monkeypatch)
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "ok", (
+        f"Expected status='ok' on a valid layout; got {status!r}. "
+        f"Captured: {caplog.text!r}. See issue #163."
+    )
+    assert "redis_key_layout=ok" in caplog.text, (
+        f"Expected structured log line 'redis_key_layout=ok' not emitted. "
+        f"Captured: {caplog.text!r}. See issue #163."
+    )
+    assert "namespace=test-ns" in caplog.text
+    assert "name=test-osc" in caplog.text
+
+
+def test_redis_key_layout_check_emits_degraded_log_line(
+    fake, client, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot-time check emits ``redis_key_layout=degraded`` when layout drifts.
+
+    The synthetic Redis is empty (no Resque keys present) — the operator
+    points at a Redis with a different prefix entirely. The check must
+    emit ``redis_key_layout=degraded`` at WARNING level AND queue a
+    ``RedisKeyLayoutDrift`` Warning Event for the next OSCM watch tick
+    (drained by ``_drain_redis_key_layout_queue``). Both invariants are
+    load-bearing: the log line is the operator's alert signal, the
+    Warning Event is the user-facing Kubernetes signal.
+    """
+    # No Resque keys — the layout has drifted.
+    _patched_client_factory(fake, monkeypatch)
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+
+    # Clear the queue from any prior test in this session.
+    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.clear()
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "degraded", (
+        f"Expected status='degraded' on a missing-Resque-key layout; got "
+        f"{status!r}. Captured: {caplog.text!r}. See issue #163."
+    )
+    assert "redis_key_layout=degraded" in caplog.text, (
+        f"Expected structured log line 'redis_key_layout=degraded' not "
+        f"emitted. Captured: {caplog.text!r}. See issue #163."
+    )
+    assert "reason=layout_drift" in caplog.text
+    assert "namespace=test-ns" in caplog.text
+    assert "name=test-osc" in caplog.text
+
+    # Warning Event queued for the next OSCM watch tick (#163).
+    pending = [
+        msg for msg in handlers_pkg._REDIS_KEY_LAYOUT_QUEUE
+        if msg[0] == "test-ns" and msg[1] == "test-osc"
+    ]
+    assert len(pending) == 1, (
+        f"Expected exactly one queued RedisKeyLayoutDrift event; got "
+        f"{len(pending)}. The Warning Event was not queued — the "
+        f"user-facing Kubernetes signal is missing. See issue #163."
+    )
+    _ns, _nm, reason, message = pending[0]
+    assert reason == "RedisKeyLayoutDrift", (
+        f"Expected reason='RedisKeyLayoutDrift'; got {reason!r}. See issue #163."
+    )
+    assert "issue #163" in message or "issue #44" in message, (
+        f"Expected the drained message to link the operator on-call to the "
+        f"issue tracker entry; got {message!r}. See issue #163."
+    )
+
+
+def test_redis_key_layout_check_emits_unreachable_log_line(
+    fake, client, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot-time check emits ``redis_key_layout=unreachable`` on connectivity failure.
+
+    A Redis connectivity failure (refused, DNS, timeout) MUST NOT crash the
+    boot — the operator continues in degraded mode and retries on the next
+    tick. The check must emit ``redis_key_layout=unreachable`` at WARNING
+    level, queue NO Warning Event (we don't know the layout drifted; we
+    just couldn't reach the server), and not raise. This is the test that
+    guarantees the try/except invariant — without it, a Redis outage at
+    boot would prevent the operator from starting.
+    """
+    import redis as _redis
+
+    def _factory(redis_url: str, **_kwargs: object) -> ReadOnlyRedisClient:
+        client = ReadOnlyRedisClient(
+            redis_url, connection=fake, now_fn=lambda: NOW
+        )
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise _redis.exceptions.ConnectionError(
+                "Connection refused at boot"
+            )
+
+        # SCAN is the very first call validate_key_layout() makes; forcing
+        # it to raise with a real RedisError reproduces the "server
+        # unreachable at boot" path. ReadOnlyRedisClient wraps that as
+        # RedisClientError, which the check catches.
+        monkeypatch.setattr(fake, "scan", _boom)
+        return client
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.ReadOnlyRedisClient", _factory
+    )
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+
+    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.clear()
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        # MUST NOT raise — this is the "operator continues to boot" invariant.
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "unreachable", (
+        f"Expected status='unreachable' on a connectivity failure; got "
+        f"{status!r}. Captured: {caplog.text!r}. See issue #163."
+    )
+    assert "redis_key_layout=unreachable" in caplog.text, (
+        f"Expected structured log line 'redis_key_layout=unreachable' not "
+        f"emitted. Captured: {caplog.text!r}. See issue #163."
+    )
+
+    # No Warning Event on the connectivity branch — we don't know the layout
+    # drifted; we just couldn't reach the server. Alerting on this would
+    # produce noise during outages unrelated to the queue fabric.
+    pending = [
+        msg for msg in handlers_pkg._REDIS_KEY_LAYOUT_QUEUE
+        if msg[0] == "test-ns" and msg[1] == "test-osc"
+    ]
+    assert not pending, (
+        f"Expected NO queued event on the connectivity branch; got {pending!r}. "
+        f"See issue #163 — the operator must not false-positive on outages."
+    )
+
+
+def test_redis_key_layout_check_skips_empty_redis_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Empty ``spec.redisUrl`` is a separate concern (#116); the check skips.
+
+    The operator's intentional refusal to default ``spec.redisUrl`` is
+    enforced elsewhere (issue #116). The boot-time check must NOT
+    short-circuit on it: the empty URL is the URL-guard's territory, not
+    the layout-validator's. Skipping is the correct response — calling
+    ``ReadOnlyRedisClient("")`` would raise a ValueError, which the
+    try/except would absorb as "unreachable", misleadingly.
+    """
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": ""},
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "skipped", (
+        f"Expected status='skipped' on empty redisUrl; got {status!r}. "
+        f"Captured: {caplog.text!r}. See issue #163."
+    )
+    # Skipped is a DEBUG-level signal so the operator's logs aren't noisy on
+    # unconfigured CRs (#116); the test asserts the absence of the warning
+    # structured log line.
+    assert "redis_key_layout=degraded" not in caplog.text
+    assert "redis_key_layout=unreachable" not in caplog.text
+    assert "redis_key_layout=ok" not in caplog.text
+
+
+def test_redis_key_layout_check_skips_nameless_item(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CR-shaped object with no metadata.namespace/name must be skipped, not crash.
+
+    Defensive: a malformed item (e.g. a partial body delivered by a future
+    kopf version change) must not crash the boot. The check returns
+    ``'skipped'`` and emits no structured log line.
+    """
+    item = {"spec": {"redisUrl": "redis://:pw@queue.test:6379"}}  # no metadata
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "skipped", (
+        f"Expected status='skipped' on a nameless item; got {status!r}. "
+        f"Captured: {caplog.text!r}. See issue #163."
+    )
+
+
+def test_drain_redis_key_layout_queue_emits_event_then_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drain handler emits the queued Warning Event and clears the queue.
+
+    Mirrors the existing pattern for ``_drain_redis_warning_queue`` and
+    ``_drain_status_map_cap_queue``: the queue is fully drained per
+    matching CR and an empty queue is a no-op. Wiring regression here
+    means the Warning Event is silently dropped — the user-facing
+    Kubernetes signal is lost.
+    """
+    handlers_pkg._REDIS_KEY_LAYOUT_QUEUE.append(
+        ("test-ns", "test-osc", "RedisKeyLayoutDrift", "drift detected")
+    )
+
+    emitted: list[dict] = []
+
+    def _fake_event(*args, **kwargs):
+        emitted.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(handlers_pkg.kopf, "event", _fake_event)
+
+    handlers_pkg._drain_redis_key_layout_queue(
+        name="test-osc", namespace="test-ns"
+    )
+
+    assert len(emitted) == 1, (
+        f"Expected exactly one kopf.event call; got {len(emitted)}. "
+        f"See issue #163 — the Warning Event was not emitted."
+    )
+    event = emitted[0]
+    assert event["kwargs"]["type"] == "Warning"
+    assert event["kwargs"]["reason"] == "RedisKeyLayoutDrift"
+    assert event["kwargs"]["message"] == "drift detected"
+    assert not handlers_pkg._REDIS_KEY_LAYOUT_QUEUE, (
+        f"Queue was not cleared after drain; still has "
+        f"{handlers_pkg._REDIS_KEY_LAYOUT_QUEUE!r}. See issue #163."
+    )
+
+    # Subsequent drain is a no-op.
+    handlers_pkg._drain_redis_key_layout_queue(
+        name="test-osc", namespace="test-ns"
+    )
+    assert len(emitted) == 1, (
+        f"Second drain emitted another event: {emitted!r}. See issue #163 — "
+        f"the drain must be idempotent."
+    )
