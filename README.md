@@ -2,7 +2,7 @@
 
 A Kubernetes operator that automates day-2 operations for [OpenStudio Server](https://github.com/NREL/OpenStudio-server) deployments (Ruby/Rails `web` + `web_background` + MongoDB + `worker` pods + NFS-shared volumes). It runs **alongside** the existing [`openstudio-server-helm`](https://github.com/NREL/openstudio-server-helm) chart — it manages that stack; it does not replace it.
 
-**Status: implementation complete (Phases 1–4, issues #2–#21); pre-cluster validation.** The verified API ground truth is [`.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md`](./.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
+**Status: implementation complete (Phases 1–4, issues #2–#21); pre-cluster validation.** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
 
 ## What it will automate
 
