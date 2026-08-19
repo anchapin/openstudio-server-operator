@@ -94,7 +94,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, AppsV1Api, CoreV1Api, CustomObjectsApi
+from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import SOFT_STOPS_TOTAL, WORKER_PODS_EVICTED_TOTAL
@@ -121,12 +121,6 @@ ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /
 #: ``WorkerRecycled``; this name follows the same <Subject><Action> shape.
 ANALYSIS_ESCALATED_EVENT = "AnalysisEscalated"
-
-#: Fallback when ``spec.targetWorkerDeployment`` is empty: the helm
-#: ``develop`` chart's fixed worker Deployment name (AGENTS.md identifiers).
-#: Duplicated from worker_recycler (which imports from this module) rather
-#: than importing back — a cycle; a shared wiring module can absorb both.
-_DEFAULT_WORKER_DEPLOYMENT = "worker"
 
 _STARTED = "started"
 #: First-sight observation outcome (issue #83 D1): the SLA clock anchor is the
@@ -199,30 +193,6 @@ def _get_client(server_url: str) -> OpenStudioClient:
     return client
 
 
-def _page_data_start_time(client: OpenStudioClient, analysis_id: str) -> datetime | None:
-    """LEGACY SLA clock anchor from page_data — ``start_time`` (issue #83 D1).
-
-    Retained as a documented seam for callers that want to read the
-    historical anchor; NOT consulted by :func:`run_sla_tick` anymore.
-    ``page_data.json``'s derived ``start_time`` is ABSENT (not null) on
-    v3.11.0 until the first job runs (contract §2) — so the SLA clock now
-    anchors on the operator-observed first sight of the analysis in
-    ``started`` via :func:`_status_is_started`. Returns ``None`` for an
-    absent/unusable ``start_time`` so callers can distinguish.
-    """
-    page = client.get_analysis_page_data(analysis_id)
-    analysis = page.get("analysis") if isinstance(page, dict) else None
-    value = analysis.get("start_time") if isinstance(analysis, dict) else None
-    if not isinstance(value, datetime):
-        logger.warning(
-            "analysis %s: page_data carries no usable start_time (live v3.11.0 — "
-            "see issue #83 D1) — caller should fall back to /status.json first-sight",
-            analysis_id,
-        )
-        return None
-    return value
-
-
 def _status_is_started(client: OpenStudioClient, analysis_id: str) -> bool:
     """``True`` iff ``/analyses/{id}/status.json`` reports ``status == "started"``.
 
@@ -260,7 +230,6 @@ def run_sla_tick(
     emit: EventEmitter,
     namespace: str = "",
     pod_api: WorkerPodApi | None = None,
-    apps_api: DeploymentReader | None = None,
     redis_client: RedisClientLike | None = None,
 ) -> SlaTickResult:
     """One SLA poll: soft-stop, then grace/escalate (issues #8, #9, #83).
@@ -294,9 +263,9 @@ def run_sla_tick(
     Raises on API/status-store/Redis failure so the caller can skip the
     tick (D12).
 
-    ``namespace``/``pod_api``/``apps_api`` wire the Kubernetes side of
+    ``namespace``/``pod_api`` wire the Kubernetes side of
     the escalation (pod deletion in the CR's namespace); ``redis_client``
-    wires the Resque side (worker → analysis match). All four default to
+    wires the Resque side (worker → analysis match). All three default to
     live clients in production and are injection seams for tests.
     """
     if not config.analysis_policy.auto_soft_stop:
@@ -334,7 +303,6 @@ def run_sla_tick(
         emit=emit,
         namespace=namespace,
         pod_api=pod_api,
-        apps_api=apps_api,
         redis_client=redis_client,
     )
     return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated)
@@ -350,7 +318,6 @@ def _grace_and_escalate(
     emit: EventEmitter,
     namespace: str,
     pod_api: WorkerPodApi | None,
-    apps_api: DeploymentReader | None,
     redis_client: RedisClientLike | None,
 ) -> tuple[list[str], list[str]]:
     """Walk persisted anchors: prune the finished, soft-stop the over-runtime, escalate the stuck.
@@ -438,60 +405,10 @@ def _grace_and_escalate(
             emit=emit,
             namespace=namespace,
             pod_api=pod_api,
-            apps_api=apps_api,
             redis_client=redis_client,
         )
         escalated.append(analysis_id)
     return soft_stopped, escalated
-
-
-def _started_datapoint_ips(client: OpenStudioClient, analysis_id: str) -> set[str]:
-    """LEGACY ``ip_address`` set of the analysis's started datapoints (issue #83 D2).
-
-    Retained as a documented seam — pre-#83 escalation used this set
-    against worker pod ``status.podIP`` to drive the surgical eviction.
-    On v3.11.0 ``ip_address`` is always null, so the escalation now
-    resolves targets via :meth:`ReadOnlyRedisClient.workers_for_analysis`
-    and :meth:`ReadOnlyRedisClient.pod_name_for_worker` instead. This
-    helper is no longer called by the SLA flow but is kept for any future
-    debugging / forensics use.
-    """
-    ips: set[str] = set()
-    for doc in client.get_datapoints_full():
-        if str(doc.get("analysis_id") or "") != analysis_id:
-            continue
-        if doc.get("status") != _STARTED:
-            continue
-        ip = doc.get("ip_address")
-        if ip:
-            ips.add(str(ip))
-    return ips
-    ips: set[str] = set()
-    for doc in client.get_datapoints_full():
-        if str(doc.get("analysis_id") or "") != analysis_id:
-            continue
-        if doc.get("status") != _STARTED:
-            continue
-        ip = doc.get("ip_address")
-        if ip:
-            ips.add(str(ip))
-    return ips
-
-
-def _worker_pod_selector(
-    apps_api: DeploymentReader, config: OperatorConfig, namespace: str
-) -> str | None:
-    """Label selector of the worker Deployment's pod template.
-
-    Read from the cluster instead of hardcoding chart labels: the selector
-    the Deployment itself owns is by definition what separates worker pods
-    from web/web_background/mongo pods. ``None`` (no selector) lists every
-    pod in the namespace — unreachable for apps/v1 Deployments (a selector
-    is required); IP matching still scopes any deletion to pods actually
-    running the stuck analysis's datapoints.
-    """
-    deployment = config.target_worker_deployment or _DEFAULT_WORKER_DEPLOYMENT
-    return deployment_label_selector(apps_api, deployment, namespace)
 
 
 def deployment_label_selector(
@@ -571,34 +488,6 @@ def deployment_label_selector(
     return ",".join(terms)
 
 
-def _matching_worker_pods(
-    apps_api: DeploymentReader,
-    pod_api: WorkerPodApi,
-    config: OperatorConfig,
-    *,
-    namespace: str,
-    target_ips: set[str],
-) -> list[tuple[str, str]]:
-    """LEGACY worker-pod → started-datapoint IP matching (issue #83 D2).
-
-    Retained for forensics: pre-#83 escalation used this helper to find
-    worker pods whose ``status.podIP`` was in the started-datapoint
-    ``ip_address`` set. On v3.11.0 datapoint ``ip_address`` is always
-    null, so the set was always empty and the IP path could never match.
-    The new escalation path is :func:`_resque_matched_worker_pods`
-    (Resque worker identity → pod name). Kept as a documented seam.
-    """
-    selector = _worker_pod_selector(apps_api, config, namespace)
-    pods = getattr(pod_api.list_namespaced_pod(namespace, label_selector=selector), "items", None)
-    victims: list[tuple[str, str]] = []
-    for pod in pods or []:
-        pod_ip = getattr(getattr(pod, "status", None), "pod_ip", None)
-        name = getattr(getattr(pod, "metadata", None), "name", None)
-        if pod_ip and name and str(pod_ip) in target_ips:
-            victims.append((str(name), str(pod_ip)))
-    return victims
-
-
 def _resque_matched_worker_pods(
     redis_client: RedisClientLike,
     pod_api: WorkerPodApi,
@@ -676,7 +565,6 @@ def _escalate_analysis(
     emit: EventEmitter,
     namespace: str,
     pod_api: WorkerPodApi | None,
-    apps_api: DeploymentReader | None,
     redis_client: RedisClientLike | None,
 ) -> str:
     """Evict the worker pods processing ``analysis_id`` (issue #9, #83 D2).
@@ -773,7 +661,6 @@ def analysis_sla_monitor(
     client = _get_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
     pod_api: WorkerPodApi = CoreV1Api()
-    apps_api: DeploymentReader = AppsV1Api()
     redis_client: RedisClientLike = _default_redis_client(config)
 
     def emit(event_type: str, reason: str, message: str) -> None:
@@ -788,7 +675,6 @@ def analysis_sla_monitor(
             emit=emit,
             namespace=namespace,
             pod_api=pod_api,
-            apps_api=apps_api,
             redis_client=redis_client,
         )
     except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError) as exc:
