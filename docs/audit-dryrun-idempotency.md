@@ -4,7 +4,7 @@
 **Date:** 2026-08-18
 **Scope:** all merged modules — `analysis_sla` (#8/#9), `datapoint_watchdog` (#10),
 `worker_recycler` (#11), `redis_client` (#12), `web_background_monitor` (#13),
-`singleton` (#14), `archival` (#15), `storage_pruner` (#16), `metrics` (#17);
+`singleton` (#14), `archival` (#15), `retention` (#16; prune CronJob since #78), `metrics` (#17);
 `hpa_floor` (#18) REMOVED in favor of KEDA ScaledObject (#77).
 **Method:** full code walk of `src/openstudio_operator/` + mechanical sweeps
 (grep for every mutating call site; AST scan of every numeric/string literal) +
@@ -70,7 +70,7 @@ to the (suppressed) spawn path, writing the standard dry-run marker — so the
 observable state machine is unchanged and the real cleanup+respawn happen on
 the first tick after dryRun lifts.
 **Regression test:** `test_dry_run_suppresses_failed_job_cleanup_delete`
-(`tests/test_storage_pruner.py`) — verified red on pre-fix code, green after.
+(`tests/test_retention.py:666`) — verified red on pre-fix code, green after.
 
 ### 1.3 Exempt categories (documented, not gated by design)
 
@@ -158,7 +158,7 @@ Every literal found outside `config.py` falls into an exempt class:
    datapoint_watchdog / web_background_monitor, `300.0`
    worker_recycler — each documented in-file as plan-mandated operator
    behavior, not cluster policy. (The `60.0` hpa_floor cadence was
-   removed in #77; the `600.0` storage_pruner cadence left the operator
+   removed in #77; the `600.0` retention cadence left the operator
    with #78: it is now the storage-prune CronJob's `*/10 * * * *`
    schedule in `deploy/storage-cronjob.yaml` — a manifest property
    owned by the cluster admin, outside this sweep by the same logic as
@@ -300,6 +300,6 @@ The durable signal of an archived-then-deleted analysis is
 archival Job's rclone copy summary (a small Job wrapper that writes a
 status annotation is the cleanest path), OR a pre/post `du` on the NFS
 tree before/after the verified `DELETE` lands. The increment site is
-the storage-pruner's verified-delete branch (`storage_pruner.py`,
+the retention pipeline's verified-delete branch (`retention.py`,
 alongside `ANALYSES_DELETED_TOTAL`). Add the counter back to this
 appendix's table at the same time.
