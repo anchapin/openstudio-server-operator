@@ -17,6 +17,7 @@ from openstudio_operator.archival import (
     NFS_MOUNT_PATH,
     NFS_PVC_NAME,
     RCLONE_IMAGE,
+    RCLONE_IMAGE_DIGEST,
     RCLONE_REMOTE_NAME,
     archival_job_name,
     build_archival_job,
@@ -145,6 +146,28 @@ def test_archival_job_has_hardened_rclone_securitycontext(backend: str) -> None:
     assert sc["seccompProfile"]["type"] == "RuntimeDefault"
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_archival_job_image_pinned_by_digest(backend: str) -> None:
+    """#124 — the rclone image is pinned by @sha256 digest. Floating
+    ``rclone/rclone:1.67.0`` would let a tag-mutation steer the image
+    between release.yml rebuild and the next refresh; the digest closes
+    that window.
+
+    The tag form is preserved for human readability — the digest is
+    what the kubelet resolves.
+    """
+    job = _job(backend)
+    container = _container(job)
+    image = container["image"]
+    # Tag + digest form: ``<repo>:<tag>@sha256:<digest>``.
+    assert "@sha256:" in image, image
+    assert image.endswith(f"@{RCLONE_IMAGE_DIGEST}")
+    # Digest matches the module-level constant — fail loudly if the
+    # constant + the import drift; that's exactly the drift #124 wants
+    # to catch.
+    assert RCLONE_IMAGE_DIGEST in image
+
+
 # --- NFS mount ----------------------------------------------------------------
 
 
@@ -176,7 +199,11 @@ def test_job_mechanics() -> None:
     assert spec["ttlSecondsAfterFinished"] == 24 * 3600
     assert spec["template"]["spec"]["restartPolicy"] == "Never"
     container = _container(job)
-    assert container["image"] == RCLONE_IMAGE == "rclone/rclone:1.67.0"
+    # Issue #124 — image is pinned by tag + @sha256 digest. The test
+    # asserts the tag form (for human readability) AND the digest pin
+    # (the deploy-time guarantee) — see test_archival_job_image_pinned_by_digest.
+    assert container["image"] == RCLONE_IMAGE
+    assert container["image"].startswith("rclone/rclone:1.67.0@")
     assert container["command"][0:2] == ["/bin/sh", "-c"]
 
 
