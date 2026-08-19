@@ -24,9 +24,12 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_hpa_floor_adjustments_total",
 )
 
-#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Operators
-#: alert on `resque_workers_seen_max == 0 AND queue depth > 0` to catch a
-#: centralized constants / live v3.11.0 layout mismatch.
+#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
+#: the gauge is emitted every poll regardless of queue depth, so
+#: `resque_workers_seen_max == 0` with a reachable Redis means no workers
+#: are registered; under load that signature additionally marks a
+#: centralized-constants / live v3.11.0 layout mismatch (the original #44
+#: alert combined it with `AND queue depth > 0`).
 EXPECTED_GAUGE_FAMILIES = ("openstudio_operator_resque_workers_seen_max",)
 
 
