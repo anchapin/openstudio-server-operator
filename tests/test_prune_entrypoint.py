@@ -166,8 +166,8 @@ def test_zero_crs_idle_exit_zero():
 def test_oldest_cr_is_served_not_the_newest():
     """D05 in the entrypoint: the OLDEST CR's spec drives the tick — the
     newer CR's different bucket is never honored."""
-    old_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "bucket": "old-bucket"}}
-    new_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "bucket": "new-bucket"}}
+    old_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": {**STORAGE, "bucket": "old-bucket"}}
+    new_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": {**STORAGE, "bucket": "new-bucket"}}
     crs = [
         make_cr("old-cr", created_days_ago=30, spec=old_spec),
         make_cr("new-cr", created_days_ago=1, spec=new_spec),
@@ -192,6 +192,35 @@ def test_empty_server_url_idles():
     assert batch.creates == [] and core.events == []
 
 
+def test_empty_redis_url_emits_warning_event_and_returns_nonzero():
+    """Issue #180 / #116 parity — the prune actor must inherit the operator's
+    redisUrl-empty guard. Empty redisUrl → Warning Event recorded on the CR,
+    exit code 3 (loud failure so the CronJob's Failed pod is visible, while
+    leaving the next-schedule retry in place per the backoffLimit=0 design).
+    """
+    spec = {"serverUrl": BASE, "redisUrl": ""}
+    crs = [make_cr(spec=spec)]
+    code, batch, core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+
+    assert code == 3
+    assert batch.creates == []
+    # Exactly one Event: Warning / RedisURLEmpty.
+    assert len(core.events) == 1
+    event_record = core.events[0]
+    assert event_record["namespace"] == NAMESPACE
+    body = event_record["body"]
+    assert body["type"] == "Warning"
+    assert body["reason"] == "RedisURLEmpty"
+    assert "spec.redisUrl is empty" in body["message"]
+    assert "issues #116, #180" in body["message"]
+    # CR is the involvedObject — event attaches to the right CR.
+    assert body["involvedObject"]["kind"] == "OpenStudioClusterManager"
+    assert body["involvedObject"]["name"] == NAME
+    assert body["involvedObject"]["namespace"] == NAMESPACE
+    # Source component distinguishes prune-CronJob events from operator events.
+    assert body["source"]["component"] == EVENT_SOURCE_COMPONENT
+
+
 def test_missing_namespace_is_a_wiring_error(monkeypatch):
     monkeypatch.delenv("POD_NAMESPACE", raising=False)
     assert main(None, custom_api=FakeCustomObjectsApi([], make_cr())) == 2
@@ -202,7 +231,7 @@ def test_missing_namespace_is_a_wiring_error(monkeypatch):
 
 @responses.activate
 def test_dry_run_suppresses_job_spawn_and_deletes_but_records_events():
-    dry_spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE), "dryRun": True}
+    dry_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE), "dryRun": True}
     crs = [make_cr(spec=dry_spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     responses.get(f"{BASE}/data_points.json", json=[])
@@ -230,7 +259,7 @@ def test_dry_run_suppresses_job_spawn_and_deletes_but_records_events():
 
 @responses.activate
 def test_real_run_spawns_the_archival_job():
-    spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE)}
+    spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE)}
     crs = [make_cr(spec=spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     responses.get(f"{BASE}/data_points.json", json=[])
@@ -250,7 +279,7 @@ def test_real_run_spawns_the_archival_job():
 
 @responses.activate
 def test_transient_api_failure_exits_zero_and_retries_next_schedule():
-    spec = {"serverUrl": BASE, "storagePolicy": dict(STORAGE)}
+    spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE)}
     crs = [make_cr(spec=spec)]
     responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
     api = FakeCustomObjectsApi(crs, crs[0])
@@ -263,7 +292,7 @@ def test_transient_api_failure_exits_zero_and_retries_next_schedule():
 
 @responses.activate
 def test_invalid_storage_policy_exits_zero():
-    bad_spec = {"serverUrl": BASE, "storagePolicy": {**STORAGE, "backend": "ftp"}}
+    bad_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": {**STORAGE, "backend": "ftp"}}
     crs = [make_cr(spec=bad_spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     api = FakeCustomObjectsApi(crs, crs[0])
@@ -319,6 +348,7 @@ def test_entrypoint_serves_every_cloud_backend_spec(backend):
     """The entrypoint is backend-agnostic: any CRD enum backend wires through."""
     spec = {
         "serverUrl": BASE,
+        "redisUrl": "redis://queue:6379",
         "storagePolicy": {**STORAGE, "backend": backend, "bucket": f"bucket-{backend}"},
     }
     crs = [make_cr(spec=spec)]

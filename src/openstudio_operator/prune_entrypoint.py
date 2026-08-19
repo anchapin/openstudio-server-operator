@@ -203,10 +203,40 @@ def main(
     if not config.server_url:
         logger.warning("spec.serverUrl is empty on %s — prune tick idle", name)
         return 0
+    # Build the Event emitter early so the redisUrl guard below can use it
+    # (issue #180). The emitter records on the CR via create_namespaced_event
+    # and is observability-only — its failures never abort the tick (see
+    # build_event_emitter's emit() closure).
+    emit = build_event_emitter(core_api, cr, namespace)
+    # Issue #180 — inherit the #116 redisUrl-empty guard. The operator process
+    # emits a Warning Event per CR (singleton.py:_emit_redis_url_guard_events);
+    # the prune actor is a separate process that shares the same Redis and the
+    # same retention pipeline, so it must enforce the same fence. Without this
+    # guard a misconfigured `spec.redisUrl` would let the prune tick fall back
+    # to in-cluster defaults and silently skip the queue-aware steps in
+    # run_retention_tick. We return non-zero so the CronJob logs the failure
+    # visibly (the next schedule IS the retry — the CronJob's backoffLimit=0
+    # means a Failed pod is not retried in place).
+    if not config.redis_url:
+        emit(
+            "Warning",
+            "RedisURLEmpty",
+            (
+                f"spec.redisUrl is empty on {namespace}/{name} (issues #116, #180). "
+                "Storage prune actor is a no-op until you set this field "
+                "explicitly. The previous default exposed the kind-recipe "
+                "password `openstudio` and has been removed; helm-chart users "
+                "should derive the URL from the Redis-secret KeyRef."
+            ),
+        )
+        logger.warning(
+            "OSCM %s/%s has empty spec.redisUrl — issue #180: prune actor is a no-op",
+            namespace, name,
+        )
+        return 3
 
     store = StatusStore(namespace, name, custom_api)  # type: ignore[arg-type]
     client = (client_factory or OpenStudioClient)(config.server_url)
-    emit = build_event_emitter(core_api, cr, namespace)
 
     try:
         result = run_retention_tick(
