@@ -18,6 +18,7 @@ import logging
 import kopf
 
 from openstudio_operator import singleton, status_store
+from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
@@ -28,7 +29,6 @@ from openstudio_operator.handlers import (  # noqa: F401
 from openstudio_operator.metrics import start_metrics_server
 from openstudio_operator.redis_client import (
     OperatorConfigError,
-    ReadOnlyRedisClient,
     RedisClientError,
 )
 
@@ -138,7 +138,7 @@ def _check_redis_key_layout_for_cr(
         )
         return "skipped"
     try:
-        ReadOnlyRedisClient(redis_url).validate_key_layout()
+        get_read_only_redis_client(redis_url).validate_key_layout()
     except OperatorConfigError as exc:
         logger.warning(
             "redis_key_layout=degraded namespace=%s name=%s reason=%s: %s",

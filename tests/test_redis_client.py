@@ -522,11 +522,12 @@ from openstudio_operator.handlers import _check_redis_key_layout_for_cr
 def _patched_client_factory(fake, monkeypatch):
     """Return a factory that bypasses the live Redis URL and uses ``fake``.
 
-    ``_check_redis_key_layout_for_cr`` closes over ``ReadOnlyRedisClient`` at
-    import time. Patching the symbol at ``openstudio_operator.handlers`` (the
-    import site) redirects the construction to a stub that uses the test
-    ``fake`` fakeredis client — the same pattern kopf tests use in the
-    wider codebase.
+    ``_check_redis_key_layout_for_cr`` closes over
+    ``get_read_only_redis_client`` at import time (issue #235 — the boot-time
+    check no longer constructs ``ReadOnlyRedisClient`` inline). Patching the
+    factory symbol at ``openstudio_operator.handlers`` (the import site)
+    redirects the construction to a stub that uses the test ``fake``
+    fakeredis client — the same pattern kopf tests use in the wider codebase.
     """
 
     def _factory(redis_url: str, **_kwargs: object) -> ReadOnlyRedisClient:
@@ -535,7 +536,7 @@ def _patched_client_factory(fake, monkeypatch):
         )
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.ReadOnlyRedisClient", _factory
+        "openstudio_operator.handlers.get_read_only_redis_client", _factory
     )
     return _factory
 
@@ -675,7 +676,7 @@ def test_redis_key_layout_check_emits_unreachable_log_line(
         return client
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.ReadOnlyRedisClient", _factory
+        "openstudio_operator.handlers.get_read_only_redis_client", _factory
     )
 
     item = {

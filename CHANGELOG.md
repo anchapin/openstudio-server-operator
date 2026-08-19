@@ -11,7 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])
 
 ### Changed
-- (no entries yet — all changes since 0.1.0 are in [0.2.0])
+- **`#235`** — `ReadOnlyRedisClient` construction is now centralized in
+  `client_factory.get_read_only_redis_client(redis_url)`
+  (`lru_cache(maxsize=8)`, keyed by URL), mirroring what `#168` did for
+  `OpenStudioClient`. Retires three divergent sites:
+  `web_background_monitor._get_redis_client` (module-level dict cache),
+  `analysis_sla._default_redis_client` (fresh client — and a fresh
+  connection pool — on every SLA tick), and the inline
+  `ReadOnlyRedisClient(redis_url)` in the `#163` boot-time Resque
+  key-layout check. The boot probe and every handler tick now share one
+  connection pool per Redis URL. No behaviour change to the client
+  itself (read-only allowlist, queue-depth reads, Resque worker
+  liveness). New AST CI gate
+  `tests/test_client_factory.py::test_only_one_read_only_redis_client_construction_point`
+  fails on any inline `ReadOnlyRedisClient(` outside the factory.
 
 ### Removed
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])

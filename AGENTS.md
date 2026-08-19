@@ -23,7 +23,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100 per pyproject.toml; CI pins ruff>=0.16)
-.venv/bin/pytest # 467 tests across 25 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 475 tests across 25 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -37,7 +37,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - `src/openstudio_operator/_constants.py` (`#165`) — Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace). Single source of truth that replaced per-handler copies. **Policy values do NOT belong here** — cluster policy lives in the CRD `spec` / `config.py`.
 - `src/openstudio_operator/_time.py` (`#174`) — Single tz-aware UTC parser (`parse_utc`) replacing three byte-equivalent duplicates (`openstudio_client._parse_timestamp`, `status_store._parse_utc`, `singleton._parse_utc`). Callers re-raise as their own exception type to preserve public contracts. `None`-safe: returns `None` for missing timestamps (D12). Use this for any new timestamp parse — don't roll your own.
 - `src/openstudio_operator/events.py` (`#164`) — `EventEmitter` class replacing per-handler `Callable[[str, str, str], None]` aliases. One instance per tick (handler receives `emit=`); the dry-run gate (D11) and the suppressed-event counter live here, not at call sites.
-- `src/openstudio_operator/client_factory.py` (`#168`) — `lru_cache`-keyed-by-`server_url` factory for `OpenStudioClient`. Replaces four module-level `_client_cache` + `_get_client()` duplicates. Mutated `spec.serverUrl` invalidates via a different key — no manual eviction needed.
+- `src/openstudio_operator/client_factory.py` (`#168`, `#235`) — `lru_cache`-keyed factories for both operator clients: `get_openstudio_client(server_url)` for `OpenStudioClient` (replaced four module-level `_client_cache` + `_get_client()` duplicates) and `get_read_only_redis_client(redis_url)` for `ReadOnlyRedisClient` (replaced `web_background_monitor._get_redis_client`'s dict cache, `analysis_sla._default_redis_client`'s fresh-per-tick client, and the inline construction in the `#163` boot-time key-layout check). A mutated `spec.serverUrl` / `spec.redisUrl` invalidates via a different key — no manual eviction needed. Both "exactly one construction site" invariants are AST-gated: `tests/test_singleton_registry_coverage.py::test_only_one_custom_objects_api_construction_point` and `tests/test_client_factory.py::test_only_one_read_only_redis_client_construction_point`.
 - `src/openstudio_operator/config.py` — CRD `spec` → typed `OperatorConfig` (defaults **must** stay in sync with `deploy/crd.yaml`; covered by `tests/test_smoke.py::test_config_defaults_parity_with_crd_yaml`).
 - `src/openstudio_operator/openstudio_client.py` — REST client (verified against v3.11.0, 3× retry/backoff, tz-aware UTC parsing).
 - `src/openstudio_operator/status_store.py` — typed 409-safe RMW helper over the CR `.status` subresource.
