@@ -1,4 +1,4 @@
-# NetworkPolicy for the operator surface (issue #112).
+# NetworkPolicy for the operator surface (issue #112 + #166).
 #
 # Default-deny egress in the `openstudio-server` namespace, with explicit
 # allow lists for the three actor pods that actually need network:
@@ -16,10 +16,14 @@
 # The historical HPA / NFS / Secrets strings are intentionally absent —
 # any policy that re-allows them is a regression (see #77 / #78 commits).
 #
-# All policies use policyTypes: [Egress] only. Ingress is not controlled —
-# the in-cluster Service `web` (port 80) and the operator's `/metrics`
-# Service are bound to the cluster's default-deny at the CNI layer, not
-# here.
+# All egress policies use policyTypes: [Egress] only.
+#
+# Ingress is controlled ONLY for the operator's /metrics endpoint
+# (issue #166): a dedicated policy `openstudio-operator-metrics-ingress`
+# restricts port 9090 to a Prometheus-style namespace selector +
+# co-located scraper. The in-cluster Service `web` (port 80) and every
+# other operator surface inherit the cluster's default-deny at the CNI
+# layer, not here.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -208,3 +212,66 @@ spec:
       ports:
         - protocol: TCP
           port: 2049
+---
+# Ingress allow for the operator's /metrics endpoint (issue #166).
+#
+# The operator exposes a plaintext Prometheus exposition format on port
+# 9090 (metrics.py:204 `prometheus_client.start_http_server(bound_port,
+# addr="0.0.0.0")`; deploy/operator-deployment.yaml:43 `containerPort:
+# 9090`). There is no authN, no authZ, no TLS — every counter/gauge is
+# readable by anything that can reach the pod IP on 9090. On a cluster
+# without a default-deny-ingress CNI plugin, any in-cluster pod can
+# scrape the operator and read `resque_workers_seen_max` together with
+# `openstudio_operator_status_conflicts_total` to time attacks against
+# operator busy periods.
+#
+# This policy restricts who can reach port 9090 of the operator pod:
+#
+#   * `namespaceSelector.kubernetes.io/metadata.name: prometheus` — the
+#     cluster's Prometheus is expected to run in a namespace labeled
+#     exactly so. Cluster admins running a different scraper (e.g.
+#     `monitoring`, `kube-prometheus-stack`) MUST edit the label match
+#     below. This is the opt-in noted in AGENTS.md.
+#   * `podSelector: {}` — same-namespace peer (e.g. a Prometheus
+#     sidecar, or a debug scraper). Empty selector matches every pod
+#     in `openstudio-server`, so a peer in the operator's namespace
+#     can scrape without crossing namespace boundaries.
+#
+# No `namespaceSelector` matching all namespaces is allowed (would be
+# a global allow) — the allow-list is the two peer selectors above.
+#
+# Acceptance criterion (issue #166): policyTypes: [Ingress]; ingress
+# restricted to port 9090/TCP only; no other ports allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openstudio-operator-metrics-ingress
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: network-policy
+  annotations:
+    energy.nrel.gov/description: |
+      Restrict ingress to the operator's /metrics endpoint (port 9090).
+      Allows Prometheus-style scrapers: pods in a `prometheus`-labeled
+      namespace, plus any pod co-located in this namespace (sidecar).
+      Cluster admins running a different scraper namespace must edit
+      the `namespaceSelector` below — see AGENTS.md "Working rules".
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: openstudio-operator
+      app: openstudio-operator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # Cluster-admin opt-in: rename to match the scraper's
+              # namespace label (e.g. `monitoring`, `kube-prometheus-stack`).
+              kubernetes.io/metadata.name: prometheus
+        - podSelector: {}  # same-namespace peer (e.g. metrics sidecar)
+      ports:
+        - port: 9090
+          protocol: TCP

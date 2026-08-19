@@ -143,13 +143,23 @@ NETPOL_DOCS = list(yaml.safe_load_all((DEPLOY / "network-policy.yaml").read_text
 
 
 def test_network_policy_manifest_exists_and_is_namespaced():
-    """Egress isolation in `openstudio-server` — issue #112 acceptance."""
+    """Egress isolation in `openstudio-server` — issue #112 acceptance.
+    #166 adds a single Ingress-only policy (`openstudio-operator-metrics-
+    ingress`); the structural invariant is that every policy targets
+    the namespace and declares one of the supported policyTypes."""
     assert NETPOL_DOCS, "deploy/network-policy.yaml is missing or empty"
     kinds = {d["kind"] for d in NETPOL_DOCS if d}
     assert kinds == {"NetworkPolicy"}, kinds
     for d in NETPOL_DOCS:
         assert d["metadata"]["namespace"] == "openstudio-server"
-        assert "Egress" in d["spec"]["policyTypes"], d["metadata"]["name"]
+        # Every NetworkPolicy MUST declare at least one policyType. Egress
+        # is the default for the operator surface (#112); the metrics
+        # ingress policy (#166) is Ingress-only and that is intentional.
+        policy_types = set(d["spec"]["policyTypes"])
+        assert policy_types & {"Egress", "Ingress"}, (
+            f"policy {d['metadata']['name']} must declare Egress or "
+            f"Ingress in policyTypes, got {policy_types}"
+        )
 
 
 def test_network_policy_default_deny_for_operator_surface():
@@ -210,3 +220,89 @@ def test_network_policy_rfc1918_egress_excluded_for_storage():
                 assert rfc1918.issubset(excepts), (
                     f"0.0.0.0/0 egress is missing RFC1918 exceptions: {excepts}"
                 )
+
+
+# ---- Issue #166: /metrics ingress is restricted -------------------
+#
+# The operator exposes /metrics on port 9090 in plaintext with no auth
+# (metrics.py:204 + deploy/operator-deployment.yaml:43). On a cluster
+# without a default-deny-ingress CNI plugin, any pod could scrape queue
+# depths, eviction counts, status-conflict retries, and the
+# resque_workers_seen_max gauge — useful reconnaissance for an attacker
+# timing attacks against operator busy periods. The fix is a NetworkPolicy
+# in deploy/network-policy.yaml that restricts ingress to port 9090 with
+# a Prometheus-style namespace selector and a same-namespace peer allow.
+
+
+def _metrics_ingress_policy():
+    matches = [
+        d for d in NETPOL_DOCS
+        if "metrics-ingress" in d["metadata"]["name"]
+    ]
+    assert matches, (
+        "no metrics-ingress NetworkPolicy in deploy/network-policy.yaml — "
+        "the operator's /metrics endpoint on port 9090 is unauthenticated "
+        "and would be readable by every in-cluster pod (#166)"
+    )
+    return matches[0]
+
+
+def test_network_policy_metrics_ingress_exists():
+    """Issue #166 acceptance: a dedicated ingress policy for /metrics exists,
+    targets the operator pod, and declares policyTypes: [Ingress]."""
+    policy = _metrics_ingress_policy()
+    assert policy["metadata"]["namespace"] == "openstudio-server"
+    # The policy must select the operator pod. The selector is the union of
+    # `app.kubernetes.io/managed-by: openstudio-operator` (added by the
+    # operator's Helm/Kustomize install path on hardened clusters) and
+    # `app: openstudio-operator` (always present on the pod template at
+    # deploy/operator-deployment.yaml:20). Both labels appear in
+    # matchLabels — cluster admins can tighten or loosen either.
+    selector = policy["spec"]["podSelector"]["matchLabels"]
+    assert selector.get("app") == "openstudio-operator"
+    assert "Ingress" in policy["spec"]["policyTypes"]
+
+
+def test_network_policy_metrics_ingress_restricts_to_port_9090():
+    """The only port allowed by the ingress rule is 9090/TCP — no plaintext
+    risky ports, no other operator surface (e.g. the kube-apiserver proxy
+    on 443) leaks through this policy."""
+    policy = _metrics_ingress_policy()
+    ingress_rules = policy["spec"]["ingress"]
+    assert ingress_rules, "ingress rules must not be empty"
+    allowed_ports = set()
+    for rule in ingress_rules:
+        for port in rule.get("ports", []):
+            assert port["protocol"] == "TCP", (
+                f"only TCP allowed on /metrics, got {port['protocol']}"
+            )
+            allowed_ports.add(port["port"])
+    assert allowed_ports == {9090}, (
+        f"/metrics ingress must allow only port 9090, got {allowed_ports}"
+    )
+
+
+def test_network_policy_metrics_ingress_has_prometheus_and_peer_allow():
+    """The from-block must (a) target the cluster's scraper namespace AND
+    (b) allow a same-namespace peer (empty podSelector). A cluster-admin
+    namespaceSelector renaming is allowed; a wholesale removal of either
+    peer would silently re-open the endpoint."""
+    policy = _metrics_ingress_policy()
+    rule = policy["spec"]["ingress"][0]
+    from_selectors = rule["from"]
+    # Flatten the from[] peer list (each entry is one AND-of-ORs selector).
+    has_namespace_selector = any(
+        "namespaceSelector" in peer for peer in from_selectors
+    )
+    has_same_ns_peer = any(
+        peer.get("podSelector") == {} for peer in from_selectors
+    )
+    assert has_namespace_selector, (
+        "metrics-ingress must include a namespaceSelector pointing at the "
+        "cluster's scraper namespace (default `prometheus`); see AGENTS.md "
+        "Working rules for the cluster-admin opt-in."
+    )
+    assert has_same_ns_peer, (
+        "metrics-ingress must include an empty podSelector to allow "
+        "co-located scrapers (e.g. sidecar) in openstudio-server"
+    )
