@@ -40,6 +40,7 @@ from prometheus_client import REGISTRY
 
 from openstudio_operator import metrics
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.analysis_sla import (
     ANALYSIS_ESCALATED_EVENT,
     ANALYSIS_SOFT_STOPPED_EVENT,
@@ -1511,3 +1512,86 @@ def test_escalate_analysis_uses_redis_resolved_pod_set():
     assert outcome == "evicted"
     assert {d["name"] for d in pod_api.deletes} == {"worker-a", "worker-b"}
     assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "evicted"
+
+
+# --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
+
+
+import types
+
+
+@responses.activate
+def test_run_sla_tick_accepts_mappingview_body_in_event_emitter():
+    """Issue #232 — MappingView (types.MappingProxyType) body end-to-end.
+
+    kopf >=1.4x delivers ``body`` to timer handlers as a
+    ``kopf._cogs.structs.bodies.Body`` — a MappingView subclass, NOT a dict
+    subclass. ``test_singleton_guard.py::test_gated_wrapper_accepts_non_dict_mapping_body``
+    pins this only at the singleton-gate boundary; the four ``@kopf.timer``
+    wrappers pass ``body=body`` straight into
+    ``EventEmitter(body=body, dry_run=...)``. This regression test wires
+    ``types.MappingProxyType`` (the standard-library stand-in for a non-dict
+    mapping) into ``EventEmitter``, drives ``run_sla_tick`` through its
+    soft-stop emit path, and asserts:
+
+    1. ``EventEmitter.dry_run`` gate still records the suppression through
+       ``EventEmitter.suppressed_count`` (D11 end-to-end);
+    2. ``body.get('metadata')`` introspection keeps working — the access
+       shape ``kopf.event`` and any status-update helper rely on.
+
+    No production code change; the test fails the day a kopf upgrade makes
+    the body shape incompatible with ``EventEmitter`` (e.g. by binding it
+    to ``dict`` semantics). Scope guard: handler / guard untouched.
+    """
+    # Anchor 2h old with maxDurationMinutes=60 → soft-stop fires this tick;
+    # gracefulStopTimeoutMinutes=600 keeps the escalation path dormant so
+    # suppressed_count reflects exactly the soft-stop Warning.
+    spec = {
+        "serverUrl": BASE,
+        "redisUrl": "redis://:pw@queue.test:6379",
+        "dryRun": True,
+        "analysisPolicy": {"maxDurationMinutes": 60, "gracefulStopTimeoutMinutes": 600},
+    }
+    api = FakeCustomObjectsApi(
+        make_cr(
+            spec,
+            status={
+                "softStops": {
+                    "a1": {"issuedAt": (NOW - timedelta(hours=2)).isoformat(), "outcome": "watching"},
+                },
+            },
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+
+    # CR body as kopf 1.4x would deliver it: a MappingView, not a dict subclass.
+    cr_body = make_cr(spec)
+    proxy_body = types.MappingProxyType(cr_body)
+    assert not isinstance(proxy_body, dict)  # the shape this regression exists for
+    # (2) body.get('metadata') still resolves through the proxy — the access
+    # pattern kopf.event and any status-update helper rely on.
+    assert proxy_body.get("metadata") == cr_body["metadata"]
+
+    # (1) Wire the production EventEmitter (not the test closure stub) — the
+    # D11 gate under test lives here.
+    emitter = EventEmitter(body=proxy_body, dry_run=True)
+    config = OperatorConfig.from_spec(spec)
+    store = StatusStore(NAMESPACE, NAME, api)
+
+    result = run_sla_tick(
+        OpenStudioClient(BASE),
+        store,
+        config,
+        now=NOW,
+        emit=emitter,
+        namespace=NAMESPACE,
+        pod_api=None,
+        redis_client=FakeRedisClient(),
+    )
+
+    assert result.soft_stopped == ["a1"]
+    assert result.escalated == []
+    # The dry-run gate still records exactly the one soft-stop Warning.
+    assert emitter.suppressed_count == 1
+    assert emitter.dry_run is True
