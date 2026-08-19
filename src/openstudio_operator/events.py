@@ -37,6 +37,11 @@ import logging
 
 import kopf
 
+from openstudio_operator.metrics import (
+    EVENTS_DRY_RUN_SUPPRESSED_TOTAL,
+    EVENTS_EMITTED_TOTAL,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +117,12 @@ class EventEmitter:
         """
         if self._dry_run:
             self._suppressed_count += 1
+            # Issue #237 — Prometheus surface for the dry-run gate. The
+            # counter is incremented at the same site as suppressed_count
+            # so a /metrics scrape can prove dry-run mode is firing
+            # without parsing logs. Labelled by reason so dashboards can
+            # distinguish which handler path the gate intercepted.
+            EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(reason=reason).inc()
             logger.info(
                 "dry-run suppressed %s Event reason=%s message=%r (#164)",
                 event_type,
@@ -119,6 +130,11 @@ class EventEmitter:
                 message,
             )
             return
+        # Issue #237 — companion emitted counter. Together with the
+        # dry-run suppressed counter above, the ratio
+        # ``rate(events_emitted_total) / rate(events_dry_run_suppressed_total)``
+        # is the headline SLO for an audit-only install.
+        EVENTS_EMITTED_TOTAL.labels(reason=reason).inc()
         kopf.event(self._body, type=event_type, reason=reason, message=message)
 
     def __call__(self, event_type: str, reason: str, message: str) -> None:

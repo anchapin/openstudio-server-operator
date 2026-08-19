@@ -28,6 +28,13 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_handler_tick_failures_total",
     # Issue #171 — defensive cap evictions on the CR .status maps.
     "openstudio_operator_status_map_caps_total",
+    # Issue #237 — EventEmitter (#164) dry-run gate Prometheus surface
+    # (per-reason labelled). Mirrors the warning-event reason vocabulary
+    # so dashboards can tell WHICH handler path the dry-run gate
+    # intercepted. Emitted companion below lets the dry-run ratio be
+    # derived via Prometheus arithmetic without log scraping.
+    "openstudio_operator_events_dry_run_suppressed_total",
+    "openstudio_operator_events_emitted_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
@@ -124,13 +131,24 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.STATUS_MAP_CAPS_TOTAL.labels(
         map_name="__metrics_test_sentinel__"
     ).inc()
+    # Issue #237 — same pattern for the two EventEmitter (#164)
+    # counters. ``events_dry_run_suppressed_total`` and
+    # ``events_emitted_total`` are both labelled by ``reason``; pre-touch
+    # both so the family-existence assertion is self-contained for the
+    # labelled-counter branch.
+    metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
+        reason="__metrics_test_sentinel__"
+    ).inc()
+    metrics.EVENTS_EMITTED_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
 
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
     for name in _declared_counter_families():
         assert f"# TYPE {name} counter" in response.text
         # Labelled counters (issue #117's ``handler_tick_failures_total``,
-        # issue #171's ``status_map_caps_total``) emit
+        # issue #171's ``status_map_caps_total``,
+        # issue #237's ``events_dry_run_suppressed_total`` /
+        # ``events_emitted_total``) emit
         # ``<name>{<labels>} value``; non-labelled emit ``<name> value``.
         # The sentinel increments above pre-touch the labelled series;
         # check the labelled form for them, the bare form for the rest.
@@ -142,6 +160,16 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_status_map_caps_total":
             assert (
                 'openstudio_operator_status_map_caps_total{map_name="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_events_dry_run_suppressed_total":
+            assert (
+                'openstudio_operator_events_dry_run_suppressed_total{reason="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_events_emitted_total":
+            assert (
+                'openstudio_operator_events_emitted_total{reason="__metrics_test_sentinel__"}'
                 in response.text
             )
         else:
@@ -247,5 +275,81 @@ def test_handler_tick_failures_counter_distinguishes_error_types():
     exposition = generate_latest().decode()
     assert (
         'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",module="analysis_sla"}'
+        in exposition
+    )
+
+
+# --- Issue #237 — EventEmitter dry-run gate Prometheus surface ----------------
+
+
+def test_events_dry_run_suppressed_counter_increments_per_reason():
+    """Issue #237 acceptance: ``events_dry_run_suppressed_total`` increments
+    per-reason at the same site that bumps ``EventEmitter.suppressed_count``.
+
+    Driving the increment directly via ``labels(...).inc()`` mirrors the
+    labelled-counter pattern from #117 and #171 — the actual emission site
+    (inside :meth:`EventEmitter.emit`) is covered end-to-end by
+    ``tests/test_events.py``. This test pins the label cardinality so a
+    future refactor that drops the label is caught at CI."""
+    counter = metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL
+    baseline = _counter_total(counter)
+    for reason in (
+        "AnalysisSoftStopped",
+        "AnalysisEscalated",
+        "DatapointRequeued",
+        "DatapointRequeueExhausted",
+        "WorkerRecycled",
+        "WebBackgroundRestarted",
+        "ResqueKeyLayoutUnknown",
+    ):
+        counter.labels(reason=reason).inc()
+    after = _counter_total(counter)
+    # 7 reasons × 1 increment each.
+    assert after - baseline == 7.0
+
+
+def test_events_emitted_counter_increments_per_reason():
+    """Issue #237 acceptance: companion ``events_emitted_total`` increments
+    per-reason for every successful ``kopf.event`` call from
+    :class:`EventEmitter`. Together with the suppressed counter above,
+    ``rate(emitted) / rate(suppressed)`` is the headline SLO for an
+    audit-only install — a non-trivial suppressed rate with a zero
+    emitted rate is the intended state; the test pin is for the inverse
+    drift (suppressed > emitted during a non-dry-run deploy)."""
+    counter = metrics.EVENTS_EMITTED_TOTAL
+    baseline = _counter_total(counter)
+    for reason in (
+        "AnalysisSoftStopped",
+        "AnalysisEscalated",
+        "DatapointRequeued",
+        "DatapointRequeueExhausted",
+        "WorkerRecycled",
+        "WebBackgroundRestarted",
+        "ResqueKeyLayoutUnknown",
+    ):
+        counter.labels(reason=reason).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 7.0
+
+
+def test_events_counters_exposition_uses_reason_label():
+    """Issue #237 — verified exposition shape: each ``reason`` value is its
+    own labelled series. Same guard pattern as #117's per-(module, error_type)
+    series check: a labelled Counter with at least one observation exposes
+    ``<name>{<labels>} <value>`` and the family line. Pinning the label key
+    here (``reason``) means a future refactor that silently renames the label
+    (e.g. to ``event_reason``) is caught at CI rather than at the on-call's
+    Grafana board."""
+    counter_suppressed = metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL
+    counter_emitted = metrics.EVENTS_EMITTED_TOTAL
+    counter_suppressed.labels(reason="ExpositionShapeProbe").inc()
+    counter_emitted.labels(reason="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_events_dry_run_suppressed_total{reason="ExpositionShapeProbe"}'
+        in exposition
+    )
+    assert (
+        'openstudio_operator_events_emitted_total{reason="ExpositionShapeProbe"}'
         in exposition
     )
