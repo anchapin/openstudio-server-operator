@@ -41,7 +41,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - `src/openstudio_operator/singleton.py` — passive oldest-CR-per-namespace guard + central gating of every OSCM timer handler.
 - `src/openstudio_operator/archival.py` — pure rclone archival Job manifest generator (backend-agnostic `s3|gcs|azure`, `envFrom`-only creds).
 - `src/openstudio_operator/retention.py` + `src/openstudio_operator/prune_entrypoint.py` — retention pipeline + Job entrypoint invoked by `deploy/storage-cronjob.yaml` (`#78`); the operator process owns no storage polling loop.
-- `src/openstudio_operator/metrics.py` — Prometheus counters + `/metrics` HTTP server (port 9090).
+- `src/openstudio_operator/metrics.py` — Prometheus counters + `/metrics` HTTP server (port 9090). The full family inventory is enumerated in [README.md#metrics](./README.md#metrics); the test invariant that catches drift is `tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES` / `EXPECTED_GAUGE_FAMILIES` (11 counters + 1 gauge today, #183).
 - `deploy/crd.yaml` · `deploy/rbac.yaml` · `deploy/operator-deployment.yaml` — CRD, namespaced **Role** only (verbs enumerated; no `horizontalpodautoscalers`, no `batch` post-`#77`/`#78`), operator Deployment (single-replica `Recreate`, hardened `securityContext` post-`#115`).
 - `deploy/keda-scaledobject.yaml` · `deploy/redis-credentials-secret.yaml` — KEDA ScaledObject + TriggerAuthentication + Redis password Secret (cluster-admin install; operator-managed? no — see Working rules).
 - `deploy/storage-cronjob.yaml` — prune CronJob (`#78`; uses `openstudio_operator.prune_entrypoint`).
