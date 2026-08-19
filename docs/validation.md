@@ -13,25 +13,33 @@ real helm deployment (NatLabRockies chart, `develop` branch, namespace
 
 - a **real NFS provisioner** behind `nfs-pvc` (kind used a hostPath
   stand-in — see [Approximations](kind-validation.md#approximations-vs-production)),
-- **real HPA dynamics** on `worker-hpa` (kind has no metrics-server),
+- **real KEDA ScaledObject dynamics** on `keda-hpa-worker` (kind has no
+  metrics-server, so KEDA cannot activate a Redis-scaler query there —
+  Scale-up/Scale-down probes need the work cluster's Prometheus stack),
+  replacing the chart's `worker-hpa` HPA which is deleted in
+  [Prerequisites](#prerequisites-cluster-installed-outside-this-operator),
+  then verified extinct in [Phase D](#phase-d--flip-dryrun-false)'s
+  negative-control step,
 - mutating actions (`soft_stop`, `requeue`, `DELETE`) against analyses that
   matter — under `dryRun` first, then for real on throwaway analyses only.
 
-## Module status at time of writing
+## Module status (post-#77/#78; column updated after wave-3 merges)
 
-| Module | Handler | State | Issue |
+The table below reflects the handlers that are loaded by `handlers/__init__.py`
+on every operator boot and the manifests actually shipped under `deploy/`.
+Earlier revisions of this runbook described modules 2/3/5 as "stubs" and
+referenced the deleted `handlers/storage_pruner.py`; those lines predate the
+#10/#11/#13/#78 merges and are no longer accurate.
+
+| Module | Code path | State | Notes |
 |---|---|---|---|
-| 1 — Analysis SLA soft-stop | `src/openstudio_operator/handlers/analysis_sla.py` | **live** | #8 merged |
-| 1b — Grace wait + pod eviction | (extends `analysis_sla.py`) | pending | #9 |
-| 2 — Zombie datapoint watchdog | `src/openstudio_operator/handlers/datapoint_watchdog.py` | stub | #10 |
-| 3 — Worker recycler | `src/openstudio_operator/handlers/worker_recycler.py` | stub | #11 |
-| 4 — Archival + NFS prune | `src/openstudio_operator/handlers/storage_pruner.py` (stub) + `src/openstudio_operator/archival.py` (Job generator, merged) | orchestration pending | #15 merged, #16 pending |
-| 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | stub (Redis client ready in `src/openstudio_operator/redis_client.py`) | #13 |
-| Phase 4 — KEDA ScaledObject | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication); operator owns zero autoscaling surface | **live** | #77 (replaces #18) |
-
-Steps depending on unmerged code are tagged **[pending module merge — #N]**.
-Run them as written once the module lands; they are part of this runbook, not
-optional extras.
+| 1 — Analysis SLA soft-stop | `src/openstudio_operator/handlers/analysis_sla.py` | **live** | SLA clock + escalation re-sourced to verified contract in #83/#96; LEGACY escalation seam trim tracked in #105 |
+| 2 — Zombie datapoint watchdog | `src/openstudio_operator/handlers/datapoint_watchdog.py` | **live** | Requeue path for `started → jobless` datapoints |
+| 3 — Worker recycler | `src/openstudio_operator/handlers/worker_recycler.py` | **live** | Idle Resque fence + pod-delete recycle; operator Surface-trim tracked in #104 |
+| 4 — NFS archival + prune | `src/openstudio_operator/archival.py` (Job generator, in-process) → `src/openstudio_operator/retention.py` + `src/openstudio_operator/prune_entrypoint.py` (CronJob entrypoint) | **live** | Prune orchestration moved from operator to a dedicated CronJob in #78; operator Role lost `batch/jobs`. Live-cloud scheduling validation tracked in #101 |
+| 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | **live** | Reads Resque queue depth via `redis_client.stale_workers(...)`; pod eviction on stall |
+| Phase 4 — KEDA autoscaling | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication) | **live** | Replaces custom Redis HPA-floor handler in #77; operator owns zero autoscaling surface and emits no `hpa_floor_adjustments_total` counter |
+| Singleton guard (D05) | `src/openstudio_operator/singleton.py`, installed from `handlers/__init__.py` | **live** | Passive oldest-CR-per-namespace guard; Warning Event + loud log on second CR |
 
 ## Ground rules (from AGENTS.md)
 
@@ -436,9 +444,11 @@ is met — KEDA installed, `worker-hpa` deleted, ScaledObject applied):
    to force it); watch the worker Deployment drop to `minReplicaCount`
    after KEDA's `cooldownPeriod: 60 s`. Capture: timestamps, replica
    count.
-4. **Negative control:** confirm `openstudio_operator_hpa_floor_adjustments_total`
-   is GONE from `curl -s localhost:9090/metrics` (proves #77 removal
-   was complete — no orphan counter, no orphan incrementer).
+4. **Negative control:** `curl -s localhost:9090/metrics | grep
+   openstudio_operator_` exposes no `hpa_floor_adjustments_total` and no
+   `^# HELP` for it (proves #77 removal was complete — no orphan
+   counter, no orphan incrementer; the operator's `/metrics` surface is
+   exclusively the action families that survived #77).
 5. **Operator metric co-existence:** KEDA's metrics adapter and the
    operator's `/metrics` endpoint serve distinct signals; both
    reachable in-cluster via `kubectl -n openstudio-server
