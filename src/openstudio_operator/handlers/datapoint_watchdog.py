@@ -60,7 +60,6 @@ recorded ones never re-fire.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import kopf
@@ -68,6 +67,7 @@ from kubernetes.client import CustomObjectsApi
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
@@ -94,10 +94,6 @@ POLL_INTERVAL_SECONDS = 60.0
 
 DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
-
-#: Event sink: ``(type, reason, message)`` — kopf.event in production, a
-#: recorder in tests (same seam as the analysis SLA monitor).
-EventEmitter = Callable[[str, str, str], None]
 
 # Presentation-only (D04): datapoints whose exhaustion Warning has already
 # been emitted in this operator process — dedupes per-tick Event spam. Not a
@@ -220,9 +216,11 @@ def zombie_datapoint_watchdog(
         return
     client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        kopf.event(body, type=event_type, reason=reason, message=message)
+    # Issue #164 — single source of truth for Event emission; class wraps
+    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
+    # shim so the existing ``emit("Warning", REASON, message)`` call
+    # sites below keep working unchanged.
+    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
     try:
         requeued = run_watchdog_tick(
