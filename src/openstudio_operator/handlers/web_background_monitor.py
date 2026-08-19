@@ -92,8 +92,8 @@ from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
     OperatorConfig,
 )
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.analysis_sla import (
-    EventEmitter,
     deployment_label_selector,
 )
 from openstudio_operator.metrics import (
@@ -561,9 +561,11 @@ def web_background_monitor(
     apps_api = AppsV1Api()
     pods_api = CoreV1Api()
     tracker = _get_tracker(namespace, name)
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        kopf.event(body, type=event_type, reason=reason, message=message)
+    # Issue #164 — single source of truth for Event emission; class wraps
+    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
+    # shim so the existing ``emit("Warning", REASON, message)`` call site
+    # below keeps working unchanged.
+    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
     try:
         fired = run_stall_tick(

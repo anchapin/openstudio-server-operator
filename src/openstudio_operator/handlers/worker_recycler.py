@@ -57,7 +57,7 @@ from kubernetes.client import ApiException, AppsV1Api, CustomObjectsApi
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
-from openstudio_operator.handlers.analysis_sla import EventEmitter
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     WORKERS_RECYCLED_TOTAL,
@@ -209,9 +209,11 @@ def worker_recycler(
     client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
     apps_api = AppsV1Api()
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        kopf.event(body, type=event_type, reason=reason, message=message)
+    # Issue #164 — single source of truth for Event emission; class wraps
+    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
+    # shim so the existing ``emit("Normal", REASON, message)`` call site
+    # below keeps working unchanged.
+    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
     try:
         trigger = run_recycler_tick(

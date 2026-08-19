@@ -88,7 +88,6 @@ stop/escalation is re-attempted next poll, a recorded one never re-fires
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -98,6 +97,7 @@ from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     HANDLER_TICK_FAILURES_TOTAL,
@@ -147,10 +147,6 @@ ESCALATION_EVICTED = "evicted"
 ESCALATION_EVICTED_PARTIAL = "evicted-partial"
 ESCALATION_NO_MATCH = "no-matching-pods"
 ESCALATION_DRY_RUN = "dry-run"
-
-#: Event sink: ``(type, reason, message)`` — kopf.event in production, a
-#: recorder in tests. Shared by the soft-stop and escalation flows.
-EventEmitter = Callable[[str, str, str], None]
 
 
 @dataclass
@@ -698,9 +694,11 @@ def analysis_sla_monitor(
     store = StatusStore(namespace, name, CustomObjectsApi())
     pod_api: WorkerPodApi = CoreV1Api()
     redis_client: RedisClientLike = _default_redis_client(config)
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        kopf.event(body, type=event_type, reason=reason, message=message)
+    # Issue #164 — single source of truth for Event emission. The class
+    # encapsulates the dry-run gate (D11) and the suppressed counter; the
+    # ``__call__`` shim keeps the ``emit("Warning", REASON, message)``
+    # syntax alive for the handler call sites below.
+    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
     try:
         result = run_sla_tick(
