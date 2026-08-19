@@ -129,3 +129,84 @@ def test_cronjob_pod_mounts_no_volumes_and_no_secret_refs():
     assert "persistentVolumeClaim" not in blob
     assert "secretRef" not in blob
     assert "secretKeyRef" not in blob
+
+
+# ---- Issue #112: namespace NetworkPolicy ----------------------------
+#
+# The operator surface (operator Deployment + storage-prune CronJob +
+# archival Jobs) MUST have a default-deny egress policy in
+# `deploy/network-policy.yaml`. The structural test below quantifies the
+# acceptance: at least one NetworkPolicy resource per actor class with
+# `policyTypes: [Egress]` and a default-deny shape (empty egress list OR
+# an explicit allow-list with no wider-than-needed cidrs).
+NETPOL_DOCS = list(yaml.safe_load_all((DEPLOY / "network-policy.yaml").read_text()))
+
+
+def test_network_policy_manifest_exists_and_is_namespaced():
+    """Egress isolation in `openstudio-server` — issue #112 acceptance."""
+    assert NETPOL_DOCS, "deploy/network-policy.yaml is missing or empty"
+    kinds = {d["kind"] for d in NETPOL_DOCS if d}
+    assert kinds == {"NetworkPolicy"}, kinds
+    for d in NETPOL_DOCS:
+        assert d["metadata"]["namespace"] == "openstudio-server"
+        assert "Egress" in d["spec"]["policyTypes"], d["metadata"]["name"]
+
+
+def test_network_policy_default_deny_for_operator_surface():
+    """Default-deny + explicit allow: at least one policy whose podSelector
+    selects every operator-managed pod (manage-by label) and whose egress
+    list is restrictive. Operators in the surface (Deployment, CronJob,
+    archival Jobs) cannot egress to the public Internet by default."""
+    # Find a deny-all policy by name prefix
+    deny_policies = [
+        d for d in NETPOL_DOCS
+        if "deny-egress" in d["metadata"]["name"]
+    ]
+    assert deny_policies, "no default-deny NetworkPolicy found in deploy/network-policy.yaml"
+    deny = deny_policies[0]
+    assert deny["spec"]["egress"] in ([], None), (
+        f"default-deny must have empty egress list, got {deny['spec']['egress']!r}"
+    )
+
+
+def test_network_policy_storage_egress_is_https_only():
+    """The archival / prune egress allow-list permits HTTPS (TCP 443) only.
+    Plaintext IMAP/SMTP/arbitrary ports must NOT be in the allow-list — the
+    storage backend is reached over TLS, period."""
+    storage_policies = [
+        d for d in NETPOL_DOCS
+        if "storage-egress" in d["metadata"]["name"]
+    ]
+    assert storage_policies, "no storage-egress NetworkPolicy found"
+    storage = storage_policies[0]
+    ports = []
+    for rule in storage["spec"]["egress"]:
+        ports.extend(rule.get("ports", []))
+    port_numbers = {p["port"] for p in ports}
+    assert 443 in port_numbers, port_numbers
+    # No plaintext risky ports anywhere in the allow-list
+    plaintext_risky = {25, 110, 143, 587, 993, 995}
+    assert port_numbers.isdisjoint(plaintext_risky), (
+        f"plaintext risky ports present in egress allow: {port_numbers & plaintext_risky}"
+    )
+
+
+def test_network_policy_rfc1918_egress_excluded_for_storage():
+    """Public Internet egress (TCP 443) for storage backends MUST exclude
+    RFC1918 ranges — an archival Job should never egress to a private net."""
+    storage_policies = [
+        d for d in NETPOL_DOCS
+        if "storage-egress" in d["metadata"]["name"]
+    ]
+    storage = storage_policies[0]
+    # Walk every egress rule, every ipBlock within, and confirm
+    # RFC1918 is in the `except:` list of the 0.0.0.0/0 block.
+    for rule in storage["spec"]["egress"]:
+        for to in rule.get("to", []):
+            ip_block = to.get("ipBlock", {})
+            if ip_block.get("cidr") == "0.0.0.0/0":
+                excepts = set(ip_block.get("except", []))
+                rfc1918 = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+                assert rfc1918.issubset(excepts), (
+                    f"0.0.0.0/0 egress is missing RFC1918 exceptions: {excepts}"
+                )

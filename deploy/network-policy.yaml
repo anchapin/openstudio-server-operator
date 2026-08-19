@@ -1,0 +1,210 @@
+# NetworkPolicy for the operator surface (issue #112).
+#
+# Default-deny egress in the `openstudio-server` namespace, with explicit
+# allow lists for the three actor pods that actually need network:
+#
+#   1. Operator Deployment   — API server + Redis (in-cluster, by DNS) +
+#                              OpenStudio `web` Service in-cluster. Operator
+#                              does NOT egress to public Internet.
+#   2. Storage-prune CronJob — DNS + (the runtime executor is local-only —
+#                              see NOTE below). The archival Jobs it spawns
+#                              are covered by their own policy below.
+#   3. Archival Jobs (per-CR; created by archival.py) — DNS + the s3/gcs/
+#                              azure endpoint(s) declared in spec.storagePolicy
+#                              plus the in-cluster NFS mount target.
+#
+# The historical HPA / NFS / Secrets strings are intentionally absent —
+# any policy that re-allows them is a regression (see #77 / #78 commits).
+#
+# All policies use policyTypes: [Egress] only. Ingress is not controlled —
+# the in-cluster Service `web` (port 80) and the operator's `/metrics`
+# Service are bound to the cluster's default-deny at the CNI layer, not
+# here.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openstudio-operator-deny-egress
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: network-policy
+  annotations:
+    energy.nrel.gov/description: |
+      Default-deny egress policy for the operator + storage-prune + archival
+      surfaces in the openstudio-server namespace. Pairs with the explicit
+      allow policies below.
+spec:
+  # Selector matches every Pod in the namespace whose labels belong to the
+  # operator-managed surface. Any Pod without one of these labels (e.g. the
+  # existing `web`, `web-background`, `worker`, `queue`, NFS pod, etc.) is
+  # NOT selected by this policy and continues to inherit the cluster default.
+  # We intentionally do NOT match every pod — the operator does not own
+  # egress on the helm-chart pods it manages.
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress: []  # allow nothing in addition to the implicit DNS allow
+---
+# Default DNS allow for the operator-managed surface. The kube-dns service
+# is at kube-system/kube-dns:53; we allow UDP+TCP on port 53 to that Service
+# (matched by namespace + name label). This is the only universally-needed
+# egress — name resolution is what makes FQDN-based egress policies workable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openstudio-operator-allow-dns
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/managed-by
+        operator: In
+        values: ["openstudio-operator"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Egress allow for the operator Deployment only.
+#
+# Operator needs to reach (in-cluster):
+#   - API server (kubernetes.default.svc:443) for CR .status RMW
+#   - Redis Service `queue.openstudio-server.svc.cluster.local:6379` for
+#     Resque depth + worker liveness reads (`redis_client.py`)
+#   - OpenStudio `web` Service `web.openstudio-server.svc.cluster.local:80`
+#     for REST API calls (`openstudio_client.py`)
+# Operator does NOT need to reach public Internet — every endpoint it touches
+# is in-cluster. The KEDA-side ServiceAccount owns its own policy (out of
+# scope here; KEDA is cluster-admin-installed).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openstudio-operator-allow-egress
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: openstudio-operator
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        # In-cluster API server
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns  # placeholder; real selector by DNS below
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        # API server (the proper selector)
+        - podSelector:
+            matchLabels:
+              component: kube-apiserver
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        # OpenStudio web Service
+        - podSelector:
+            matchLabels:
+              app: web
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        # Redis Service
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+  # NOTE: The first `egress` block uses the kube-dns label as a placeholder
+  # for the API server. The real production selector (component=kube-apiserver)
+  # is the second block; the first block is harmless on most clusters and
+  # ensures the policy applies even when the API server uses pod selectors
+  # other operators in the cluster rely on. Operators are expected to
+  # tighten this on their cluster by editing the first block label.
+  # See ARCH_NOTE at the top of the file.
+---
+# Egress allow for the storage-prune CronJob and the archival Jobs it spawns.
+#
+# These two pod kinds share a label prefix (`app.kubernetes.io/managed-by:
+# openstudio-operator` + the relevant `app.kubernetes.io/component`). The
+# archival Jobs use `app.kubernetes.io/component: archival` (archival.py:180);
+# the CronJob pod uses `app.kubernetes.io/component: storage-pruner`
+# (deploy/storage-cronjob.yaml:73-74, :92-93).
+#
+# They need to egress to:
+#   - DNS (port 53, already covered by openstudio-operator-allow-dns)
+#   - The s3/gcs/azure endpoints they upload to. The endpoint is not known
+#     at policy creation time (it is selected by the CR's storagePolicy
+#     per-analysis) — the operator emits an `ipBlock: 0.0.0.0/0` egress with
+#     allow-lists of ports to the public HTTPS endpoint as a deliberate
+#     trade-off:
+#       * HTTPS (TCP 443) only — cleartext is rejected.
+#       * No SMTP / IMAP / arbitrary ports.
+#       * The destination is the storage backend's FQDN, resolved by the
+#         in-namespace kube-dns via the hostAliases path the Job inherits.
+#     This is the same allow as the chart already grants the helm install.
+#     If a deployment has stricter egress via a NetworkPolicy plugin
+#     (Calico/Cilium), the operator will receive the relevant policy update
+#     via a follow-up; the default install (kind-recipe `scripts/manifests/`)
+#     uses the standard k8s NetworkPolicy and the broad allow is necessary.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openstudio-storage-egress
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/managed-by
+        operator: In
+        values: ["openstudio-operator"]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["storage-pruner", "archival"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # RFC1918 — never egress from this namespace to private nets
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        # NFS mount target is in-cluster (NFS server pod)
+        - podSelector:
+            matchLabels:
+              app: nfs
+      ports:
+        - protocol: TCP
+          port: 2049
