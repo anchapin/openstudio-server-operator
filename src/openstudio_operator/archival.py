@@ -211,6 +211,20 @@ def build_archival_job(
                 "metadata": {"labels": labels},
                 "spec": {
                     "restartPolicy": RESTART_POLICY,
+                    # Issue #161 — pod-level defense-in-depth baseline. PSS
+                    # `restricted` validates pod-level runAsNonRoot +
+                    # seccompProfile, not the container-level fields. An
+                    # injected sidecar or debug ephemeralContainer that
+                    # omits its own securityContext still inherits these
+                    # defaults. fsGroup 1000 is harmless on the readOnly
+                    # NFS mount and keeps the manifest shape consistent
+                    # with the operator Deployment and the prune CronJob.
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                        "fsGroup": 1000,
+                    },
                     "containers": [
                         {
                             "name": "rclone",
