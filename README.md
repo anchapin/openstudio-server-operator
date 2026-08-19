@@ -4,6 +4,8 @@ A Kubernetes operator that automates day-2 operations for [OpenStudio Server](ht
 
 **Status: implementation complete (Phases 1–4, issues #2–#21); live kind-cluster validation done for modules 2/3/5/singleton and the full-module `dryRun: true` walkthrough (#66/#67/#84); Phase-4 autoscaling is now driven by a standard KEDA ScaledObject (#77, replacing the custom HPA-floor adjuster #18); D1/D2 contract drift resolved by #96 (Resque-worker identity path — see Module 1 row).** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). First-time contributors and AI agents: start at [`docs/onboarding.md`](./docs/onboarding.md) (issue #178). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
 
+Changelog: [CHANGELOG.md](./CHANGELOG.md) — curated per-release notes (Keep a Changelog format; see issue #177).
+
 ## What it will automate
 
 | Module | Plan phase | Purpose |
