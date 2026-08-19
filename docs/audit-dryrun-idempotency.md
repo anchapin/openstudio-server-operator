@@ -230,10 +230,10 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **11
-counters + 1 gauge** — is asserted by `tests/test_metrics_endpoint.py`'s
-`EXPECTED_COUNTER_FAMILIES` and `EXPECTED_GAUGE_FAMILIES`: drift in
-either direction fails CI before it ships, so any new metric added to
+local; the scrape is in-cluster). The exhaustive inventory — **12
+counters + 1 gauge + 1 histogram** — is asserted by `tests/test_metrics_endpoint.py`'s
+`EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES`:
+drift in either direction fails CI before it ships, so any new metric added to
 this codebase MUST be added to both the table below and the matching
 `EXPECTED_*` tuple in the same PR (the `hpa_floor_adjustments_total`
 counter, removed in #77, is the canonical "you forgot" example — see
@@ -268,6 +268,7 @@ stays self-contained.
 | `openstudio_operator_status_conflicts_total` | `status_store` (#119) | Per-attempt 409 from the K8s API Server inside `_mutate`'s except branch (one increment per 409, before the backoff sleep) | n/a — conflict counter, not a decision counter |
 | `openstudio_operator_status_conflict_retries_exhausted_total` | `status_store` (#119) | RMW cycle that exhausted the 409 retry budget and raised `StatusStoreConflictError` (tick skipped, anchor NOT written) | n/a — terminal failure of an anchor write |
 | `openstudio_operator_handler_tick_failures_total` | `handlers/*` timer wrappers (#117) | Tick failure caught by a timer wrapper (catch-and-skip path). **Labelled by `(module, error_type)`** — `module` ∈ {`analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor`}; `error_type` ∈ {`OpenStudioApiError`, `StatusStoreError`, `ApiException`, `RedisClientError`} | n/a — observability for the wrapper catch-and-skip path (the tick was suppressed, no anchor was written) |
+| `openstudio_operator_status_map_caps_total` | `status_store` (#171) | Defensive cap hit on a CR `.status` map — one increment per actual eviction (post-RMW, retry-stable — not per 409 attempt). **Labelled by `map_name`** — `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`}. When a map hits `STATUS_MAP_MAX_ENTRIES = 10000`, `status_store._set_map_entry` evicts the **oldest entries first** (sorted by key — the operator's keys are UUIDs, so the sort order is deterministic but not age-aware) before adding the new entry; the cap fires before etcd's 1.5 MB object-size limit can blow up a tick's read + JSON-parse + merge-patch. | n/a — defensive cap on the (otherwise unbounded) `.status` map; not a decision counter. The companion Warning Event (`StatusMapCapped`) is emitted from the same code path so the on-call has both a log/Event and a Prometheus signal to correlate (`rate(...[5m]) > 0` fires once per cap hit). |
 
 **Labelled convention (#117).** `handler_tick_failures_total` is the
 first labelled counter in the registry and the canonical pattern for
@@ -284,6 +285,12 @@ unlabelled counter here is exactly the regression #181 guards against.
 | Gauge | Module | Sets / Meaning | Notes |
 |---|---|---|---|
 | `openstudio_operator_resque_workers_seen_max` | `web_background_monitor` (#44/#87) | Monotonic max of distinct Resque worker ids ever observed in process lifetime (`SMEMBERS resque:workers`, emitted every poll regardless of queue depth) | #44 — Resque key-layout leg-2 non-vacuity safeguard; #87 dropped the original `AND queue depth > 0` alert conjunction so the gauge populates on a healthy idle fleet. `0` with a reachable Redis unambiguously means no workers are registered — alert on `== 0`. Not a decision counter — does not follow the §2 anchor pairing convention. |
+
+### Histogram
+
+| Histogram | Module | Observes | Buckets |
+|---|---|---|---|
+| `openstudio_operator_analysis_datapoint_count` | `analysis_sla` + `datapoint_watchdog` (#179) | Per-tick count of datapoints observed by the SLA monitor (analyses per tick, `ANALYSIS_DATAPOINT_COUNT.observe(len(analyses))` at `handlers/analysis_sla.py:277`) and the datapoint watchdog (started datapoints per tick, `ANALYSIS_DATAPOINT_COUNT.observe(len(started_ids))` at `handlers/datapoint_watchdog.py:145`). Unlabelled — one `.observe()` per observed count, not per-CR; per-CR labelling would multiply the series count by the analysis count and defeat the bounded-cardinality design. The observation site is `analysis_sla.py` for the SLA branch and `datapoint_watchdog.py` for the watchdog branch — both increment identically under `spec.dryRun` (D11-exempt category — in-process metrics, not cluster state). | `[5, 10, 50, 100, 500, 1000, 5000]` — bucket-capped to bound per-(analysis \| datapoint) cardinality while still surfacing the "we just started getting 5000-point analyses" shift (Goal 10, OSS hardening). |
 
 ### D.1 Removed counter — `STORAGE_FREED_BYTES` (issue #50)
 
