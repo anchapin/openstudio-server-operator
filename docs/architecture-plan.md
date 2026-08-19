@@ -177,7 +177,7 @@ spec:
 | `apps` `deployments` | get, list, watch, patch, update | unchanged | — |
 | `""` `pods` | get, list, watch, delete | unchanged | — |
 | `""` `events` | get, list, watch, create, patch | unchanged | create |
-| `autoscaling` `horizontalpodautoscalers` | get, list, patch | unchanged | — |
+| `autoscaling` `horizontalpodautoscalers` | get, list, patch | **— (rule removed in #77)** | — |
 | `batch` `jobs` | get, list, watch, create, delete | **— (rule removed)** | get, create, delete |
 | **Total** | 6 rules / 22+ enumerated verbs (+CR `*`) | 5 rules / 17+ (+CR `*`) | 4 rules / 8 verbs |
 
@@ -241,44 +241,45 @@ The operator requires restricted K8s permissions.
 
 ### **operator\_rbac.yaml**
 
-apiVersion: v1  
-kind: ServiceAccount  
-metadata:  
-  name: openstudio-operator-sa  
-  namespace: openstudio  
-\---  
-apiVersion: rbac.authorization.k8s.io/v1  
-kind: Role  
-metadata:  
-  name: openstudio-operator-role  
-  namespace: openstudio  
-rules:  
-  \# Manage Custom Resources  
-  \- apiGroups: \["energy.nrel.gov"\]  
-    resources: \["openstudioclustermanagers", "openstudioclustermanagers/status"\]  
-    verbs: \["\*"\]  
-  \# Manage Worker Deployments & Pod Restarts  
-  \- apiGroups: \["apps"\]  
-    resources: \["deployments"\]  
-    verbs: \["get", "list", "watch", "patch", "update"\]  
-  \- apiGroups: \[""\]  
-    resources: \["pods", "events"\]  
-    verbs: \["get", "list", "watch", "create", "patch"\]  
-  \# Create Ephemeral Archival Jobs  
-  \- apiGroups: \["batch"\]  
-    resources: \["jobs"\]  
-    verbs: \["get", "list", "watch", "create", "delete"\]  
-\---  
-apiVersion: rbac.authorization.k8s.io/v1  
-kind: RoleBinding  
-metadata:  
-  name: openstudio-operator-rb  
-  namespace: openstudio  
-subjects:  
-  \- kind: ServiceAccount  
-    name: openstudio-operator-sa  
-    namespace: openstudio  
-roleRef:  
-  kind: Role  
-  name: openstudio-operator-role  
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openstudio-operator-sa
+  namespace: openstudio-server
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openstudio-operator-role
+  namespace: openstudio-server
+rules:
+  # Manage Custom Resources
+  - apiGroups: ["energy.nrel.gov"]
+    resources: ["openstudioclustermanagers", "openstudioclustermanagers/status"]
+    verbs: ["*"]
+  # Manage Worker Deployments & Pod Restarts
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  # NOTE: archival Jobs no longer run in the operator process (#78) — the
+  # storage-prune CronJob's ServiceAccount owns batch/jobs create/delete
+  # (deploy/storage-cronjob.yaml). This Role intentionally omits batch/jobs.
+  # The custom HPA-floor adjuster (#18) was removed in #77; horizontal
+  # pod autoscaling is owned by the KEDA ScaledObject (deploy/keda-scaledobject.yaml).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openstudio-operator-rb
+  namespace: openstudio-server
+subjects:
+  - kind: ServiceAccount
+    name: openstudio-operator-sa
+    namespace: openstudio-server
+roleRef:
+  kind: Role
+  name: openstudio-operator-role
   apiGroup: rbac.authorization.k8s.io  
