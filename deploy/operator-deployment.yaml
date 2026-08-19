@@ -1,5 +1,7 @@
 # Operator image is published by .github/workflows/release.yml on pushes to develop.
-# TODO(phase 1): verify against a real cluster once handler logic lands.
+# This Deployment manifest is what runs the operator in production; the dryRun
+# walkthrough evidence lives in docs/kind-validation.md and the securityContext
+# hardening is in line with the prune CronJob's (deploy/storage-cronjob.yaml:114).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
