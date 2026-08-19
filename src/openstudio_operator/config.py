@@ -8,7 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-DEFAULT_REDIS_URL = "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
+#: Issue #116 — empty by design. The historical default
+#: ``redis://:openstudio@queue...`` baked the kind-recipe password
+#: ``openstudio`` into every published CRD, leaking it through every
+#: ``kubectl get oscrm -o yaml`` of an unconfigured CR. The operator now
+#: refuses to operate when ``spec.redisUrl`` is empty (handlers/__init__.py
+#: startup guard); helm-chart users must set it explicitly or read the
+#: URL from the Redis Secret via a templating step.
+DEFAULT_REDIS_URL = ""
 
 #: Module 5 (#13): heartbeat-staleness threshold (seconds) passed to
 #: ``ReadOnlyRedisClient.stale_workers`` when judging "no worker is

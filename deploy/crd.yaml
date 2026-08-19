@@ -34,8 +34,17 @@ spec:
                   description: "Internal K8s DNS URL for OpenStudio web service."
                 redisUrl:
                   type: string
-                  default: "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
-                  description: "Redis (Resque) URL for read-only queue-depth checks. Default: redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
+                  default: ""
+                  description: |
+                    Redis (Resque) URL for read-only queue-depth checks.
+                    Issue #116: the default is intentionally EMPTY — the historical
+                    default `redis://:openstudio@queue....` baked the kind-recipe
+                    password `openstudio` into every published CRD, so a fresh
+                    deploy that did not override the field shipped a public-facing
+                    password. The operator now refuses to start when this is
+                    empty (see handlers/__init__.py startup guard). Helm-chart
+                    users should derive the URL from the Redis-secret KeyRef
+                    and set `spec.redisUrl` explicitly.
                 dryRun:
                   type: boolean
                   default: false
