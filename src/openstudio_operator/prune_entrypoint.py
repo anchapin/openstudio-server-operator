@@ -59,6 +59,7 @@ from kubernetes.config import ConfigException, load_incluster_config, load_kube_
 from openstudio_operator import singleton
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.logging_setup import install_json_logging
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
 from openstudio_operator.singleton import (
@@ -177,7 +178,14 @@ def main(
     for tests; production wiring builds real clients from in-cluster config.
     Returns the process exit code (see module docstring).
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Issue #256 — install the structured JSON log formatter before any
+    # tick code emits. Idempotent on the root logger; safe to call even
+    # when the test harness has already installed a different formatter
+    # (the sentinel attribute guards against double-install). The
+    # previous ``logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s")``
+    # emitted unstructured text that broke Loki/CloudWatch structured
+    # queries; this is the replacement.
+    install_json_logging()
     if namespace is None:
         namespace = os.environ.get("POD_NAMESPACE")
     if not namespace:

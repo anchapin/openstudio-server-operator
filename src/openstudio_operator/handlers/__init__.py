@@ -26,6 +26,7 @@ from openstudio_operator.handlers import (  # noqa: F401
     web_background_monitor,
     worker_recycler,
 )
+from openstudio_operator.logging_setup import install_json_logging
 from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS, start_metrics_server
 from openstudio_operator.redis_client import (
     OperatorConfigError,
@@ -33,6 +34,16 @@ from openstudio_operator.redis_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Issue #256 — install the structured JSON log formatter on the root
+# logger BEFORE any handler module emits its first record. Idempotent:
+# ``install_json_logging`` is guarded by a sentinel attribute on the root
+# logger so repeated ``import openstudio_operator.handlers`` (collection +
+# execution in pytest, or kopf's own startup re-import) does not double
+# the log output. The kopf structured logger (``kopf.objects`` / ``kopf``)
+# is NOT replaced — its records flow through the same root chain and are
+# formatted as JSON by the handler we install here.
+install_json_logging()
 
 # Issue #234 — the consolidated Warning-Event queue/drain mechanism.
 # Replaces the three module-level queues + enqueue functions + drain
