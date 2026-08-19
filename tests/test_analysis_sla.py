@@ -38,6 +38,7 @@ from types import SimpleNamespace
 import responses
 from prometheus_client import REGISTRY
 
+from openstudio_operator import metrics
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.handlers.analysis_sla import (
     ANALYSIS_ESCALATED_EVENT,
@@ -353,6 +354,68 @@ def test_first_sight_writes_watching_anchor_without_soft_stop():
     anchor = api.obj["status"]["softStops"]["a1"]
     assert anchor["issuedAt"] == NOW.isoformat()
     assert anchor["outcome"] == "watching"
+
+
+# --- Issue #179 — per-CR datapoint-budget Histogram ---------------------------
+
+
+def _histogram_count(histogram) -> float:
+    """Sum of all sample counts in a Histogram (issue #179).
+
+    An unlabelled Histogram (the shape ``ANALYSIS_DATAPOINT_COUNT`` is)
+    exposes a single bucket set; summing ``_sum`` of counts across the
+    buckets surfaces the total number of observations, which is what the
+    SLA tick produces per .observe() call.
+    """
+    samples = list(REGISTRY.collect())
+    for fam in samples:
+        if fam.name == histogram._name:
+            return sum(sample.value for sample in fam.samples if sample.name.endswith("_count"))
+    return 0.0
+
+
+@responses.activate
+def test_analysis_datapoint_count_observed_on_sla_poll():
+    """Issue #179 — the SLA tick records the per-CR datapoint budget via
+    ``ANALYSIS_DATAPOINT_COUNT.observe(len(analyses))`` after the initial
+    ``/analyses.json`` poll. Each tick is one observation; the value is
+    the count of analyses returned by the index endpoint. The
+    observation is recorded even when ``autoSoftStop`` is false (the
+    histogram is independent of the soft-stop decision — its purpose is
+    to surface the per-tick analysis-size distribution, not the
+    soft-stop rate)."""
+    api = FakeCustomObjectsApi(make_cr())
+    register_analyses_index("a1", "a2", "a3")
+    for aid in ("a1", "a2", "a3"):
+        register_analysis_status(aid, status="na")  # not started → no anchor
+    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+
+    tick(api)
+
+    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    assert after - before == 1.0  # exactly one observation per tick
+
+
+@responses.activate
+def test_analysis_datapoint_count_not_observed_when_auto_soft_stop_disabled():
+    """Issue #179 — the histogram is wired to the post-initial-poll site
+    in the SLA tick. ``autoSoftStop: false`` short-circuits the tick
+    BEFORE the initial poll, so the histogram is NOT observed in that
+    branch (no analysis list means no count to record). The
+    "passive this tick" contract is preserved — no observations, no
+    Events, no soft-stop decisions."""
+    spec = {**SPEC, "analysisPolicy": {"maxDurationMinutes": 180, "autoSoftStop": False}}
+    api = FakeCustomObjectsApi(make_cr(spec))
+    register_analyses_index("a1")
+    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+
+    result, events = tick(api, spec=spec)
+
+    assert result.soft_stopped == [] and result.escalated == []
+    assert events == []
+    assert calls_to("/analyses.json") == 0  # no initial poll — disabled is a full stop
+    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    assert after == before
 
 
 @responses.activate

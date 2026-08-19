@@ -98,6 +98,7 @@ from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import (
+    ANALYSIS_DATAPOINT_COUNT,
     HANDLER_TICK_FAILURES_TOTAL,
     SOFT_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
@@ -278,6 +279,12 @@ def run_sla_tick(
         return SlaTickResult(soft_stopped=[], escalated=[])
     soft_stops = store.get_soft_stops()
     analyses = client.list_analyses()
+    # Issue #179 — observe the per-CR datapoint budget observed by the SLA
+    # monitor's initial poll. Recorded once per tick (per-observation), no
+    # labels — bounding cardinality at the histogram level rather than by
+    # tagging each analysis. The watchdog records the same family for the
+    # started-datapoints view, so the two per-CR surfaces share one chart.
+    ANALYSIS_DATAPOINT_COUNT.observe(len(analyses))
     started_ids: set[str] = set()
     for doc in analyses:
         analysis_id = str(doc.get("_id") or "")
