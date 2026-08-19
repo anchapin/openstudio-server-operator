@@ -1127,10 +1127,169 @@ def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
     assert redis_client.workers_for_analysis_calls == []
 
 
+# --- Issue #118 — escalation Event re-emission bound ---------------------------
+
+
+@responses.activate
+def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_does_not_re_emit():
+    """Pod A evicts; Pod B raises on delete_namespaced_pod. The function must
+    (a) record the partial outcome, (b) stamp mark_soft_stop_escalated anyway,
+    (c) NOT re-emit ``AnalysisEscalated`` on the next tick (because
+    ``escalatedAt`` is now set on the anchor)."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pods = [make_pod("worker-1"), make_pod("worker-2")]
+
+    class PartialPodApi(FakeCoreV1Api):
+        def delete_namespaced_pod(self, name, namespace, **kwargs):
+            if name == "worker-2":
+                from kubernetes.client import ApiException
+
+                raise ApiException(status=500, reason="Internal Server Error")
+            return super().delete_namespaced_pod(name, namespace, **kwargs)
+
+    pod_api = PartialPodApi(pods)
+    # Two Resque workers currently processing the analysis — victims will
+    # be 2 entries, exercising the per-pod try/except in the loop.
+    redis_client = FakeRedisClient(
+        {
+            "worker-1:1:requeued,simulations": ["a1"],
+            "worker-2:1:requeued,simulations": ["a1"],
+        }
+    )
+
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        redis_client=redis_client,
+    )
+
+    assert result.escalated == ["a1"]
+    assert len(events) == 1
+    assert events[0][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
+    # outcome recorded as partial
+    anchor = api.obj["status"]["softStops"]["a1"]
+    assert anchor["escalationOutcome"] == "evicted-partial"
+    assert anchor["escalatedAt"] is not None
+    # pod_api saw exactly one real delete call before the failure.
+    assert [d["name"] for d in pod_api.deletes] == ["worker-1"]
+
+    # Second tick — must be a no-op (anchor is pre-escalated). Resque and
+    # pod-side mocks must be re-supplied identically.
+    api2 = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                        "escalatedAt": anchor["escalatedAt"],
+                        "escalationOutcome": "evicted-partial",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")  # register on the new api
+    register_analysis_status("a1")
+    redis_client2 = FakeRedisClient(
+        {
+            "worker-1:1:requeued,simulations": ["a1"],
+            "worker-2:1:requeued,simulations": ["a1"],
+        }
+    )
+    result2, events2 = tick(
+        api2,
+        pod_api=FakeCoreV1Api(pods),
+        redis_client=redis_client2,
+    )
+    assert result2.escalated == []
+    assert events2 == []
+
+
+@responses.activate
+def test_escalation_with_all_pod_deletes_failing_re_raises_for_wrapper():
+    """Both pod deletes raise: every pod failed → ``escalationOutcome`` is
+    ``no-matching-pods`` (no pods successfully evicted) AND the last
+    failure is re-raised. The re-raise is what the production
+    ``analysis_sla_monitor`` wrapper's ``except ApiException`` branch
+    catches and feeds into ``HANDLER_TICK_FAILURES_TOTAL`` (#117).
+
+    The test exercises the same path with pytest.raises — wrapping
+    mirrors the production wrapper.
+    """
+    from kubernetes.client import ApiException
+
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+
+    class AllFailPodApi(FakeCoreV1Api):
+        def delete_namespaced_pod(self, name, namespace, **kwargs):
+            raise ApiException(status=404, reason="Not Found")
+
+    pod_api = AllFailPodApi([make_pod("worker-1"), make_pod("worker-2")])
+    redis_client = FakeRedisClient(
+        {
+            "worker-1:1:requeued,simulations": ["a1"],
+            "worker-2:1:requeued,simulations": ["a1"],
+        }
+    )
+
+    with pytest.raises(ApiException, match="404"):
+        tick(
+            api,
+            pod_api=pod_api,
+            redis_client=redis_client,
+        )
+
+
+def handler_tick_failures_total(module: str, error_type: str) -> float:
+    """Read the labelled-counter value from HANDLER_TICK_FAILURES_TOTAL."""
+    counter = HANDLER_TICK_FAILURES_TOTAL
+    metrics_dict = getattr(counter, "_metrics", None)
+    if metrics_dict:
+        snap = metrics_dict.get((module, error_type))
+        if snap is not None:
+            return float(snap._value.get())
+    raw = getattr(counter, "_value", None)
+    if raw is not None:
+        v = raw.get()
+        if isinstance(v, (int, float)):
+            return float(v)
+    return 0.0
+
+
 # --- Issue #44: pod discovery with matchExpressions -------------------------
 
 
+import pytest
+
 from openstudio_operator.handlers.analysis_sla import deployment_label_selector
+from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
 
 
 def _exp(key, operator, values=None):

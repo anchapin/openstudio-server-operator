@@ -139,6 +139,7 @@ _OUTCOME_ISSUED = "issued"
 _OUTCOME_DRY_RUN = "dry-run"
 #: Escalation outcomes persisted on the anchor's ``escalationOutcome``.
 ESCALATION_EVICTED = "evicted"
+ESCALATION_EVICTED_PARTIAL = "evicted-partial"
 ESCALATION_NO_MATCH = "no-matching-pods"
 ESCALATION_DRY_RUN = "dry-run"
 
@@ -606,13 +607,44 @@ def _escalate_analysis(
     # cap; preStop touches kill.worker + Resque QUIT — cooperative drain).
     # 0 = grace_period_seconds=0 → immediate SIGKILL, no drain window.
     grace_seconds: int | None = 0 if force else None
+    # Issue #118 — per-pod try/except. Previously a single stuck pod (404
+    # Terminating, RBAC-denied, transient 5xx) raised ApiException mid-loop
+    # and prevented mark_soft_stop_escalated from being written — making
+    # the next tick re-resolve the same victims and re-emit the Event
+    # forever. The fix: catch per pod, accumulate evicted-vs-failed, stamp
+    # the marker regardless of partial failure with the partial outcome.
+    evicted_count = 0
+    failed_count = 0
+    last_failure: ApiException | None = None
     for pod_name, _worker_id in victims:
-        if not dry_run:
+        if dry_run:
+            WORKER_PODS_EVICTED_TOTAL.inc()
+            evicted_count += 1
+            continue
+        try:
             pod_api.delete_namespaced_pod(pod_name, namespace, grace_period_seconds=grace_seconds)
+        except ApiException as exc:
+            failed_count += 1
+            last_failure = exc
+            logger.warning(
+                "escalation pod-delete failed for %s/%s (will not block marker): %s",
+                namespace, pod_name, exc,
+            )
+            continue
         WORKER_PODS_EVICTED_TOTAL.inc()
-    outcome = (
-        ESCALATION_DRY_RUN if dry_run else (ESCALATION_EVICTED if victims else ESCALATION_NO_MATCH)
-    )
+        evicted_count += 1
+    if dry_run:
+        outcome = ESCALATION_DRY_RUN
+    elif evicted_count == 0:
+        outcome = ESCALATION_NO_MATCH
+    elif failed_count > 0:
+        outcome = ESCALATION_EVICTED_PARTIAL
+    else:
+        outcome = ESCALATION_EVICTED
+    if last_failure is not None and evicted_count == 0:
+        # All pods failed — re-raise so the wrapper's except branch can
+        # observe it (and the tick counter can record the failure).
+        raise last_failure
     age_minutes = int((now - record.issued_at) // timedelta(minutes=1))
     message = (
         f"Analysis {analysis_id} still started {age_minutes}m after soft stop "
