@@ -69,7 +69,9 @@ jobs:
       # Parses YAML structurally so comments / image names / namespace labels
       # are NOT flagged.
       - name: Check no legacy Redis password literal (issue #150)
-        run: bash scripts/check_redis_password_unique.sh
+        run: |
+          pip install pyyaml  # the guard script uses yaml.safe_load
+          bash scripts/check_redis_password_unique.sh
 
   test:
     runs-on: ubuntu-latest
