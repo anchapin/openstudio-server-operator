@@ -147,6 +147,25 @@ def test_archival_job_has_hardened_rclone_securitycontext(backend: str) -> None:
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_archival_job_pod_securitycontext_hardened(backend: str) -> None:
+    """Issue #161 — defense-in-depth pod-level baseline. PSS `restricted`
+    validates pod-level runAsNonRoot + seccompProfile, NOT the
+    container-level fields. An injected sidecar or debug
+    ephemeralContainer that omits its own securityContext still
+    inherits these pod-level defaults. fsGroup 1000 is harmless on the
+    readOnly NFS mount and keeps the manifest shape consistent with
+    the operator Deployment and the prune CronJob.
+    """
+    job = _job(backend)
+    pod_spec = job["spec"]["template"]["spec"]
+    sc = pod_spec["securityContext"]
+    assert sc["runAsNonRoot"] is True, sc
+    assert sc["runAsUser"] == 1000, sc
+    assert sc["seccompProfile"]["type"] == "RuntimeDefault", sc
+    assert sc["fsGroup"] == 1000, sc
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_archival_job_image_pinned_by_digest(backend: str) -> None:
     """#124 — the rclone image is pinned by @sha256 digest. Floating
     ``rclone/rclone:1.67.0`` would let a tag-mutation steer the image

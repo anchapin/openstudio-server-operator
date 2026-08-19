@@ -20,7 +20,21 @@ spec:
         app: openstudio-operator
     spec:
       serviceAccountName: openstudio-operator-sa
-containers:
+      # Issue #161 — pod-level defense-in-depth baseline. PSS `restricted`
+      # validates pod-level runAsNonRoot + seccompProfile (NOT the
+      # container-level fields), so an injected sidecar (Istio ambient
+      # mesh) or a debug `ephemeralContainers` patch that omits its own
+      # securityContext still inherits these pod-level defaults. fsGroup
+      # 1000 makes the emptyDir /tmp mount writable by the non-root UID
+      # the container runs as. Mirrors deploy/storage-cronjob.yaml:97-109
+      # and archival.py's pod-level block.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
+      containers:
         - name: operator
           image: ghcr.io/anchapin/openstudio-server-operator:dev
           args:
