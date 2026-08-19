@@ -518,3 +518,188 @@ def test_web_background_monitor_wrapper_empty_server_url_logs_idle_and_no_failur
     assert result is None
     assert after == before
     assert "web_background monitor idle" in caplog.text
+
+
+# --- Issue #249 — per-wrapper exception-tuple negative coverage ----------------
+#
+# The four parametrised cases above assert that every class INSIDE the
+# wrapper's declared tuple increments HANDLER_TICK_FAILURES_TOTAL by
+# exactly 1. The reverse direction is just as important: a class that is
+# NOT in the wrapper's tuple must NOT increment the counter and must
+# propagate out (the kopf runtime then handles it as an uncaught handler
+# error — the operator's design is fail-closed, so a stray
+# ``RuntimeError`` in a handler becomes a loud watcher event rather than
+# silently skipped ticks). The negative cases here cover that surface:
+#
+#   * each wrapper is invoked with run_*_tick monkeypatched to raise a
+#     class NOT in its declared tuple (``ValueError`` — chosen because it
+#     is the stdlib's generic "something went wrong" exception and is
+#     guaranteed not to subclass any of the four tuple classes);
+#   * the wrapper's HANDLER_TICK_FAILURES_TOTAL must NOT increment on
+#     this branch;
+#   * the exception must propagate out (re-raise through the wrapper)
+#     because the wrapper's ``except`` tuple does not catch it.
+#
+# Without these tests a future patch that adds ``ValueError`` (or any
+# other class) to a wrapper's tuple would silently widen the catch and
+# the ``error_type`` label cardinality would drift undetected — the
+# on-call would only notice once ``rate(handler_tick_failures_total)``
+# stops firing on the genuine kopf-handler-error signal they expect to
+# alert on.
+#
+# The four modules use distinct sets so the "not in tuple" assertion
+# truly tests a class that is NOT in the wrapper's declared set:
+
+#: ``ValueError`` is NOT a subclass of any of the four tuple classes and
+#: not in any wrapper's tuple — a clean "out of tuple" sentinel for the
+#: negative cases below.
+_OUT_OF_TUPLE_EXCEPTION = ValueError("out of tuple — must propagate, not increment")
+
+
+def test_analysis_sla_monitor_does_not_count_out_of_tuple_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """``ValueError`` (not in analysis_sla's 4-tuple) must NOT increment the counter.
+
+    The wrapper declares
+    ``except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError)``
+    — a regression that adds ``ValueError`` to that tuple (e.g. a
+    well-meaning "let's catch more things") would silently widen the
+    counter's trigger set. The negative case here pins the tuple's exact
+    membership: out-of-tuple classes propagate out, the counter stays
+    put.
+    """
+    monkeypatch.setattr(analysis_sla, "run_sla_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
+
+    before = _counter("analysis_sla", "ValueError")
+    with pytest.raises(ValueError, match="out of tuple"):
+        analysis_sla.analysis_sla_monitor(
+            body=BODY,
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("analysis_sla", "ValueError")
+    assert after == before, (
+        f"HANDLER_TICK_FAILURES_TOTAL{{module=analysis_sla, error_type=ValueError}} "
+        f"must NOT increment for an out-of-tuple class; observed delta {after - before}. "
+        f"See issue #249 — the wrapper's failure path silently widened."
+    )
+
+
+def test_zombie_datapoint_watchdog_does_not_count_out_of_tuple_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """``ValueError`` (not in datapoint_watchdog's 2-tuple) must NOT increment the counter.
+
+    The watchdog declares
+    ``except (OpenStudioApiError, StatusStoreError)`` — narrower than
+    the SLA wrapper because the watchdog never touches the K8s API or
+    Redis. A future patch that adds ``RedisClientError`` to the
+    watchdog's tuple (the watchdog never reads Redis, so this would be
+    a bug, not a feature) would silently widen the catch and the
+    counter would start firing on Redis connectivity issues that the
+    watchdog cannot actually hit.
+    """
+    monkeypatch.setattr(datapoint_watchdog, "run_watchdog_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
+
+    before = _counter("datapoint_watchdog", "ValueError")
+    with pytest.raises(ValueError, match="out of tuple"):
+        datapoint_watchdog.zombie_datapoint_watchdog(
+            body=BODY,
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("datapoint_watchdog", "ValueError")
+    assert after == before, (
+        f"HANDLER_TICK_FAILURES_TOTAL{{module=datapoint_watchdog, error_type=ValueError}} "
+        f"must NOT increment for an out-of-tuple class; observed delta {after - before}."
+    )
+
+
+def test_worker_recycler_does_not_count_out_of_tuple_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """``ValueError`` (not in worker_recycler's 3-tuple) must NOT increment the counter.
+
+    The recycler declares
+    ``except (OpenStudioApiError, StatusStoreError, ApiException)`` —
+    K8s+REST, no Redis. A future patch that adds ``RedisClientError``
+    would be wrong on its face (the recycler never reads Redis) but
+    would silently widen the counter's trigger set unless this test
+    pins the tuple's exact membership.
+    """
+    monkeypatch.setattr(worker_recycler, "run_recycler_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
+
+    before = _counter("worker_recycler", "ValueError")
+    with pytest.raises(ValueError, match="out of tuple"):
+        worker_recycler.worker_recycler(
+            body=BODY,
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("worker_recycler", "ValueError")
+    assert after == before, (
+        f"HANDLER_TICK_FAILURES_TOTAL{{module=worker_recycler, error_type=ValueError}} "
+        f"must NOT increment for an out-of-tuple class; observed delta {after - before}."
+    )
+
+
+def test_web_background_monitor_does_not_count_out_of_tuple_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """``ValueError`` (not in web_background_monitor's 3-tuple) must NOT increment the counter.
+
+    The web_background monitor is the only wrapper that does NOT catch
+    :class:`OpenStudioApiError` — it never talks to the OpenStudio REST
+    surface, only Redis and the K8s API. The tuple is
+    ``(RedisClientError, StatusStoreError, ApiException)``. A future
+    patch that adds ``OpenStudioApiError`` to the tuple (e.g. a
+    well-meaning "let's catch all the operator's exception types") would
+    silently widen the counter's trigger set; this negative case pins
+    that absence at CI.
+    """
+    monkeypatch.setattr(web_background_monitor, "run_stall_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
+
+    before = _counter("web_background_monitor", "ValueError")
+    with pytest.raises(ValueError, match="out of tuple"):
+        web_background_monitor.web_background_monitor(
+            body=BODY,
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("web_background_monitor", "ValueError")
+    assert after == before, (
+        f"HANDLER_TICK_FAILURES_TOTAL{{module=web_background_monitor, error_type=ValueError}} "
+        f"must NOT increment for an out-of-tuple class; observed delta {after - before}."
+    )
+
+
+def test_each_wrapper_out_of_tuple_class_is_distinct_from_in_tuple_class() -> None:
+    """Sanity fence: ``ValueError`` is NOT a subclass of any in-tuple class.
+
+    The negative-case tests above rely on ``ValueError`` being
+    genuinely out-of-tuple for every wrapper. If a future refactor
+    made :class:`ValueError` a subclass of any in-tuple class (very
+    unlikely, but the bug is silent), the negative tests would catch
+    the in-tuple exceptions and pass with a counter increment — the
+    regression would never surface. This sanity test pins the
+    subclass relationship explicitly so any drift here fails loud.
+    """
+    for in_tuple_cls in (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError):
+        assert not issubclass(ValueError, in_tuple_cls), (
+            f"ValueError unexpectedly subclasses {in_tuple_cls.__name__}; "
+            f"the issue #249 negative-case tests would silently start "
+            f"catching in-tuple exceptions."
+        )

@@ -30,6 +30,7 @@ dev = [
     "ruff>=0.16",
     "responses>=0.25.0", # mock OpenStudio REST API in tests
     "fakeredis>=2.23", # mock Redis for the read-only client tests (#12)
+    "hypothesis>=6", # property-based tests for the D12 timestamp boundary (#246)
 ]
 
 [build-system]
