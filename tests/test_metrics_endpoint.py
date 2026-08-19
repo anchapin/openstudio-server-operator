@@ -35,6 +35,10 @@ EXPECTED_COUNTER_FAMILIES = (
     # derived via Prometheus arithmetic without log scraping.
     "openstudio_operator_events_dry_run_suppressed_total",
     "openstudio_operator_events_emitted_total",
+    # Issue #239 — singleton-guard election outcomes (per outcome).
+    "openstudio_operator_singleton_election_total",
+    # Issue #255 — kopf.event emission failures (per reason).
+    "openstudio_operator_events_emit_failures_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
@@ -43,7 +47,26 @@ EXPECTED_COUNTER_FAMILIES = (
 #: are registered; under load that signature additionally marks a
 #: centralized-constants / live v3.11.0 layout mismatch (the original #44
 #: alert combined it with `AND queue depth > 0`).
-EXPECTED_GAUGE_FAMILIES = ("openstudio_operator_resque_workers_seen_max",)
+#:
+#: Issue #238 — ``resque_queue_depth{queue="..."}`` exposes the operator's
+#: authoritative LLEN reads on every sensing tick (the same value KEDA's
+#: external metrics API exposes — the operator's view is the cross-check
+#: that surfaces a centralized-constants drift).
+#:
+#: Issue #253 — ``redis_key_layout_status`` Gauge (1.0=ok, 0.0=any-other)
+#: surfaces the boot-time validator outcome as a cluster-wide latest-
+#: observation signal so an SRE can alert on `== 0` without log scraping.
+#:
+#: Issue #254 — ``stall_window_elapsed_seconds`` Gauge tracks the
+#: ``StallWindowTracker`` state between the first sustained observation
+#: and the eventual ``web_background_restarts_total`` increment — a heads-
+#: up display that gives SREs time to react before the gate trips.
+EXPECTED_GAUGE_FAMILIES = (
+    "openstudio_operator_resque_workers_seen_max",
+    "openstudio_operator_resque_queue_depth",
+    "openstudio_operator_redis_key_layout_status",
+    "openstudio_operator_stall_window_elapsed_seconds",
+)
 
 #: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
 #: datapoint watchdog each observe the count off the OpenStudio REST
@@ -140,6 +163,20 @@ def test_metrics_http_server_serves_all_declared_counters():
         reason="__metrics_test_sentinel__"
     ).inc()
     metrics.EVENTS_EMITTED_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # Issue #239 — pre-touch the singleton-guard election outcome
+    # counter so its labelled family is exposed at the exposition
+    # surface. ``outcome`` label vocabulary mirrors the enforce()'s three
+    # branches (idle | active | conflict).
+    metrics.SINGLETON_ELECTION_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    # Issue #255 — pre-touch the kopf.event emission-failure counter.
+    # ``reason`` label vocabulary matches ``events_emitted_total`` so the
+    # two can be rate-correlated on a dashboard.
+    metrics.EVENTS_EMIT_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
+    # so the family line is exposed alongside the unlabelled #44, #253,
+    # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
+    # below alongside the bare-form unlabelled gauges.
+    metrics.RESQUE_QUEUE_DEPTH.labels(queue="__metrics_test_sentinel__").set(0)
 
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
@@ -148,7 +185,9 @@ def test_metrics_http_server_serves_all_declared_counters():
         # Labelled counters (issue #117's ``handler_tick_failures_total``,
         # issue #171's ``status_map_caps_total``,
         # issue #237's ``events_dry_run_suppressed_total`` /
-        # ``events_emitted_total``) emit
+        # ``events_emitted_total``, issue #239's
+        # ``singleton_election_total``, issue #255's
+        # ``events_emit_failures_total``) emit
         # ``<name>{<labels>} value``; non-labelled emit ``<name> value``.
         # The sentinel increments above pre-touch the labelled series;
         # check the labelled form for them, the bare form for the rest.
@@ -172,12 +211,29 @@ def test_metrics_http_server_serves_all_declared_counters():
                 'openstudio_operator_events_emitted_total{reason="__metrics_test_sentinel__"}'
                 in response.text
             )
+        elif name == "openstudio_operator_singleton_election_total":
+            assert (
+                'openstudio_operator_singleton_election_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_events_emit_failures_total":
+            assert (
+                'openstudio_operator_events_emit_failures_total{reason="__metrics_test_sentinel__"}'
+                in response.text
+            )
         else:
             assert f"\n{name} " in response.text
     # Issue #44: gauge exposed alongside counters.
     for name in _declared_gauge_families():
         assert f"# TYPE {name} gauge" in response.text
-        assert f"\n{name} " in response.text
+        if name == "openstudio_operator_resque_queue_depth":
+            # Labelled gauge — check the labelled form (issue #238).
+            assert (
+                'openstudio_operator_resque_queue_depth{queue="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        else:
+            assert f"\n{name} " in response.text
     # Issue #179: histogram exposed alongside counters and the gauge. The
     # pre-touch above creates the sentinel SERIES for the labelled counter;
     # the histogram is unlabelled, but it ALSO only emits its `# TYPE` line
@@ -351,5 +407,144 @@ def test_events_counters_exposition_uses_reason_label():
     )
     assert (
         'openstudio_operator_events_emitted_total{reason="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+# --- Issue #238 — Resque queue-depth Gauge --------------------------------------
+
+
+def test_resque_queue_depth_gauge_exposes_both_queues():
+    """Issue #238 acceptance: ``openstudio_operator_resque_queue_depth{queue}``
+    Gauge is exposed with both managed Resque queues (``simulations`` +
+    ``requeued``) as label values. Cardinality is bounded to the two
+    queues; a future refactor that adds a third queue without updating
+    this pin (or that collapses the label and emits two unlabelled
+    gauges) is caught at CI rather than at the operator's /metrics
+    scrape. Same labelled-counter pattern as #117 / #171 / #237 / #239
+    / #255.
+    """
+    metrics.RESQUE_QUEUE_DEPTH.labels(queue="simulations").set(7)
+    metrics.RESQUE_QUEUE_DEPTH.labels(queue="requeued").set(3)
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_resque_queue_depth{queue="simulations"} 7.0' in exposition
+    )
+    assert (
+        'openstudio_operator_resque_queue_depth{queue="requeued"} 3.0' in exposition
+    )
+
+
+# --- Issue #239 — singleton-guard election outcomes -----------------------------
+
+
+def test_singleton_election_counter_increments_per_outcome():
+    """Issue #239 acceptance: ``openstudio_operator_singleton_election_total``
+    counter increments per outcome (idle | active | conflict) at the
+    three branches in :meth:`SingletonGuard.enforce`. Driving the
+    increment directly via ``labels(...).inc()`` mirrors the labelled-
+    counter pattern from #117 / #171 / #237 / #255 and pins the label
+    cardinality so a future refactor that drops or renames the label is
+    caught at CI."""
+    counter = metrics.SINGLETON_ELECTION_TOTAL
+    baseline = _counter_total(counter)
+    for outcome in ("idle", "active", "conflict"):
+        counter.labels(outcome=outcome).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 3.0
+
+
+def test_singleton_election_counter_exposition_uses_outcome_label():
+    """Issue #239 — verified exposition shape: each ``outcome`` value is
+    its own labelled series. Pinning the label key (``outcome``) means a
+    future refactor that silently renames the label (e.g. to
+    ``election_outcome``) is caught at CI rather than at the on-call's
+    Grafana board."""
+    counter = metrics.SINGLETON_ELECTION_TOTAL
+    counter.labels(outcome="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_singleton_election_total{outcome="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+# --- Issue #253 — Redis key-layout status Gauge ---------------------------------
+
+
+def test_redis_key_layout_status_gauge_ok_vs_other():
+    """Issue #253 acceptance: ``openstudio_operator_redis_key_layout_status``
+    Gauge reads ``1.0`` for the ``ok`` validator outcome and ``0.0`` for
+    every other terminal status (``degraded`` | ``unreachable`` |
+    ``error`` | ``skipped``). The gauge is cluster-wide latest-observation
+    — no per-CR labels, cardinality stays bounded regardless of CR count.
+    """
+    metrics.REDIS_KEY_LAYOUT_STATUS.set(1.0)
+    assert metrics.REDIS_KEY_LAYOUT_STATUS._value.get() == 1.0
+    metrics.REDIS_KEY_LAYOUT_STATUS.set(0.0)
+    assert metrics.REDIS_KEY_LAYOUT_STATUS._value.get() == 0.0
+    # Exposition shape — unlabelled gauge, no {label} suffix.
+    exposition = generate_latest().decode()
+    assert "# TYPE openstudio_operator_redis_key_layout_status gauge" in exposition
+    assert (
+        "\nopenstudio_operator_redis_key_layout_status 0.0" in exposition
+    )
+
+
+# --- Issue #254 — sustained-window elapsed seconds Gauge ------------------------
+
+
+def test_stall_window_elapsed_seconds_gauge_round_trip():
+    """Issue #254 acceptance: ``openstudio_operator_stall_window_elapsed_seconds``
+    Gauge accepts arbitrary float values (the metric is set in
+    ``run_stall_tick`` after ``tracker.observe()``) and is reset to 0 on
+    a broken-condition tick. Unlabelled Gauge — one series, no
+    cardinality growth. The exposition shape mirrors ``resque_workers_
+    seen_max``: bare ``<name> <value>`` line, no labels.
+    """
+    metrics.STALL_WINDOW_ELAPSED_SECONDS.set(123.5)
+    assert metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 123.5
+    metrics.STALL_WINDOW_ELAPSED_SECONDS.set(0.0)
+    assert metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 0.0
+    exposition = generate_latest().decode()
+    assert "# TYPE openstudio_operator_stall_window_elapsed_seconds gauge" in exposition
+
+
+# --- Issue #255 — kopf.event emission-failure counter --------------------------
+
+
+def test_events_emit_failures_counter_increments_per_reason():
+    """Issue #255 acceptance: ``openstudio_operator_events_emit_failures_total``
+    counter increments per ``reason`` inside the try/except wrapping the
+    ``kopf.event`` call in :meth:`EventEmitter.emit`. Same ``reason``
+    vocabulary as ``events_emitted_total`` so the two can be rate-
+    correlated on a dashboard. Mirrors the labelled-counter pattern
+    from #117 / #171 / #237 / #239.
+    """
+    counter = metrics.EVENTS_EMIT_FAILURES_TOTAL
+    baseline = _counter_total(counter)
+    for reason in (
+        "AnalysisSoftStopped",
+        "AnalysisEscalated",
+        "DatapointRequeued",
+        "DatapointRequeueExhausted",
+        "WorkerRecycled",
+        "WebBackgroundRestarted",
+        "ResqueKeyLayoutUnknown",
+    ):
+        counter.labels(reason=reason).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 7.0
+
+
+def test_events_emit_failures_counter_exposition_uses_reason_label():
+    """Issue #255 — verified exposition shape: each ``reason`` value is
+    its own labelled series. Pinning the label key (``reason``) means a
+    future refactor that silently renames the label is caught at CI."""
+    counter = metrics.EVENTS_EMIT_FAILURES_TOTAL
+    counter.labels(reason="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_events_emit_failures_total{reason="ExpositionShapeProbe"}'
         in exposition
     )

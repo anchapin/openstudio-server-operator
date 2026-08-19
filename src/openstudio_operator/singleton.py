@@ -65,6 +65,7 @@ from kubernetes.client import ApiException, CustomObjectsApi
 from kubernetes.config import ConfigException
 
 from openstudio_operator._time import parse_iso_utc
+from openstudio_operator.metrics import SINGLETON_ELECTION_TOTAL
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
@@ -194,11 +195,26 @@ class SingletonGuard:
 
         if winner is None:
             logger.info("no OpenStudioClusterManager CRs — operator idle (D05)")
+            # Issue #239 — singleton-guard election outcome counter.
+            # Increment on the zero-CR (idle) branch only when the state
+            # CHANGED (the early-return above already filters unchanged
+            # snapshots). Mirrors the existing change-gated log/Event
+            # noise channel so steady state is silent.
+            SINGLETON_ELECTION_TOTAL.labels(outcome="idle").inc()
             return
         winner_name = _cr_name(winner)
         if not losers:
             logger.info("serving OpenStudioClusterManager %s — single CR in namespace (D05)", winner_name)
+            # Issue #239 — singleton-guard election outcome counter
+            # (active branch — exactly one CR in namespace).
+            SINGLETON_ELECTION_TOTAL.labels(outcome="active").inc()
             return
+
+        # Issue #239 — singleton-guard election outcome counter
+        # (conflict branch — more than one CR in namespace, losers
+        # ignored). Increments on the same state-change gate as the
+        # Warning/Normal Events below.
+        SINGLETON_ELECTION_TOTAL.labels(outcome="conflict").inc()
 
         roster = ", ".join(f"{_cr_name(o)} (created {_cr_created(o)})" for o in sort_crs_by_seniority(items))
         logger.error(
