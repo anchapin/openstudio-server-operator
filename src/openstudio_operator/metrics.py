@@ -161,6 +161,44 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
     labelnames=["module", "error_type"],
 )
 
+# Issue #237 — observability surface for the dry-run gate on
+# :class:`openstudio_operator.events.EventEmitter` (#164). When
+# ``spec.dryRun=true`` the EventEmitter suppresses every Event that would
+# have been posted to the kube-apiserver and only bumps a Python attribute
+# (:attr:`EventEmitter.suppressed_count`). That attribute is per-process and
+# per-tick — there was no /metrics signal, so a cluster running dry-run mode
+# (canary staging, audit-only installs) was invisible to Prometheus: an SRE
+# could not verify via a metrics scrape that the operator was actually doing
+# the work, only a log scrape for the ``dry-run suppressed`` INFO line.
+# Increment happens inside :meth:`EventEmitter.emit` at the same site that
+# increments :attr:`EventEmitter.suppressed_count`. Labelled by ``reason``
+# mirroring the warning-event reason vocabulary
+# (``AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued`` |
+# ``DatapointRequeueExhausted`` | ``WorkerRecycled`` |
+# ``WebBackgroundRestarted`` | ``ResqueKeyLayoutUnknown``) so a dashboard can
+# tell WHICH action the dry-run gate intercepted, not just that it did.
+# Companion emitted counter below lets ``rate(emitted) / rate(suppressed)``
+# be derived without log parsing — the dry-run ratio is the headline SLO for
+# an audit-only install.
+EVENTS_DRY_RUN_SUPPRESSED_TOTAL = Counter(
+    "openstudio_operator_events_dry_run_suppressed_total",
+    "Kubernetes Events suppressed by the dry-run gate on EventEmitter (#164). "
+    "Incremented at the same site as EventEmitter.suppressed_count, inside "
+    "EventEmitter.emit when dry_run=True (issue #237). Labelled by reason "
+    "(the same warning-event reasons used by the four handler modules).",
+    labelnames=["reason"],
+)
+
+EVENTS_EMITTED_TOTAL = Counter(
+    "openstudio_operator_events_emitted_total",
+    "Kubernetes Events posted to the kube-apiserver via EventEmitter (#164). "
+    "Companion to events_dry_run_suppressed_total: emitted-vs-suppressed "
+    "rate is the headline SLO for an audit-only install (issue #237). "
+    "Labelled by reason (the same warning-event reasons used by the four "
+    "handler modules).",
+    labelnames=["reason"],
+)
+
 # Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
 # datapoint watchdog each iterate a count off the OpenStudio REST analysis
 # payload (or the equivalent summary endpoint) — the number of analyses per
