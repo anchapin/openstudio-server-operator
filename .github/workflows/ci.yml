@@ -84,3 +84,26 @@ jobs:
           /tmp/lockfile-verify/bin/python -m pip install --upgrade pip
           /tmp/lockfile-verify/bin/pip install --require-hashes -r requirements.lock
       - run: pytest
+      # Issue #151 — guard against AGENTS.md test-count claim drift. The previous
+      # three (#106, #144, plus this one) were each caught by hand-editing the
+      # line. The guard below fails the CI job loudly when the claim desyncs
+      # from `pytest --collect-only` + a glob of `tests/test_*.py`.
+      - name: Verify AGENTS.md test-count claim (#151)
+        run: |
+          set -euo pipefail
+          ACTUAL_TESTS=$(pytest --collect-only 2>/dev/null | tail -1 | awk '{print $1}')
+          ACTUAL_FILES=$(ls tests/test_*.py | wc -l | tr -d ' ')
+          CLAIM=$(grep -oE '# ?[0-9]+ tests across [0-9]+ files' AGENTS.md | head -1)
+          if [ -z "$CLAIM" ]; then
+            echo "::error::AGENTS.md is missing the '# N tests across M files' claim"
+            exit 1
+          fi
+          EXPECTED_TESTS=$(echo "$CLAIM" | awk '{print $2}')
+          EXPECTED_FILES=$(echo "$CLAIM" | awk '{print $5}')
+          echo "AGENTS.md claim: $CLAIM"
+          echo "Actual:          $ACTUAL_TESTS tests across $ACTUAL_FILES files"
+          if [ "$ACTUAL_TESTS" != "$EXPECTED_TESTS" ] || [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
+            echo "::error::AGENTS.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, AGENTS.md says '$CLAIM'"
+            exit 1
+          fi
+
