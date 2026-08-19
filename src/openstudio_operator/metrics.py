@@ -112,6 +112,27 @@ STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
     "Issued by status_store._mutate just before raising; #119.",
 )
 
+# Issue #117 — observability surface for handler tick failures.
+# Each handler timer wrapper (analysis_sla, datapoint_watchdog,
+# worker_recycler, web_background_monitor) catches its respective
+# exception tuples and silently skips the tick. Without a counter, a
+# sustained degraded window (REST API down, Redis unreachable, k8s
+# API unavailable) is invisible at the /metrics endpoint, and an SRE
+# alerting on tick failure rate cannot tell which module is degraded.
+# Per-issue #117: one increment per observation (i.e., per tick that
+# the wrapper caught), labelled by module name and exception class.
+HANDLER_TICK_FAILURES_TOTAL = Counter(
+    "openstudio_operator_handler_tick_failures_total",
+    "Handler tick failures caught by the timer wrappers (issue #117). "
+    "Labelled by module (analysis_sla | datapoint_watchdog | "
+    "worker_recycler | web_background_monitor) and error_type "
+    "(OpenStudioApiError | StatusStoreError | ApiException | "
+    "RedisClientError). Increment-by-1 per tick the wrapper suppresses; "
+    "the WARNING log line in the wrapper records the same event for log "
+    "forwarding.",
+    labelnames=["module", "error_type"],
+)
+
 DEFAULT_METRICS_PORT = 9090
 
 _start_lock = threading.Lock()

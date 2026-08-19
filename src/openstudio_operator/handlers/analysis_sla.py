@@ -97,7 +97,11 @@ import kopf
 from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
 
 from openstudio_operator.config import OperatorConfig
-from openstudio_operator.metrics import SOFT_STOPS_TOTAL, WORKER_PODS_EVICTED_TOTAL
+from openstudio_operator.metrics import (
+    HANDLER_TICK_FAILURES_TOTAL,
+    SOFT_STOPS_TOTAL,
+    WORKER_PODS_EVICTED_TOTAL,
+)
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import (
@@ -678,6 +682,9 @@ def analysis_sla_monitor(
             redis_client=redis_client,
         )
     except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError) as exc:
+        HANDLER_TICK_FAILURES_TOTAL.labels(
+            module="analysis_sla", error_type=type(exc).__name__
+        ).inc()
         logger.warning(
             "analysis SLA tick skipped, retrying next poll (%s: %s)",
             type(exc).__name__,

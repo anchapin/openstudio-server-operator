@@ -57,7 +57,10 @@ from kubernetes.client import ApiException, AppsV1Api, CustomObjectsApi
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.handlers.analysis_sla import EventEmitter
-from openstudio_operator.metrics import WORKERS_RECYCLED_TOTAL
+from openstudio_operator.metrics import (
+    HANDLER_TICK_FAILURES_TOTAL,
+    WORKERS_RECYCLED_TOTAL,
+)
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.status_store import (
     GROUP,
@@ -230,6 +233,9 @@ def worker_recycler(
             emit=emit,
         )
     except (OpenStudioApiError, StatusStoreError, ApiException) as exc:
+        HANDLER_TICK_FAILURES_TOTAL.labels(
+            module="worker_recycler", error_type=type(exc).__name__
+        ).inc()
         logger.warning(
             "worker recycler tick skipped, retrying next poll (%s: %s)",
             type(exc).__name__,
