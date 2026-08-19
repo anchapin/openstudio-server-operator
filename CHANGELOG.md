@@ -35,7 +35,9 @@ on the same day.
   `spec.redisUrl` arrives empty at the prune actor. Closes the
   parity gap between operator and pruner redisUrl handling.
 - **`#183`** — `/metrics` surface enumeration in `README.md` and
-  `AGENTS.md` (11 counters + 1 gauge); test invariant updated in
+  `AGENTS.md` (11 counters + 1 gauge as-of #183; the registry is
+  12 counters + 1 gauge + 1 histogram at this release after
+  #171 / #179); test invariant updated in
   `tests/test_metrics_endpoint.py` to fail loudly on drift.
 - **`#178`** — first-time-contributor onboarding doc
   (`docs/onboarding.md`): setup, single-test / full-suite commands,
@@ -265,8 +267,9 @@ pipeline moves.
 - **Prometheus `/metrics` scrape endpoint** (`:9090`) — operator-only
   observability window. Family inventory mirrored in
   `tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES` /
-  `EXPECTED_GAUGE_FAMILIES` (CI drift guard); 11 counters + 1 gauge at
-  this release (`#183`).
+  `EXPECTED_GAUGE_FAMILIES` (CI drift guard); 11 counters + 1 gauge
+  as-of this release (`#183`) — the registry is 12 counters + 1 gauge
+  + 1 histogram at HEAD post-#171 / #179.
 - **First-time-contributor onboarding doc** (`docs/onboarding.md`,
   `#178`) — setup, single-test / full-suite commands, venv-drift guard
   (`#71`), the 5-step "add a new OSCM timer handler" pattern,
