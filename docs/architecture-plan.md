@@ -179,9 +179,9 @@ spec:
 | `""` `events` | get, list, watch, create, patch | unchanged | create |
 | `autoscaling` `horizontalpodautoscalers` | get, list, patch | **— (rule removed in #77)** | — |
 | `batch` `jobs` | get, list, watch, create, delete | **— (rule removed)** | get, create, delete |
-| **Total** | 6 rules / 22+ enumerated verbs (+CR `*`) | 5 rules / 17+ (+CR `*`) | 4 rules / 8 verbs |
+| **Total** | 6 rules / 22 enumerated verbs (+CR `*`) | 4 rules / 14 enumerated verbs (+CR `*`) | 4 rules / 7 verbs |
 
-Net: the operator drops one whole rule and 5 verbs; the prune SA adds 8 narrowly-scoped verbs on 4 resources — **no** Secrets, Deployments, Pods, HPA, PVC or NFS access (the archival Jobs it spawns carry their own envFrom credentials and read-only PVC mount). Both Roles stay namespaced; no ClusterRole anywhere.
+Net: the operator drops two whole rules (autoscaling/horizontalpodautoscalers via #77 and batch/jobs via #78) and 8 enumerated verbs; the prune SA adds 7 narrowly-scoped verbs on 4 resources — **no** Secrets, Deployments, Pods, HPA, PVC or NFS access (the archival Jobs it spawns carry their own envFrom credentials and read-only PVC mount). Both Roles stay namespaced; no ClusterRole anywhere.
 
 ### **Module 5: Resque / web\_background Watchdog**
 
@@ -261,8 +261,13 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "update"]
+  # Read pods; delete for surgical escalation of zombie datapoint workers (#9)
   - apiGroups: [""]
-    resources: ["pods", "events"]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # Emit Kubernetes Events (soft-stop / recycle / dry-run markers)
+  - apiGroups: [""]
+    resources: ["events"]
     verbs: ["get", "list", "watch", "create", "patch"]
   # NOTE: archival Jobs no longer run in the operator process (#78) — the
   # storage-prune CronJob's ServiceAccount owns batch/jobs create/delete
