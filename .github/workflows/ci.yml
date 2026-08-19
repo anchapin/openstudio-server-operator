@@ -64,6 +64,12 @@ jobs:
           python-version: "3.12"
       - run: pip install 'ruff>=0.16' # same floor as pyproject dev deps (#68); otherwise follows latest
       - run: ruff check .
+      # Issue #150 — fail the build if the legacy kind-recipe Redis password
+      # literal `openstudio` re-appears as a password value in source.
+      # Parses YAML structurally so comments / image names / namespace labels
+      # are NOT flagged.
+      - name: Check no legacy Redis password literal (issue #150)
+        run: bash scripts/check_redis_password_unique.sh
 
   test:
     runs-on: ubuntu-latest
