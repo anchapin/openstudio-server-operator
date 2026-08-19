@@ -233,6 +233,47 @@ def test_delete_analysis_uses_delete_verb(client):
     assert responses.calls[0].request.method == "DELETE"
 
 
+# --- Session default Accept header (issue #227) -----------------------
+
+
+@responses.activate
+def test_all_requests_carry_accept_application_json_header(client):
+    """Issue #227: every request must carry ``Accept: application/json``.
+
+    The v3.11.0 contract (`docs/contracts/openstudio-server-v3.11.0-rest.md`)
+    §4 documents that the mutating endpoints
+    ``DELETE /analyses/{id}``, ``POST /analyses/{id}/action``, and
+    ``POST /data_points/{id}/requeue`` only return 204/200 JSON with
+    ``Accept: application/json``; without it they return 302 HTML
+    (or 500 for the jobless-requeue edge case). Setting the header on
+    the session is the single fix — no per-call override required.
+    """
+    responses.get(f"{BASE}/analyses.json", json=[])
+    responses.get(f"{BASE}/analyses/a1/status.json", json={"analysis": {"status": "na"}})
+    responses.get(f"{BASE}/data_points/status", json={"data_points": []})
+    responses.get(f"{BASE}/analyses/a1/soft_stop", status=200, json={"result": "accepted"})
+    responses.post(f"{BASE}/analyses/a1/action", status=200, json={"result": "accepted"})
+    responses.post(f"{BASE}/data_points/dp1/requeue", status=204, body="")
+    responses.delete(f"{BASE}/analyses/a1", status=204, body="")
+
+    client.list_analyses()
+    client.get_analysis_status("a1")
+    client.list_started_datapoints()
+    client.soft_stop_analysis("a1")
+    client.stop_analysis("a1")
+    client.requeue_datapoint("dp1")
+    client.delete_analysis("a1")
+
+    assert len(responses.calls) == 7
+    for call in responses.calls:
+        accept = call.request.headers.get("Accept")
+        assert accept == "application/json", (
+            f"{call.request.method} {call.request.url} sent Accept={accept!r}; "
+            "OpenStudioClient must set a session-level "
+            "Accept: application/json header (issue #227)"
+        )
+
+
 # --- Retry / backoff (D12) ----------------------------------------------
 
 

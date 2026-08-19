@@ -98,6 +98,7 @@ class OpenStudioClient:
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
         self._session = requests.Session()
+        self._session.headers.update({"Accept": "application/json"})
 
     def _jittered_backoff(self, retry: int) -> float:
         return random.uniform(0.5, 1.5) * self._backoff_base_seconds * 2 ** (retry - 1)
