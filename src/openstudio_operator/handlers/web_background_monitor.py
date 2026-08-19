@@ -115,10 +115,15 @@ logger = logging.getLogger(__name__)
 
 _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
-#: Tick cadence for detection (60 s, matching the scaffold's declared
-#: cadence and the datapoint watchdog). Operator behavior, not cluster
-#: policy — policy values live in the CRD spec/config (AGENTS.md).
-POLL_INTERVAL_SECONDS = 60.0
+#: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WEB_BACKGROUND_POLL_INTERVAL_SECONDS`
+#: — operator behavior, not cluster policy; policy values live in the CRD
+#: spec/config (AGENTS.md).
+from openstudio_operator._constants import (
+    LAYOUT_WARNING_GRACE_SECONDS,
+    WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
+)
+
+POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 
 #: Fallback when ``spec.targetWebBackgroundDeployment`` is empty: the helm
 #: ``develop`` chart's fixed web_background Deployment name (AGENTS.md).
@@ -147,8 +152,9 @@ RESQUE_KEY_LAYOUT_UNKNOWN_EVENT = "ResqueKeyLayoutUnknown"
 #: heartbeat observation before concluding the Resque layout is wrong and
 #: emitting :data:`RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`. 60 s — comfortably
 #: more than one Resque heartbeat (5 s) but short enough that a misconfig
-#: surfaces well within the first stall window.
-_LAYOUT_WARNING_GRACE_SECONDS = timedelta(seconds=60)
+#: surfaces well within the first stall window. See
+#: :data:`openstudio_operator._constants.LAYOUT_WARNING_GRACE_SECONDS`.
+_LAYOUT_WARNING_GRACE_SECONDS = LAYOUT_WARNING_GRACE_SECONDS
 
 #: Module-level cache (D04-clean): one Redis client session per redis URL,
 #: never operator state — mirrors the REST client caches of the sibling
