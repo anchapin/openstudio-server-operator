@@ -64,6 +64,18 @@ jobs:
           python-version: "3.12"
       - run: pip install 'ruff>=0.16' # same floor as pyproject dev deps (#68); otherwise follows latest
       - run: ruff check .
+      # Issue #152: drift guard against initial-scaffold TODO(phase N)
+      # placeholders (e.g. the one tracked from #146 in
+      # deploy/operator-deployment.yaml). These were stage markers that
+      # should be deleted once the acceptance criterion they refer to
+      # ships — any surviving match is a regression of the
+      # "remove-after-scaffold-completion" discipline.
+      - name: Reject initial-scaffold TODO(phase N) markers in deploy/ + scripts/ (#152)
+        run: |
+          if grep -rE 'TODO\(phase [0-9]+\)' deploy/ scripts/ 2>/dev/null; then
+              echo "::error::deploy/ or scripts/ contains a TODO(phase N) marker — these were initial-scaffold placeholders that should have been resolved by now (issue #152)"
+              exit 1
+          fi
 
   test:
     runs-on: ubuntu-latest
