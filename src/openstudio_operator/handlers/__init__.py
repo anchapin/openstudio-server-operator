@@ -11,7 +11,6 @@ from openstudio_operator import singleton
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
     datapoint_watchdog,
-    hpa_floor,
     web_background_monitor,
     worker_recycler,
 )

@@ -27,7 +27,7 @@ real helm deployment (NatLabRockies chart, `develop` branch, namespace
 | 3 — Worker recycler | `src/openstudio_operator/handlers/worker_recycler.py` | stub | #11 |
 | 4 — Archival + NFS prune | `src/openstudio_operator/handlers/storage_pruner.py` (stub) + `src/openstudio_operator/archival.py` (Job generator, merged) | orchestration pending | #15 merged, #16 pending |
 | 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | stub (Redis client ready in `src/openstudio_operator/redis_client.py`) | #13 |
-| Phase 4 — HPA-floor adjuster | (none yet) | pending | #18 |
+| Phase 4 — KEDA ScaledObject | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication); operator owns zero autoscaling surface | **live** | #77 (replaces #18) |
 
 Steps depending on unmerged code are tagged **[pending module merge — #N]**.
 Run them as written once the module lands; they are part of this runbook, not
@@ -107,6 +107,72 @@ scripts/check_fixture_drift.py --live
 
 Record drift results next to the run in the validation ticket. Any drift
 means stop and fix the contract/tests first — not the runbook.
+
+## KEDA cluster prerequisite (issue #77)
+
+The operator no longer owns worker autoscaling — a standard KEDA
+ScaledObject does. **Two cluster-prerequisite steps** (both idempotent,
+both are cluster-admin tasks outside the operator process):
+
+1. **Install KEDA in the `keda` namespace** — pick one of:
+
+   ```bash
+   # Path A: helm (preferred)
+   helm repo add kedacore https://kedacore.github.io/charts && helm repo update kedacore
+   helm install keda kedacore/keda --namespace keda --create-namespace --version 2.20.2
+
+   # Path B: raw manifests (no helm required)
+   scripts/install-keda.sh
+   ```
+
+   The script prefers helm when present; the raw-manifest path is the
+   fallback. Both install KEDA 2.20.2 into the `keda` namespace and
+   wait for `keda-operator` rollout.
+
+2. **Disable the chart's `worker-hpa` HorizontalPodAutoscaler** — the
+   helm chart ships an unconditional CPU HPA on `worker` (1–2 in kind,
+   2–20 in production). The custom HPA-floor adjuster (#18) previously
+   co-existed with it by patching only `minReplicas`; the KEDA
+   ScaledObject scales the same Deployment, so **two autoscalers would
+   fight one Deployment** if both are present. Disable the chart's HPA
+   **BEFORE** applying the ScaledObject:
+
+   ```bash
+   # Helm-managed chart: disable the HPA via values override
+   helm upgrade <release> openstudio-server/openstudio-server \
+     --namespace openstudio-server \
+     --set worker.autoscaling.enabled=false
+   # OR post-render (raw delete)
+   kubectl -n openstudio-server delete hpa worker-hpa --ignore-not-found
+   ```
+
+   On the kind cluster, the post-render is the recipe's
+   `scripts/manifests/06-worker.yaml`: the `worker-hpa` HPA block is
+   REMOVED from that manifest as of #77, so a fresh
+   `scripts/deploy-openstudio-stack.sh` does not apply it.
+
+Then apply the ScaledObject and its credentials:
+
+```bash
+kubectl apply -f deploy/redis-credentials-secret.yaml
+kubectl apply -f deploy/keda-scaledobject.yaml
+```
+
+Verify the ScaledObject is `Ready=True` and the HPA KEDA owns is
+active:
+
+```bash
+kubectl -n openstudio-server get hpa,scaledobject,worker
+kubectl -n keda logs deploy/keda-operator -f   # watch scaling decisions
+kubectl -n keda logs deploy/keda-metrics-apiserver -f   # watch Redis polls
+```
+
+The autoscaling acceptance criterion — **worker deployment scales from
+0 to N based on pending Redis queue items** — is verified by submitting
+N jobs to `resque:queue:simulations` and watching
+`kubectl get worker -w`; scale-down is verified by waiting for the
+queue to drain and watching the same. Live evidence in
+[docs/kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration](kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration).
 
 ## Phase A — deploy the operator with `dryRun: true`
 
@@ -343,21 +409,44 @@ client (`src/openstudio_operator/redis_client.py`, #12) — queue depths
 3. Cooldown: a second induced stall inside the cooldown must not restart
    again (anchor = `.status.lastWebBackgroundRestart`).
 
-### Phase 4 — HPA-floor adjuster **[pending module merge — #18]**
+### Phase 4 — KEDA ScaledObject scaling (issue #77)
 
-**Work-cluster-only check (explicit deferral):** real HPA dynamics are
-untestable on kind (no metrics-server there; `worker-hpa` sat pinned at
-`minReplicas` — see
-[Approximations](kind-validation.md#approximations-vs-production)).
+The custom HPA-floor reconciliation loop (#18) was REMOVED in #77 and
+replaced with a standard KEDA ScaledObject. The operator has zero
+autoscaling surface — KEDA owns the HPA, and the operator's Role lost
+its `horizontalpodautoscalers` verbs (the same RBAC-shrink pattern as
+#78). The acceptance criterion is:
 
-1. Enqueue a batch large enough to grow the Redis backlog; verify the
-   operator **patches the chart's existing `worker-hpa` `minReplicas`**
-   (`kubectl -n openstudio-server get hpa worker-hpa -o jsonpath='{.spec.minReplicas}'`)
-   — and that **no second autoscaler exists** (no KEDA objects; KEDA is a
-   documented future migration, not this design).
-2. Backlog drains → the floor relaxes back; CPU-driven scaling above the
-   floor still belongs to the HPA. Confirm the operator never touches
-   `desiredReplicas` directly.
+> "Worker deployment scales from 0 to N based on pending Redis queue
+> items."
+
+Steps (assumes the [KEDA cluster prerequisite](#keda-cluster-prerequisite-issue-77)
+is met — KEDA installed, `worker-hpa` deleted, ScaledObject applied):
+
+1. **Baseline:** `kubectl -n openstudio-server get hpa,scaledobject,worker`
+   — ONE HPA (`keda-hpa-worker`; the chart's `worker-hpa` is gone), the
+   ScaledObject reports `Ready=True`, worker at `replicas: 0` (or 1 if
+   `minReplicaCount` was raised).
+2. **Scale-up probe:** RPUSH N jobs onto `resque:queue:simulations` (or
+   `resque:queue:requeued`); watch `kubectl -n openstudio-server get
+   worker -w` for the replica count to climb to N (clamped to
+   `maxReplicaCount: 5`). Capture: timestamps, `keda_scaledobject_metrics`
+   value, `keda_scaler_metrics` value, replica count progression.
+3. **Scale-down probe:** drain the queue (or `DEL resque:queue:simulations`
+   to force it); watch the worker Deployment drop to `minReplicaCount`
+   after KEDA's `cooldownPeriod: 60 s`. Capture: timestamps, replica
+   count.
+4. **Negative control:** confirm `openstudio_operator_hpa_floor_adjustments_total`
+   is GONE from `curl -s localhost:9090/metrics` (proves #77 removal
+   was complete — no orphan counter, no orphan incrementer).
+5. **Operator metric co-existence:** KEDA's metrics adapter and the
+   operator's `/metrics` endpoint serve distinct signals; both
+   reachable in-cluster via `kubectl -n openstudio-server
+   port-forward deploy/openstudio-operator 9090:9090` and `kubectl -n
+   keda port-forward deploy/keda-metrics-apiserver 6443:6443`
+   respectively.
+
+Live evidence in [docs/kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration](kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration).
 
 ## Phase D — flip `dryRun: false`
 
@@ -439,6 +528,6 @@ CRD cascades all CRs and their `.status` state with no per-object control).
 - [ ] `dryRun: false` evidence captured on throwaway analyses — Phase D;
 - [ ] NFS-mount behavior verified against the real provisioner
       (Module 1b eviction, Module 4 archival + space reclaim);
-- [ ] HPA-floor dynamics verified against the real `worker-hpa` (#18);
+- [ ] KEDA-driven scaling verified end-to-end (worker scales 0→N on backlog, back to 0 on drain; `keda_scaledobject_metrics` advances; `openstudio_operator_hpa_floor_adjustments_total` is absent from the operator `/metrics`) — #77;
 - [ ] Rollback rehearsed or at least dry-walked, including the PV
       reclaimPolicy patch before any helm uninstall.

@@ -47,11 +47,13 @@ from openstudio_operator import singleton
 # Removed with #78: "storage_pruner" — the storage retention pipeline moved
 # out of the operator into the storage-prune CronJob
 # (deploy/storage-cronjob.yaml); the handlers package no longer registers it.
+# Removed with #77: "hpa_floor_adjuster" — replaced by a standard KEDA
+# ScaledObject (deploy/keda-scaledobject.yaml); the operator no longer
+# mutates the worker HPA, so no OSCM timer is registered for it.
 EXPECTED_OSCM_TIMER_HANDLER_IDS: frozenset[str] = frozenset(
     {
         "analysis_sla_monitor",
         "zombie_datapoint_watchdog",
-        "hpa_floor_adjuster",
         "web_background_monitor",
         "worker_recycler",
     }

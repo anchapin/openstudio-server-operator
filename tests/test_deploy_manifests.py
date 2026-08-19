@@ -40,6 +40,27 @@ def test_operator_role_no_longer_holds_any_batch_permission():
     assert jobs_rules == []
 
 
+def test_operator_role_no_longer_holds_any_hpa_permission():
+    """The #77 reduction: the autoscaling/horizontalpodautoscalers rule is gone.
+
+    Before #77: the operator patched ``worker-hpa`` ``spec.minReplicas`` from
+    Redis backlog (Phase 4 HPA-floor adjuster, #18). The custom loop was
+    removed in favor of a standard KEDA ScaledObject
+    (deploy/keda-scaledobject.yaml) — KEDA owns the autoscaling surface and
+    runs under its own ServiceAccount, so the operator no longer needs ANY
+    HPA verbs. This is the same RBAC-shrink pattern as #78: operator
+    footprint strictly smaller, dedicated workload SA picks up the powers.
+    """
+    assert all("autoscaling" not in rule["apiGroups"] for rule in OPERATOR_ROLE["rules"])
+    hpa_rules = [
+        rule
+        for rule in OPERATOR_ROLE["rules"]
+        for res in rule["resources"]
+        if res == "horizontalpodautoscalers"
+    ]
+    assert hpa_rules == []
+
+
 def test_operator_role_still_namespaced_enumerated_style():
     """House invariants kept: namespaced Role/RoleBinding only, no ClusterRole."""
     kinds = {doc["kind"] for doc in OPERATOR_RBAC_DOCS}
