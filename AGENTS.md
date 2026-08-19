@@ -48,6 +48,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - `deploy/network-policy.yaml` — default-deny egress + per-actor allow-lists for the operator surface (`#112`): deny-all + DNS allow + operator-only egress + storage-egress (HTTPS-only, RFC1918 excepted).
 - `tests/fixtures/` — `contract-shapes.json` + `samples/` (synthetic) + `live/` (captured from a real v3.11.0 cluster).
 - `tests/golden/` — snapshot tests for generated rclone Job manifests.
+- `docs/onboarding.md` — first-time-contributor + AI-agent walkthrough (issue #178): setup, single-test/full-suite commands, venv drift guard (#71), the 5-step "add a new OSCM timer handler" pattern, Working-rules-that-bite, audit-doc update rules, branch/PR conventions, good-first-PR candidates.
 - `.github/workflows/ci.yml` — `lint` + `test` + `guard-branch-pairing`; keep that job name stable — it is a **required status check on `main`**.
 - `.github/workflows/release.yml` — publishes `ghcr.io/anchapin/openstudio-server-operator:dev` on every push to `develop`; `v*` tags publish a versioned image and create a GitHub Release (`linux/amd64` only). Both jobs enable SLSA provenance (`mode=max`) + SPDX SBOM as OCI attestations and cosign-keyless sign the published digest (`#113`); CI guards on `cosign verify-attestation --type slsaprovenance`. `Dockerfile` pins `python:3.12-slim` by digest (`#113`).
 
