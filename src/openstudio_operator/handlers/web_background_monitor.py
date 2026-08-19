@@ -97,6 +97,7 @@ from openstudio_operator.handlers.analysis_sla import (
     deployment_label_selector,
 )
 from openstudio_operator.metrics import (
+    HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_WORKERS_SEEN_MAX,
     WEB_BACKGROUND_RESTARTS_TOTAL,
 )
@@ -523,6 +524,9 @@ def web_background_monitor(
             tracker=tracker,
         )
     except (RedisClientError, StatusStoreError, ApiException) as exc:
+        HANDLER_TICK_FAILURES_TOTAL.labels(
+            module="web_background_monitor", error_type=type(exc).__name__
+        ).inc()
         logger.warning(
             "web_background monitor tick skipped, retrying next poll (%s: %s)",
             type(exc).__name__,

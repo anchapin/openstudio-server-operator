@@ -70,6 +70,7 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import (
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
     DATAPOINTS_REQUEUED_TOTAL,
+    HANDLER_TICK_FAILURES_TOTAL,
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.status_store import (
@@ -239,6 +240,9 @@ def zombie_datapoint_watchdog(
             exhausted_seen=_EXHAUSTED_WARNED,
         )
     except (OpenStudioApiError, StatusStoreError) as exc:
+        HANDLER_TICK_FAILURES_TOTAL.labels(
+            module="datapoint_watchdog", error_type=type(exc).__name__
+        ).inc()
         logger.warning(
             "datapoint watchdog tick skipped, retrying next poll (%s: %s)",
             type(exc).__name__,
