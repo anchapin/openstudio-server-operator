@@ -43,5 +43,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[dev]'
+      - name: Install runtime deps from hash-pinned lockfile (#173)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir --require-hashes -r requirements.lock
+      - name: Install operator + dev extras
+        run: pip install --no-cache-dir -e '.[dev]'
+      - name: Verify lockfile hashes in a fresh venv (#173)
+        run: |
+          python -m venv /tmp/lockfile-verify
+          /tmp/lockfile-verify/bin/python -m pip install --upgrade pip
+          /tmp/lockfile-verify/bin/pip install --require-hashes -r requirements.lock
       - run: pytest
