@@ -704,3 +704,72 @@ def test_deny_egress_does_not_select_helm_chart_pods():
                 f"{pod_labels!r}; the deny would break egress for this "
                 f"pod (issue #154)"
             )
+
+
+# ---- Issue #224: operator pod template carries every NetworkPolicy
+# selector's matchLabels -------------------------------------------
+#
+# The deny-egress (#112) and metrics-ingress (#166) NetworkPolicies in
+# `deploy/network-policy.yaml` select the operator pod via the
+# conjunction `app: openstudio-operator` AND `app.kubernetes.io/
+# managed-by: openstudio-operator`; the allow-egress policy selects via
+# `app: openstudio-operator` alone. Pre-fix, the operator Deployment
+# template at deploy/operator-deployment.yaml declared ONLY `app:
+# openstudio-operator` — so the deny and the metrics-ingress selectors
+# failed to select the operator pod:
+#
+#   (a) the operator could egress to any destination on any port,
+#       contradicting network-policy.yaml:8 ("operator does NOT egress
+#       to public Internet");
+#   (b) the plaintext Prometheus endpoint on port 9090 was reachable
+#       from every pod in every namespace on clusters without a
+#       default-deny-ingress CNI plugin (the #166 attack surface).
+#
+# The fix adds `app.kubernetes.io/managed-by: openstudio-operator` to
+# the operator pod template. This test asserts the operator pod template
+# carries the union of labels every matchLabels selector requires, so
+# the regression cannot silently recur.
+#
+# Scope guard: this test is operator-only. The prune CronJob
+# (deploy/storage-cronjob.yaml:91-93) and the archival Job
+# (archival.py:185-189) carry `app.kubernetes.io/managed-by:
+# openstudio-operator` but not `app: openstudio-operator` — they are
+# owned by #112/#166 and explicitly out of scope for #224, so the test
+# does not flag them.
+
+
+def test_operator_pod_template_carries_union_of_network_policy_matchlabels():
+    """Issue #224 acceptance: the operator pod template must carry every
+    label required by every NetworkPolicy `matchLabels` block in
+    deploy/network-policy.yaml. Pre-fix the operator pod had only
+    `app: openstudio-operator`, which is sufficient for the allow-egress
+    selector but NOT for the deny-egress + metrics-ingress selectors
+    that require the conjunction — so those policies never selected the
+    operator pod. Post-fix the operator pod template carries both
+    labels and every matchLabels selector selects it.
+
+    The test scopes to the operator Deployment pod template only;
+    the prune CronJob + archival Job templates are owned by #112/#166
+    and out of scope per the issue's scope guard."""
+    operator_labels = OPERATOR_DEPLOYMENT["spec"]["template"]["metadata"]["labels"]
+    offenders = []
+    for policy in NETPOL_DOCS:
+        match_labels = policy["spec"].get("podSelector", {}).get("matchLabels", {})
+        if not match_labels:
+            # matchExpressions-only selectors are out of scope for this
+            # test (allow-dns, storage-egress). The test exercises the
+            # structural matchLabels invariant #224 violates; matching
+            # expressions have their own invariant in
+            # `test_deny_egress_selector_matches_allow_policies`.
+            continue
+        missing = {
+            key: {"selector_requires": value, "pod_has": operator_labels.get(key)}
+            for key, value in match_labels.items()
+            if operator_labels.get(key) != value
+        }
+        if missing:
+            offenders.append((policy["metadata"]["name"], missing))
+    assert not offenders, (
+        "operator pod template is missing labels required by these "
+        f"NetworkPolicies (#224): {offenders}"
+    )

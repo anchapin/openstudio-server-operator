@@ -21,7 +21,19 @@ spec:
   template:
     metadata:
       labels:
+        # Issue #224 — the operator pod MUST carry every label the
+        # NetworkPolicies in deploy/network-policy.yaml match on. The
+        # deny-egress (#112) and metrics-ingress (#166) policies both
+        # require the conjunction `app: openstudio-operator` AND
+        # `app.kubernetes.io/managed-by: openstudio-operator`; the
+        # allow-egress policy requires only `app: openstudio-operator`.
+        # Without the second label the deny never selects the operator
+        # pod (it can egress anywhere on any port, contradicting
+        # network-policy.yaml:8) and the metrics endpoint on :9090 is
+        # readable by every pod in every namespace on clusters without
+        # a default-deny-ingress CNI plugin.
         app: openstudio-operator
+        app.kubernetes.io/managed-by: openstudio-operator
     spec:
       serviceAccountName: openstudio-operator-sa
       # Issue #161 — pod-level defense-in-depth baseline. PSS `restricted`
