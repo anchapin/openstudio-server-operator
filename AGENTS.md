@@ -74,6 +74,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - **Policy values belong in the CRD `spec` / `config.py`** — configuration, not hardcoded constants in handlers.
 - **`kopf` is pinned `>=1.37,<1.45` on purpose.** `singleton.install_singleton_guard` reaches into kopf's private `registry._spawning._handlers` (1.37+). A kopf upgrade can rename or move that internal without crashing, and the failure mode is silently unwrapped handlers (D05 enforcement quietly disabled). `tests/test_singleton_registry_coverage.py` is the CI gate that fails loudly when the internals change shape, but the upper bound requires a deliberate bump.
 - **The CRD `spec.serverUrl` is the authoritative server URL** (`config.py` reads it); the `OPENSTUDIO_SERVER_URL` env var is gone — single config path enforced (`#3`).
+- **`spec.redisUrl` defaults to empty by design (`#116`).** The historical default baked the kind-recipe password `openstudio` into every CRD; the operator now refuses to operate and emits a per-CR `Warning` event when the field is empty. Helm-chart users must set it explicitly (or template it from the Redis Secret). Don't "fix" the default — it's the regression fence.
 - **`deploy/operator-deployment.yaml` is single-replica with `strategy: Recreate` on purpose** — one active poller, no leader election. Don't scale replicas or switch to `RollingUpdate` without adding leader election.
 - **The operator never reads secrets.** rclone archival jobs receive credentials via `envFrom` `secretRef` only.
 - **No custom autoscaling code.** All autoscaling lives in `deploy/keda-scaledobject.yaml`. The `hpa_floor` handler module is deleted; the `openstudio_operator_hpa_floor_adjustments_total` counter is gone.
@@ -81,4 +82,4 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 
 ## Update protocol
 
-Keep this file accurate: update when facts change, delete what tooling now answers. Cross-check with `README.md` and the audit doc; the contract file (`docs/contracts/openstudio-server-v3.11.0-rest.md`) is the ground truth for REST surface details.
+Keep this file accurate: update when facts change, delete what tooling now answers. Cross-check with `README.md` and the audit doc; the contract file (`docs/contracts/openstudio-server-v3.11.0-rest.md`) is the ground truth for REST surface details. When bumping things that affect the test count, the layout bullets, or the Working rules (e.g. adding a new handler module, changing a default), re-verify rather than re-assert — drift here is what CI history #106/#144 has already flagged.
