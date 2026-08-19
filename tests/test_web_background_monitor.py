@@ -726,6 +726,73 @@ def test_tracker_observes_resets_and_sustains():
     assert tracker.observe(True, NOW + minute(30), window) is False  # fresh clock
 
 
+def test_stall_tracker_documents_singleton_guard_invariant() -> None:
+    """Issue #167: the ``(namespace, name)`` key invariant must be stated.
+
+    The module-level :data:`_tracker_cache` keys per-CR sustained-window
+    clocks on ``(namespace, name)``. The D05 singleton guard
+    (``openstudio_operator.singleton``) ensures only ONE OSCM CR per
+    namespace, so the tuple uniquely identifies the active CR. The
+    invariant is correct but, until this issue, was unstated in the
+    code — a future maintainer who bypassed the guard (e.g. for a
+    canary deploy) would discover the cache silently shares state
+    between the two CRs.
+
+    This test is a regression fence: it asserts the docstring on
+    :meth:`StallWindowTracker.__init__` carries the invariant AND names
+    the test that fails loudly when the singleton guard is bypassed.
+    If a future refactor drops or rewrites the docstring, this test
+    fails and forces the author to consciously preserve the invariant.
+    """
+    doc = StallWindowTracker.__init__.__doc__ or ""
+    assert "singleton guard" in doc, (
+        "StallWindowTracker.__init__ docstring must mention the singleton "
+        "guard — see issue #167 and the key invariant on "
+        "(namespace, name) in handlers/web_background_monitor.py."
+    )
+    assert "(namespace, name)" in doc, (
+        "StallWindowTracker.__init__ docstring must state the (namespace, "
+        "name) keying scheme that the singleton guard makes unique — "
+        "see issue #167."
+    )
+    assert "tests/test_singleton_registry_coverage.py" in doc, (
+        "StallWindowTracker.__init__ docstring must reference the "
+        "singleton-guard test of record (tests/test_singleton_registry_"
+        "coverage.py) — issue #167."
+    )
+
+
+def test_get_tracker_warns_when_singleton_guard_is_bypassed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #167: when the D05 singleton guard is bypassed, ``_get_tracker`` warns.
+
+    Two OSCM CRs in the same namespace is the bug the singleton guard
+    prevents. If a maintainer adds a second CR (e.g. canary A/B) the
+    tracker cache would silently share state — ``_get_tracker`` must
+    surface this with a Warning log so the behavior is visible, not
+    silent. We don't raise because the canary use case is legitimate.
+    """
+    import logging
+
+    # Fresh cache: build two distinct keys for the SAME namespace.
+    wbm_module._tracker_cache.clear()
+    try:
+        caplog.set_level(logging.WARNING, logger=wbm_module.logger.name)
+        first = wbm_module._get_tracker("ns-shared", "oscm-a")
+        # First call must not warn — there is no prior tracker for this ns.
+        assert "ns-shared" not in caplog.text
+        # Second call with a DIFFERENT name in the SAME namespace: warn.
+        second = wbm_module._get_tracker("ns-shared", "oscm-b")
+        assert "singleton guard" in caplog.text
+        assert "oscm-a" in caplog.text and "oscm-b" in caplog.text
+        # The cache now holds both — we share state, we don't raise.
+        assert len(wbm_module._tracker_cache) == 2
+        assert first is not second
+    finally:
+        wbm_module._tracker_cache.clear()
+
+
 # --- Issue #44 leg-2 non-vacuity safeguard -------------------------------------
 
 
