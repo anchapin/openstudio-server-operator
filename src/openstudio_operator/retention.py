@@ -147,10 +147,6 @@ _COMPLETED = "completed"
 _JOB_COMPLETE = "Complete"
 _JOB_FAILED = "Failed"
 
-# Cache-only (D04): one client session per server URL, never operator state
-# — same convention as every sibling handler.
-_client_cache: dict[str, OpenStudioClient] = {}
-
 
 @dataclass
 class RetentionTickResult:
@@ -172,14 +168,6 @@ class BatchApi(Protocol):
     def create_namespaced_job(self, namespace: str, body: dict, **_: object) -> object: ...
 
     def delete_namespaced_job(self, name: str, namespace: str, **_: object) -> object: ...
-
-
-def _get_client(server_url: str) -> OpenStudioClient:
-    client = _client_cache.get(server_url)
-    if client is None:
-        client = OpenStudioClient(server_url)
-        _client_cache[server_url] = client
-    return client
 
 
 def _completion_time(doc: Mapping, analysis_id: str) -> datetime | None:

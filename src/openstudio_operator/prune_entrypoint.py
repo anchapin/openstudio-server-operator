@@ -62,6 +62,7 @@ from kubernetes.client import (
 from kubernetes.config import ConfigException, load_incluster_config, load_kube_config
 
 from openstudio_operator import singleton
+from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
@@ -236,7 +237,7 @@ def main(
         return 3
 
     store = StatusStore(namespace, name, custom_api)  # type: ignore[arg-type]
-    client = (client_factory or OpenStudioClient)(config.server_url)
+    client = (client_factory or get_openstudio_client)(config.server_url)
 
     try:
         result = run_retention_tick(
