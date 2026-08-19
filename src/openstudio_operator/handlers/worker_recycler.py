@@ -76,10 +76,12 @@ logger = logging.getLogger(__name__)
 
 _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
-#: Tick cadence for detection/gate evaluation (5 min, matching the scaffold's
-#: declared cadence). Operator behavior, not cluster policy — policy values
-#: live in the CRD spec/config (AGENTS.md).
-POLL_INTERVAL_SECONDS = 300.0
+#: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WORKER_RECYCLE_POLL_INTERVAL_SECONDS`
+#: — operator behavior, not cluster policy; policy values live in the CRD
+#: spec/config (AGENTS.md).
+from openstudio_operator._constants import WORKER_RECYCLE_POLL_INTERVAL_SECONDS
+
+POLL_INTERVAL_SECONDS = WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 
 #: Fallback when ``spec.targetWorkerDeployment`` is empty: the helm
 #: ``develop`` chart's fixed worker Deployment name (AGENTS.md identifiers).

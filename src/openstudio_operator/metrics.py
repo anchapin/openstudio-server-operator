@@ -9,9 +9,10 @@ handlers package import (``kopf run --module openstudio_operator.handlers``
 imports that package exactly once), which is the operator's de-facto
 entrypoint — see ``openstudio_operator/handlers/__init__.py``.
 
-Port choice: 9090, the conventional Prometheus port, as a single module
-constant that must stay in sync with the containerPort in
-deploy/operator-deployment.yaml.
+Port choice (issue #165): the conventional Prometheus port lives in
+:mod:`openstudio_operator._constants` as :data:`METRICS_PORT` — the single
+source of truth shared with ``deploy/operator-deployment.yaml`` ``containerPort``
+and the ``openstudio-operator-metrics-ingress`` NetworkPolicy (issue #166).
 """
 
 import logging
@@ -19,6 +20,8 @@ import threading
 
 import prometheus_client
 from prometheus_client import Counter, Gauge, Histogram
+
+from openstudio_operator._constants import METRICS_PORT
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +181,10 @@ ANALYSIS_DATAPOINT_COUNT = Histogram(
     buckets=[5, 10, 50, 100, 500, 1000, 5000],
 )
 
-DEFAULT_METRICS_PORT = 9090
+#: Re-exported alias for back-compat with the historical ``DEFAULT_METRICS_PORT``
+#: identifier and any external callers that import it from this module (issue #165
+#: consolidated the port into :data:`openstudio_operator._constants.METRICS_PORT`).
+DEFAULT_METRICS_PORT = METRICS_PORT
 
 _start_lock = threading.Lock()
 _started = False

@@ -119,9 +119,12 @@ logger = logging.getLogger(__name__)
 
 _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
-#: Poll cadence fixed by the plan (30 s). Not a CRD field: it is operator
-#: behavior, not cluster policy — policy values live in the CRD spec/config.
-POLL_INTERVAL_SECONDS = 30.0
+#: Poll cadence (issue #165). See :data:`openstudio_operator._constants.SLA_POLL_INTERVAL_SECONDS`
+#: — not a CRD field, it is operator behavior, not cluster policy (policy values
+#: live in the CRD spec/config).
+from openstudio_operator._constants import SLA_POLL_INTERVAL_SECONDS
+
+POLL_INTERVAL_SECONDS = SLA_POLL_INTERVAL_SECONDS
 
 ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /

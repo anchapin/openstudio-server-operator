@@ -88,9 +88,12 @@ logger = logging.getLogger(__name__)
 
 _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
-#: Poll cadence fixed by the plan (60 s, D06). Not a CRD field: it is operator
-#: behavior, not cluster policy — policy values live in the CRD spec/config.
-POLL_INTERVAL_SECONDS = 60.0
+#: Poll cadence (issue #165). See :data:`openstudio_operator._constants.DATAPOINT_POLL_INTERVAL_SECONDS`
+#: — not a CRD field, it is operator behavior, not cluster policy (policy values
+#: live in the CRD spec/config).
+from openstudio_operator._constants import DATAPOINT_POLL_INTERVAL_SECONDS
+
+POLL_INTERVAL_SECONDS = DATAPOINT_POLL_INTERVAL_SECONDS
 
 DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
