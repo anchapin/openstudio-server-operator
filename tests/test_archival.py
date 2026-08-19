@@ -166,6 +166,23 @@ def test_archival_job_pod_securitycontext_hardened(backend: str) -> None:
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_archival_job_disables_service_account_token_mount(backend: str) -> None:
+    """Issue #241 — the archival Job is rclone-only; it never calls the
+    kube-apiserver. The kubelet's default is to mount the SA token at
+    /var/run/secrets/kubernetes.io/serviceaccount, which is pure
+    attack surface (a compromised rclone could cat the token and
+    authenticate against the API server with whatever RBAC the SA
+    carries). Set ``automountServiceAccountToken: false`` on the pod
+    spec to opt out. Scope guard: do NOT propagate this field to the
+    prune CronJob — its SA token mount is intentional (StatusStore
+    RMW + Batch Jobs).
+    """
+    job = _job(backend)
+    pod_spec = job["spec"]["template"]["spec"]
+    assert pod_spec.get("automountServiceAccountToken") is False, pod_spec
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_archival_job_image_pinned_by_digest(backend: str) -> None:
     """#124 — the rclone image is pinned by @sha256 digest. Floating
     ``rclone/rclone:1.67.0`` would let a tag-mutation steer the image
