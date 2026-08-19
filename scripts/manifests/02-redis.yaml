@@ -2,7 +2,12 @@
 # `queue` (develop branch). Image, password, args and Service name mirror the
 # chart defaults:
 #   redis.container.image = redis:7.4.10 (chart default is 6.0.9 — EOL since 2021)
-#   redis.password        = openstudio
+#   redis.password        = openstudio-rotated (issue #150 — was the legacy literal
+#                           'openstudio'; rotated because shipping a known
+#                           hardcoded password in source defeats the kind-recipe
+#                           cluster's auth boundary. Run
+#                           scripts/rotate_redis_password.sh per-cluster to
+#                           install a fresh random password before applying.)
 #   redis_svc.name        = queue   (port 6379)
 #   args                  = redis-server --appendonly yes --requirepass ... --maxclients 10000
 # The operator's read-only Redis client (#12) targets `queue:6379` with this
@@ -42,7 +47,7 @@ spec:
             - --appendonly
             - "yes"
             - --requirepass
-            - openstudio
+            - openstudio-rotated
             - --maxclients
             - "10000"
           volumeMounts:
