@@ -32,8 +32,8 @@ The machine-readable distillation lives in `tests/fixtures/contract-shapes.json`
 | Endpoint | Method | Notes |
 |---|---|---|
 | `/analyses.json` | GET | Raw Mongoid docs. Fields include `status`, `run_flag`, `created_at`, `updated_at` (Mongoid timestamps, ISO8601 with zone). **No derived methods** (`start_time` NOT included). **Live-verified (2026-08-18):** raw Mongoid docs OMIT nil fields — a fresh analysis has no `status` key at all until the workflow advances. `start_time` is forbidden here (derived only on `page_data`). See "Live-verified server quirks" §2. |
-| `/analyses/{id}/status.json` | GET | Derived view: dp counts by status, `run_flag`, job statuses. |
-| `/analyses/{id}/page_data.json` | GET | `{analysis: {status, start_time, end_time, run_flag?, ...}}` — `start_time` is derived from first job. **SLA clock anchor lives here** (Q4/Q5 chain: poll index for candidates, fetch page_data for `status=="started"` only). **Live-verified (2026-08-18):** `as_json(only:)` drops nil fields too — a minimal analysis serializes as `{name, data_points, results, output_variables}` only; `start_time` is **absent (not null)** until the first job runs. SLA anchor must be absence-tolerant. Unknown ids yield **200 `{analysis: null}`** (not 404). See "Live-verified server quirks" §1, §2. |
+| `/analyses/{id}/status.json` | GET | Derived view: dp counts by status, `run_flag`, job statuses. **SLA clock anchor lives here** post-#83 D1 (operator's first sight of the analysis in the `started` state — written to CR `status.softStops[aid].issuedAt`; see Module 1 below). Live-verified (2026-08-18): the only endpoint that reliably reports the real analysis status; `page_data.start_time` and `analyses.json` raw-doc `status` are both unreliable on v3.11.0 (the former is absent until the first job runs; the latter is omitted when nil). Unknown ids yield **200 `{analyses: []}`** (not 404) — see "Live-verified server quirks" §1, §7. |
+| `/analyses/{id}/page_data.json` | GET | `{analysis: {status, start_time, end_time, run_flag?, ...}}` — `start_time` is derived from first job. **No longer the SLA clock anchor** as of #83 D1: the `as_json(only:)` filter drops nil fields, so `start_time` is **absent (not null)** until the first job runs (a minimal analysis serializes as `{name, data_points, results, output_variables}` only). The SLA clock now anchors on `/status.json` first-sight; `page_data` is still useful for derived fields (point counts, output variables) but the clock anchor has moved. Unknown ids yield **200 `{analysis: null}`** (not 404). See "Live-verified server quirks" §1, §2. |
 | `/analyses/{id}/action` | POST | Body param is **`analysis_action`** ∈ `start` \| `stop` — NOT `action`, NOT `soft_stop`/`kill`/`hard_stop`. `stop` = set run_flag false, wait for in-flight. |
 | `/analyses/{id}/soft_stop` | GET | Cooperative stop that does NOT wait for in-flight runs (semantics roughly inverted vs `stop`). |
 | `/analyses/{id}/stop` | GET | Stop waiting for last submitted run. |
@@ -79,8 +79,13 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
    advances); `start_time` never appears in `/analyses.json` (derived only
    on `page_data`). `page_data.json` (`as_json(only:)`) drops nil fields too
    — a minimal analysis serializes as `{name, data_points, results,
-   output_variables}` only. The SLA anchor `start_time` is **absent, not
-   null**, until the first job. DataPoint docs, in contrast, carry
+   output_variables}` only. The historical SLA clock anchor
+   `page_data.start_time` is **absent, not null**, until the first job —
+   the only endpoint that reports the live analysis `status` is
+   `GET /analyses/{id}/status.json` (issue #83 D1: the SLA clock anchor
+   has moved to the operator-observed first sight of the analysis in the
+   `started` state via `/status.json`, written to CR
+   `status.softStops[aid].issuedAt`). DataPoint docs, in contrast, carry
    `run_start_time` / `ip_address` / `job_id` as explicit `null`s before
    start.
 
@@ -118,6 +123,7 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
 - Redis Service: `queue:6379` in ns `openstudio-server`; URL `redis://:openstudio@queue:6379` (password `openstudio` by default).
 - Workers consume `QUEUES=requeued,simulations` (Resque).
 - Queue depth: `LLEN resque:queue:simulations` / `LLEN resque:queue:requeued` (Resque 2.x key layout — live-verified 2026-08-18, issue #67; the bare `LLEN simulations` form reads a non-existent key and returns 0 forever). Worker liveness: Resque worker registry/heartbeats keys.
+- Per-worker record: `GET resque:worker:{worker_id}` (STRING, JSON) — used by the Module 1 escalation path (issue #83 D2) to discover which Resque workers are currently processing a given analysis. The JSON's `payload.args` carries the job arguments (e.g. `[analysis_id, datapoint_id, ...]` for the OpenStudio Server `RunSimulateDataPoint` job class). Worker ids are `{hostname}:{pid}:{queues}` — the first colon-delimited segment is the K8s pod name (pods default `hostname` to the pod name), so the escalation can map a worker id to a pod for `kubectl delete pod`. **Pre-#83 escalation matched started-datapoint `ip_address` against worker pod `status.podIP`** — but on v3.11.0 datapoint `ip_address` is always null, so that path never matched (issue #83 D2: surgical pod eviction re-sourced to Resque worker identity).
 - ResqueWeb mounted at `/resque` (HTML only).
 - Admin levers (future use): `POST /admin/prune_resque_workers`, `POST /admin/requeue_failed`.
 

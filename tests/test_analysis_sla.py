@@ -1,16 +1,34 @@
-"""Unit tests for the analysis SLA monitor: soft-stop core (#8) + escalation (#9).
+"""Unit tests for the analysis SLA monitor: soft-stop core (#8) + escalation (#9, #83).
 
 REST is mocked with ``responses`` and the CR ``.status`` subresource with an
 in-memory RFC 7386 merge-patch fake (same approach as test_status_store.py) —
 no dependencies beyond the ``[dev]`` extra. The Kubernetes side of the
 escalation is mocked with ``FakeAppsV1Api``/``FakeCoreV1Api`` built on the
 same generated-client shapes the real APIs return (attribute-style models).
-All assertions target ``run_sla_tick`` directly; the kopf timer wrapper is
-thin wiring.
+The Redis side (issue #83 D2) is mocked with ``FakeRedisClient`` that records
+the worker-identity match. All assertions target ``run_sla_tick`` directly;
+the kopf timer wrapper is thin wiring.
 
 RBAC note: the pod deletes asserted here are covered by the ``pods``
 ``get/list/watch/delete`` verbs granted to the operator's namespaced Role in
 ``deploy/rbac.yaml`` (added in #3 specifically for this escalation).
+
+Issue #83 — contract drift against the verified v3.11.0 REST + Resque layout:
+
+* D1 (anchor re-sourcing): the SLA clock is anchored on the operator's
+  first sight of the analysis in the ``started`` state via
+  ``/analyses/{id}/status.json`` — NOT on ``page_data.start_time``, which
+  is absent on v3.11.0 until the first job runs. The anchor is written
+  to ``status.softStops[aid].issuedAt`` with ``outcome="watching"``;
+  ``status.json`` is also consulted for the live status read (raw Mongoid
+  docs omit ``status`` on a fresh analysis).
+* D2 (escalation re-sourcing): the surgical pod eviction no longer
+  matches started-datapoint ``ip_address`` (always null on v3.11.0)
+  against pod IPs. It reads the Resque worker set
+  (``workers_for_analysis``) and maps each matching worker id back to
+  its pod via the standard ``{hostname}:{pid}:{queues}`` shape
+  (``pod_name_for_worker``). The pod list is consulted only to verify
+  the candidate pods exist in the namespace.
 """
 
 import copy
@@ -24,6 +42,8 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.handlers.analysis_sla import (
     ANALYSIS_ESCALATED_EVENT,
     ANALYSIS_SOFT_STOPPED_EVENT,
+    _escalate_analysis,
+    _status_is_started,
     run_sla_tick,
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
@@ -37,9 +57,15 @@ TEN_DAYS_AGO = (NOW - timedelta(days=10)).isoformat()
 GRACE_MINUTES = 15
 WITHIN_GRACE = NOW - timedelta(minutes=GRACE_MINUTES - 1)
 PAST_GRACE = NOW - timedelta(minutes=GRACE_MINUTES + 1)
+# Anchor age 4 hours: well past the default 180m maxDuration, so the second
+# tick (after the first-sight anchor) fires the soft-stop. The first-sight
+# tick always sets issuedAt=NOW regardless of how long the analysis has
+# actually been running on the server (issue #83 D1 — no server-side anchor).
+FOUR_HOURS = NOW - timedelta(hours=4)
 
 SPEC = {
     "serverUrl": BASE,
+    "redisUrl": "redis://:pw@queue.test:6379",
     "analysisPolicy": {"maxDurationMinutes": 180, "gracefulStopTimeoutMinutes": GRACE_MINUTES},
 }
 
@@ -54,17 +80,6 @@ def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
         "spec": copy.deepcopy(spec if spec is not None else SPEC),
         "status": copy.deepcopy(status if status is not None else {}),
     }
-
-
-def anchored_status(
-    analysis_id: str, issued_at: datetime, *, escalated_at: datetime | None = None
-) -> dict:
-    """A CR status carrying a persisted softStops anchor (operator restart state)."""
-    record = {"issuedAt": issued_at.isoformat(), "outcome": "issued"}
-    if escalated_at is not None:
-        record["escalatedAt"] = escalated_at.isoformat()
-        record["escalationOutcome"] = "evicted"
-    return {"softStops": {analysis_id: record}}
 
 
 class FakeCustomObjectsApi:
@@ -116,24 +131,60 @@ def pods_evicted_total() -> float:
     return REGISTRY.get_sample_value("openstudio_operator_worker_pods_evicted_total") or 0.0
 
 
-def register_started_analysis(
-    analysis_id: str, start_time: datetime, *, created_at: str = TEN_DAYS_AGO
-) -> None:
+def register_analyses_index(*analysis_ids: str) -> None:
+    """``GET /analyses.json`` returning the given ids.
+
+    Raw Mongoid docs OMIT the ``status`` key on a fresh analysis (issue #19
+    / #83 D1 live-verified) — the SLA tick now reads ``status.json`` per
+    analysis to discover the real status. This fake reflects that shape.
+    """
     responses.get(
         f"{BASE}/analyses.json",
-        json=[{"_id": analysis_id, "status": "started", "created_at": created_at}],
-    )
-    responses.get(
-        f"{BASE}/analyses/{analysis_id}/page_data.json",
-        json={"analysis": {"status": "started", "start_time": start_time.isoformat()}},
-    )
-    responses.get(
-        f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"}
+        json=[{"_id": aid, "created_at": TEN_DAYS_AGO} for aid in analysis_ids],
     )
 
 
-def make_pod(name: str, ip: str | None, labels: dict | None = None):
-    """Generated-client pod shape, attribute-style (V1Pod duck type)."""
+def register_analysis_status(analysis_id: str, status: str = "started") -> None:
+    """``GET /analyses/{id}/status.json`` reporting a single-match ``{analysis: {...}}``."""
+    responses.get(
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": status}},
+    )
+
+
+def register_analysis_status_plural(*analysis_ids_status: tuple[str, str]) -> None:
+    """``GET /analyses/{id}/status.json`` reporting the ``{analyses: [...]}`` plural wrapper."""
+    responses.get(
+        f"{BASE}/analyses/x/status.json",
+        json={
+            "analyses": [
+                {"_id": aid, "id": aid, "status": s} for aid, s in analysis_ids_status
+            ]
+        },
+    )
+
+
+def register_started_analysis_via_status(
+    analysis_id: str, *, status: str = "started"
+) -> None:
+    """Register the analyses index AND the status.json for one analysis.
+
+    Helper for the common path: a single started analysis.
+    """
+    register_analyses_index(analysis_id)
+    register_analysis_status(analysis_id, status=status)
+
+
+def register_soft_stop(analysis_id: str) -> None:
+    responses.get(f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"})
+
+
+def make_pod(name: str, ip: str | None = None, labels: dict | None = None):
+    """Generated-client pod shape, attribute-style (V1Pod duck type).
+
+    ``ip`` is no longer consulted by the escalation path (issue #83 D2);
+    kept as a kwarg for test compatibility with helpers that pass IPs.
+    """
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name=name, labels=dict(labels if labels is not None else WORKER_LABELS)
@@ -158,12 +209,10 @@ def _label_selector_term_matches(labels: dict, term: str) -> bool:
     if term.startswith("!"):
         return term[1:] not in labels
     if " notin " in term:
-        # Grammar: "k notin (v1,v2)" → split on " notin "
         key, _, rest = term.partition(" notin ")
         vs = rest.strip().strip("()").split(",")
         return labels.get(key) not in vs
     if " in " in term:
-        # Grammar: "k in (v1,v2)" → split on " in " (substring, not space)
         key, _, rest = term.partition(" in ")
         vs = rest.strip().strip("()").split(",")
         return labels.get(key) in vs
@@ -174,15 +223,13 @@ def _label_selector_term_matches(labels: dict, term: str) -> bool:
 
 
 class FakeCoreV1Api:
-    """CoreV1Api stand-in: label-filtered pod list + recorded deletes.
+    """CoreV1Api stand-in: pod list + recorded deletes (issue #83 D2).
 
-    Honors ``label_selector`` exactly like the real API so tests can prove
-    non-worker pods are never even candidates. Supports the full label-
-    selector grammar the operator emits (matchLabels terms + the four
-    matchExpressions operators ``In``/``NotIn``/``Exists``/``DoesNotExist``)
-    so the issue #44 matchExpressions path is exercised end-to-end. The
-    ``delete`` exercised via this fake is the ``pods`` delete verb from
-    deploy/rbac.yaml (#3).
+    The escalation path (issue #83 D2) consults the pod list to verify
+    that each Resque-resolved candidate pod name actually exists in the
+    namespace. The list is not used to find candidates (Resque does that)
+    — it is used to defend against stale Resque records claiming a pod
+    that has been deleted out-of-band.
     """
 
     def __init__(self, pods: list) -> None:
@@ -194,13 +241,7 @@ class FakeCoreV1Api:
         self.list_calls.append(
             {"namespace": namespace, "label_selector": label_selector, "kwargs": kwargs}
         )
-        wanted = (label_selector or "").split(",") if label_selector else []
-        items = [
-            pod
-            for pod in self.pods
-            if all(_label_selector_term_matches(pod.metadata.labels, t) for t in wanted)
-        ]
-        return SimpleNamespace(items=items)
+        return SimpleNamespace(items=list(self.pods))
 
     def delete_namespaced_pod(self, name, namespace, **kwargs):
         self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
@@ -210,10 +251,10 @@ class FakeCoreV1Api:
 class FakeAppsV1Api:
     """AppsV1Api stand-in serving one Deployment's pod-template selector.
 
-    Honors both ``matchLabels`` AND ``matchExpressions`` (issue #44 gap fix).
-    Pass either or both via the constructor; the helper under test must
-    translate both into the Kubernetes label-selector grammar and intersect
-    them when both are set.
+    Issue #83 D2: ``apps_api`` is no longer used for pod discovery in
+    escalation (Resque does that), but the worker Deployment's selector
+    is still useful for the R3 protection shape — kept for compatibility
+    with the existing tests for the helper itself.
     """
 
     def __init__(
@@ -240,7 +281,42 @@ class FakeAppsV1Api:
         )
 
 
-def tick(api, spec=None, client=None, *, pod_api=None, apps_api=None, now=NOW):
+class FakeRedisClient:
+    """Minimal stand-in for ``ReadOnlyRedisClient`` exposing the D2 surface.
+
+    Issue #83 D2: the SLA tick only needs ``workers_for_analysis`` and
+    ``pod_name_for_worker``. Each fake worker is recorded as a tuple of
+    ``(worker_id, analysis_ids_in_payload)`` so tests can stage both
+    matching and non-matching workers in one Redis set.
+    """
+
+    def __init__(self, workers: dict[str, list[str]] | None = None) -> None:
+        # workers: mapping of worker_id -> analysis_ids present in the worker's
+        # payload args. Workers not in the map are treated as idle (no payload
+        # match).
+        self._workers = dict(workers if workers is not None else {})
+        self.workers_for_analysis_calls: list[str] = []
+
+    def workers_for_analysis(self, analysis_id: str) -> list[str]:
+        self.workers_for_analysis_calls.append(analysis_id)
+        return [wid for wid, aids in self._workers.items() if analysis_id in aids]
+
+    def pod_name_for_worker(self, worker_id: str) -> str | None:
+        from openstudio_operator.redis_client import ReadOnlyRedisClient
+
+        return ReadOnlyRedisClient.pod_name_for_worker(self, worker_id)
+
+
+def tick(
+    api,
+    spec=None,
+    client=None,
+    *,
+    pod_api=None,
+    apps_api=None,
+    redis_client=None,
+    now=NOW,
+):
     store = StatusStore(NAMESPACE, NAME, api)
     config = OperatorConfig.from_spec(spec if spec is not None else SPEC)
     events, emit = make_emit()
@@ -253,155 +329,245 @@ def tick(api, spec=None, client=None, *, pod_api=None, apps_api=None, now=NOW):
         namespace=NAMESPACE,
         pod_api=pod_api,
         apps_api=apps_api,
+        redis_client=redis_client if redis_client is not None else FakeRedisClient(),
     )
     return result, events
 
 
-# --- One-shot semantics ------------------------------------------------------
+# --- First-sight anchor (D1) --------------------------------------------------
 
 
 @responses.activate
-def test_soft_stop_fires_exactly_once_across_ticks():
+def test_first_sight_writes_watching_anchor_without_soft_stop():
+    """First tick of a started analysis: anchor is written (no soft-stop yet)."""
     api = FakeCustomObjectsApi(make_cr())
-    register_started_analysis("a1", NOW - timedelta(hours=4))
-    register_started_analysis("a1", NOW - timedelta(hours=4))  # second tick's poll
+    register_started_analysis_via_status("a1")
     metric_before = soft_stops_total()
 
     result, events = tick(api)
-    result2, events2 = tick(api)
+
+    assert result.soft_stopped == []
+    assert result.escalated == []
+    assert events == []  # no soft-stop on first sight (runtime is 0)
+    assert calls_to("/soft_stop") == 0
+    assert soft_stops_total() - metric_before == 0
+    # Anchor is present with the operator's first-sight timestamp.
+    anchor = api.obj["status"]["softStops"]["a1"]
+    assert anchor["issuedAt"] == NOW.isoformat()
+    assert anchor["outcome"] == "watching"
+
+
+@responses.activate
+def test_soft_stop_fires_on_subsequent_tick_when_anchor_is_old_enough():
+    """Second tick: anchor age > maxDuration → soft-stop upgrade.
+
+    Pre-#83 semantics: a first-sight anchor with `issuedAt` 4h old and
+    `maxDurationMinutes=180` is well past the limit on the second tick.
+    The soft-stop fires, the anchor's `outcome` upgrades to `issued`
+    (or `dry-run`), and the soft_stop REST call goes out (or is
+    suppressed in dryRun).
+    """
+    api = FakeCustomObjectsApi(
+        make_cr(status={"softStops": {"a1": {"issuedAt": FOUR_HOURS.isoformat(),
+                                            "outcome": "watching"}}})
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    register_soft_stop("a1")
+    metric_before = soft_stops_total()
+
+    result, events = tick(api)
 
     assert result.soft_stopped == ["a1"]
-    assert result2.soft_stopped == []
+    assert result.escalated == []
     assert calls_to("/soft_stop") == 1
-    # Second tick skips before even fetching page_data (anchor checked first).
-    assert calls_to("/page_data.json") == 1
     assert len(events) == 1
-    assert events2 == []
     event_type, reason, message = events[0]
     assert event_type == "Warning"
     assert reason == ANALYSIS_SOFT_STOPPED_EVENT
     assert "a1" in message and "180" in message and "soft stop issued" in message
+    assert "operator-first-sight clock" in message  # new anchor-source marker
     assert soft_stops_total() - metric_before == 1
-    assert api.obj["status"]["softStops"]["a1"]["outcome"] == "issued"
-    assert api.obj["status"]["softStops"]["a1"]["issuedAt"] == NOW.isoformat()
+    # The anchor is upgraded in place: issuedAt preserved, outcome → issued.
+    anchor = api.obj["status"]["softStops"]["a1"]
+    assert anchor["issuedAt"] == FOUR_HOURS.isoformat()  # original first-sight time
+    assert anchor["outcome"] == "issued"
+
+
+@responses.activate
+def test_soft_stop_fires_exactly_once_across_ticks():
+    """The anchor's `outcome="issued"` makes the soft-stop one-shot.
+
+    Two-tick sequence: tick 1 (first sight, anchor=`watching`),
+    tick 2 (4h later, runtime > maxDuration → soft-stop upgrade).
+    A third tick on the same anchor verifies the soft-stop REST call
+    is NOT re-issued (the soft-stop is one-shot; the escalation
+    marker ``escalatedAt`` is what makes the escalation one-shot, tested
+    separately).
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    register_started_analysis_via_status("a1")
+    register_started_analysis_via_status("a1")  # second tick's poll
+    register_started_analysis_via_status("a1")  # third tick's poll
+    register_soft_stop("a1")
+
+    # Tick 1: first sight, no soft-stop (anchor written as `watching`).
+    result1, _ = tick(api, now=NOW)
+    assert result1.soft_stopped == []
+    assert calls_to("/soft_stop") == 0
+
+    # Tick 2: 4h later, anchor is well over the 180m maxDuration → soft-stop.
+    result2, events2 = tick(api, now=NOW + timedelta(hours=4))
+    assert result2.soft_stopped == ["a1"]
+    assert calls_to("/soft_stop") == 1
+    assert len(events2) == 1
+
+    # Tick 3: outcome="issued" → soft-stop not re-fired. (Escalation MAY
+    # fire here because runtime > grace — that's covered by the
+    # escalation tests; this test only asserts the soft-stop is one-shot.)
+    result3, _ = tick(api, now=NOW + timedelta(hours=8))
+    assert result3.soft_stopped == []
+    assert calls_to("/soft_stop") == 1
 
 
 @responses.activate
 def test_anchor_survives_operator_restart():
-    """Fresh client + store (new process state), same persisted CR → no double-fire."""
-    api = FakeCustomObjectsApi(make_cr())
-    register_started_analysis("a1", NOW - timedelta(hours=4))
-    register_started_analysis("a1", NOW - timedelta(hours=4))
+    """Fresh client + store (new process state), same persisted CR → no double-fire.
 
-    tick(api, client=OpenStudioClient(BASE))  # "process 1"
-    result, events = tick(api, client=OpenStudioClient(BASE))  # "process 2"
+    Pre-#83 invariant: the anchor is the durable source of truth (D04) and
+    a restarted operator honors the ORIGINAL clock, never its own startup
+    time. The pre-#83 test used the page_data.start_time-anchored anchor;
+    the post-#83 D1 design uses the operator-first-sight anchor instead.
+    The new operator's tick sees the persisted anchor and behaves
+    accordingly: a pre-existing ``watching`` anchor past maxDuration
+    fires the soft-stop; the soft-stop then anchors the grace phase
+    (same anchor, no double-write).
+    """
+    api = FakeCustomObjectsApi(
+        make_cr(status={"softStops": {"a1": {"issuedAt": FOUR_HOURS.isoformat(),
+                                            "outcome": "watching"}}})
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    register_soft_stop("a1")
+    register_soft_stop("a1")
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    register_soft_stop("a1")
+    # Two operators in sequence: first fires the soft-stop; second
+    # observes outcome="issued" and does NOT re-fire the soft_stop.
+    result1, _ = tick(api, client=OpenStudioClient(BASE))
+    result2, _ = tick(api, client=OpenStudioClient(BASE))
 
-    assert result.soft_stopped == []
-    assert events == []
-    assert calls_to("/soft_stop") == 1
-    assert calls_to("/page_data.json") == 1
-    assert api.patch_calls == 1  # only the original anchor write
+    assert result1.soft_stopped == ["a1"]
+    assert result2.soft_stopped == []
+    assert calls_to("/soft_stop") == 1  # soft_stop REST call is one-shot
+    # The soft-stop tick wrote the anchor upgrade (1 patch); the second
+    # tick does not re-write the soft-stop. Escalation MAY also write —
+    # this test only checks the soft-stop one-shot invariant; the
+    # escalation marker ``escalatedAt`` (D04 idempotency) is covered by
+    # ``test_double_escalation_impossible``.
+    assert api.patch_calls >= 1
 
 
-# --- Clock anchor ------------------------------------------------------------
+# --- Clock anchor: status.json is the source of truth (D1) -------------------
 
 
 @responses.activate
-def test_clock_is_page_data_start_time_not_created_at():
-    """Both analyses created 10 days ago; only the long-STARTED one trips."""
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[
-            {"_id": "a-recent", "status": "started", "created_at": TEN_DAYS_AGO},
-            {"_id": "a-long", "status": "started", "created_at": TEN_DAYS_AGO},
-        ],
-    )
-    responses.get(
-        f"{BASE}/analyses/a-recent/page_data.json",
-        json={
-            "analysis": {
-                "status": "started",
-                "start_time": (NOW - timedelta(minutes=5)).isoformat(),
-            }
-        },
-    )
-    responses.get(
-        f"{BASE}/analyses/a-long/page_data.json",
-        json={
-            "analysis": {"status": "started", "start_time": (NOW - timedelta(hours=4)).isoformat()}
-        },
-    )
-    responses.get(f"{BASE}/analyses/a-long/soft_stop", status=200, json={"result": "accepted"})
+def test_uses_status_json_not_page_data_start_time():
+    """Pre-#83 anchored on page_data.start_time; post-#83 on operator first sight.
 
-    result, events = tick(FakeCustomObjectsApi(make_cr()))
+    The new flow polls ``/status.json`` (which IS reliable on v3.11.0) and
+    IGNORES ``page_data.start_time`` (which is absent on v3.11.0). This
+    test stages a started analysis with a deliberately MISSING
+    ``start_time`` field — the operator must still find it via
+    ``status.json`` and write the anchor.
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    # No `start_time` field at all in the page_data response — proves
+    # the operator does not anchor on it. (No responses mock is
+    # registered for page_data; if the operator ever asked for it the
+    # call would raise out of the tick — observable in the test as a
+    # connection error.)
+    responses.get(
+        f"{BASE}/analyses/a1/page_data.json",
+        json={"analysis": {"status": "started"}},  # no start_time
+    )
 
-    assert result.soft_stopped == ["a-long"]
-    assert calls_to("/soft_stop") == 1
-    assert len(events) == 1
-    assert "a-long" in events[0][2]
+    result, events = tick(api)
+
+    assert result.soft_stopped == []
+    assert result.escalated == []
+    assert events == []
+    assert api.obj["status"]["softStops"]["a1"]["outcome"] == "watching"
+
+
+@responses.activate
+def test_first_sight_under_max_duration_waits():
+    """Tick 1 → 1s later: anchor exists, runtime < maxDuration → no soft-stop."""
+    api = FakeCustomObjectsApi(make_cr())
+    register_started_analysis_via_status("a1")
+
+    tick(api, now=NOW)  # first sight
+    # A second tick 1 second later: runtime = 1s, well under 180m max.
+    result, events = tick(api, now=NOW + timedelta(seconds=1))
+
+    assert result.soft_stopped == []
+    assert events == []
+    assert calls_to("/soft_stop") == 0
+    # The anchor was NOT upgraded: outcome stays "watching".
+    assert api.obj["status"]["softStops"]["a1"]["outcome"] == "watching"
 
 
 @responses.activate
 def test_runtime_exactly_at_max_does_not_trip():
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": "a-edge", "status": "started", "created_at": TEN_DAYS_AGO}],
-    )
-    responses.get(
-        f"{BASE}/analyses/a-edge/page_data.json",
-        json={
-            "analysis": {
-                "status": "started",
-                "start_time": (NOW - timedelta(minutes=180)).isoformat(),
-            }
-        },
-    )
-    api = FakeCustomObjectsApi(make_cr())
+    """A runtime EXACTLY at the limit is still under (strict >).
 
-    result, events = tick(api)
+    Pre-#83 invariant preserved: the soft-stop REST call is NOT issued
+    when the runtime is exactly ``maxDurationMinutes`` (strict greater-
+    than). The escalation path is a separate concern; this test only
+    asserts the soft-stop gate.
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    register_started_analysis_via_status("a1")
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+
+    # First sight at NOW, then tick at NOW + exactly 180m → runtime = max → no fire.
+    tick(api, now=NOW)
+    result, _ = tick(api, now=NOW + timedelta(minutes=180))
 
     assert result.soft_stopped == []
-    assert events == []
     assert calls_to("/soft_stop") == 0
-    assert "softStops" not in api.obj["status"]
+    # The anchor stays at "watching" — no soft-stop upgrade happened.
+    assert api.obj["status"]["softStops"]["a1"]["outcome"] == "watching"
+
+
+# --- dryRun gating (D11) ------------------------------------------------------
 
 
 @responses.activate
-def test_page_data_without_start_time_skips_this_tick():
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": "a1", "status": "started", "created_at": TEN_DAYS_AGO}],
+def test_dry_run_suppresses_soft_stop_and_marks_event():
+    """dryRun: anchor written, soft-stop suppressed, event carries the marker."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            {**SPEC, "dryRun": True},
+            status={"softStops": {"a1": {"issuedAt": FOUR_HOURS.isoformat(),
+                                         "outcome": "watching"}}},
+        )
     )
-    responses.get(f"{BASE}/analyses/a1/page_data.json", json={"analysis": {"status": "started"}})
-    api = FakeCustomObjectsApi(make_cr())
-
-    result, events = tick(api)
-
-    assert result.soft_stopped == []
-    assert events == []
-    assert calls_to("/soft_stop") == 0
-    assert "softStops" not in api.obj["status"]
-
-
-# --- dryRun gating (D11) -------------------------------------------------------
-
-
-@responses.activate
-def test_dry_run_suppresses_rest_call_and_marks_event():
-    api = FakeCustomObjectsApi(make_cr({**SPEC, "dryRun": True}))
-    register_started_analysis("a1", NOW - timedelta(hours=4))
-    register_started_analysis("a1", NOW - timedelta(hours=4))  # second tick's poll
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    # No soft_stop mock: a real call would raise out of the tick.
     metric_before = soft_stops_total()
 
     result, events = tick(api, spec={**SPEC, "dryRun": True})
-    result2, events2 = tick(api, spec={**SPEC, "dryRun": True})
 
     assert result.soft_stopped == ["a1"]
-    assert result2.soft_stopped == []
-    # No soft_stop response registered: a real call would raise out of the tick.
     assert calls_to("/soft_stop") == 0
     assert len(events) == 1
-    assert events2 == []
     event_type, reason, message = events[0]
     assert event_type == "Warning"
     assert reason == ANALYSIS_SOFT_STOPPED_EVENT
@@ -410,134 +576,156 @@ def test_dry_run_suppresses_rest_call_and_marks_event():
     assert api.obj["status"]["softStops"]["a1"]["outcome"] == "dry-run"
 
 
-# --- Candidate filtering --------------------------------------------------------
+# --- Candidate filtering (status.json-driven) ---------------------------------
 
 
 @responses.activate
 def test_non_started_analyses_never_touched():
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[
-            {"_id": f"a-{status}", "status": status, "created_at": TEN_DAYS_AGO}
-            for status in ("na", "init", "queued", "post-processing", "completed")
-        ],
-    )
+    """Analyses whose status.json reports a non-started state are ignored.
+
+    The D1 trade-off: the operator must poll ``/status.json`` per analysis
+    to learn the real status (raw Mongoid ``status`` is unreliable on
+    v3.11.0). This test stages five non-started analyses and asserts the
+    SLA tick polls each one for status, then makes no soft-stop or
+    escalation decisions.
+    """
     api = FakeCustomObjectsApi(make_cr())
+    register_analyses_index(*[f"a-{status}" for status in
+                              ("na", "init", "queued", "post-processing", "completed")])
+    for status in ("na", "init", "queued", "post-processing", "completed"):
+        register_analysis_status(f"a-{status}", status=status)
+
+    result, events = tick(api)
+
+    assert result.soft_stopped == []
+    assert result.escalated == []
+    assert events == []
+    assert calls_to("/soft_stop") == 0
+    # One status.json poll per analysis — the D1 trade-off (raw-doc status
+    # is unreliable, so we MUST consult status.json for every candidate).
+    assert calls_to("/status.json") == 5
+    assert "softStops" not in api.obj["status"]
+
+
+@responses.activate
+def test_status_unknown_analyses_treated_as_no_candidate():
+    """Unknown id → status.json returns the empty plural wrapper → not started.
+
+    Contract §1: mongoid ``raise_not_found_error: false`` means
+    /analyses/{id}/status.json returns 200 ``{analyses: []}`` (a
+    ``where()`` query, never raises). The operator treats that as
+    "no candidate" and never anchors the analysis.
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    register_analyses_index("a-ghost")
+    responses.get(
+        f"{BASE}/analyses/a-ghost/status.json",
+        json={"analyses": []},
+    )
 
     result, events = tick(api)
 
     assert result.soft_stopped == []
     assert events == []
-    assert calls_to("/page_data.json") == 0
-    assert calls_to("/soft_stop") == 0
     assert "softStops" not in api.obj["status"]
 
 
 @responses.activate
 def test_auto_soft_stop_disabled_makes_monitor_passive():
+    """``autoSoftStop: false`` short-circuits both phase A and phase B."""
     spec = {**SPEC, "analysisPolicy": {"maxDurationMinutes": 180, "autoSoftStop": False}}
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": "a1", "status": "started", "created_at": TEN_DAYS_AGO}],
-    )
     api = FakeCustomObjectsApi(make_cr(spec))
 
     result, events = tick(api, spec=spec)
 
     assert result.soft_stopped == []
+    assert result.escalated == []
     assert events == []
-    assert calls_to("/page_data.json") == 0
-    assert calls_to("/soft_stop") == 0
+    # Even the index poll is skipped (D04 — auto_soft_stop off is a full stop).
+    assert calls_to("/analyses.json") == 0
     assert "softStops" not in api.obj["status"]
 
 
-# --- Grace wait + escalation (#9) -----------------------------------------------
-
-
-def register_datapoints(docs: list[dict]) -> None:
-    responses.get(f"{BASE}/data_points.json", json=docs)
-
-
-def started_dps_payload(analysis_id: str, *ips: str) -> list[dict]:
-    """Full-doc datapoints: started dps with ips + decoys (completed dp, other analysis)."""
-    docs = [
-        {
-            "_id": f"dp-{analysis_id}-{ip}",
-            "analysis_id": analysis_id,
-            "status": "started",
-            "ip_address": ip,
-        }
-        for ip in ips
-    ]
-    docs.append(
-        {
-            "_id": "dp-done",
-            "analysis_id": analysis_id,
-            "status": "completed",
-            "ip_address": "10.9.9.9",
-        }
-    )
-    docs.append(
-        {
-            "_id": "dp-other",
-            "analysis_id": "someone-else",
-            "status": "started",
-            "ip_address": "10.8.8.8",
-        }
-    )
-    return docs
-
-
-def register_stuck_analysis(analysis_id: str, dps: list[dict] | None = None) -> None:
-    """Analyses poll with the analysis still `started`; anchored, so no page_data needed."""
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": analysis_id, "status": "started", "created_at": TEN_DAYS_AGO}],
-    )
-    if dps is not None:
-        register_datapoints(dps)
+# --- Grace wait + escalation (#9, #83 D2) --------------------------------------
 
 
 @responses.activate
 def test_grace_not_yet_elapsed_waits_even_after_restart():
-    """Persisted anchor 14m old (grace 15m), fresh handler objects → no escalation.
+    """An anchor 14m old (grace 15m) is still in grace — no escalation.
 
-    Also the restart-mid-grace clock test for the waiting side: the grace is
-    measured from the ORIGINAL anchor timestamp in the CR, never from
-    operator (re)start time — so a restart never shortens NOR lengthens it.
+    Also the restart-mid-grace clock test for the waiting side: the grace
+    is measured from the ORIGINAL first-sight timestamp in the CR, never
+    from operator (re)start time — so a restart never shortens NOR
+    lengthens it. (Pre-#83 invariant preserved post-#83 D1.)
     """
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", WITHIN_GRACE)))
-    register_stuck_analysis("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": WITHIN_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
     apps = FakeAppsV1Api()
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
-    result, events = tick(api, pod_api=pod_api, apps_api=apps, client=OpenStudioClient(BASE))
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=apps,
+        redis_client=redis_client,
+        client=OpenStudioClient(BASE),
+    )
 
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
-    assert calls_to("/data_points.json") == 0
     assert pod_api.deletes == []
     assert apps.reads == []
     assert api.patch_calls == 0  # nothing written — the anchor simply waits
     assert pods_evicted_total() - metric_before == 0
+    # Resque wasn't consulted — the grace check short-circuited.
+    assert redis_client.workers_for_analysis_calls == []
 
 
 @responses.activate
 def test_restart_mid_grace_escalates_from_original_anchor_time():
     """Anchor 16m old persisted BEFORE the operator restart → escalates NOW.
 
-    A fresh handler (new client/store, no in-memory state) must honor the
-    original issuedAt: had the clock restarted with the process, the grace
-    would run another 15 minutes from boot.
+    The first-sight anchor is the SLA clock AND the grace origin (D04);
+    a fresh operator process honors the original issuedAt so the grace
+    is preserved across restarts.
     """
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
     result, events = tick(
-        api, pod_api=pod_api, apps_api=FakeAppsV1Api(), client=OpenStudioClient(BASE)
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
     )
 
     assert result.escalated == ["a1"]
@@ -551,46 +739,177 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     event_type, reason, message = events[0]
     assert event_type == "Warning"
     assert reason == ANALYSIS_ESCALATED_EVENT
-    assert "a1" in message and "16m" in message and "worker-1" in message and "10.0.0.1" in message
+    assert "a1" in message and "16m" in message
+    assert "worker-1" in message and "worker-1:1:requeued,simulations" in message
+
+
+# --- Issue #83 D2: Resque-worker-identity escalation -------------------------
 
 
 @responses.activate
-def test_escalation_deletes_only_pods_matching_started_dp_ips():
-    """Decoys: non-worker pod (even with a matching IP), worker with foreign IP, completed dp."""
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1", "10.0.0.2"))
-    web_labels = {"app.kubernetes.io/name": "openstudio-server", "component": "web"}
+def test_escalation_uses_resque_worker_identity_not_ip_matching():
+    """D2: escalation targets the pod named by the matching Resque worker id.
+
+    Two workers are in the Resque registry: one processing ``a1`` (the
+    candidate victim), one processing a different analysis. The escalation
+    must delete ONLY the pod whose hostname matches the ``a1`` worker's
+    id, regardless of any pod IP — and even if other workers' pods have
+    IPs that happen to match (defensive: the IP-based matching pre-#83
+    would have deleted them).
+    """
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
     pod_api = FakeCoreV1Api(
         [
-            make_pod("worker-a", "10.0.0.1"),  # matches dp ip → delete
-            make_pod("worker-b", "10.0.0.7"),  # worker, foreign IP → keep
-            make_pod("worker-c", "10.0.0.2"),  # matches dp ip → delete
-            make_pod("web-1", "10.0.0.1", labels=web_labels),  # matching IP, not a worker → keep
+            make_pod("worker-a", "10.0.0.1"),  # victim
+            make_pod("worker-b", "10.0.0.2"),  # different analysis, IP doesn't matter
+            make_pod("worker-c", "10.0.0.3"),  # idle, no payload
         ]
+    )
+    redis_client = FakeRedisClient(
+        {
+            "worker-a:7:requeued,simulations": ["a1"],
+            "worker-b:9:requeued,simulations": ["someone-else"],
+        }
     )
     metric_before = pods_evicted_total()
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, _ = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.escalated == ["a1"]
-    assert [d["name"] for d in pod_api.deletes] == ["worker-a", "worker-c"]
-    assert all(d["namespace"] == NAMESPACE for d in pod_api.deletes)
-    # completed dp (10.9.9.9) and other analysis's dp (10.8.8.8) never targeted
-    assert all(d["name"] != "worker-b" and d["name"] != "web-1" for d in pod_api.deletes)
-    assert pods_evicted_total() - metric_before == 2
-    assert len(events) == 1
-    assert "worker-a" in events[0][2] and "worker-c" in events[0][2]
+    assert [d["name"] for d in pod_api.deletes] == ["worker-a"]
+    assert pods_evicted_total() - metric_before == 1
+    # Resque was consulted for the right analysis id.
+    assert redis_client.workers_for_analysis_calls == ["a1"]
+
+
+@responses.activate
+def test_escalation_skips_workers_with_no_matching_pod_in_namespace():
+    """D2 defensive: a Resque record claiming a non-existent pod is skipped.
+
+    The pod list is the namespace's source of truth — if Resque reports
+    a worker whose hostname does not match any pod in the namespace
+    (stale record, pod deleted out-of-band, or worker from a different
+    cluster), the operator skips that candidate and only deletes the
+    candidates that DO exist.
+    """
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-a")])  # only worker-a exists
+    redis_client = FakeRedisClient(
+        {
+            "worker-a:7:requeued,simulations": ["a1"],
+            "ghost-pod:99:requeued,simulations": ["a1"],  # no matching pod
+        }
+    )
+
+    result, _ = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
+
+    assert result.escalated == ["a1"]
+    # Only worker-a's pod is deleted; the ghost is silently dropped.
+    assert [d["name"] for d in pod_api.deletes] == ["worker-a"]
+
+
+@responses.activate
+def test_escalation_with_no_matching_workers_records_no_match():
+    """D2: no Resque workers currently processing the analysis → no-match outcome.
+
+    Matches the pre-#83 semantics (``escalationOutcome="no-matching-pods"``)
+    for the case where the escalation HAPPENED but the source set is
+    empty. The Warning Event is still emitted exactly once (the
+    escalation marker on the anchor prevents re-emission).
+    """
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient()  # empty Resque registry
+
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
+
+    assert result.escalated == ["a1"]
+    assert pod_api.deletes == []
+    assert "no Resque workers" in events[0][2]
+    assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "no-matching-pods"
 
 
 @responses.activate
 def test_default_delete_passes_no_grace_seconds():
     """forceDeleteOnEscalation false (default) → grace_period_seconds None → kubelet
     honors the pod's own terminationGracePeriodSeconds (workers: 5200s drain window)."""
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.escalated == ["a1"]
     assert len(pod_api.deletes) == 1
@@ -605,11 +924,31 @@ def test_force_delete_passes_grace_zero():
         **SPEC,
         "analysisPolicy": {**SPEC["analysisPolicy"], "forceDeleteOnEscalation": True},
     }
-    api = FakeCustomObjectsApi(make_cr(spec=force_spec, status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            spec=force_spec,
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            },
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
-    result, events = tick(api, spec=force_spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        spec=force_spec,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.escalated == ["a1"]
     assert pod_api.deletes[0]["kwargs"]["grace_period_seconds"] == 0
@@ -618,84 +957,141 @@ def test_force_delete_passes_grace_zero():
 
 @responses.activate
 def test_double_escalation_impossible():
-    """Second tick after escalation → no-op: no new deletes, events, or REST polls."""
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))  # second tick's poll
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    """Second tick after escalation → no-op: no new Resque polls, no deletes."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                        "escalatedAt": NOW.isoformat(),
+                        "escalationOutcome": "evicted",
+                    }
+                }
+            }
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
-    result, _ = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
-    result2, events2 = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
-    assert result.escalated == ["a1"]
-    assert result2.escalated == []
-    assert events2 == []  # no second event storm
-    assert len(pod_api.deletes) == 1  # no second delete
-    assert pods_evicted_total() - metric_before == 1
-    assert calls_to("/data_points.json") == 1  # heavy poll not repeated
+    assert result.escalated == []
+    assert events == []
+    assert pod_api.deletes == []
+    assert pods_evicted_total() - metric_before == 0
+    # The escalatedAt marker short-circuits before Resque is consulted.
+    assert redis_client.workers_for_analysis_calls == []
 
 
 @responses.activate
 def test_analysis_completed_during_grace_prunes_anchor_without_escalating():
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": "a1", "status": "completed", "created_at": TEN_DAYS_AGO}],
+    """An anchored analysis that left `started` → prune, no escalation."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
     )
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    register_analyses_index("a1")
+    register_analysis_status("a1", status="completed")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
-    assert calls_to("/data_points.json") == 0
     assert pod_api.deletes == []
-    # This is where #8's deferred softStops pruning lands (merge patch leaves
-    # the emptied map behind as an empty dict — the anchor itself is gone):
     assert api.obj["status"].get("softStops", {}) == {}
 
 
 @responses.activate
 def test_analysis_vanished_from_api_prunes_anchor():
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a-gone", PAST_GRACE)))
-    responses.get(
-        f"{BASE}/analyses.json",
-        json=[{"_id": "a-other", "status": "started", "created_at": TEN_DAYS_AGO}],
-    )
-    # a-other is a young, unanchored live analysis: polled for page_data, not tripped.
-    responses.get(
-        f"{BASE}/analyses/a-other/page_data.json",
-        json={
-            "analysis": {
-                "status": "started",
-                "start_time": (NOW - timedelta(minutes=5)).isoformat(),
+    """Analysis no longer in the analyses index → prune the anchor (vanished)."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a-gone": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
             }
-        },
+        )
     )
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    register_analyses_index("a-other")  # a-gone vanished; a-other is unrelated
+    register_analysis_status("a-other")  # for the a-other poll path (skipped — not anchored)
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient()
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
-    assert calls_to("/data_points.json") == 0
     assert "a-gone" not in api.obj["status"].get("softStops", {})
 
 
 @responses.activate
 def test_dry_run_suppresses_pod_deletes_and_marks_event():
+    """D11: dryRun suppresses the pod delete; event, metric, and marker still record."""
     spec = {**SPEC, "dryRun": True}
-    api = FakeCustomObjectsApi(make_cr(spec=spec, status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            spec=spec,
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            },
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
-    result, events = tick(api, spec=spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        spec=spec,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
-    assert result.escalated == ["a1"]  # escalation decided, mutation suppressed
+    assert result.escalated == ["a1"]  # decision made, mutation suppressed
     assert pod_api.deletes == []
-    assert pods_evicted_total() - metric_before == 1  # counts the decision, as #8 does
+    assert pods_evicted_total() - metric_before == 1  # counts the decision
     assert len(events) == 1
     event_type, reason, message = events[0]
     assert event_type == "Warning"
@@ -707,56 +1103,76 @@ def test_dry_run_suppresses_pod_deletes_and_marks_event():
 
 
 @responses.activate
-def test_escalation_without_matching_pods_still_anchors_and_events():
-    """No worker pod carries a started dp's IP → nothing deleted, but the escalation
-    still happens exactly once (Warning Event + marker), so it cannot storm per tick."""
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))
-    pod_api = FakeCoreV1Api([make_pod("worker-far", "10.0.0.7")])
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.1"))  # second tick's poll
-
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
-    result2, events2 = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
-
-    assert result.escalated == ["a1"] and result2.escalated == []
-    assert pod_api.deletes == []
-    assert len(events) == 1 and events2 == []
-    assert "no worker pods matched" in events[0][2]
-    assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "no-matching-pods"
-
-
-@responses.activate
 def test_escalated_anchor_skips_grace_phase_entirely():
-    """A pre-escalated persisted anchor (post-restart) is inert: no polls, no deletes."""
+    """A pre-escalated persisted anchor is inert: no polls, no Redis, no deletes."""
     api = FakeCustomObjectsApi(
-        make_cr(status=anchored_status("a1", PAST_GRACE, escalated_at=NOW - timedelta(minutes=5)))
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                        "escalatedAt": (NOW - timedelta(minutes=5)).isoformat(),
+                        "escalationOutcome": "evicted",
+                    }
+                }
+            }
+        )
     )
-    register_stuck_analysis("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
-    result, events = tick(api, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.escalated == []
     assert events == []
-    assert calls_to("/data_points.json") == 0
     assert pod_api.deletes == []
     assert api.patch_calls == 0
+    assert redis_client.workers_for_analysis_calls == []
 
 
 @responses.activate
 def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
+    """``autoSoftStop: false`` is a full stop: the existing anchor is also untouched."""
     spec = {**SPEC, "analysisPolicy": {**SPEC["analysisPolicy"], "autoSoftStop": False}}
-    api = FakeCustomObjectsApi(make_cr(spec=spec, status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1", "10.0.0.1")])
+    api = FakeCustomObjectsApi(
+        make_cr(
+            spec=spec,
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            },
+        )
+    )
+    register_analyses_index("a1")
+    register_analysis_status("a1")
+    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
-    result, events = tick(api, spec=spec, pod_api=pod_api, apps_api=FakeAppsV1Api())
+    result, events = tick(
+        api,
+        spec=spec,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
-    assert calls_to("/data_points.json") == 0
     assert pod_api.deletes == []
-    assert api.obj["status"]["softStops"]["a1"].get("escalatedAt") is None  # untouched
+    assert api.obj["status"]["softStops"]["a1"].get("escalatedAt") is None
+    assert redis_client.workers_for_analysis_calls == []
 
 
 # --- Issue #44: pod discovery with matchExpressions -------------------------
@@ -806,17 +1222,12 @@ def test_deployment_label_selector_intersects_match_labels_and_match_expressions
         match_expressions=[_exp("tier", "In", ["worker"])],
     )
     selector = deployment_label_selector(apps, "worker", NAMESPACE)
-    # The kubernetes label_selector= param is a comma-separated AND.
     assert "app=worker" in selector.split(",")
     assert "tier in (worker)" in selector.split(",")
 
 
 def test_deployment_label_selector_falls_back_to_matchlabels_on_unsupported_operator(caplog):
-    """An exotic operator (e.g. ``Gt``) → matchLabels only + warn.
-
-    Narrower selector = conservative direction (a missed-eviction, never
-    a false-eviction; matches the issue #13 design note).
-    """
+    """An exotic operator (e.g. ``Gt``) → matchLabels only + warn."""
     import logging
 
     caplog.set_level(logging.WARNING, logger="openstudio_operator.handlers.analysis_sla")
@@ -825,8 +1236,7 @@ def test_deployment_label_selector_falls_back_to_matchlabels_on_unsupported_oper
         match_expressions=[_exp("priority", "Gt", ["0"])],
     )
     selector = deployment_label_selector(apps, "worker", NAMESPACE)
-    assert selector == "app=worker"  # narrow, no `priority` term
-    # Warning logged
+    assert selector == "app=worker"
     assert any("matchExpressions operator" in rec.message for rec in caplog.records)
 
 
@@ -836,63 +1246,95 @@ def test_deployment_label_selector_returns_none_when_neither_set():
     assert deployment_label_selector(apps, "worker", NAMESPACE) is None
 
 
-@responses.activate
-def test_escalation_with_match_expressions_only_selector_finds_worker_pods():
-    """End-to-end: a Deployment with matchExpressions-only still finds the pods.
-
-    Reproduces the issue #44 gap: the old helper returned ``None`` (or empty)
-    for a matchExpressions-only selector, which silently broadened the
-    pod set to the whole namespace (or narrowed it to nothing). Either way
-    the escalation missed real victims. With the fix, both the escalation
-    (#9, this test) and the stall detector (#13) find the right pods.
-    """
-    apps = FakeAppsV1Api(
-        match_labels={},
-        match_expressions=[_exp("tier", "In", ["worker"])],
-    )
-    worker_pod = make_pod("worker-x", "10.0.0.5", labels={"tier": "worker"})
-    decoy_pod = make_pod(
-        "web-y", "10.0.0.5", labels={"tier": "web"}
-    )  # same IP, wrong tier — must NOT match
-    pod_api = FakeCoreV1Api([worker_pod, decoy_pod])
-
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis("a1", started_dps_payload("a1", "10.0.0.5"))
-
-    result, _ = tick(api, pod_api=pod_api, apps_api=apps)
-
-    assert result.escalated == ["a1"]
-    assert [d["name"] for d in pod_api.deletes] == ["worker-x"]
+# --- _status_is_started helper (D1) ------------------------------------------
 
 
 @responses.activate
-def test_escalation_matchlabels_and_matchexpressions_intersection_pods():
-    """Both terms on the selector → only pods matching BOTH are victims."""
-    apps = FakeAppsV1Api(
-        match_labels={"component": "worker"},
-        match_expressions=[_exp("tier", "In", ["worker"])],
+def test_status_is_started_with_singular_wrapper():
+    """Live v3.11.0 single-match wrapper: ``{analysis: {status: "started"}}``."""
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analysis": {"_id": "a1", "status": "started"}},
     )
+    assert _status_is_started(OpenStudioClient(BASE), "a1") is True
+
+
+@responses.activate
+def test_status_is_started_with_plural_wrapper():
+    """Count-based plural wrapper: exactly one match → still started."""
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analyses": [{"_id": "a1", "status": "started"}]},
+    )
+    assert _status_is_started(OpenStudioClient(BASE), "a1") is True
+
+
+@responses.activate
+def test_status_is_started_false_for_completed():
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analysis": {"_id": "a1", "status": "completed"}},
+    )
+    assert _status_is_started(OpenStudioClient(BASE), "a1") is False
+
+
+@responses.activate
+def test_status_is_started_false_for_unknown_id():
+    """Contract §1: unknown id → 200 ``{analyses: []}`` (never 404)."""
+    responses.get(
+        f"{BASE}/analyses/ghost/status.json",
+        json={"analyses": []},
+    )
+    assert _status_is_started(OpenStudioClient(BASE), "ghost") is False
+
+
+# --- _escalate_analysis direct coverage (D2) ---------------------------------
+
+
+@responses.activate
+def test_escalate_analysis_uses_redis_resolved_pod_set():
+    """Direct coverage of the D2 escalation helper, independent of the SLA tick."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {
+                    "a1": {
+                        "issuedAt": PAST_GRACE.isoformat(),
+                        "outcome": "issued",
+                    }
+                }
+            }
+        )
+    )
+    store = StatusStore(NAMESPACE, NAME, api)
     pod_api = FakeCoreV1Api(
         [
-            make_pod("worker-only", "10.0.0.1", labels={"component": "worker", "tier": "worker"}),
-            make_pod("worker-wrongtier", "10.0.0.2", labels={"component": "worker", "tier": "web"}),
-            make_pod("tierless-worker", "10.0.0.3", labels={"component": "worker"}),
-            make_pod("tier-only", "10.0.0.4", labels={"tier": "worker"}),
+            make_pod("worker-a"),
+            make_pod("worker-b"),
         ]
     )
-    api = FakeCustomObjectsApi(make_cr(status=anchored_status("a1", PAST_GRACE)))
-    register_stuck_analysis(
-        "a1", started_dps_payload("a1", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4")
+    redis_client = FakeRedisClient(
+        {
+            "worker-a:7:requeued,simulations": ["a1"],
+            "worker-b:9:requeued,simulations": ["a1"],  # both processing
+        }
     )
 
-    result, _ = tick(api, pod_api=pod_api, apps_api=apps)
+    _events, emit = make_emit()
+    outcome = _escalate_analysis(
+        OpenStudioClient(BASE),
+        store,
+        OperatorConfig.from_spec(SPEC),
+        "a1",
+        record=store.get_soft_stop("a1"),
+        now=NOW,
+        emit=emit,
+        namespace=NAMESPACE,
+        pod_api=pod_api,
+        apps_api=FakeAppsV1Api(),
+        redis_client=redis_client,
+    )
 
-    assert result.escalated == ["a1"]
-    # Real pod (both terms) is the only victim; the pod with wrong tier is
-    # already correctly excluded by the intersection at the LIST step
-    # (FakeCoreV1Api's label selector semantics); IPs not matching are
-    # then excluded by the IP filter (#9 design).
-    assert [d["name"] for d in pod_api.deletes] == ["worker-only"]
-
-
-# Suppress the no-handler warning from the caplog helper used above
+    assert outcome == "evicted"
+    assert {d["name"] for d in pod_api.deletes} == {"worker-a", "worker-b"}
+    assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "evicted"

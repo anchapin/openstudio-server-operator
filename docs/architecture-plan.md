@@ -127,17 +127,14 @@ spec:
 
 ### **Module 1: Analysis Lifecycle & Soft-Stop Manager**
 
-* **Goal:** Prevent stuck simulations from clogging worker pods indefinitely.  
-* **Logic Flow:**  
-  1. Poll GET /analyses.json every 30 seconds (raw Mongoid docs; no derived fields).  
-  2. For each analysis with status \== "started":  
-     * Fetch GET /analyses/{id}/page\_data.json and anchor the SLA clock on its derived start\_time (never on created\_at).  
-     * Check runtime against spec.analysisPolicy.maxDurationMinutes.  
-     * If limit exceeded:  
-       1. Issue GET /analyses/{id}/soft\_stop (cooperative stop; does not wait for in-flight runs). The waiting variant is POST /analyses/{id}/action with body param analysis\_action set to stop (the only allowed values are start and stop).  
-       2. Log K8s Warning Event: AnalysisSoftStopped.  
-       3. Wait for spec.analysisPolicy.gracefulStopTimeoutMinutes, anchored on CR .status timestamps (v3.11.0 analysis states are na, init, queued, started, post-processing, completed; there is no stopping or failed state, and stop/soft\_stop only flip the run\_flag boolean without changing status).  
-       4. Escalate on the Kubernetes side: delete the worker pods whose pod IP matches a started datapoint's ip\_address (fetched escalation-only from GET /data\_points.json, which ignores query params), gated by analysisPolicy.forceDeleteOnEscalation. No kill or hard\_stop action exists in v3.11.0.
+* **Goal:** Prevent stuck simulations from clogging worker pods indefinitely.
+* **Logic Flow (issue #83 re-sourced — D1 SLA clock anchor, D2 escalation path):**
+  1. Poll `GET /analyses.json` every 30 seconds (raw Mongoid docs; no reliable `status` field — issue #19 D1/#83 D1: status is omitted on a fresh analysis, so the SLA tick cannot filter candidates from the index alone).
+  2. For each analysis, fetch `GET /analyses/{id}/status.json` to read the real analysis `status` (the only endpoint that reliably reports status on v3.11.0). The new SLA clock anchor is the **operator-observed first sight of the analysis in the `started` state** — written to `CR .status.softStops[aid].issuedAt` with `outcome="watching"` (D04 durable store). On subsequent ticks, runtime is `now - issuedAt`; the page_data `start_time` field is no longer consulted as a clock anchor (it is absent until the first job runs, per contract §2).
+  3. Once a `watching` anchor exists, check runtime against `spec.analysisPolicy.maxDurationMinutes`. If exceeded, **soft-stop**: `GET /analyses/{id}/soft_stop` (cooperative stop; does not wait for in-flight runs). Upgrade the anchor's `outcome` to `"issued"` (or `"dry-run"` under dryRun). Emit K8s Warning Event `AnalysisSoftStopped`. This is the operator's one-shot soft-stop (the `issuedAt`+`outcome="issued"` pair is the durable idempotency mechanism — survives ticks and operator restarts).
+  4. Grace wait: a still-`started` anchor past `analysisPolicy.gracefulStopTimeoutMinutes` from its `issuedAt` is escalated (issue #9). Restart-safe: a fresh operator process honors the original `issuedAt`, never its own startup time.
+  5. Escalate on the Kubernetes side: the surgical pod eviction is now re-sourced to **Resque worker identity** (issue #83 D2). Pre-#83 matched started-datapoint `ip_address` (heavy `GET /data_points.json`) against worker pod `status.podIP` — but on v3.11.0 datapoint `ip_address` is always null, so that path never matched. The new path reads the Resque worker set (`SMEMBERS resque:workers`), filters to workers whose `payload.args` reference the analysis id (`GET resque:worker:{worker_id}` per candidate), and maps each matching worker id back to its pod via the standard `{hostname}:{pid}:{queues}` shape (the K8s pod's `hostname` defaults to the pod name). `list_namespaced_pod` is consulted to verify each candidate pod exists in the namespace. `analysisPolicy.forceDeleteOnEscalation` switches the delete grace: `false` (default) passes no `grace_period_seconds` (cooperative drain via the chart's preStop + 5200s cap); `true` passes `grace_period_seconds=0` (immediate SIGKILL).
+  6. Each escalated analysis emits a Warning Event `AnalysisEscalated`, counts the decision in `WORKER_PODS_EVICTED_TOTAL`, and stamps the anchor via `StatusStore.mark_soft_stop_escalated`. Anchor retirement: an anchored analysis that left `started` (completed, post-processing, ...) or vanished from the API prunes the anchor — no escalation, the soft stop worked.
 
 **Reserved surface: ``stop_analysis`` (issue #49).** The waiting-variant stop (``POST /analyses/{id}/action`` with ``analysis_action=stop``) is contract-correct and tested, but has zero call sites: SLA uses the non-waiting ``soft_stop`` (Module 1, step 3) and retention owns the deletion path. It is kept in ``OpenStudioClient`` for contract completeness and is **reserved** for future wiring. Any handler that wires it MUST add ``spec.dryRun`` gating (D11) and a ``.status``-anchored idempotency record (D04), and MUST update ``docs/audit-dryrun-idempotency.md`` §1.1 row R2 (replace DORMANT with GATED) in the same PR.
 
@@ -211,7 +208,7 @@ Net: the operator drops one whole rule and 5 verbs; the prune SA adds 8 narrowly
                      │                            │               │         │  
                      └────────────────────────────┴───────────────┴─────────┴─\> \[ Trigger Worker Recycle & Storage Prune \]
 
-Analysis states (verified v3.11.0): na \-\> init \-\> queued \-\> started \-\> post-processing \-\> completed. There is no stopping, stopped, or failed state; soft\_stop and action stop only flip the run\_flag boolean, so grace-period decisions anchor on CR .status timestamps rather than server state. There is no kill or hard\_stop action: the (No) branch is Kubernetes-side eviction of worker pods whose IP matches a started datapoint's ip\_address (Module 1, step 4).
+Analysis states (verified v3.11.0): na \-\> init \-\> queued \-\> started \-\> post-processing \-\> completed. There is no stopping, stopped, or failed state; soft\_stop and action stop only flip the run\_flag boolean, so grace-period decisions anchor on CR .status timestamps rather than server state. There is no kill or hard\_stop action: the (No) branch is Kubernetes-side eviction of worker pods identified by their Resque worker record (issue #83 D2 — pre-#83 escalation matched started-datapoint `ip_address` against worker pod IPs, but on v3.11.0 datapoint `ip_address` is always null, so the IP path never matched; the Resque-worker-identity path uses `SMEMBERS resque:workers` + `GET resque:worker:{worker_id}` to resolve the worker to its pod name).
 
 ## **6\. Implementation Phasing & Roadmap**
 

@@ -102,6 +102,91 @@ def test_get_analysis_page_data_normalizes_sla_anchor(client):
 
 
 @responses.activate
+def test_get_analysis_status_returns_singular_wrapper(client):
+    """Issue #83 D1: ``/status.json`` is the new SLA clock anchor source.
+
+    Live v3.11.0: the response wraps a single match as
+    ``{analysis: {…}}``. The operator's ``_status_is_started`` helper
+    reads this wrapper.
+    """
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analysis": {"_id": "a1", "id": "a1", "status": "started"}},
+    )
+    payload = client.get_analysis_status("a1")
+    assert payload["analysis"]["status"] == "started"
+    assert payload["analysis"]["_id"] == "a1"
+
+
+@responses.activate
+def test_get_analysis_status_returns_plural_wrapper(client):
+    """Count-based wrapping (live-verified #66): zero or many matches →
+    ``{analyses: [...]}``."""
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analyses": [{"_id": "a1", "id": "a1", "status": "started"}]},
+    )
+    payload = client.get_analysis_status("a1")
+    assert payload["analyses"][0]["status"] == "started"
+
+
+@responses.activate
+def test_get_analysis_status_normalizes_timestamps(client):
+    """Timestamps in the status payload (e.g. ``run_at``) are tz-aware UTC."""
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={
+            "analysis": {
+                "_id": "a1",
+                "id": "a1",
+                "status": "started",
+                "run_flag": True,
+                "jobs": [
+                    {
+                        "index": 0,
+                        "analysis_type": "batch_run",
+                        "status": "completed",
+                        "status_message": "completed normal",
+                    }
+                ],
+                "data_points": [
+                    {
+                        "_id": "dp1",
+                        "id": "dp1",
+                        "name": "dp",
+                        "analysis_id": "a1",
+                        "status": "started",
+                        "status_message": "",
+                        "run_start_time": "2026-08-18T08:00:00-06:00",
+                    }
+                ],
+            }
+        },
+    )
+    payload = client.get_analysis_status("a1")
+    assert (
+        payload["analysis"]["data_points"][0]["run_start_time"]
+        == datetime(2026, 8, 18, 14, 0, 0, tzinfo=UTC)
+    )
+
+
+@responses.activate
+def test_get_analysis_status_retries_5xx_then_succeeds(client, sleeps):
+    """D12: status.json reads ride the same 3x retry/jitter envelope as
+    every other REST method — the SLA tick's N+1 polls are protected."""
+    responses.get(f"{BASE}/analyses/a1/status.json", status=503)
+    responses.get(
+        f"{BASE}/analyses/a1/status.json",
+        json={"analysis": {"_id": "a1", "id": "a1", "status": "started"}},
+    )
+    payload = client.get_analysis_status("a1")
+    assert payload["analysis"]["status"] == "started"
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+    assert 0.5 <= sleeps[0] <= 1.5
+
+
+@responses.activate
 def test_list_started_datapoints_uses_status_and_jobs_params(client):
     responses.get(
         f"{BASE}/data_points/status",

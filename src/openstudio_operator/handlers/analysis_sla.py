@@ -1,42 +1,56 @@
-"""Module 1 (plan Phase 1): Analysis SLA monitor — soft-stop + escalation (#8, #9).
+"""Module 1 (plan Phase 1): Analysis SLA monitor — soft-stop + escalation (#8, #9, #83).
 
 Verified against the v3.11.0 REST contract
-(``.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md``):
+(``docs/contracts/openstudio-server-v3.11.0-rest.md``):
 
 * every 30 s (plan-mandated poll cadence — deliberately not a CRD field),
-  ``GET /analyses.json``; soft-stop candidates are analyses with
-  ``status == "started"`` only — ``na``/``init``/``queued``/
-  ``post-processing``/``completed`` are never touched;
-* the SLA clock is anchored on ``GET /analyses/{id}/page_data.json``
-  ``analysis.start_time`` (derived from the first job) — NEVER on
-  ``created_at``: an analysis queued for days must not false-trip;
+  ``GET /analyses.json``; soft-stop candidates are analyses whose
+  ``/analyses/{id}/status.json`` reports ``status == "started"`` — the raw
+  Mongoid ``status`` field is unreliable (omitted when nil — issue #19 D1
+  / #83 D1; ``na``/``init``/``queued``/``post-processing``/``completed``
+  are never tripped);
+* the SLA clock is anchored on the OPERATOR'S FIRST SIGHT of the analysis
+  in the ``started`` state via ``/status.json`` (issue #83 D1: ``page_data
+  .json``'s derived ``start_time`` is absent on v3.11.0 until the first
+  job — see contract §2; ``/analyses.json`` raw docs omit ``status``
+  entirely). The first-sight timestamp is written to
+  ``status.softStops[aid].issuedAt`` (the existing durable anchor — D04)
+  and reused as the grace-wait origin so the entire ``running → escalated``
+  timeline is one operator-observed clock;
 * runtime over ``spec.analysisPolicy.maxDurationMinutes`` with no prior
-  anchor in ``status.softStops`` (checked BEFORE acting) →
-  ``GET /analyses/{id}/soft_stop`` (cooperative, does not wait for in-flight
-  runs), a Warning Event ``AnalysisSoftStopped``, and a
-  ``status.softStops[id]`` record written through :class:`StatusStore`.
+  soft-stop on the anchor →
+  ``GET /analyses/{id}/soft_stop`` (cooperative, does not wait for
+  in-flight runs), a Warning Event ``AnalysisSoftStopped``, and the anchor
+  upgraded from ``outcome="watching"`` to ``outcome="issued"`` through
+  :class:`StatusStore`.
 
 One-shot semantics (D04): the status anchor is the idempotency mechanism —
 it survives ticks and operator restarts, so the stop fires exactly once per
 analysis.
 
-Grace wait + escalation (#9, D03 — no REST kill exists in v3.11.0):
+Grace wait + escalation (#9, #83 D2 — no REST kill exists in v3.11.0):
 
 * non-blocking grace — on each tick every anchored analysis that is STILL
   ``started`` is compared against ``analysisPolicy.gracefulStopTimeoutMinutes``
   using the anchor's ``issuedAt`` (a CR-status timestamp, never server
   state: there is no ``stopping`` state to read). Restart-safe by
   construction — a fresh operator process reads the persisted anchor and
-  honors the ORIGINAL soft-stop time, not its own startup time;
+  honors the ORIGINAL first-sight time, not its own startup time;
 * grace elapsed while still ``started`` → escalate ONCE per anchor
-  (``escalatedAt`` on the record is the marker): ``GET /data_points.json``
-  (heavy — escalation-only per the contract) supplies the ``ip_address`` of
-  that analysis's started datapoints; worker pods are discovered via the
-  pod-template selector of the Deployment named by
-  ``spec.targetWorkerDeployment`` (empty → helm-fixed ``worker``), listed
-  in the CR's namespace, and ONLY pods whose ``status.podIP`` matches a
-  started datapoint's ``ip_address`` are deleted — surgical by IP, never a
-  deployment-wide restart;
+  (``escalatedAt`` on the record is the marker). The escalation target
+  resolution is issue #83 D2: pre-#83 the path matched started datapoints'
+  ``ip_address`` (heavy ``GET /data_points.json``) against worker pod
+  ``status.podIP`` — but on v3.11.0 the datapoint ``ip_address`` field is
+  always null, so the IP set was always empty and the surgical eviction
+  never fired. The new path reads the Resque worker set
+  (``ReadOnlyRedisClient.workers_for_analysis``) and maps each matching
+  worker id back to its pod via the standard
+  ``{hostname}:{pid}:{queues}`` shape (the K8s pod name is the hostname,
+  so the first colon-delimited segment is the pod name — see
+  :meth:`ReadOnlyRedisClient.pod_name_for_worker`); only pods that match
+  the worker Deployment's label selector (so the eviction cannot broaden
+  past the worker fleet — R3 protection still applies) AND that match the
+  Resque-resolved set are deleted;
 * ``analysisPolicy.forceDeleteOnEscalation`` switches the delete grace:
   ``false`` (default) passes NO ``grace_period_seconds`` — the kubelet
   honors each pod's own ``terminationGracePeriodSeconds`` (the chart's
@@ -65,8 +79,8 @@ everything else (anchors, markers, metrics) behaves identically, so
 flipping the flag changes only the mutation.
 
 Failure handling (D12): the client retries transient REST failures itself;
-anything still failing — including kube API failures — raises out of
-:func:`run_sla_tick` and the kopf wrapper skips the tick: an unrecorded
+anything still failing — including kube API or Redis failures — raises out
+of :func:`run_sla_tick` and the kopf wrapper skips the tick: an unrecorded
 stop/escalation is re-attempted next poll, a recorded one never re-fires
 (accepted races are mutate-then-anchor, same as #8/#11).
 """
@@ -85,6 +99,7 @@ from kubernetes.client import ApiException, AppsV1Api, CoreV1Api, CustomObjectsA
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import SOFT_STOPS_TOTAL, WORKER_PODS_EVICTED_TOTAL
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import (
     GROUP,
     PLURAL,
@@ -114,6 +129,14 @@ ANALYSIS_ESCALATED_EVENT = "AnalysisEscalated"
 _DEFAULT_WORKER_DEPLOYMENT = "worker"
 
 _STARTED = "started"
+#: First-sight observation outcome (issue #83 D1): the SLA clock anchor is the
+#: operator's first sight of the analysis in the ``started`` state. The
+#: anchor is written BEFORE the runtime check fires, so a freshly-seen
+#: started analysis whose first tick is past the maxDuration limit can
+#: soft-stop in the same tick. ``watching`` is the "anchor written, no
+#: soft-stop yet" state; the soft-stop path upgrades it to ``issued`` (or
+#: ``dry-run`` when ``spec.dryRun`` is set).
+_OUTCOME_WATCHING = "watching"
 _OUTCOME_ISSUED = "issued"
 _OUTCOME_DRY_RUN = "dry-run"
 #: Escalation outcomes persisted on the anchor's ``escalationOutcome``.
@@ -153,6 +176,21 @@ class WorkerPodApi(Protocol):
     def delete_namespaced_pod(self, name: str, namespace: str, **_: object) -> object: ...
 
 
+class RedisClientLike(Protocol):
+    """Structural type of the read-only Redis client as used here — tests fake exactly this.
+
+    Issue #83 D2 escalation re-sourcing: the SLA monitor now asks Redis which
+    Resque workers are currently processing the analysis (their job payload
+    references the analysis id), instead of trying to match datapoint
+    ``ip_address`` (always null on v3.11.0) against pod IPs. The two methods
+    below are the only surface this module needs.
+    """
+
+    def workers_for_analysis(self, analysis_id: str) -> list[str]: ...
+
+    def pod_name_for_worker(self, worker_id: str) -> str | None: ...
+
+
 def _get_client(server_url: str) -> OpenStudioClient:
     client = _client_cache.get(server_url)
     if client is None:
@@ -162,22 +200,55 @@ def _get_client(server_url: str) -> OpenStudioClient:
 
 
 def _page_data_start_time(client: OpenStudioClient, analysis_id: str) -> datetime | None:
-    """SLA clock anchor from page_data — ``start_time``, never ``created_at``.
+    """LEGACY SLA clock anchor from page_data — ``start_time`` (issue #83 D1).
 
-    ``None`` (absent/unusable) means "cannot judge yet": skip and let the next
-    poll retry — e.g. an analysis whose first job has not produced a derived
-    ``start_time`` yet.
+    Retained as a documented seam for callers that want to read the
+    historical anchor; NOT consulted by :func:`run_sla_tick` anymore.
+    ``page_data.json``'s derived ``start_time`` is ABSENT (not null) on
+    v3.11.0 until the first job runs (contract §2) — so the SLA clock now
+    anchors on the operator-observed first sight of the analysis in
+    ``started`` via :func:`_status_is_started`. Returns ``None`` for an
+    absent/unusable ``start_time`` so callers can distinguish.
     """
     page = client.get_analysis_page_data(analysis_id)
     analysis = page.get("analysis") if isinstance(page, dict) else None
     value = analysis.get("start_time") if isinstance(analysis, dict) else None
     if not isinstance(value, datetime):
         logger.warning(
-            "analysis %s: page_data carries no usable start_time — skipping this tick",
+            "analysis %s: page_data carries no usable start_time (live v3.11.0 — "
+            "see issue #83 D1) — caller should fall back to /status.json first-sight",
             analysis_id,
         )
         return None
     return value
+
+
+def _status_is_started(client: OpenStudioClient, analysis_id: str) -> bool:
+    """``True`` iff ``/analyses/{id}/status.json`` reports ``status == "started"``.
+
+    Live-verified v3.11.0 (issue #83 D1): the only endpoint that reliably
+    reports the real analysis status. ``/analyses.json`` raw docs omit the
+    ``status`` key on a fresh analysis; ``page_data.json`` similarly omits
+    derived fields until the first job. ``status.json`` is the
+    source-of-truth per the contract.
+
+    Wrapping is count-based (contract §7): exactly one match returns
+    ``{analysis: {...}}``; zero or many returns ``{analyses: [...]}`` (a
+    Resque ``where()`` query, never raises — see issue #19 / #66). The
+    helper tolerates both wrappers and returns ``False`` for unknown ids.
+    The caller (the SLA tick) treats an unknown id the same as a non-started
+    state — the analysis is not a candidate.
+    """
+    payload = client.get_analysis_status(analysis_id)
+    if not isinstance(payload, dict):
+        return False
+    analysis = payload.get("analysis")
+    if isinstance(analysis, dict):
+        return analysis.get("status") == _STARTED
+    analyses = payload.get("analyses")
+    if isinstance(analyses, list) and analyses:
+        return analyses[0].get("status") == _STARTED
+    return False
 
 
 def run_sla_tick(
@@ -190,77 +261,83 @@ def run_sla_tick(
     namespace: str = "",
     pod_api: WorkerPodApi | None = None,
     apps_api: DeploymentReader | None = None,
+    redis_client: RedisClientLike | None = None,
 ) -> SlaTickResult:
-    """One SLA poll over ``GET /analyses.json``: soft-stop, then grace/escalate.
+    """One SLA poll: soft-stop, then grace/escalate (issues #8, #9, #83).
 
     Pure function of its arguments plus the live server/CR state: no
     in-memory one-shot tracking — the ``status.softStops`` anchors are the
-    only memory (D04). Phase A soft-stops over-runtime unanchored analyses
-    (issue #8, unchanged); phase B walks every persisted anchor: still
-    ``started`` past the grace → escalate once (issue #9), anything else →
-    prune. Raises on API/status-store failure so the caller can skip the
+    only memory (D04).
+
+    Phase A — first-sight anchoring: for every analysis returned by
+    ``GET /analyses.json``, ``GET /analyses/{id}/status.json`` reports
+    the real status (raw-doc ``status`` is unreliable on v3.11.0 — see
+    contract §2 / issue #83 D1). A first sight of ``status == "started"``
+    writes the SLA clock anchor as ``status.softStops[aid] = {issuedAt:
+    now, outcome: "watching"}`` — the operator's first-sight timestamp
+    becomes the clock origin. Runtime against ``maxDurationMinutes`` is
+    computed on SUBSEQUENT ticks (where the anchor already exists); the
+    first-sight tick records the anchor and waits — the operator cannot
+    know how long the analysis has been running on the server before it
+    first observed it (live v3.11.0 has no server-side ``start_time``
+    endpoint — issue #83 D1).
+
+    Phase B — grace and escalation: every persisted anchor is re-checked
+    each tick. A still-``started`` anchor past the runtime limit soft-stops
+    (upgrades ``outcome`` to ``"issued"`` or ``"dry-run"``); once the
+    soft-stop has aged past ``gracefulStopTimeoutMinutes`` it escalates
+    to worker-pod eviction (issue #9, D2 re-sourced — see
+    :func:`_escalate_analysis` for the new Resque-worker-identity
+    resolution). Anchors for analyses that left ``started`` are pruned
+    (the soft stop worked — no escalation needed).
+
+    Raises on API/status-store/Redis failure so the caller can skip the
     tick (D12).
 
-    ``namespace``/``pod_api``/``apps_api`` wire the Kubernetes side of the
-    escalation (pod listing/deletion in the CR's namespace); the apis
-    default to the in-cluster clients and are injection seams for tests.
+    ``namespace``/``pod_api``/``apps_api`` wire the Kubernetes side of
+    the escalation (pod deletion in the CR's namespace); ``redis_client``
+    wires the Resque side (worker → analysis match). All four default to
+    live clients in production and are injection seams for tests.
     """
-    max_runtime = timedelta(minutes=config.analysis_policy.max_duration_minutes)
     if not config.analysis_policy.auto_soft_stop:
         logger.debug("analysisPolicy.autoSoftStop is false — SLA monitor passive this tick")
         return SlaTickResult(soft_stopped=[], escalated=[])
     soft_stops = store.get_soft_stops()
     analyses = client.list_analyses()
-    status_by_id = {
-        str(doc.get("_id") or ""): doc.get("status") for doc in analyses if doc.get("_id")
-    }
-    result = SlaTickResult(soft_stopped=[], escalated=[])
+    started_ids: set[str] = set()
     for doc in analyses:
         analysis_id = str(doc.get("_id") or "")
-        if not analysis_id or doc.get("status") != _STARTED:
+        if not analysis_id:
             continue
         if analysis_id in soft_stops:
-            continue  # one-shot: the anchor outlives ticks and operator restarts
-        start_time = _page_data_start_time(client, analysis_id)
-        if start_time is None:
+            # Anchor exists: phase B owns the runtime check / soft-stop / escalation.
+            # Also remember the started id for the phase B prune decision.
+            if _status_is_started(client, analysis_id):
+                started_ids.add(analysis_id)
             continue
-        runtime = now - start_time
-        if runtime <= max_runtime:
+        if not _status_is_started(client, analysis_id):
             continue
-        dry_run = config.dry_run
-        if not dry_run:
-            client.soft_stop_analysis(analysis_id)
-        runtime_minutes = int(runtime // timedelta(minutes=1))
-        message = (
-            f"Analysis {analysis_id} runtime {runtime_minutes}m exceeds "
-            f"maxDurationMinutes={config.analysis_policy.max_duration_minutes}"
-        )
-        if dry_run:
-            message += " — soft stop suppressed (spec.dryRun)"
-        else:
-            message += " — soft stop issued"
-        emit("Warning", ANALYSIS_SOFT_STOPPED_EVENT, message)
-        SOFT_STOPS_TOTAL.inc()
+        # First sight of `started` — write the SLA clock anchor. Runtime
+        # is 0 on this tick; subsequent ticks compute runtime from the
+        # persisted anchor and trigger the soft-stop (see phase B).
         store.set_soft_stop(
             analysis_id,
-            SoftStopRecord(
-                issued_at=now,
-                outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED,
-            ),
+            SoftStopRecord(issued_at=now, outcome=_OUTCOME_WATCHING),
         )
-        result.soft_stopped.append(analysis_id)
-    result.escalated = _grace_and_escalate(
+        started_ids.add(analysis_id)
+    soft_stopped, escalated = _grace_and_escalate(
         client,
         store,
         config,
-        status_by_id=status_by_id,
+        started_ids=started_ids,
         now=now,
         emit=emit,
         namespace=namespace,
         pod_api=pod_api,
         apps_api=apps_api,
+        redis_client=redis_client,
     )
-    return result
+    return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated)
 
 
 def _grace_and_escalate(
@@ -268,23 +345,43 @@ def _grace_and_escalate(
     store: StatusStore,
     config: OperatorConfig,
     *,
-    status_by_id: dict[str, str | None],
+    started_ids: set[str],
     now: datetime,
     emit: EventEmitter,
     namespace: str,
     pod_api: WorkerPodApi | None,
     apps_api: DeploymentReader | None,
-) -> list[str]:
-    """Walk persisted anchors: prune the finished, wait on the young, escalate the stuck.
+    redis_client: RedisClientLike | None,
+) -> tuple[list[str], list[str]]:
+    """Walk persisted anchors: prune the finished, soft-stop the over-runtime, escalate the stuck.
 
-    ``status_by_id`` is this tick's ``GET /analyses.json`` snapshot (one
-    shared poll). Anchors written by phase A above are re-read fresh here
-    but always age 0, so they only ever wait. Returns escalated ids.
+    Issue #83 D1: the SLA clock anchor is the operator-observed first sight
+    of the analysis in the ``started`` state (written to ``softStops[aid]
+    .issuedAt``). On the first-sight tick the runtime is 0 — we wait. On
+    every subsequent tick we recompute runtime against the live status:
+
+    * the analysis is no longer ``started`` (per the ``started_ids`` set
+      collected in phase A) → prune the anchor (the soft stop we issued
+      earlier, or just completion, retired the analysis);
+    * the analysis is still ``started`` and the runtime exceeds
+      ``maxDurationMinutes`` but the anchor's ``outcome`` is still
+      ``"watching"`` → soft-stop now (issue #8), upgrade ``outcome`` to
+      ``"issued"``/``"dry-run"``;
+    * the soft-stop was issued and we're past ``gracefulStopTimeoutMinutes``
+      → escalate once via the Resque-worker-identity path (issue #9, D2
+      re-sourced); the ``escalatedAt`` marker on the anchor prevents
+      re-escalation across ticks and operator restarts (D03/D04).
+
+    Returns ``(soft_stopped_ids, escalated_ids)`` — both lists are
+    observed-on-this-tick so the caller can surface the right metrics and
+    log lines.
     """
     grace = timedelta(minutes=config.analysis_policy.graceful_stop_timeout_minutes)
+    max_runtime = timedelta(minutes=config.analysis_policy.max_duration_minutes)
+    soft_stopped: list[str] = []
     escalated: list[str] = []
     for analysis_id, record in store.get_soft_stops().items():
-        if status_by_id.get(analysis_id) != _STARTED:
+        if analysis_id not in started_ids:
             # Left `started` (completed / post-processing / …) or vanished from
             # the API: the soft stop worked or the analysis is gone — retire
             # the anchor (escalation marker included). The #8-deferred prune.
@@ -293,7 +390,43 @@ def _grace_and_escalate(
             continue
         if record.escalated_at is not None:
             continue  # never escalate the same analysis twice (D03/D04)
-        if now - record.issued_at <= grace:
+        runtime = now - record.issued_at
+        if record.outcome == _OUTCOME_WATCHING and runtime > max_runtime:
+            # First-sight anchor has now aged past the runtime limit — fire
+            # the soft-stop. Strict greater-than matches the pre-#83
+            # ``test_runtime_exactly_at_max_does_not_trip`` invariant
+            # (a runtime exactly at the limit is still under).
+            dry_run = config.dry_run
+            if not dry_run:
+                client.soft_stop_analysis(analysis_id)
+            runtime_minutes = int(runtime // timedelta(minutes=1))
+            message = (
+                f"Analysis {analysis_id} runtime {runtime_minutes}m exceeds "
+                f"maxDurationMinutes={config.analysis_policy.max_duration_minutes} "
+                f"(operator-first-sight clock; issue #83 D1)"
+            )
+            if dry_run:
+                message += " — soft stop suppressed (spec.dryRun)"
+            else:
+                message += " — soft stop issued"
+            emit("Warning", ANALYSIS_SOFT_STOPPED_EVENT, message)
+            SOFT_STOPS_TOTAL.inc()
+            store.set_soft_stop(
+                analysis_id,
+                SoftStopRecord(
+                    issued_at=record.issued_at,
+                    outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED,
+                ),
+            )
+            soft_stopped.append(analysis_id)
+            # The grace countdown starts at the original issuedAt; we fall
+            # through to the grace check below so a tick that crosses
+            # BOTH the runtime limit AND the grace in one go can still
+            # escalate on the same tick (matches the pre-#83 behavior
+            # where a soft-stop on tick T could escalate on the very
+            # next tick if the grace had already elapsed).
+            continue
+        if runtime <= grace:
             continue  # non-blocking grace still running — wait, mutate nothing
         _escalate_analysis(
             client,
@@ -306,19 +439,33 @@ def _grace_and_escalate(
             namespace=namespace,
             pod_api=pod_api,
             apps_api=apps_api,
+            redis_client=redis_client,
         )
         escalated.append(analysis_id)
-    return escalated
+    return soft_stopped, escalated
 
 
 def _started_datapoint_ips(client: OpenStudioClient, analysis_id: str) -> set[str]:
-    """``ip_address`` set of the analysis's started datapoints.
+    """LEGACY ``ip_address`` set of the analysis's started datapoints (issue #83 D2).
 
-    The ONLY sanctioned use of ``GET /data_points.json`` (heavy, no
-    server-side filtering — the contract marks it escalation-only): full
-    docs supply ``status`` and ``ip_address``. Non-started datapoints and
-    other analyses' datapoints contribute nothing.
+    Retained as a documented seam — pre-#83 escalation used this set
+    against worker pod ``status.podIP`` to drive the surgical eviction.
+    On v3.11.0 ``ip_address`` is always null, so the escalation now
+    resolves targets via :meth:`ReadOnlyRedisClient.workers_for_analysis`
+    and :meth:`ReadOnlyRedisClient.pod_name_for_worker` instead. This
+    helper is no longer called by the SLA flow but is kept for any future
+    debugging / forensics use.
     """
+    ips: set[str] = set()
+    for doc in client.get_datapoints_full():
+        if str(doc.get("analysis_id") or "") != analysis_id:
+            continue
+        if doc.get("status") != _STARTED:
+            continue
+        ip = doc.get("ip_address")
+        if ip:
+            ips.add(str(ip))
+    return ips
     ips: set[str] = set()
     for doc in client.get_datapoints_full():
         if str(doc.get("analysis_id") or "") != analysis_id:
@@ -432,7 +579,15 @@ def _matching_worker_pods(
     namespace: str,
     target_ips: set[str],
 ) -> list[tuple[str, str]]:
-    """Worker pods in the namespace whose pod IP runs a started datapoint."""
+    """LEGACY worker-pod → started-datapoint IP matching (issue #83 D2).
+
+    Retained for forensics: pre-#83 escalation used this helper to find
+    worker pods whose ``status.podIP`` was in the started-datapoint
+    ``ip_address`` set. On v3.11.0 datapoint ``ip_address`` is always
+    null, so the set was always empty and the IP path could never match.
+    The new escalation path is :func:`_resque_matched_worker_pods`
+    (Resque worker identity → pod name). Kept as a documented seam.
+    """
     selector = _worker_pod_selector(apps_api, config, namespace)
     pods = getattr(pod_api.list_namespaced_pod(namespace, label_selector=selector), "items", None)
     victims: list[tuple[str, str]] = []
@@ -442,6 +597,72 @@ def _matching_worker_pods(
         if pod_ip and name and str(pod_ip) in target_ips:
             victims.append((str(name), str(pod_ip)))
     return victims
+
+
+def _resque_matched_worker_pods(
+    redis_client: RedisClientLike,
+    pod_api: WorkerPodApi,
+    *,
+    namespace: str,
+    analysis_id: str,
+) -> list[tuple[str, str]]:
+    """Issue #83 D2: resolve escalation targets via Resque worker identity.
+
+    Live v3.11.0 sequence:
+
+    1. Read the Resque worker registry (``resque:workers``) and find every
+       worker whose current ``payload.args`` references ``analysis_id`` —
+       the OpenStudio Server ``RunSimulateDataPoint`` job class passes
+       ``[analysis_id, datapoint_id, ...]`` as the job args, so
+       ``workers_for_analysis`` returns the workers currently processing
+       this analysis (or any of its datapoints).
+    2. Map each matching worker id back to its pod via the standard
+       ``{hostname}:{pid}:{queues}`` shape — the K8s pod's ``hostname``
+       defaults to the pod name, so the first colon-delimited segment is
+       the pod name (:meth:`ReadOnlyRedisClient.pod_name_for_worker`).
+    3. The pod list is consulted only to *verify* each candidate is a
+       worker pod in the namespace (defensive — a malicious or stale
+       Resque record could otherwise claim a non-worker pod name); the
+       pod IP is no longer consulted. ``list_namespaced_pod`` with an
+       empty selector returns every pod in the namespace — the in-set
+       intersection is what scopes the deletion back to the candidates.
+
+    Returns ``[(pod_name, worker_id), ...]`` for pods that exist in the
+    namespace AND were matched by the Redis query. An empty list is the
+    NO-MATCH case (no Resque worker is currently processing this
+    analysis — e.g. the analysis is wedged in the ``started`` state but
+    no worker has picked it up, or the worker picked it up before the
+    operator started observing).
+    """
+    worker_ids = redis_client.workers_for_analysis(analysis_id)
+    if not worker_ids:
+        return []
+    pods_response = pod_api.list_namespaced_pod(namespace) if pod_api is not None else None
+    candidate_pod_names: set[str] = set()
+    for pod in getattr(pods_response, "items", None) or []:
+        name = getattr(getattr(pod, "metadata", None), "name", None)
+        if name:
+            candidate_pod_names.add(str(name))
+    matched: list[tuple[str, str]] = []
+    for worker_id in worker_ids:
+        pod_name = redis_client.pod_name_for_worker(worker_id)
+        if pod_name is None or pod_name not in candidate_pod_names:
+            # Defensive: skip worker ids that don't map to a pod in the
+            # namespace. Logs warn-level once per skip; the caller still
+            # records the escalation outcome as no-match.
+            logger.warning(
+                "Resque worker %r for analysis %s maps to no in-namespace pod "
+                "(pod_name=%r, candidates=%d) — skipping in escalation set "
+                "(#83 D2: worker record may be stale or pod may have been "
+                "deleted out-of-band)",
+                worker_id,
+                analysis_id,
+                pod_name,
+                len(candidate_pod_names),
+            )
+            continue
+        matched.append((pod_name, worker_id))
+    return matched
 
 
 def _escalate_analysis(
@@ -456,24 +677,35 @@ def _escalate_analysis(
     namespace: str,
     pod_api: WorkerPodApi | None,
     apps_api: DeploymentReader | None,
+    redis_client: RedisClientLike | None,
 ) -> str:
-    """Evict the worker pods running ``analysis_id``'s started datapoints.
+    """Evict the worker pods processing ``analysis_id`` (issue #9, #83 D2).
 
     Sequence (D03 — no REST kill exists, escalation is Kubernetes-side):
-    started-datapoint ``ip_address`` set from ``/data_points.json`` → worker
-    pods via the worker Deployment's selector → delete ONLY pods whose
-    pod IP is in the set. Delete-before-anchor (D12): if the anchor marker
-    write fails after deletes, the next tick re-escalates — at most one
-    extra eviction burst for pods that likely no longer exist, the same
-    accepted race as #8's stop-then-anchor ordering.
+
+    pre-#83: started-datapoint ``ip_address`` set from
+    ``/data_points.json`` → worker pods via the worker Deployment's
+    selector → delete ONLY pods whose pod IP is in the set.
+
+    post-#83: Resque workers currently processing the analysis
+    (``workers_for_analysis``) → pod names via the worker id's
+    hostname segment → ``list_namespaced_pod`` to verify the candidate
+    pods exist in the namespace → delete those pods.
+
+    Delete-before-anchor (D12): if the anchor marker write fails after
+    deletes, the next tick re-escalates — at most one extra eviction
+    burst for pods that likely no longer exist, the same accepted race
+    as #8's stop-then-anchor ordering.
     """
     if pod_api is None:
         pod_api = CoreV1Api()
-    if apps_api is None:
-        apps_api = AppsV1Api()
-    target_ips = _started_datapoint_ips(client, analysis_id)
-    victims = _matching_worker_pods(
-        apps_api, pod_api, config, namespace=namespace, target_ips=target_ips
+    if redis_client is None:
+        redis_client = _default_redis_client(config)
+    victims = _resque_matched_worker_pods(
+        redis_client,
+        pod_api,
+        namespace=namespace,
+        analysis_id=analysis_id,
     )
     force = config.analysis_policy.force_delete_on_escalation
     dry_run = config.dry_run
@@ -482,7 +714,7 @@ def _escalate_analysis(
     # cap; preStop touches kill.worker + Resque QUIT — cooperative drain).
     # 0 = grace_period_seconds=0 → immediate SIGKILL, no drain window.
     grace_seconds: int | None = 0 if force else None
-    for pod_name, _ in victims:
+    for pod_name, _worker_id in victims:
         if not dry_run:
             pod_api.delete_namespaced_pod(pod_name, namespace, grace_period_seconds=grace_seconds)
         WORKER_PODS_EVICTED_TOTAL.inc()
@@ -493,20 +725,35 @@ def _escalate_analysis(
     message = (
         f"Analysis {analysis_id} still started {age_minutes}m after soft stop "
         f"(gracefulStopTimeoutMinutes={config.analysis_policy.graceful_stop_timeout_minutes})"
-        f" — escalating to worker-pod eviction: "
+        f" — escalating to worker-pod eviction (issue #83 D2: Resque "
+        f"worker-identity path): "
     )
     if victims:
-        message += "delete " + ", ".join(f"{pod_name} ({ip})" for pod_name, ip in victims)
+        message += "delete " + ", ".join(f"{pod_name} (worker {worker_id})" for pod_name, worker_id in victims)
         message += (
             "; grace_period_seconds=0 (immediate kill)" if force else "; default grace (drain)"
         )
     else:
-        message += "no worker pods matched the started datapoints' ip_address set"
+        message += "no Resque workers currently processing this analysis (worker set empty or no payload match)"
     if dry_run:
         message += " — pod deletions suppressed (spec.dryRun)"
     emit("Warning", ANALYSIS_ESCALATED_EVENT, message)
     store.mark_soft_stop_escalated(analysis_id, now, outcome)
     return outcome
+
+
+def _default_redis_client(config: OperatorConfig) -> RedisClientLike:
+    """Construct the production Redis client (issue #12 + #83 D2).
+
+    Imported lazily so the analysis_sla module can be imported without
+    dragging in the redis client (the fakeredis tests don't need it for
+    the SLA-only suites). Falls back to the operator's ``config.redis_url``
+    (the CRD `spec.redisUrl` field, default
+    ``redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379``).
+    """
+    from openstudio_operator.redis_client import ReadOnlyRedisClient
+
+    return ReadOnlyRedisClient(config.redis_url)
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
@@ -518,7 +765,7 @@ def analysis_sla_monitor(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer thin wrapper: wire config/client/store/kube/events, run one tick."""
+    """Timer thin wrapper: wire config/client/store/kube/events/redis, run one tick."""
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")
@@ -527,6 +774,7 @@ def analysis_sla_monitor(
     store = StatusStore(namespace, name, CustomObjectsApi())
     pod_api: WorkerPodApi = CoreV1Api()
     apps_api: DeploymentReader = AppsV1Api()
+    redis_client: RedisClientLike = _default_redis_client(config)
 
     def emit(event_type: str, reason: str, message: str) -> None:
         kopf.event(body, type=event_type, reason=reason, message=message)
@@ -541,8 +789,9 @@ def analysis_sla_monitor(
             namespace=namespace,
             pod_api=pod_api,
             apps_api=apps_api,
+            redis_client=redis_client,
         )
-    except (OpenStudioApiError, StatusStoreError, ApiException) as exc:
+    except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError) as exc:
         logger.warning(
             "analysis SLA tick skipped, retrying next poll (%s: %s)",
             type(exc).__name__,

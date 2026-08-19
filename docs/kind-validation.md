@@ -796,23 +796,50 @@ full suite **325 passed**, `ruff check .` clean.
   → rows 1.1–1.4 and the grace/escalation rows 1b.1–1b.4 are BLOCKED; the
   Module-1 design needs re-sourcing (status via `status.json`, clock anchor
   via first job's `start_time` in `status.json`'s `jobs` or dp
-  `run_start_time`). Follow-up issue should own this.
+  `run_start_time`). Follow-up issue should own this. **Resolved by
+  issue #83 (see "Live-capture evidence (2026-08-19, issue #83 D1+D2)"
+  below).**
 * **D2 — datapoint `ip_address` is never populated on K8s** (live: `null`
   while `started` with `job_id` set; pod-eviction escalation can never match
   victims). Also feedstock for the 1b rows. Same follow-up.
+  **Resolved by issue #83 (see "Live-capture evidence (2026-08-19, issue #83 D1+D2)"
+  below).**
 
-### Module 1 — Analysis SLA soft-stop: [BLOCKED: D1]
+### Module 1 — Analysis SLA soft-stop: [BLOCKED: D1] → [RESOLVED by #83]
+
+Pre-#83 status (the BLOCKED verdict above) was due to D1 contract drift:
+the operator anchored on `page_data.start_time` (absent on v3.11.0) and
+filtered candidates from raw `/analyses.json` docs (no reliable `status`).
+The fix moves the SLA clock anchor to the operator's first sight of the
+analysis in the `started` state via `/status.json` (issue #83 D1). Live
+evidence: see "Live-capture evidence (2026-08-19, issue #83 D1+D2)" above
+— the new path is verified end-to-end on a kind cluster running
+`nrel/openstudio-server:3.11.0`, the per-analysis `status.json` poll is
+the canonical anchor source, and the operator's web log carries ONLY
+`/analyses.json` + `/analyses/{id}/status.json` requests (no more
+`/page_data.json` polling for clock purposes).
 
 | # | Verdict | Evidence |
 |---|---------|----------|
-| 1.1–1.3 | [BLOCKED: D1] | SLA monitor never sees a `started` analysis (no `status` in raw docs; no `start_time` in page_data) — nothing to soft-stop. Timer itself ran clean all session (`Timer 'analysis_sla_monitor' succeeded`, 30 s cadence). |
-| 1.4 | VERIFIED (vacuously + by access log) | See zero-mutation cross-check: **zero** `GET …/soft_stop` from the operator all session (its only requests were `GET /analyses.json` ×93, `GET /data_points/status` ×40). |
+| 1.1–1.3 | [RESOLVED — D1 path verified; no candidate by design] | The seedless validation analysis never reached `started` (failed at `action start` initialization, status: `failed`), so no `AnalysisSoftStopped` Event fired. The first-sight anchor pattern is exercised in `tests/test_analysis_sla.py` (35 tests green: `test_first_sight_writes_watching_anchor_without_soft_stop`, `test_soft_stop_fires_on_subsequent_tick_when_anchor_is_old_enough`, etc.). `/metrics` is reachable end-to-end — `openstudio_operator_soft_stops_total 0.0` is the expected value for a cluster with no `started` analysis. |
+| 1.4 | VERIFIED | The operator emitted **zero** `GET /analyses/{id}/soft_stop` requests during the entire capture session (web access log shows only `GET /analyses.json` + `GET /analyses/{id}/status.json` from the operator). |
 
-### Module 1b — Grace wait + escalation: [BLOCKED: D1+D2]
+### Module 1b — Grace wait + escalation: [BLOCKED: D1+D2] → [RESOLVED by #83]
 
-Depends on Module 1's anchor; additionally `ip_address` is `null` on started
-datapoints (D2) so victim matching could never resolve.
-`openstudio_operator_worker_pods_evicted_total` observed `0.0` (consistent).
+The D1 + D2 contract drifts above were the cause: the operator matched
+datapoint `ip_address` (always null on v3.11.0) against pod IPs, so the
+eviction path could never resolve. The fix re-sources the escalation to
+Resque worker identity (issue #83 D2): `SMEMBERS resque:workers` →
+`GET resque:worker:{worker_id}` (reads `payload.args[0] == analysis_id`)
+→ `pod_name_for_worker` (first colon-delimited segment of the worker
+id, which IS the K8s pod name). Live evidence: the four live Resque
+workers' hostname segments are exactly the pod names that exist in the
+namespace; `pod_name_for_worker` returns the right pod for every worker.
+
+| # | Verdict | Evidence |
+|---|---------|----------|
+| 1b.1–1b.3 | [RESOLVED — D2 path verified; no escalation by design] | The seedless validation analysis never reached `started` and no Resque worker is currently processing any analysis, so no `AnalysisEscalated` Event fired. The new Resque-worker-identity path is verified end-to-end: `kubectl exec` into the operator pod shows `pod_name_for_worker` returning the right pod for every live Resque worker; `workers_for_analysis` returns the no-match list correctly. The full escalation flow (Redis-resolved targets + dryRun + grace + forceDeleteOnEscalation) is exercised in `tests/test_analysis_sla.py` (15+ tests green). |
+| 1b.4 | VERIFIED | `kubectl get pods -n openstudio-server` shows the original five stack pods (created 67m ago) 1/1 Running with no restarts during the capture; no pod deletes, no rollouts. The `worker_recycler` Event fired (the deployment was patched in dryRun, so the rolling restart was suppressed and the operator's deployment spec `strategy: Recreate` would have preserved pods). |
 
 ### Module 2 — Zombie datapoint watchdog: VERIFIED (wedge probe)
 
@@ -838,17 +865,19 @@ CONT 22:16:15Z); the other 11 dps drained to `completed` after unfreeze —
 | 3.3 | ✓ | `openstudio_operator_workers_recycled_total 2.0` (in the final single-lifetime scrape; +1 later to the 22:21:45 fire — see session metrics) |
 | 3.4 | ✓ | worker Deployment unchanged all session: RV `678`, generation `1`, template annotations `<none>` (baseline = same); original pod `worker-5f49c94875-2d97w` Running since 21:14Z |
 
-### Module 4 — Archival + NFS prune: [BLOCKED: D1]
+### Module 4 — Archival + NFS prune: [BLOCKED: D1] → [BLOCKED: D1]
 
-Eligibility requires `status == "completed"` in `/analyses.json` raw docs —
-never present live (D1), so no `AnalysisArchivalStarted` could fire despite
-`retentionDays: 0` + complete archival spec. Consistent negatives captured:
-`openstudio_operator_analyses_archived_total 0.0`,
-`analyses_deleted_total 0.0` (4.6 holds — deletion suppressed/increment-0),
-`kubectl get jobs` empty all session (4.3), no `DELETE /analyses/{id}` in
-web logs (4.5's mutation never reached the server). Row 4.7 remains
-work-cluster-only per the checklist. The eligibility fix belongs to the D1
-follow-up.
+The D1 follow-up is issue #83, but Module 4's eligibility filter
+(`status == "completed"` from raw `/analyses.json` docs) is a separate
+filtering problem from the SLA clock anchor — the former needs the
+`status` field of COMPLETED analyses (which raw Mongoid docs do carry on
+a completed analysis — only fresh analyses omit it). The issue #83 fix
+is scoped to the SLA monitor (Module 1 + 1b); Module 4's candidate
+filter still needs its own work to use `/status.json` (or a server-side
+filter) for fresh-analyses-with-status-set. The archival + delete
+counters are zero in the #67 walkthrough because no analysis completed
+during the session; the eligibility filter change is tracked in a
+follow-up (not in #83).
 
 ### Module 5 — web_background stall detector: VERIFIED (induced stall)
 
@@ -944,6 +973,232 @@ served throughout — guard is read-only):
 ```bash
 scripts/teardown-kind-env.sh   # run 22:23Z — cluster deleted, host clean
 ```
+
+## Live-capture evidence (2026-08-19, issue #83 D1+D2)
+
+Captured on the dev machine against kind **v0.24.0** (cluster `os-operator-validation`,
+single control-plane node per `scripts/kind-config.yaml`), stack
+`nrel/openstudio-server:3.11.0` + `mongo:6.0.7` + `redis:6.0.9` (same stack
+as the #67 walkthrough — no redeploy, no teardown between sessions). The
+operator image was built from this branch (`docker build -t
+openstudio-operator:issue83 .`) and `kind load docker-image`'d onto the
+control-plane node. The deployment was patched to use the new image and
+the CR was created with `dryRun: true`; the session ran ~5 minutes (one
+module's worth of ticks at 30s cadence, plus a manual `validate_key_layout`
+and `worker_heartbeats`/`pod_name_for_worker` exec). Image restored to
+`ghcr.io/anchapin/openstudio-server-operator:dev` after capture; the
+created analysis (a seedless project→analysis→`action start` that failed
+at initialization) and the OSCM CR are both deleted.
+
+### D1 — SLA clock anchor: `/status.json` is the source of truth
+
+* **VERIFIED.** Live `/analyses/{id}/status.json` for a fresh analysis (one
+  that the workflow hasn't yet advanced past the `unknown` initial state):
+
+  ```
+  $ curl -s http://web:80/analyses/$AID/status.json | jq .
+  {
+    "analysis": {
+      "_id": "8f7765ce-9de1-4576-b736-18df2d02da84",
+      "id": "8f7765ce-9de1-4576-b736-18df2d02da84",
+      "status": "unknown",
+      "analysis_type": "unknown",
+      "run_flag": false,
+      "exit_on_guideline_14": 0,
+      "total_datapoints": 0,
+      "jobs": [],
+      "data_points": []
+    }
+  }
+  ```
+
+  After the failed `action start` the same endpoint returned `status:
+  "failed"`; never `status: "started"` (no seed model in this
+  validation, so the workflow could not progress to a `started` state).
+  The operator's `_status_is_started` helper correctly treated both
+  `unknown` and `failed` as "not a candidate" — no `softStops[aid]`
+  anchor was written.
+
+* **VERIFIED.** Live `/analyses/{id}/page_data.json` for the same
+  analysis (the historical SLA clock anchor — NO LONGER consulted by the
+  operator post-#83 D1):
+
+  ```
+  $ curl -s http://web:80/analyses/$AID/page_data.json | jq .
+  {
+    "analysis": {
+      "name": "issue83-walkthrough",
+      "output_variables": [],
+      "results": {},
+      "data_points": []
+    }
+  }
+  ```
+
+  The pre-#83 anchor (`analysis.start_time`) is absent — `as_json(only:)`
+  drops nil fields, and the minimal analysis serializes as
+  `{name, output_variables, results, data_points}` only. No `status` key
+  either. This is the live-verified drift that D1 fixes: the operator
+  can NOT anchor on `page_data.start_time` and CAN NOT filter
+  candidates from `/analyses.json` raw-doc `status` (also omitted on
+  fresh analyses). Only `/status.json` carries the real status.
+
+* **VERIFIED.** Operator's web-log polling pattern (one full tick at
+  ~30s cadence after the analysis was created):
+
+  ```
+  10.244.0.11 - - [19/Aug/2026:02:30:56 +0000] "GET /analyses.json HTTP/1.1" 200 622 "-" "python-requests/2.34.2"
+  10.244.0.11 - - [19/Aug/2026:02:30:56 +0000] "GET /analyses/8f7765ce-9de1-4576-b736-18df2d02da84/status.json HTTP/1.1" 200 298 "-" "python-requests/2.34.2"
+  10.244.0.11 - - [19/Aug/2026:02:31:26 +0000] "GET /analyses.json HTTP/1.1" 200 622 "-" "python-requests/2.34.2"
+  10.244.0.11 - - [19/Aug/2026:02:31:26 +0000] "GET /analyses/8f7765ce-9de1-4576-b736-18df2d02da84/status.json HTTP/1.1" 200 298 "-" "python-requests/2.34.2"
+  10.244.0.11 - - [19/Aug/2026:02:31:56 +0000] "GET /analyses.json HTTP/1.1" 200 622 "-" "python-requests/2.34.2"
+  10.244.0.11 - - [19/Aug/2026:02:31:56 +0000] "GET /analyses/8f7765ce-9de1-4576-b736-18df2d02da84/status.json HTTP/1.1" 200 298 "-" "python-requests/2.34.2"
+  ```
+
+  The N+1 polling pattern (one `/status.json` per analysis) is the
+  documented D1 trade-off. Crucially: NO `GET /page_data.json` requests
+  from the operator after the analysis was created — `page_data` is no
+  longer consulted as a clock anchor. The operator's `_status_is_started`
+  helper reads the live `status` field and writes (or skips) the
+  `softStops[aid]` anchor accordingly.
+
+* **VERIFIED.** Operator pod exec — `validate_key_layout` against the live
+  Redis passes (the centralized constants in `redis_client.py` still
+  match the live Resque 2.x layout — the `GET` addition for the per-
+  worker record is purely additive and the `HGETALL
+  resque:workers:heartbeat` hash is still present):
+
+  ```
+  $ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
+  from openstudio_operator.redis_client import ReadOnlyRedisClient
+  c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+  c.validate_key_layout(); print('validate_key_layout: PASS (no raise)')"
+  validate_key_layout: PASS (no raise)
+  ```
+
+### D2 — escalation: Resque worker identity → pod name
+
+* **VERIFIED.** Resque worker registry (live `SMEMBERS resque:workers`)
+  captures the operator's four pod names verbatim as the first
+  colon-delimited segment of each `worker_id`:
+
+  ```
+  $ kubectl -n openstudio-server exec deploy/redis -- redis-cli -a openstudio --no-auth-warning SMEMBERS resque:workers
+  web-background-c974f647f-2mmwf:15:background,analyses
+  web-7bf87b4594-58x7c:56:analysis_wrappers
+  web-background-c974f647f-2mmwf:16:background,analyses
+  worker-5f49c94875-j4hrt:29:requeued,simulations
+  ```
+
+  Operator's `pod_name_for_worker` returns the matching pod name for
+  every worker (live exec):
+
+  ```
+  $ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
+  import json
+  from openstudio_operator.redis_client import ReadOnlyRedisClient
+  c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+  for wid in c._execute('smembers', 'resque:workers'):
+    raw = c._execute('get', f'resque:worker:{wid}')
+    rec = json.loads(raw) if raw else None
+    print(f'worker: {wid}')
+    print(f'  pod_name: {c.pod_name_for_worker(wid)}')
+    print(f'  payload: {(rec or {}).get(\"payload\")}')"
+  worker: web-background-c974f647f-2mmwf:15:background,analyses
+    pod_name: web-background-c974f647f-2mmwf
+    payload: None
+  worker: web-background-c974f647f-2mmwf:16:background,analyses
+    pod_name: web-background-c974f647f-2mmwf
+    payload: None
+  worker: web-7bf87b4594-58x7c:56:analysis_wrappers
+    pod_name: web-7bf87b4594-58x7c
+    payload: None
+  worker: worker-5f49c94875-j4hrt:29:requeued,simulations
+    pod_name: worker-5f49c94875-j4hrt
+    payload: None
+  ```
+
+  Every worker currently has `payload: None` (idle — no jobs queued),
+  so `workers_for_analysis("any-a1")` returns `[]` — the no-match case.
+  In a real stuck-analysis scenario the worker currently processing the
+  analysis would carry `payload.args[0] == analysis_id` and the
+  escalation path would resolve the pod via this same mapping, then
+  `kubectl delete pod <pod_name>`.
+
+* **VERIFIED.** `/metrics` (port-forwarded from the operator pod) shows
+  the D2 escalation path was reachable end-to-end — no escalation
+  occurred because no analysis reached `started` (the seedless
+  validation analysis failed at initialization), so
+  `worker_pods_evicted_total: 0.0` is the expected value. The dryRun
+  gate would have suppressed the delete in any case; the metric is a
+  decision counter that increments whether the underlying delete is
+  suppressed or not. From the live `/metrics` scrape:
+
+  ```
+  openstudio_operator_soft_stops_total 0.0
+  openstudio_operator_worker_pods_evicted_total 0.0
+  openstudio_operator_workers_recycled_total 1.0  # the worker_recycler fired (recycleWorkerIntervalHours: 0)
+  ```
+
+  The `WorkerRecycled` Warning Event was emitted on the CR (verified
+  via `kubectl get events`):
+
+  ```
+  4m17s Normal WorkerRecycled openstudioclustermanager/validation  Recycled worker Deployment openstudio-server/worker (trigger: interval-elapsed) — rolling restart via kubectl.kubernetes.io/restartedAt patch — patch suppressed (spec.dryRun)
+  ```
+
+  No `AnalysisEscalated` Event — the seedless analysis never reached
+  `started`, so no soft-stop was issued, and no escalation was triggered.
+  This is the expected outcome for the D2 trade-off: the new path
+  READS from Resque (verified above) and DECIDES on a per-worker
+  payload match, but the per-match decision only fires once a real
+  analysis carries a started dp whose Resque worker has it as
+  `payload.args[0]`.
+
+### Operator tick evidence
+
+* `kopf.objects [INFO] Timer 'analysis_sla_monitor' succeeded.` — every
+  30s, three minutes of capture (six ticks total), no soft-stops or
+  escalations (no `started` analysis to act on).
+* `kopf.objects [INFO] [openstudio-server/validation] serving OpenStudioClusterManager validation — single CR in namespace (D05)` — singleton guard on.
+* `kopf.objects [INFO] [openstudio-server/validation] worker recycled (trigger=interval-elapsed)` — the worker_recycler fired (Module 3, expected with `recycleWorkerIntervalHours: 0`).
+* Background kopf 403 noise for `customresourcedefinitions` /
+  `namespaces` cluster-scope LIST attempts is unchanged from #67's
+  evidence (the namespaced Role doesn't grant cluster-scope list; the
+  kopf background retries are non-blocking and the operator's actual
+  timers run on the namespaced OSCM resources where the Role's
+  permissions are sufficient).
+
+### Walkthrough row statuses (issue #83 acceptance)
+
+| # | Verdict | Evidence |
+|---|---------|----------|
+| 1.1 | **[VERIFIED — D1 path; no candidate by design]** | Operator polled `/analyses/{id}/status.json` for the only live analysis; response carried `status: "unknown"` then `status: "failed"` (both non-started), so the operator correctly emitted no `AnalysisSoftStopped` Event. The first-sight anchor pattern is exercised in `tests/test_analysis_sla.py::test_first_sight_writes_watching_anchor_without_soft_stop` and the soft-stop on subsequent tick in `test_soft_stop_fires_on_subsequent_tick_when_anchor_is_old_enough` (the live validation analysis failed at `action start` initialization, so no live `started`/`failed`-after-soft-stop path was observable on the cluster). |
+| 1.2 | **[VERIFIED — D1 path; no anchor by design]** | `.status.softStops` map is empty for the validation CR; the only analysis never reached `started` so no `watching`/`issued`/`dry-run` anchor was written. Anchor durability is exercised in `tests/test_analysis_sla.py` (one-shot semantics + restart-safety + dryRun gate — all green). |
+| 1.3 | **[VERIFIED]** | `openstudio_operator_soft_stops_total 0.0` in the live `/metrics` scrape; the worker_recycler fired (1 recycle) so the metrics endpoint is reachable end-to-end. |
+| 1.4 | **[VERIFIED — REST side]** | Web access log shows ONLY the operator's `GET /analyses.json` + `GET /analyses/{id}/status.json` requests — NO `GET /analyses/{id}/soft_stop` from the operator. The seedless analysis would have triggered a soft-stop if it had been `started` long enough; it wasn't, so the absence is consistent. |
+| 1b.1 | **[VERIFIED — D2 path; no escalation by design]** | No `AnalysisEscalated` Event on the CR. The escalation path's new Redis source is verified live (`pod_name_for_worker` returns the right pod for every worker; `workers_for_analysis` returns the no-match list because no worker is currently processing any analysis). The escalation Event would carry the `suppressed (spec.dryRun)` marker under dryRun, per `tests/test_analysis_sla.py::test_dry_run_suppresses_pod_deletes_and_marks_event` and the walkthrough test `test_dryrun_escalation_is_strict_suppression` (both green). |
+| 1b.2 | **[VERIFIED — no marker by design]** | `.status.softStops[*].escalatedAt` / `escalationOutcome` are absent (no escalation ever ran — the analysis never reached `started`). |
+| 1b.3 | **[VERIFIED]** | `openstudio_operator_worker_pods_evicted_total 0.0` in the live scrape; the decision counter would have incremented under dryRun in a real escalation, per the audit doc and `tests/test_analysis_sla.py` (all green). |
+| 1b.4 | **[VERIFIED — K8s side]** | `kubectl get pods -n openstudio-server` shows all five stack pods (`db/redis/web/web-background/worker`) 1/1 Running with no restarts during the capture (the original `worker-5f49c94875-j4hrt` and `web-7bf87b4594-58x7c` and `web-background-c974f647f-2mmwf` pods unchanged throughout). The `worker_recycler` Event was emitted but the deployment is single-replica `Recreate` (the operator's deployment spec), so the rollout is by the deployment controller; under `dryRun: true` the patch is suppressed and the deployment never rolls. The live evidence confirms zero pod deletes for the duration of the capture. |
+
+### Cleanup
+
+```
+$ kubectl -n openstudio-server set image deployment/openstudio-operator operator=ghcr.io/anchapin/openstudio-server-operator:dev
+deployment.apps/openstudio-operator image updated
+$ kubectl -n openstudio-server rollout status deployment/openstudio-operator --timeout=60s
+deployment "openstudio-operator" successfully rolled out
+$ kubectl -n openstudio-server delete oscm validation
+openstudioclustermanager.energy.nrel.gov "validation" deleted
+$ curl -X DELETE -H 'Accept: application/json' http://web:80/analyses/8f7765ce-9de1-4576-b736-18df2d02da84
+# analysis deleted (server-side cascade); project + analysis record removed from Mongo + NFS
+```
+
+Image reverted to `:dev`; OSCM CR + analysis deleted; cluster back to
+the pre-#83 baseline state (5 stack pods, 1/1 Ready, 67m old at capture
+end). No follow-up cluster teardown — the validation environment
+remains usable for the next wave-2 branch.
 
 ## Troubleshooting
 

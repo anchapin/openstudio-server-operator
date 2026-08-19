@@ -3,8 +3,9 @@
 The queue fabric behind OpenStudio Server is Redis (Service ``queue`` :6379) carrying
 the Resque queues ``simulations`` and ``requeued`` (workers consume
 ``QUEUES=requeued,simulations``). The operator reads it directly and STRICTLY
-read-only — this client is a shared dependency of Module 5 (#13) and the HPA-floor
-adjuster (#18). No write command may exist in this module; enforcement is layered:
+read-only — this client is a shared dependency of Module 5 (#13), the HPA-floor
+adjuster (#18), and the Module 1 escalation re-sourcing (issue #83 D2). No write
+command may exist in this module; enforcement is layered:
 
 * every Redis call funnels through ``_execute()``, which asserts the command against
   ``READ_ONLY_COMMANDS`` before dispatching (runtime guard raising
@@ -23,6 +24,11 @@ Why each read is present (and nothing else):
     HGETALL   one-shot fetch of the worker-heartbeat hash (all fields at once —
               the live v3.11.0 Resque stores every worker's heartbeat as a field
               of a single HASH key, not per-worker STRING keys)
+    GET       one-shot fetch of a single worker's record (issue #83 D2 —
+              escalation re-sourcing). Resque 2.x stores per-worker state at
+              ``resque:worker:{worker_id}`` as a JSON STRING whose ``payload``
+              sub-object carries the running job's class and args. ``GET`` is
+              strictly a read.
     SCAN      one-shot key-prefix probe for the startup layout validator
               (:meth:`validate_key_layout`, issue #44). SCAN is non-blocking,
               read-only, and never used outside the validator — the steady-state
@@ -38,6 +44,13 @@ Key layout (LIVE-VERIFIED 2026-08-18 on the kind validation cluster running
                                   timestamp as an ISO8601 string with UTC offset
                                   (e.g. ``2026-08-18T20:46:06+00:00``), rewritten
                                   by each worker roughly every 60 s
+    resque:worker:{id}            STRING — JSON-encoded worker record
+                                  (host, pid, queues, payload, run_at).
+                                  Issue #83 D2: ``payload.args`` carries the
+                                  queued job's arguments, the first of which
+                                  is the analysis id (Resque 2.x convention for
+                                  OpenStudio Server's ``RunSimulateDataPoint``
+                                  job class).
     resque:worker:{id}:started    STRING — human-readable first-registration time
                                   (informational; the operator does not read it)
 
@@ -67,6 +80,7 @@ subclass so existing callers that catch ``RedisClientError`` continue to handle 
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -74,7 +88,7 @@ from urllib.parse import urlparse
 
 import redis
 
-READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "SCAN"})
+READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"})
 
 #: Queue-depth keys. Live-verified on kind/v3.11.0 (issue #67): Resque 2.x
 #: stores queue payloads at ``resque:queue:<name>`` — the bare names the
@@ -91,6 +105,13 @@ WORKER_REGISTRY_KEY = "resque:workers"
 #: (``resque:workers:{id}`` holding epoch floats) — those do not exist on the
 #: live server; this hash is the single point of change.
 WORKER_HEARTBEAT_HASH_KEY = "resque:workers:heartbeat"
+#: Resque per-worker record (STRING, JSON-encoded). Live-verified on
+#: kind/v3.11.0: each registered worker also has its own key at
+#: ``resque:worker:{worker_id}`` whose value is a JSON object
+#: ``{host, pid, queues, payload, run_at}`` — the canonical Resque 2.x worker
+#: record. Issue #83 D2 reads this key to learn which worker is currently
+#: processing which analysis (payload.args carries the analysis id for the
+#: ``RunSimulateDataPoint`` job class).
 
 #: Hard cap on how many keys :meth:`validate_key_layout` will SCAN before giving
 #: up; protects against accidental full-DB traversal on a misconfigured prefix.
@@ -323,3 +344,69 @@ class ReadOnlyRedisClient:
             for worker_id, heartbeat in self.worker_heartbeats().items()
             if heartbeat is None or (now - heartbeat) > threshold_seconds
         }
+
+    # --- Worker identity → analysis matching (issue #83 D2) ---------------
+
+    def workers_for_analysis(self, analysis_id: str) -> list[str]:
+        """Worker ids currently processing ``analysis_id`` — issue #83 D2.
+
+        Live-verified v3.11.0 (Resque 2.x): each registered worker has a JSON
+        STRING at ``resque:worker:{worker_id}`` whose ``payload.args`` list
+        carries the Resque job's arguments. The OpenStudio Server job class
+        ``RunSimulateDataPoint`` passes the analysis id as ``args[0]`` and the
+        datapoint id as ``args[1]``; this helper returns the worker ids whose
+        ``args[0] == analysis_id`` (the first argument position is the
+        contract — checked defensively, with multiple positions supported for
+        any future job class that may rearrange).
+
+        Workers with no current job (no ``payload`` or empty ``args``) never
+        match. A non-parseable worker record, a missing key, or a transient
+        Redis failure ALL raise :class:`RedisClientError` — escalation is
+        safety-critical, registry garbage must be loud, never silently absent.
+        The caller (Module 1) is D12-shaped: a raised exception skips the tick
+        and the next poll retries naturally; idempotency comes from the
+        :attr:`SoftStopRecord.escalated_at` marker, not from this read.
+
+        Returns a list (not a set) so the caller sees the matching worker ids
+        in ``SMEMBERS`` order — deterministic for tests and consistent with
+        the rest of the module.
+        """
+        matches: list[str] = []
+        worker_ids = self._execute("smembers", WORKER_REGISTRY_KEY)
+        for worker_id in worker_ids:
+            raw = self._execute("get", f"resque:worker:{worker_id}")
+            if raw is None:
+                # Worker is registered but the per-worker record has no
+                # payload (idle) — not a match, not an error.
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RedisClientError(
+                    f"unparseable worker record for {worker_id!r}: {raw!r}"
+                ) from exc
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            args = payload.get("args")
+            if not isinstance(args, list):
+                continue
+            if analysis_id in args:
+                matches.append(worker_id)
+        return matches
+
+    def pod_name_for_worker(self, worker_id: str) -> str | None:
+        """Pod name embedded in a Resque worker id — ``None`` when the id is
+        not the standard ``{hostname}:{pid}:{queues}`` shape.
+
+        In Kubernetes, the pod's ``hostname`` defaults to the pod name (the
+        ``hostname`` field in the pod spec, used by Resque to build the
+        worker id), so the first colon-delimited segment of the worker id
+        IS the pod name — issue #83 D2 escalation targets pods by exactly
+        this mapping. ``None`` for malformed ids (defensive: the caller skips
+        rather than mistakenly deleting something that looks like a pod name).
+        """
+        segments = worker_id.split(":")
+        if len(segments) < 3 or not segments[0]:
+            return None
+        return segments[0]
