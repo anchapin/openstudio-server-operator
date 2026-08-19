@@ -124,6 +124,27 @@ def test_credentials_via_envfrom_secretref_only(backend: str) -> None:
         assert set(volume) == {"name", "persistentVolumeClaim"}
 
 
+# --- Security: hardened rclone container (#114) ------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_archival_job_has_hardened_rclone_securitycontext(backend: str) -> None:
+    """Match the operator Deployment (#115) and the prune CronJob (#78).
+
+    The rclone container holds S3/GCS/Azure credentials via envFrom — a
+    writable root FS + net-raw would let a compromised rclone pivot out.
+    """
+    job = _job(backend)
+    container = _container(job)
+    sc = container["securityContext"]
+    assert sc["allowPrivilegeEscalation"] is False
+    assert sc["readOnlyRootFilesystem"] is True
+    assert sc["capabilities"]["drop"] == ["ALL"]
+    assert sc["runAsNonRoot"] is True
+    assert sc["runAsUser"] == 1000
+    assert sc["seccompProfile"]["type"] == "RuntimeDefault"
+
+
 # --- NFS mount ----------------------------------------------------------------
 
 

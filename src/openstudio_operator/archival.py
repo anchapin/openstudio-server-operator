@@ -209,6 +209,20 @@ def build_archival_job(
                             "name": "rclone",
                             "image": RCLONE_IMAGE,
                             "command": ["/bin/sh", "-c", script],
+                            # Issue #114 — match the operator Deployment's
+                            # hardening (#115) and the prune CronJob's
+                            # (#78). The rclone container holds the S3/GCS/Azure
+                            # credentials via envFrom secretRef (#218); all-caps
+                            # net-raw + a writable root FS would let a
+                            # compromised rclone pivot out, so deny it.
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                                "runAsNonRoot": True,
+                                "runAsUser": 1000,
+                                "seccompProfile": {"type": "RuntimeDefault"},
+                            },
                             "env": [
                                 {
                                     "name": f"RCLONE_CONFIG_{RCLONE_REMOTE_NAME.upper()}_TYPE",
