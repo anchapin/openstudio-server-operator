@@ -211,6 +211,19 @@ def build_archival_job(
                 "metadata": {"labels": labels},
                 "spec": {
                     "restartPolicy": RESTART_POLICY,
+                    # Issue #241 — the archival Job's ServiceAccount is
+                    # rclone-only; the pod never calls the kube-apiserver,
+                    # so the kubelet-mounted SA token at
+                    # /var/run/secrets/kubernetes.io/serviceaccount is pure
+                    # attack surface (a compromised rclone could cat the
+                    # token and authenticate against the API server with
+                    # whatever RBAC the SA carries). Disable the mount
+                    # explicitly; the kubelet default would otherwise leave
+                    # it in place. The prune CronJob intentionally keeps
+                    # its SA token mount (it needs API access for
+                    # StatusStore RMW and Batch Jobs) — do not copy this
+                    # field onto it.
+                    "automountServiceAccountToken": False,
                     # Issue #161 — pod-level defense-in-depth baseline. PSS
                     # `restricted` validates pod-level runAsNonRoot +
                     # seccompProfile, not the container-level fields. An
