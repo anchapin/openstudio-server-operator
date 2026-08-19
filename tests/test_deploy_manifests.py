@@ -556,3 +556,151 @@ def test_network_policy_metrics_ingress_has_prometheus_and_peer_allow():
         "metrics-ingress must include an empty podSelector to allow "
         "co-located scrapers (e.g. sidecar) in openstudio-server"
     )
+
+
+# ---- Issue #154: deny-egress NetworkPolicy must NOT match every pod --
+#
+# `openstudio-operator-deny-egress` is the operator-managed-surface default-
+# deny. An empty `podSelector: {}` selects every pod in `openstudio-server`,
+# which means the helm chart's `web`, `web-background`, `worker`, `queue`
+# (Redis), `db` (MongoDB), and NFS pods inherit the deny BEFORE any allow-
+# list can apply — silently breaking DNS + Service egress for the deployment
+# the operator is supposed to manage. The fix narrows the selector to the
+# operator-managed surface; the three tests below pin that narrowing.
+
+
+def _deny_egress_policy():
+    matches = [
+        d for d in NETPOL_DOCS
+        if "deny-egress" in d["metadata"]["name"]
+    ]
+    assert matches, (
+        "no deny-egress NetworkPolicy in deploy/network-policy.yaml — "
+        "issue #112 default-deny is missing"
+    )
+    return matches[0]
+
+
+def _allow_egress_policies():
+    """Every egress policy other than the deny itself — i.e. the allow-
+    lists the deny must be consistent with. Excludes the metrics-ingress
+    policy (Ingress-only, no egress allow to reconcile with)."""
+    deny_name = _deny_egress_policy()["metadata"]["name"]
+    out = []
+    for d in NETPOL_DOCS:
+        if d["metadata"]["name"] == deny_name:
+            continue
+        if d["spec"].get("policyTypes") != ["Egress"]:
+            continue
+        out.append(d)
+    return out
+
+
+def test_deny_egress_policy_selector_is_not_empty():
+    """Issue #154 acceptance #1: `openstudio-operator-deny-egress`'s
+    podSelector must not be empty. An empty selector (`podSelector: {}`)
+    matches every pod in the namespace and silently breaks egress for the
+    helm chart's `web`, `worker`, `queue`, etc. The selector MUST declare
+    at least one of `matchLabels` or `matchExpressions` to qualify as
+    "operator-managed surface only"."""
+    deny = _deny_egress_policy()
+    selector = deny["spec"]["podSelector"]
+    assert selector, (
+        f"deny-egress podSelector is empty ({selector!r}); an empty "
+        "selector matches every pod in the namespace and breaks helm "
+        "chart egress (issue #154)"
+    )
+    has_labels = bool(selector.get("matchLabels"))
+    has_exprs = bool(selector.get("matchExpressions"))
+    assert has_labels or has_exprs, (
+        "deny-egress podSelector must declare at least one label or "
+        f"expression, got {selector!r}"
+    )
+
+
+def test_deny_egress_selector_matches_allow_policies():
+    """Issue #154 acceptance #2: the deny selector must be COVERED by the
+    union of the allow-policy selectors — every label key the deny matches
+    on must also be matched by at least one allow policy. Otherwise the
+    deny would select pods that no allow covers, and those pods would
+    have zero egress (the exact bug the empty selector caused for the helm
+    chart pods)."""
+    deny = _deny_egress_policy()
+    allows = _allow_egress_policies()
+    assert allows, (
+        "no Egress-typed allow NetworkPolicy found in deploy/network-policy."
+        "yaml — without an allow, the deny has nothing to reconcile against"
+    )
+    deny_match_labels = deny["spec"]["podSelector"].get("matchLabels", {})
+    deny_match_expr_keys = {
+        expr["key"]
+        for expr in deny["spec"]["podSelector"].get("matchExpressions", [])
+    }
+    deny_keys = set(deny_match_labels) | deny_match_expr_keys
+
+    # Collect, per allow policy, the set of label keys it matches on
+    allow_keys_by_policy = {}
+    for allow in allows:
+        keys = set(allow["spec"]["podSelector"].get("matchLabels", {}))
+        keys.update(
+            expr["key"]
+            for expr in allow["spec"]["podSelector"].get("matchExpressions", [])
+        )
+        allow_keys_by_policy[allow["metadata"]["name"]] = keys
+
+    # Every deny key must appear in at least one allow selector
+    for key in deny_keys:
+        covered_by = [
+            name for name, keys in allow_keys_by_policy.items() if key in keys
+        ]
+        assert covered_by, (
+            f"deny-egress requires label {key!r} but no allow policy "
+            f"matches on that key — pods selected by the deny alone "
+            f"would lose all egress (issue #154)"
+        )
+
+
+def test_deny_egress_does_not_select_helm_chart_pods():
+    """Issue #154 acceptance #3: the deny selector must NOT match any helm
+    chart pod. The helm chart pods (web, web-background, worker, queue/
+    redis, db, NFS) carry the labels actually emitted by
+    scripts/manifests/* and the NFS deployment; the deny must leave them
+    alone so they keep inheriting the cluster default egress."""
+    deny = _deny_egress_policy()
+    selector = deny["spec"]["podSelector"]
+
+    # Helm chart pod label sets as actually emitted by scripts/manifests/
+    # and the NFS pod. Each is a dict mapping the pod labels a selector
+    # would have to consider. None of these carry the operator-managed
+    # labels the deny selects on.
+    helm_chart_pods = [
+        {"app": "web"},
+        {"app": "web-background"},
+        {"app": "worker"},
+        {"app": "redis"},          # the Resque `queue` Service
+        {"app": "db"},             # MongoDB
+        {"app": "nfs"},
+    ]
+
+    for pod_labels in helm_chart_pods:
+        # matchLabels: AND across all required label keys
+        if "matchLabels" in selector:
+            matches = all(
+                pod_labels.get(k) == v
+                for k, v in selector["matchLabels"].items()
+            )
+            assert not matches, (
+                f"deny-egress matches helm chart pod {pod_labels!r} via "
+                f"matchLabels={selector['matchLabels']!r}; the deny would "
+                f"break egress for this pod (issue #154)"
+            )
+        # matchExpressions: AND across all required expressions
+        for expr in selector.get("matchExpressions", []):
+            if expr["operator"] != "In":
+                continue
+            val = pod_labels.get(expr["key"])
+            assert val not in expr["values"], (
+                f"deny-egress expression {expr!r} matches helm chart pod "
+                f"{pod_labels!r}; the deny would break egress for this "
+                f"pod (issue #154)"
+            )
