@@ -1,40 +1,43 @@
-"""Unit tests for the storage pruner retention pipeline (#16, D09).
+"""Unit tests for the retention pipeline (plan Module 4; #16, D09; actor move #78).
 
 REST is mocked with ``responses`` (analyses index, heavy data_points index,
 DELETE cascade), the CR ``.status`` subresource with the in-memory RFC 7386
 merge-patch fake (same approach as test_analysis_sla.py / test_status_store.py)
 and the Kubernetes batch API with ``FakeBatchV1Api`` built on generated-client
 shapes (attribute-style Job objects, 404/409 ``ApiException``s). All
-assertions target ``run_retention_tick`` directly; the kopf timer wrapper is
-thin wiring.
+assertions target ``run_retention_tick`` directly; the CronJob entrypoint
+(``openstudio_operator.prune_entrypoint``, covered by
+test_prune_entrypoint.py) is thin wiring around it.
 
 THE CARDINAL RULE is asserted as its own test
 (``test_cardinal_never_deleted_without_verified_success``): pending, failed
 and vanished Jobs all leave the analysis undeleted.
 
-RBAC note: the Job create/read/delete asserted here are covered by the
-``batch/jobs`` verbs granted to the operator's namespaced Role in
-``deploy/rbac.yaml``.
+RBAC note (#78): the Job create/read/delete asserted here are covered by the
+``batch/jobs`` verbs granted to the storage-pruner ServiceAccount's Role in
+``deploy/storage-cronjob.yaml`` — the operator's own Role no longer holds
+any batch permissions.
 """
 
 import copy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 import responses
 from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
-from openstudio_operator.archival import archival_job_name
-from openstudio_operator.config import OperatorConfig
-from openstudio_operator.handlers.storage_pruner import (
+from openstudio_operator.archival import archival_job_name, build_archival_job
+from openstudio_operator.config import OperatorConfig, StoragePolicy
+from openstudio_operator.openstudio_client import OpenStudioClient
+from openstudio_operator.retention import (
     ANALYSIS_ARCHIVAL_FAILED_EVENT,
     ANALYSIS_ARCHIVAL_STARTED_EVENT,
     ANALYSIS_ARCHIVAL_SUCCEEDED_EVENT,
     ANALYSIS_DELETED_EVENT,
     run_retention_tick,
 )
-from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.status_store import StatusStore
 
 BASE = "http://web.test"
@@ -206,7 +209,7 @@ class FakeBatchV1Api:
     """BatchV1Api stand-in: in-memory Jobs with faithful 404/409 semantics.
 
     The create/read/delete exercised here are the ``batch/jobs`` verbs from
-    deploy/rbac.yaml.
+    deploy/storage-cronjob.yaml (the prune CronJob's Role, #78).
     """
 
     def __init__(self, jobs: list | None = None) -> None:
@@ -733,3 +736,47 @@ def test_dry_run_suppresses_delete_of_verified_analysis():
 
     _, events2 = tick(api, spec=dry, batch_api=batch)  # later ticks: silent, no storm
     assert events2 == []
+
+
+# --- Backend-agnostic spawn (issue #78 AC3) --------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["s3", "gcs", "azure"])
+@responses.activate
+def test_spawn_emits_the_backend_job_template_for_every_cloud_target(backend):
+    """AC3: a spawn tick per backend creates EXACTLY the #15 generator's Job.
+
+    The pipeline never mutates the generated manifest — for each of the three
+    cloud targets the created object equals ``build_archival_job`` verbatim
+    (remote type, envFrom creds, read-only NFS mount, deterministic name),
+    which is the unit-level "runs cleanly across AWS, GCP, and Azure" gate.
+    """
+    policy = StoragePolicy(
+        archive_to_s3=True,
+        backend=backend,
+        bucket="os-archives",
+        secret_ref="archive-creds",
+        retention_days=7,
+        purge_completed_nfs_files=True,
+    )
+    spec = {
+        "serverUrl": BASE,
+        "storagePolicy": {
+            "archiveToS3": True,
+            "backend": backend,
+            "bucket": "os-archives",
+            "secretRef": "archive-creds",
+            "retentionDays": 7,
+            "purgeCompletedNFSFiles": True,
+        },
+    }
+    register_analyses(analysis("a1"))
+    register_datapoints([{"_id": "dp-1", "analysis_id": "a1"}])
+    api = FakeCustomObjectsApi(make_cr(spec=spec))
+    batch = FakeBatchV1Api()
+
+    result, _ = tick(api, spec=spec, batch_api=batch)
+
+    assert result.spawned == ["a1"]
+    assert len(batch.creates) == 1
+    assert batch.creates[0]["body"] == build_archival_job("a1", policy, NAMESPACE, ("dp-1",))

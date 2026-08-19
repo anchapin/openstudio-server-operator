@@ -1,11 +1,17 @@
-"""Kopf handlers, one module per operator component in the plan doc."""
+"""Kopf handlers, one module per operator component in the plan doc.
+
+Storage pruning/archival is NOT here by design (#78): the retention pipeline
+runs as native Job primitives via ``deploy/storage-cronjob.yaml`` +
+``openstudio_operator.prune_entrypoint`` (library code in
+``openstudio_operator.retention``) — the operator core keeps no storage
+polling loop.
+"""
 
 from openstudio_operator import singleton
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
     datapoint_watchdog,
     hpa_floor,
-    storage_pruner,
     web_background_monitor,
     worker_recycler,
 )

@@ -44,12 +44,14 @@ from openstudio_operator import singleton
 #
 # Update this set when a new OSCM spawning handler is added. Forgetting to do
 # so will fail this test (and that is the point — see issue #47).
+# Removed with #78: "storage_pruner" — the storage retention pipeline moved
+# out of the operator into the storage-prune CronJob
+# (deploy/storage-cronjob.yaml); the handlers package no longer registers it.
 EXPECTED_OSCM_TIMER_HANDLER_IDS: frozenset[str] = frozenset(
     {
         "analysis_sla_monitor",
         "zombie_datapoint_watchdog",
         "hpa_floor_adjuster",
-        "storage_pruner",
         "web_background_monitor",
         "worker_recycler",
     }

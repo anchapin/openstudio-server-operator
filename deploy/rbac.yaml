@@ -32,10 +32,11 @@ rules:
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "patch"]
-  # Create Ephemeral Archival Jobs
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+  # NOTE (#78): no batch/jobs rule anymore — the storage retention pipeline
+  # (archival Job spawn/watch/cleanup) moved out of the operator into the
+  # storage-prune CronJob, whose ServiceAccount holds its own least-privilege
+  # Role in deploy/storage-cronjob.yaml. See docs/architecture-plan.md
+  # Module 4 for the before/after RBAC quantification.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
