@@ -114,6 +114,66 @@ curl -s localhost:9090/metrics | grep -E '^openstudio_operator_'
 curl -s localhost:9090/metrics | grep '^openstudio_operator_handler_tick_failures_total{' # labelled series
 ```
 
+## Logs
+
+The operator and the prune CronJob emit **one JSON object per log line** to
+stderr (issue #256). The format is a stdlib `logging.Formatter` subclass
+installed at process startup — `:func:`openstudio_operator.logging_setup.install_json_logging``
+called from `handlers/__init__.py` (operator process) and from
+`prune_entrypoint.py::main` (CronJob). kopf's own `kopf.objects` /
+`kopf` loggers are NOT replaced; their records flow through the root
+logger chain and are formatted as JSON by the same handler, so the
+stream is uniformly machine-parseable.
+
+**Canonical fields** (top-level keys in every record):
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `timestamp` | string (ISO-8601 UTC) | `record.created` | tz-aware, e.g. `2026-08-19T14:23:45.123456+00:00`. Use this for log ordering, NOT container timestamps. |
+| `level` | string | `record.levelname` | `INFO` / `WARNING` / `ERROR` / `DEBUG`. |
+| `logger` | string | `record.name` | Dotted name; `openstudio_operator.handlers` for handler logs, `kopf.objects` for per-CR kopf adapter logs, `openstudio_operator.prune_entrypoint` for the CronJob. |
+| `message` | string | `record.getMessage()` | The formatted message (args interpolated). |
+| `module` | string | `record.module` | Filename without `.py` — useful for grepping back to a handler. |
+| `funcName` | string | `record.funcName` | Function or method that emitted the record. |
+| `lineno` | integer | `record.lineno` | Source line number. |
+
+**kopf-injected fields** (present iff the record was emitted from
+inside a kopf handler with the `ObjectLogger` adapter — true for every
+CR-scoped log line):
+
+| Field | Type | Notes |
+|---|---|---|
+| `namespace` | string | Flattened from `k8s_ref['namespace']`. Queryable in Loki as `{namespace="openstudio-server"}`. |
+| `name` | string | Flattened from `k8s_ref['name']`. Queryable in Loki as `{name="osc-prod"}`. |
+
+**Forward-compat:** any other non-reserved `extra=` field on the
+underlying `logging.LogRecord` is emitted as a top-level key, so a
+future handler that adds `extra={'analysis_id': '...'}` gets a free
+`"analysis_id": "..."` field in the JSON line without a formatter
+change.
+
+**Example line** (from the boot-time Redis key-layout validator, #163):
+
+```json
+{"timestamp": "2026-08-19T14:23:45.123456+00:00", "level": "INFO", "logger": "openstudio_operator.handlers", "message": "redis_key_layout=ok namespace=openstudio-server name=osc-prod", "module": "handlers", "funcName": "_check_redis_key_layout_for_cr", "lineno": 202, "namespace": "openstudio-server", "name": "osc-prod"}
+```
+
+**Quick triage commands:**
+
+```bash
+# All handler log lines for a specific CR, in Loki syntax:
+kubectl logs -n openstudio-server deploy/openstudio-operator \
+  | jq -c 'select(.logger=="openstudio_operator.handlers" and .name=="osc-prod")'
+
+# WARNING/ERROR only, with namespace context:
+kubectl logs -n openstudio-server deploy/openstudio-operator \
+  | jq -c 'select(.level=="WARNING" or .level=="ERROR") | {ts:.timestamp, level, namespace, name, msg:.message}'
+
+# Prune-CronJob failure triage (logs ship from a completed Job):
+kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
+  | jq -c 'select(.level!="INFO") | {ts:.timestamp, level, msg:.message}'
+```
+
 ## Repository layout
 
 ```
@@ -141,6 +201,7 @@ curl -s localhost:9090/metrics | grep '^openstudio_operator_handler_tick_failure
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
 │   ├── metrics.py              # Prometheus counters + /metrics endpoint
+│   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py

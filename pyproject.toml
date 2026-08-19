@@ -46,4 +46,10 @@ src = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Issue #257 — print the slowest 10 tests in CI (any >1 s is visible by
+# default; the floor of 1.0 s suppresses the noise from sub-second tests
+# that dominate the count) so a regression that pushes one test over the
+# budget surfaces in PR feedback. The hard ceiling (slowest 10 total
+# >30 s) is enforced by a `pytest_terminal_summary` hook in
+# `tests/conftest.py` — the addopts just make the slow tests visible.
+addopts = "-q --durations=10 --durations-min=1.0"
