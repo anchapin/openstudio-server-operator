@@ -285,8 +285,10 @@ class ArchivedAnalysisRecord:
 class StatusStore:
     """Typed get/set/prune over the OSCM ``.status`` subresource (D04).
 
-    One instance per namespace/CR; handlers construct it once (or use
-    :meth:`in_cluster`) and share it — never patch ``.status`` directly.
+    One instance per namespace/CR; handlers construct it once — passing the
+    :class:`CustomObjectsApi` from
+    :func:`openstudio_operator.singleton.operator_custom_objects_api` — and
+    share it. Never patch ``.status`` directly.
     """
 
     def __init__(self, namespace: str, name: str, custom_api: CustomObjectsApi) -> None:
@@ -294,14 +296,6 @@ class StatusStore:
         self._name = name
         self._api = custom_api
         self._cache: dict[str, Any] | None = None
-
-    @classmethod
-    def in_cluster(cls, namespace: str, name: str) -> StatusStore:
-        """Build a store using the operator pod's service account."""
-        from kubernetes import config as kube_config
-
-        kube_config.load_incluster_config()
-        return cls(namespace, name, CustomObjectsApi())
 
     @property
     def cache(self) -> dict[str, Any] | None:

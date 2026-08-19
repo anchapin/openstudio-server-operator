@@ -24,9 +24,11 @@ deliberate bump here AND in this test (see issue #47).
 
 from __future__ import annotations
 
+import ast
 import importlib
 import logging
 import sys
+from pathlib import Path
 
 import kopf
 import pytest
@@ -420,4 +422,92 @@ def test_redis_key_layout_handler_invokes_validate_key_layout(
     assert "redis_key_layout=ok" in caplog.text, (
         f"Expected structured log line 'redis_key_layout=ok' not found. "
         f"Captured: {caplog.text!r}. See issue #163."
+    )
+
+
+# --- Issue #158 — exactly one ``CustomObjectsApi()`` construction site ----------
+#
+# Issue #158: ``StatusStore.in_cluster`` was a defined-but-never-set class
+# attribute, and every handler reached for ``kubernetes.client.CustomObjectsApi()``
+# inline (the SLA monitor, worker recycler, web_background monitor, datapoint
+# watchdog, plus ``singleton._build_custom_objects_api``). Bypassing the
+# factory meant the inline calls ran with whatever the default kubeconfig
+# resolution picked up — correct only because the operator is in-cluster.
+# A future change to the factory's loader would silently leave the inline
+# callsites behind.
+#
+# The fix is a single factory — ``singleton.operator_custom_objects_api()`` —
+# that every handler imports. This test pins the "exactly one construction
+# site" invariant at the source level via AST scan: if a maintainer adds a
+# new ``CustomObjectsApi()`` call outside the factory, the CI gate fails
+# loudly. The companion runtime contract tests live in
+# ``tests/test_k8s_clients.py`` (caching + load-once behaviour).
+#
+# Scan scope: every ``.py`` file under ``src/openstudio_operator/``. Tests
+# are excluded by the path filter (they live under ``tests/``). The
+# factory's own file (``singleton.py``) is the ONE allowed construction
+# site; the assertion message names the offending file + line so a
+# maintainer can fix the regression in one read.
+
+
+def _find_custom_objects_api_constructions() -> list[tuple[str, int]]:
+    """Return ``(relative_path, lineno)`` for every ``CustomObjectsApi()`` call.
+
+    Walks the operator's production source tree (``src/openstudio_operator/``),
+    parses each ``.py`` file with :mod:`ast`, and locates ``Call`` nodes
+    whose function is a bare ``CustomObjectsApi`` name. The bare-name match
+    excludes qualified calls like ``kubernetes.client.CustomObjectsApi()``
+    (which would already be a regression — the factory should be the only
+    construction point regardless of how it's spelled). Line numbers come
+    from the parsed AST so they survive future source edits (the
+    alternative — regex on raw bytes — would silently miss
+    ``CustomObjectsApi ( )`` or other whitespace variations).
+    """
+    src_root = Path(singleton.__file__).parent
+    found: list[tuple[str, int]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "CustomObjectsApi":
+                continue
+            if node.args or node.keywords:
+                # The factory calls ``CustomObjectsApi()`` with no args;
+                # any other signature (kwargs, positional) would be a
+                # different construction site worth surfacing separately.
+                continue
+            found.append((str(py.relative_to(src_root.parent)), node.lineno))
+    return found
+
+
+def test_only_one_custom_objects_api_construction_point() -> None:
+    """Issue #158: ``CustomObjectsApi()`` is constructed in EXACTLY one place.
+
+    The factory in :mod:`openstudio_operator.singleton` is the operator's
+    only legitimate construction site. Any inline
+    ``CustomObjectsApi()`` outside the factory is a regression: the
+    handler bypasses the in-cluster / kubeconfig fallback loader, so a
+    future change to that loader (kubeconfig Secret reference, network
+    proxy, …) silently leaves the inline callsite behind.
+
+    The assertion message names the offending file + line so the
+    maintainer can fix the regression in one read.
+    """
+    found = _find_custom_objects_api_constructions()
+
+    assert len(found) == 1, (
+        f"Expected exactly ONE CustomObjectsApi() construction in "
+        f"src/openstudio_operator/; found {len(found)}: {found}. "
+        f"Every handler must use "
+        f"openstudio_operator.singleton.operator_custom_objects_api() "
+        f"instead of constructing the client inline. See issue #158."
+    )
+
+    path, lineno = found[0]
+    assert path.endswith("openstudio_operator/singleton.py"), (
+        f"CustomObjectsApi() must be constructed only in "
+        f"singleton.py (the factory); found it at {path}:{lineno}. "
+        f"See issue #158."
     )

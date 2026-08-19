@@ -63,7 +63,6 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import kopf
-from kubernetes.client import CustomObjectsApi
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
@@ -75,6 +74,7 @@ from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
     PLURAL,
@@ -218,7 +218,7 @@ def zombie_datapoint_watchdog(
         logger.warning("spec.serverUrl is empty — datapoint watchdog idle this tick")
         return
     client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, CustomObjectsApi())
+    store = StatusStore(namespace, name, operator_custom_objects_api())
     # Issue #164 — single source of truth for Event emission; class wraps
     # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
     # shim so the existing ``emit("Warning", REASON, message)`` call

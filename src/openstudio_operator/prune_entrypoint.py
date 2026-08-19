@@ -57,7 +57,6 @@ from kubernetes.client import (
     ApiException,
     BatchV1Api,
     CoreV1Api,
-    CustomObjectsApi,
 )
 from kubernetes.config import ConfigException, load_incluster_config, load_kube_config
 
@@ -66,6 +65,7 @@ from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
+from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION, StatusStore, StatusStoreError
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,7 @@ def main(
 
     if custom_api is None or batch_api is None or core_api is None:
         _load_kube_config()
-        custom_api = custom_api if custom_api is not None else CustomObjectsApi()
+        custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
         batch_api = batch_api if batch_api is not None else BatchV1Api()
         core_api = core_api if core_api is not None else CoreV1Api()
 

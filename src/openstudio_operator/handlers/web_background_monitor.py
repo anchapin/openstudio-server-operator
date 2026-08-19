@@ -86,7 +86,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, AppsV1Api, CoreV1Api, CustomObjectsApi
+from kubernetes.client import ApiException, AppsV1Api, CoreV1Api
 
 from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
@@ -102,6 +102,7 @@ from openstudio_operator.metrics import (
     WEB_BACKGROUND_RESTARTS_TOTAL,
 )
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
+from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
     MERGE_PATCH_CONTENT_TYPE,
@@ -557,7 +558,7 @@ def web_background_monitor(
         logger.warning("spec.serverUrl is empty — web_background monitor idle this tick")
         return
     redis_client = _get_redis_client(config.redis_url)
-    store = StatusStore(namespace, name, CustomObjectsApi())
+    store = StatusStore(namespace, name, operator_custom_objects_api())
     apps_api = AppsV1Api()
     pods_api = CoreV1Api()
     tracker = _get_tracker(namespace, name)
