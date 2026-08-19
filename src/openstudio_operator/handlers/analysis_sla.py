@@ -93,7 +93,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, CoreV1Api
+from kubernetes.client import ApiException
 
 from openstudio_operator.client_factory import (
     get_openstudio_client,
@@ -109,7 +109,7 @@ from openstudio_operator.metrics import (
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.redis_client import RedisClientError
-from openstudio_operator.singleton import operator_custom_objects_api
+from openstudio_operator.singleton import operator_core_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
     PLURAL,
@@ -508,7 +508,7 @@ def _escalate_analysis(
     as #8's stop-then-anchor ordering.
     """
     if pod_api is None:
-        pod_api = CoreV1Api()
+        pod_api = operator_core_api()
     if redis_client is None:
         redis_client = get_read_only_redis_client(config.redis_url)
     victims = _resque_matched_worker_pods(
@@ -599,7 +599,7 @@ def analysis_sla_monitor(
         return
     client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, operator_custom_objects_api())
-    pod_api: WorkerPodApi = CoreV1Api()
+    pod_api: WorkerPodApi = operator_core_api()
     redis_client: RedisClientLike = get_read_only_redis_client(config.redis_url)
     # Issue #164 — single source of truth for Event emission. The class
     # encapsulates the dry-run gate (D11) and the suppressed counter; the

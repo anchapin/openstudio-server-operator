@@ -275,6 +275,24 @@ def make_registry_with_handlers() -> kopf.OperatorRegistry:
     def oscm_timer(body: dict, spec: dict, **_: object):
         return ("served", spec.get("serverUrl"))
 
+    # Issue #250 — the cross-check inside `install_singleton_guard`
+    # requires every OSCM timer to be in the Python-level registry.
+    # Pre-#250 tests constructed a fake OSCM timer inline; the test
+    # factory now registers it explicitly so the gate's cross-check
+    # passes. The handler id below is the kopf-assigned id (which
+    # includes the ``<locals>`` qualifier for nested-scope handlers) —
+    # the gate's cross-check is id-based, so a literal ``"oscm_timer"``
+    # would fail to match. The non-OSCM deployment_timer below is
+    # intentionally NOT registered — `_selector_matches_oscms` excludes
+    # it before the cross-check runs.
+    from openstudio_operator import _oscm_handlers
+
+    kopf_id = next(
+        h.id for h in registry._spawning._handlers
+        if h.fn is oscm_timer
+    )
+    _oscm_handlers.register(kopf_id, oscm_timer)
+
     @kopf.timer("apps", "v1", "deployments", interval=30.0, registry=registry)
     def deployment_timer(body: dict, **_: object):
         return "deployments-are-not-gated"

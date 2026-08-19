@@ -1,6 +1,8 @@
 """Unit tests for OpenStudioClient against the verified v3.11.0 REST contract."""
 
+import ast
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import requests
@@ -458,3 +460,110 @@ def test_tls_error_propagates_as_api_error(client, monkeypatch, sleeps):
         client.list_analyses()
     assert isinstance(excinfo.value.__cause__, requests.exceptions.SSLError)
     assert len(sleeps) == 3
+
+
+# --- Issue #252 — public surface (``list_datapoints``) over the private seam ---
+
+# Issue #252: ``retention.py`` reached into ``client._request_json("GET",
+# "/data_points.json")`` — the private REST helper. The path was
+# workaround-shaped: ``get_datapoints_full()`` was deleted in #104 and the
+# retention pipeline still needed the per-analysis datapoint ID set for
+# archival Job args. The fix landed a public ``OpenStudioClient.list_datapoints()``
+# method that wraps the same heavy poll with the same retry / backoff /
+# timestamp-normalisation envelope, and the previous section of the
+# module swapped the ``retention.py`` call to the public surface.
+#
+# The AST test below pins the "no module outside ``openstudio_client.py``
+# calls ``_request_json``" invariant at the source level: a future
+# maintainer who reaches into the private method again (because the
+# public surface "didn't have what they needed") fails the CI gate
+# loudly and is forced to add a public method instead. The
+# alternative — silently bypass the public surface — would skip the
+# retry / backoff / timestamp-normalisation envelope and break the
+# maintainer's caller the next time the private method signature
+# changes (e.g. an issue #226 follow-up that splits retry behaviour by
+# HTTP verb).
+#
+# Scan scope: every ``.py`` file under ``src/openstudio_operator/``;
+# the ``_request_json`` method body inside ``openstudio_client.py`` is
+# the ONE allowed call site (it is the method's own implementation).
+# Tests are excluded by the path filter (they live under ``tests/``).
+# The walker matches attribute calls (``obj._request_json(...)``) so
+# subclass-style invocation is also caught; attribute shadowing in
+# a non-``OpenStudioClient`` class would also be flagged.
+#
+# Note: the previous test surface (see e.g. ``test_retention.py``)
+# asserts the public ``list_datapoints()`` envelope (timestamp
+# normalisation, retry-on-transient); this AST test is the callsite
+# fence that closes the loop — the private method exists only inside
+# ``openstudio_client.py``.
+
+
+def _find_request_json_calls() -> list[tuple[str, int]]:
+    """Return ``(relative_path, lineno)`` for every ``_request_json(...)`` call.
+
+    Walks the operator's production source tree (``src/openstudio_operator/``),
+    parses each ``.py`` file with :mod:`ast`, and locates ``Call`` nodes
+    whose function is an attribute reference ending in ``_request_json``
+    (the only documented call shape — ``obj._request_json(...)``). The
+    attribute match excludes any identically-named local helper in
+    another module: a fresh maintainer who defines ``def _request_json``
+    on their own class would also be flagged, which is the intended
+    (conservative) behaviour.
+    """
+    src_root = Path(OpenStudioClient.__module__.replace(".", "/"))
+    # Resolve the source root from the openstudio_client module file
+    # (its parent is the operator package; the parent's parent is the
+    # ``src`` directory's child operator package).
+    src_root = Path(OpenStudioClient.__module__.replace(".", "/"))
+    # Fall back to the singleton-derived source root if the module-path
+    # resolution above ever drifts (defensive against a future maintainer
+    # moving the module).
+    import openstudio_operator.singleton as _singleton
+
+    src_root = Path(_singleton.__file__).parent
+    found: list[tuple[str, int]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        rel = str(py.relative_to(src_root.parent))
+        if rel.endswith("openstudio_operator/openstudio_client.py"):
+            # The private method is implemented here; its own
+            # ``self._request_json(...)`` calls inside ``list_analyses``
+            # / ``get_analysis_status`` / ``list_started_datapoints`` /
+            # ``list_datapoints`` are the ONLY allowed call sites.
+            continue
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr != "_request_json":
+                continue
+            found.append((rel, node.lineno))
+    return found
+
+
+def test_request_json_not_called_outside_openstudio_client() -> None:
+    """Issue #252: ``_request_json`` is private to ``OpenStudioClient`` — no module calls it.
+
+    The public surface replacement is :meth:`OpenStudioClient.list_datapoints`
+    (plus the existing ``list_analyses`` / ``get_analysis_status`` /
+    ``list_started_datapoints``). A maintainer who reaches for the
+    private method again — because the public surface "didn't have what
+    they needed" — fails this test loudly and is forced to add a public
+    method on ``OpenStudioClient`` instead. The private method is the
+    retry / backoff / timestamp-normalisation envelope; bypassing it
+    silently skips that envelope and breaks the caller's contract the
+    next time the private method signature changes.
+
+    The assertion message names the offending file + line so the
+    maintainer can fix the regression in one read.
+    """
+    found = _find_request_json_calls()
+    assert not found, (
+        f"OpenStudioClient._request_json is private and must NOT be called "
+        f"from any module outside openstudio_client.py; found inline "
+        f"calls at {found}. Add a public method to OpenStudioClient "
+        f"and call that instead. See issue #252."
+    )

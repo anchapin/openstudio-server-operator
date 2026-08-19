@@ -86,7 +86,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, AppsV1Api, CoreV1Api
+from kubernetes.client import ApiException
 
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import (
@@ -102,7 +102,11 @@ from openstudio_operator.metrics import (
     WEB_BACKGROUND_RESTARTS_TOTAL,
 )
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
-from openstudio_operator.singleton import operator_custom_objects_api
+from openstudio_operator.singleton import (
+    operator_apps_api,
+    operator_core_api,
+    operator_custom_objects_api,
+)
 from openstudio_operator.status_store import (
     GROUP,
     MERGE_PATCH_CONTENT_TYPE,
@@ -585,8 +589,8 @@ def web_background_monitor(
         return
     redis_client = get_read_only_redis_client(config.redis_url)
     store = StatusStore(namespace, name, operator_custom_objects_api())
-    apps_api = AppsV1Api()
-    pods_api = CoreV1Api()
+    apps_api = operator_apps_api()
+    pods_api = operator_core_api()
     tracker = _get_tracker(namespace, name)
     # Issue #164 — single source of truth for Event emission; class wraps
     # kopf.event with the dry-run gate (D11) and exposes a ``__call__``

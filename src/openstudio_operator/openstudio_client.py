@@ -202,6 +202,42 @@ class OpenStudioClient:
         """
         return self._request_json("GET", "/analyses.json")
 
+    def list_datapoints(self) -> list[dict]:
+        """GET /data_points.json — full data_point docs (heavy poll, escalation-only).
+
+        Live v3.11.0 contract: this is the heavy endpoint — the per-dp docs
+        carry ``_id``, ``analysis_id``, ``status``, ``status_message``, and
+        ``ip_address`` (always ``null`` on K8s — see #83 D2; the SLA
+        escalator no longer uses it). The retention pipeline is the ONLY
+        caller (issue #252): it needs the per-analysis datapoint ID set
+        for archival Job args, so the heavy poll is gated by the
+        retention tick (run at most once per ``storage-cronjob.yaml``
+        schedule — 600 s by default) and only when a spawn is actually
+        due. The SLA monitor's per-tick observation is the LIGHT
+        endpoint (:meth:`list_started_datapoints`); the watchdog's
+        per-tick observation is also the LIGHT endpoint.
+
+        Issue #252 — added as the public surface replacement for the
+        legacy ``client._request_json("GET", "/data_points.json")`` seam
+        that retention.py reached into after ``get_datapoints_full()``
+        was deleted in #104. The private method is unchanged in
+        signature; the AST test in
+        ``tests/test_openstudio_client.py::test_request_json_not_called_outside_openstudio_client``
+        enforces "no module outside ``openstudio_client.py`` calls
+        ``_request_json``" so a future maintainer refactoring the
+        private method (retry/backoff signature, timestamp
+        normalisation, etc.) silently breaks no caller. Same retry /
+        backoff / timestamp-normalisation envelope as every other
+        method on this client.
+
+        Returns a list of raw data_point dicts with timestamp fields
+        normalised to tz-aware UTC. Empty list is the canonical
+        "no datapoints yet" response (404 is not a possibility here —
+        the endpoint always returns 200 with an empty list on a clean
+        cluster).
+        """
+        return self._request_json("GET", "/data_points.json")
+
     def get_analysis_status(self, analysis_id: str) -> dict:
         """GET /analyses/{id}/status.json — derived view, the SLA clock anchor (#83 D1).
 
