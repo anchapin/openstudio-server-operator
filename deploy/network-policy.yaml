@@ -45,7 +45,16 @@ spec:
   # NOT selected by this policy and continues to inherit the cluster default.
   # We intentionally do NOT match every pod — the operator does not own
   # egress on the helm-chart pods it manages.
-  podSelector: {}
+  # Issue #154: an empty `podSelector: {}` would select every pod in the
+  # namespace and apply the deny before any allow-list could, silently
+  # breaking DNS + Service egress for the helm chart's `web`, `worker`,
+  # `queue`, etc. The labels below mirror the operator Deployment template
+  # (deploy/operator-deployment.yaml:19-20) and the storage-prune +
+  # archival-job templates — i.e. exactly the surface the operator owns.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: openstudio-operator
+      app: openstudio-operator
   policyTypes: ["Egress"]
   egress: []  # allow nothing in addition to the implicit DNS allow
 ---
