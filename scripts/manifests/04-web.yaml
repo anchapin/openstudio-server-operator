@@ -13,7 +13,10 @@
 #   REDIS_URL=redis://:openstudio-rotated@queue:6379
 #     (issue #150 — was the legacy literal 'openstudio'; rotated via
 #      scripts/rotate_redis_password.sh per-cluster before apply)
-#   MONGO_USER/MONGO_PASSWORD=openstudio (mongoid auth_source admin, host db:27017)
+#   MONGO_USER/MONGO_PASSWORD via valueFrom.secretKeyRef -> openstudio-mongo
+#     Secret (issue #219 — was the legacy literal 'openstudio'/'openstudio';
+#     rotated via scripts/rotate_mongo_password.sh per-cluster before apply.
+#     mongoid auth_source admin, host db:27017)
 #   SECRET_KEY_BASE — the chart's committed default (upstream public value, not a secret)
 # Scaled-minimal: MAX_REQUESTS/MAX_POOL/OS_SERVER_NUMBER_OF_WORKERS tuned down
 # from the chart's production formulas for a single-node kind cluster.
@@ -59,9 +62,15 @@ spec:
             - name: REDIS_URL
               value: redis://:openstudio-rotated@queue:6379
             - name: MONGO_USER
-              value: openstudio
+              valueFrom:
+                secretKeyRef:
+                  name: openstudio-mongo
+                  key: username
             - name: MONGO_PASSWORD
-              value: openstudio
+              valueFrom:
+                secretKeyRef:
+                  name: openstudio-mongo
+                  key: password
             - name: MAX_REQUESTS
               value: "50"
             - name: MAX_POOL

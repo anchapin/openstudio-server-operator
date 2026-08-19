@@ -84,6 +84,15 @@ jobs:
         run: |
           pip install pyyaml  # the guard script uses yaml.safe_load
           bash scripts/check_redis_password_unique.sh
+      # Issue #219 — Mongo companion to the #150 Redis guard. Fails the build
+      # if the legacy literal `openstudio` re-appears as a Mongo password
+      # value in 01-mongo.yaml / 04-web.yaml / 05-web-background.yaml /
+      # 06-worker.yaml / deploy/mongo-credentials-secret.yaml.
+      - name: Check no legacy Mongo password literal (issue #219)
+        run: |
+          bash scripts/check_mongo_password_unique.sh
+        # pyyaml is already installed by the #150 step above; the Mongo
+        # companion guards uses the same yaml.safe_load.
 
   test:
     runs-on: ubuntu-latest

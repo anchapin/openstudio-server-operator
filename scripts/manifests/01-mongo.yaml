@@ -1,7 +1,14 @@
 # MongoDB — stand-in for the helm chart's `db` Deployment (develop branch).
 # Image, root credentials, Service name and port mirror the chart defaults:
 #   db.container.image          = mongo:7.0.40 (chart default is 6.0.7 — EOL July 2025)
-#   db.username/password        = openstudio / openstudio
+#   db.username/password        = openstudio / openstudio-rotated
+#                                   (issue #219 — was the legacy literal
+#                                    'openstudio'/'openstudio'; rotated via
+#                                    scripts/rotate_mongo_password.sh before
+#                                    apply. Username kept literal — it's not
+#                                    a secret, mirroring the #150 convention
+#                                    where the Redis username is blank and
+#                                    only the password is rotated.)
 #   db.container.ports.db_port  = 27017
 # APPENDIX (approximation vs production): the chart uses a 100Gi PVC; here it
 # is an emptyDir. Mongo data does not survive pod restarts. Acceptable for
@@ -37,7 +44,7 @@ spec:
             - name: MONGO_INITDB_ROOT_USERNAME
               value: openstudio
             - name: MONGO_INITDB_ROOT_PASSWORD
-              value: openstudio
+              value: openstudio-rotated
           volumeMounts:
             - mountPath: /data/db
               name: db
