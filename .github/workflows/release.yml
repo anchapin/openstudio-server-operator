@@ -67,12 +67,17 @@ jobs:
             "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
       # Issue #113 CI guard: fail the release if the published `:dev` image
       # carries no SLSA provenance attestation.
+      # Issue #169: pin certificate identity to the exact workflow + ref that
+      # produced the attestation (release.yml@refs/heads/develop), not a regex
+      # that would match any workflow from this repo. Use the exact-match
+      # --certificate-identity and --certificate-oidc-issuer flags because the
+      # OIDC issuer is a fixed string (Sigstore Fulcio).
       - name: Verify provenance exists
         env:
           COSIGN_EXPERIMENTAL: "true"
         run: |
-          cosign verify-attestation --certificate-identity-regexp "https://github.com/anchapin/openstudio-server-operator" \
-            --certificate-oidc-issuer-regexp "https://token.actions.githubusercontent.com" \
+          cosign verify-attestation --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type slsaprovenance \
             "ghcr.io/anchapin/openstudio-server-operator:dev"
 
@@ -108,12 +113,15 @@ jobs:
           cosign attest --yes --predicate release-slsa.json \
             --type slsaprovenance \
             "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
+      # Issue #169: pin certificate identity to the exact workflow + ref
+      # that produced the attestation (release.yml@refs/tags/v*). Note the
+      # `v*` glob is part of the cosign identity check, not a shell glob.
       - name: Verify provenance exists
         env:
           COSIGN_EXPERIMENTAL: "true"
         run: |
-          cosign verify-attestation --certificate-identity-regexp "https://github.com/anchapin/openstudio-server-operator" \
-            --certificate-oidc-issuer-regexp "https://token.actions.githubusercontent.com" \
+          cosign verify-attestation --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/tags/v*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type slsaprovenance \
             "ghcr.io/anchapin/openstudio-server-operator:${{ github.ref_name }}"
       - uses: softprops/action-gh-release@v2
