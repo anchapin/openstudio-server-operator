@@ -93,7 +93,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
+from kubernetes.client import ApiException, CoreV1Api
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
@@ -106,6 +106,7 @@ from openstudio_operator.metrics import (
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.redis_client import RedisClientError
+from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
     PLURAL,
@@ -691,7 +692,7 @@ def analysis_sla_monitor(
         logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")
         return
     client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, CustomObjectsApi())
+    store = StatusStore(namespace, name, operator_custom_objects_api())
     pod_api: WorkerPodApi = CoreV1Api()
     redis_client: RedisClientLike = _default_redis_client(config)
     # Issue #164 — single source of truth for Event emission. The class

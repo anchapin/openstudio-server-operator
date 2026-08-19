@@ -53,7 +53,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException, AppsV1Api, CustomObjectsApi
+from kubernetes.client import ApiException, AppsV1Api
 
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
@@ -63,6 +63,7 @@ from openstudio_operator.metrics import (
     WORKERS_RECYCLED_TOTAL,
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
     MERGE_PATCH_CONTENT_TYPE,
@@ -207,7 +208,7 @@ def worker_recycler(
         logger.warning("spec.serverUrl is empty — worker recycler idle this tick")
         return
     client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, CustomObjectsApi())
+    store = StatusStore(namespace, name, operator_custom_objects_api())
     apps_api = AppsV1Api()
     # Issue #164 — single source of truth for Event emission; class wraps
     # kopf.event with the dry-run gate (D11) and exposes a ``__call__``

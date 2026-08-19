@@ -236,34 +236,100 @@ def set_guard(guard: SingletonGuard | None) -> None:
     _process_guard = guard
 
 
-def _build_custom_objects_api() -> CustomObjectsApi:
-    """Construct the guard's client against a LOADED configuration (#79).
+# Issue #158 — the operator's single ``CustomObjectsApi()`` construction
+# point. Every handler that talks to the K8s API server for the OSCM custom
+# object imports THIS function — never ``CustomObjectsApi()`` directly. The
+# factory loads the operator pod's service-account config (falling back to
+# ``kube_config`` for local ``kopf run`` dev sessions), then caches the
+# resulting client for the operator's lifetime. The AST test in
+# ``tests/test_singleton_registry_coverage.py::test_only_one_custom_objects_api_construction_point``
+# enforces "exactly one construction site" so a future regression that
+# bypasses the factory fails the CI gate loudly.
+_operator_custom_objects_api: CustomObjectsApi | None = None
 
-    kopf >=1.44 drives its own (kr8s) clients and never initializes
-    client-python's global default ``Configuration`` — a bare
-    ``CustomObjectsApi()`` therefore carries an empty host (``host == ''``)
-    and every call raises ``LocationValueError``. The guard check runs as a
-    kopf ``on.startup`` activity, so that failure kept kopf from finishing
-    startup at all: pod Running, operator functionally dead (proven live in
-    #66's kind validation). Mirror ``StatusStore.in_cluster``: load the
-    operator pod's service-account config in-cluster, falling back to
-    kubeconfig for local/dev ``kopf run`` sessions. Pure wiring — no policy
-    values here; if neither config loads, the exception propagates and
-    callers fail closed (skip the tick, retry next poll).
+
+def operator_custom_objects_api() -> CustomObjectsApi:
+    """Return the process-wide :class:`CustomObjectsApi` (issue #158).
+
+    The SINGLE ``CustomObjectsApi()`` construction point in the operator —
+    every handler that needs to read or patch the OSCM ``.status``
+    subresource (``StatusStore``'s RMW path), list CRs
+    (``SingletonGuard.list_crs``), or talk to the K8s API server for any
+    other custom-object reason imports this factory. Inline
+    ``CustomObjectsApi()`` calls outside this function are a regression: a
+    bare ``CustomObjectsApi()`` carries whatever the default kubeconfig
+    resolution picks up (typically ``KUBERNETES_SERVICE_HOST`` /
+    ``KUBERNETES_SERVICE_PORT`` envs and a service-account token mount),
+    which is correct only because the operator Deployment is in-cluster.
+    Any future change to this loader (kubeconfig Secret reference,
+    network-proxy client, etc.) would silently leave inline callsites
+    behind.
+
+    Behaviour:
+
+    * Loads the operator pod's in-cluster service-account config via
+      ``kubernetes.config.load_incluster_config``; on ``ConfigException``
+      (bare ``kopf run`` dev sessions, no service-account env vars) falls
+      back to ``kubernetes.config.load_kube_config``. Same posture as the
+      original ``_build_custom_objects_api`` (issue #79) — kopf >=1.44
+      never initializes client-python's default ``Configuration``, so a
+      bare ``CustomObjectsApi()`` with no loaded config raises
+      ``LocationValueError`` on every call (proven live in #66's kind
+      validation).
+    * Caches the resulting :class:`CustomObjectsApi` for the process's
+      lifetime. All callers share the same instance, so the underlying
+      :class:`kubernetes.client.ApiClient` (HTTP connection pool, retry
+      config) is reused across every operator tick.
+    * On config-loading failure, raises — callers fail closed (skip the
+      tick, retry next poll per D12).
+
+    Tests that mock ``kubernetes.config.load_incluster_config`` use
+    :func:`reset_operator_k8s_client` to drop the cache between cases so
+    the next call re-runs the load path with the freshly patched loader.
     """
-    from kubernetes import config as kube_config
+    global _operator_custom_objects_api
+    if _operator_custom_objects_api is None:
+        from kubernetes import config as kube_config
 
-    try:
-        kube_config.load_incluster_config()
-    except ConfigException:
-        kube_config.load_kube_config()
-    return CustomObjectsApi()
+        try:
+            kube_config.load_incluster_config()
+        except ConfigException:
+            kube_config.load_kube_config()
+        _operator_custom_objects_api = CustomObjectsApi()
+    return _operator_custom_objects_api
+
+
+def reset_operator_k8s_client() -> None:
+    """Drop the cached :class:`CustomObjectsApi` (test seam — issue #158).
+
+    The production factory caches for the operator's lifetime; tests that
+    swap ``kubernetes.config.load_incluster_config`` or
+    ``kubernetes.config.load_kube_config`` need to clear the cache between
+    cases so the next call to :func:`operator_custom_objects_api` re-runs
+    the load path with the freshly patched loader. Idempotent; harmless to
+    call when nothing is cached.
+    """
+    global _operator_custom_objects_api
+    _operator_custom_objects_api = None
 
 
 def _get_guard() -> SingletonGuard:
-    global _process_guard
+    global _process_guard, _operator_custom_objects_api
     if _process_guard is None:
-        _process_guard = SingletonGuard(_build_custom_objects_api())
+        # Issue #158 — the guard-rebuild path also clears the K8s client
+        # cache so the new guard's client is built against the currently
+        # loaded (or freshly-loaded) kubeconfig. The reset is the test
+        # seam that keeps ``test_singleton_guard.py``'s config-loader
+        # mocks in effect across cases: the existing tests reset
+        # ``_process_guard`` to ``None`` between cases so a freshly patched
+        # ``load_incluster_config`` is honored — without this reset the
+        # factory would hand back a client built under a previous test's
+        # mocks and the new mocks would never fire. Production operators
+        # never reset ``_process_guard`` (the guard is built once at the
+        # first tick and reused for the process lifetime), so this only
+        # matters under test.
+        _operator_custom_objects_api = None
+        _process_guard = SingletonGuard(operator_custom_objects_api())
     return _process_guard
 
 
