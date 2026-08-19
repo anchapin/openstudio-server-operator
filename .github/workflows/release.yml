@@ -26,6 +26,15 @@ jobs:
   publish-dev:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
     runs-on: ubuntu-latest
+    outputs:
+      # Issue #149: the digest published for the dev image, as a job-level
+      # output for downstream tooling. `steps.build.outputs.digest` is the
+      # image manifest digest emitted by docker/build-push-action@v5; for
+      # a single-platform build (linux/amd64) that is also the value
+      # kubectl pins via `@sha256:...`. For a multi-platform build the
+      # action emits the image-index digest; Kubernetes ≥ 1.25 honors that
+      # form across platforms.
+      image-digest: ${{ steps.pin.outputs.image-digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -47,6 +56,43 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:dev
           provenance: mode=max
           sbom: true
+      # Issue #149: after the build step resolves the digest, pin
+      # deploy/operator-deployment.yaml to `@sha256:<digest>` and commit
+      # back to develop. The standard pattern, made idempotent: if the
+      # manifest already pins this digest, exit 0 without committing (this
+      # avoids the auto-commit→auto-rebuild infinite loop the obvious
+      # implementation falls into, because the Dockerfile is unchanged
+      # and the build deterministically emits the same digest for a
+      # given source tree). `storage-cronjob.yaml` is intentionally out
+      # of scope for this step — it ships its own separate pin.
+      - name: Pin operator image by SHA256 digest
+        id: pin
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [ -z "${DIGEST}" ]; then
+            echo "ERROR: docker/build-push-action did not emit a digest; cannot pin manifest."
+            exit 1
+          fi
+          echo "image-digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          CURRENT=$(grep -oE '@sha256:[a-f0-9]+' deploy/operator-deployment.yaml | head -1 || true)
+          if [ "@${DIGEST}" = "${CURRENT}" ]; then
+            echo "deploy/operator-deployment.yaml already pins ${DIGEST}; no commit needed."
+            exit 0
+          fi
+          sed -i.bak "s|image: ${IMAGE}:.*|image: ${IMAGE}@${DIGEST}|" deploy/operator-deployment.yaml
+          rm -f deploy/operator-deployment.yaml.bak
+          if git diff --quiet deploy/operator-deployment.yaml; then
+            echo "No changes after sed (manifest already had no mutable tag); nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/operator-deployment.yaml
+          git commit -m "build: refs #149 — pin operator image by SHA256 digest (${DIGEST})"
+          git push origin develop
       # Issue #113: cosign keyless sign against the digest just published,
       # using GitHub Actions OIDC (no long-lived key). Pushes the signature
       # to the public Sigstore transparency log + the GHCR signature store.
