@@ -168,7 +168,25 @@ spec:
                       description: "Destination bucket name (backend-agnostic)."
                     secretRef:
                       type: string
-                      description: "Name of a Secret in this namespace; mounted into archival Jobs via envFrom — never read by the operator."
+                      # Issue #240: unconstrained, this field let a CR-write
+                      # user point `archival.py`'s envFrom at ANY Secret in
+                      # the openstudio-server namespace — openstudio-redis
+                      # (KEDA TriggerAuthentication password), any TLS
+                      # Secret, any docker-registry Secret, any
+                      # operator-managed credential. The rclone process
+                      # reads every key in the named Secret as an env var
+                      # and could exfiltrate it via `rclone config` (which
+                      # reads `RCLONE_CONFIG_*` env vars). The
+                      # DNS-1035-style pattern locks the name to the
+                      # documented `os-archive-<suffix>` convention used by
+                      # the test fixtures (`os-archive-creds`) and the
+                      # runbooks; the CEL rule gives a readable apply-time
+                      # message for the same constraint.
+                      pattern: '^os-archive-[a-z0-9-]+$'
+                      x-kubernetes-validations:
+                        - rule: "self.startsWith('os-archive-')"
+                          message: "spec.storagePolicy.secretRef must match '^os-archive-[a-z0-9-]+$' (issue #240)."
+                      description: "Name of a Secret in this namespace; mounted into archival Jobs via envFrom — never read by the operator. Must match the os-archive-<suffix> naming convention (issue #240)."
                     retentionDays:
                       type: integer
                       # Issue #170: 0 is the documented "archive immediately"

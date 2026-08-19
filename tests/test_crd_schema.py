@@ -383,3 +383,79 @@ def test_server_url_has_cel_scheme_rule():
     assert any("issue #160" in r["message"].lower() for r in rules), (
         f"spec.serverUrl: CEL rule message must reference 'issue #160'; got {rules!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #240: ``storagePolicy.secretRef`` must constrain archival Job envFrom
+# to the documented ``os-archive-<suffix>`` naming convention. An
+# unconstrained secretRef let a CR-write user mount any Secret in the
+# namespace (openstudio-redis password, TLS Secrets, docker-registry Secrets,
+# operator-managed credentials); the rclone process reads every key as an
+# env var and could exfiltrate it via ``rclone config``. The DNS-1035-style
+# pattern enforces the convention; the CEL rule gives a readable apply-time
+# message for the same constraint.
+# ---------------------------------------------------------------------------
+
+
+_SECRET_REF_BAD_NAMES = (
+    # Real Secret names in the openstudio-server namespace (#150):
+    "openstudio-redis",        # KEDA TriggerAuthentication password (#116/#150)
+    "openstudio-rotated",      # current default Redis Secret literal
+    "openstudio-redis-creds",  # plausible alternative spelling
+    # Other Secrets a CR-write user could pivot at:
+    "tls-cert",                # any TLS Secret
+    "docker-pull-secret",      # imagePullSecrets
+    "kube-system/coredns",     # namespaced path (slash)
+    "WEB",                     # uppercase — K8s names are lowercase
+)
+_SECRET_REF_GOOD_NAME = "os-archive-creds"  # used by test_archival.py + golden fixtures
+
+
+def test_crd_spec_validations():
+    """Issue #240 acceptance: ``spec.storagePolicy.secretRef`` carries both a
+    ``pattern`` constraint matching the documented ``os-archive-<suffix>``
+    naming convention AND an ``x-kubernetes-validations`` rule that surfaces
+    the same constraint with a readable apply-time message.
+
+    Pre-#240 the field was plain ``type: string`` with no constraint, so a
+    CR-write user could set it to ``openstudio-redis`` and have rclone mount
+    the KEDA TriggerAuthentication password as env vars — the rclone
+    process reads every key as an env var and could exfiltrate the value via
+    ``rclone config`` (which reads ``RCLONE_CONFIG_*`` env vars)."""
+    schema = _field("storagePolicy", "secretRef")
+
+    # Pattern must be present and equal the documented convention.
+    pattern = schema.get("pattern")
+    assert pattern == r"^os-archive-[a-z0-9-]+$", (
+        f"spec.storagePolicy.secretRef must declare the os-archive- pattern "
+        f"(issue #240); got {pattern!r}"
+    )
+
+    # The legitimate value used by every test fixture and runbook must pass.
+    assert _matches_pattern(_SECRET_REF_GOOD_NAME, schema), (
+        f"spec.storagePolicy.secretRef: {_SECRET_REF_GOOD_NAME!r} is the "
+        f"documented valid value and must be accepted by the pattern"
+    )
+
+    # Every real-world Secret name from the issue body must be rejected —
+    # these are the names the pre-#240 unconstrained field could reach.
+    for bad in _SECRET_REF_BAD_NAMES:
+        assert not _matches_pattern(bad, schema), (
+            f"spec.storagePolicy.secretRef: {bad!r} must be rejected by the "
+            f"pattern (issue #240)"
+        )
+
+    # CEL x-kubernetes-validations rule must be present, assert the
+    # os-archive- prefix, and surface 'issue #240' in its apply-time message.
+    rules = _cel_rules(schema)
+    assert any(
+        r["rule"] == "self.startsWith('os-archive-')"
+        for r in rules
+    ), (
+        f"spec.storagePolicy.secretRef: no CEL rule asserting the "
+        f"os-archive- prefix; got {rules!r}"
+    )
+    assert any("issue #240" in r["message"].lower() for r in rules), (
+        f"spec.storagePolicy.secretRef: CEL rule message must reference "
+        f"'issue #240'; got {rules!r}"
+    )
