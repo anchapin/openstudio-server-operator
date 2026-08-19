@@ -51,8 +51,14 @@ is owned by KEDA's own ServiceAccount. Same RBAC-shrink pattern as #78
 ```
 .
 ├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (GHCR + releases)
-├── deploy/                     # CRD, RBAC (namespaced Role only), operator Deployment
-├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md
+├── deploy/                     # CRD, RBAC (namespaced Role only), operator Deployment, KEDA, CronJob
+│   ├── crd.yaml                # OpenStudioClusterManager CRD
+│   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
+│   ├── operator-deployment.yaml
+│   ├── keda-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication (#77)
+│   ├── redis-credentials-secret.yaml  # Redis password for KEDA (#77)
+│   └── storage-cronjob.yaml    # prune CronJob (#78)
+├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
 │   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
@@ -60,22 +66,17 @@ is owned by KEDA's own ServiceAccount. Same RBAC-shrink pattern as #78
 │   ├── status_store.py         # CR .status RMW helper (D04 durable store, 409-safe)
 │   ├── redis_client.py         # read-only Redis client (queue depths + Resque liveness)
 │   ├── archival.py             # rclone archival Job manifest generator (backend-agnostic)
+│   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
+│   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
 │   ├── metrics.py              # Prometheus counters + /metrics endpoint
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py
 │       ├── worker_recycler.py
-│       ├── web_background_monitor.py
+│       └── web_background_monitor.py
 │       # (storage_pruner moved to the prune CronJob in #78;
 │       #  hpa_floor removed in #77 — autoscaling is a KEDA ScaledObject.)
-├── deploy/
-│   ├── keda-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication (#77)
-│   ├── redis-credentials-secret.yaml  # Redis password for KEDA (#77)
-│   ├── crd.yaml                # OpenStudioClusterManager CRD
-│   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
-│   ├── operator-deployment.yaml
-│   └── storage-cronjob.yaml    # prune CronJob (#78)
 ├── tests/                      # unit tests for every handler + client + status store + fixtures
 │   ├── fixtures/               # contract-shapes.json + samples/ (synthetic) + live/ (captured)
 │   └── golden/                 # snapshot tests for generated rclone Job manifests
