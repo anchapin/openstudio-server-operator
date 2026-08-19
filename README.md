@@ -60,10 +60,12 @@ restart. The scrape target is the operator Pod on port 9090 (matches the
 `containerPort` in `deploy/operator-deployment.yaml`).
 
 **Source of truth:** the family names below mirror
-`tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES` and
-`EXPECTED_GAUGE_FAMILIES` exactly — the test asserts `declared == expected`
-on every CI run, so adding a counter here without adding it there (or vice
-versa) fails CI loudly. **Current shape: 12 counters + 1 gauge (post-#171 status-map defensive cap).**
+`tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES`,
+`EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES` exactly —
+the test asserts `declared == expected` on every CI run, so adding a counter,
+gauge, or histogram here without adding it there (or vice versa) fails CI
+loudly. **Current shape: 12 counters + 1 gauge + 1 histogram (post-#171
+status-map defensive cap; post-#179 datapoint-budget distribution).**
 
 | Family | Type | Module / issue origin | Meaning for an on-call |
 |---|---|---|---|
@@ -79,6 +81,7 @@ versa) fails CI loudly. **Current shape: 12 counters + 1 gauge (post-#171 status
 | `openstudio_operator_status_conflict_retries_exhausted_total` | counter | `status_store` (RMW helper) · #119 | RMW cycles that exhausted the 409 retry budget and raised `StatusStoreConflictError` — the tick that hit this counter was skipped (WARNING log line, no `.status` write). Alert: a CR status write was lost. |
 | `openstudio_operator_handler_tick_failures_total{module,error_type}` | counter (labelled) | all four timer wrappers (`analysis_sla` / `datapoint_watchdog` / `worker_recycler` / `web_background_monitor`) · #117 | Per-tick failures caught by the timer wrappers. Increment-by-1 per tick suppressed. Labelled by `module` and `error_type` (`OpenStudioApiError` \| `StatusStoreError` \| `ApiException` \| `RedisClientError`). Sustained nonzero per `(module, error_type)` tells you which downstream — REST, Redis, k8s API — is degraded. |
 | `openstudio_operator_status_map_caps_total{map_name}` | counter (labelled) | `status_store` (`_set_map_entry` cap path) · #171 | Evictions triggered by the per-map defensive cap (drop-oldest when a map reaches `STATUS_MAP_MAX_ENTRIES = 10_000`). Labelled by `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`}. Sustained nonzero means something is filling the maps faster than they drain (e.g. an admin batch-`create` of 10k+ draft analyses) — investigate the upstream cause, don't raise the cap. |
+| `openstudio_operator_analysis_datapoint_count` | histogram | `analysis_sla` (Module 1) + `datapoint_watchdog` (Module 2) · #179 | Datapoints-per-analysis distribution observed by the SLA tick (`/analyses/{id}` page count, governs soft-stop timing) and the watchdog tick (`/data_points.json?analysis_id=...` started-datapoint count, governs zombie requeue timing). Buckets `[5, 10, 50, 100, 500, 1000, 5000]` — bounded cardinality while still surfacing the "we just started getting 5000-point analyses" shift. **No labels:** per-observation by design (one `.observe()` per observed count, not per-CR) — relabelling per analysis would multiply series cardinality by the analysis count and defeat the bounded-cardinality design, so the `an` and `dp` source-module identity is intentionally collapsed. Lets an on-call correlate "why are SLA stops spiking?" with a shift in analysis-size distribution. |
 | `openstudio_operator_resque_workers_seen_max` | gauge | `web_background_monitor` (Module 4) · #44 / #87 | Monotonic max of distinct Resque worker ids ever observed in process lifetime (SMEMBERS `resque:workers` cardinality, read on **every** sensing tick since #87 regardless of queue depth). **`== 0` with reachable Redis means no workers are registered** — the leg-2 non-vacuity safeguard is then vacuously true and the operator will periodic-restart `web_background` while everything looks healthy. Alert on `== 0`. |
 
 The one labelled counter (`handler_tick_failures_total`) emits one series per
