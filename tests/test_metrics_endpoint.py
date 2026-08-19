@@ -21,6 +21,9 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_web_background_restarts_total",
     "openstudio_operator_analyses_archived_total",
     "openstudio_operator_analyses_deleted_total",
+    # Issue #119 — status-store 409 retry observability surface.
+    "openstudio_operator_status_conflicts_total",
+    "openstudio_operator_status_conflict_retries_exhausted_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87

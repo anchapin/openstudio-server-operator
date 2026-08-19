@@ -331,6 +331,83 @@ def test_non_409_api_error_propagates_without_retry(store, api, sleeps, monkeypa
     assert sleeps == []
 
 
+# --- Issue #119 — status-store 409 retry observability surface --------------------
+#
+# `openstudio_operator_status_conflicts_total` increments at every observed 409,
+# BEFORE the backoff sleep, so a sustained conflict burst reads as N+1 from a
+# single tick. `openstudio_operator_status_conflict_retries_exhausted_total`
+# increments exactly once per StatusStoreConflictError raised. Both must stay
+# in sync with the existing retry semantics — these tests pin the contract so
+# a refactor doesn't silently lose visibility on contention storms.
+
+
+def _counter_value(counter):
+    """Read a prometheus_client.Counter's current sample value.
+
+    prometheus_client 0.26.x exposes ``Counter._value`` as a ``MutexValue``
+    whose ``.get()`` returns the current float directly (no iterable wrapper).
+    Earlier versions returned a list of values; this helper picks whatever
+    the installed client gives us.
+    """
+    raw = counter._value.get()
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        samples = list(raw)
+    except TypeError:
+        return float(raw)
+    return float(samples[0].value) if samples else 0.0
+
+
+def test_status_store_conflict_counter_increments_per_attempt(api, sleeps):
+    """5 consecutive 409s (retried, then exhausted) → 5 per-attempt counters
+    and 1 exhausted counter, exactly."""
+    from openstudio_operator import metrics as metrics_module
+
+    before_conflicts = _counter_value(metrics_module.STATUS_CONFLICTS_TOTAL)
+    before_exhausted = _counter_value(metrics_module.STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL)
+
+    api.remaining_conflicts = status_store.MAX_CONFLICT_RETRIES
+    store = StatusStore(NAMESPACE, NAME, api)
+
+    with pytest.raises(StatusStoreConflictError, match="409"):
+        store.set_last_recycle_at(datetime(2026, 8, 18, 8, 0, 0, tzinfo=UTC))
+
+    assert api.patch_calls == status_store.MAX_CONFLICT_RETRIES
+
+    after_conflicts = _counter_value(metrics_module.STATUS_CONFLICTS_TOTAL)
+    after_exhausted = _counter_value(metrics_module.STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL)
+    # +1 per observed 409, +1 on exhaustion — matches the retry loop exactly.
+    assert after_conflicts - before_conflicts == status_store.MAX_CONFLICT_RETRIES
+    assert after_exhausted - before_exhausted == 1
+
+
+def test_status_store_conflict_counter_does_not_increment_on_non_409(store, api, sleeps, monkeypatch):
+    """A non-409 ApiException (e.g., 404) propagates without retry and must NOT
+    touch the conflict counters — otherwise a 404 storm would look like 409
+    contention to a dashboard alerting on `rate(_conflicts_total[5m])`."""
+    from openstudio_operator import metrics as metrics_module
+
+    before_conflicts = _counter_value(metrics_module.STATUS_CONFLICTS_TOTAL)
+    before_exhausted = _counter_value(metrics_module.STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL)
+
+    def boom(*args, **kwargs):
+        api.patch_calls += 1
+        raise ApiException(status=404, reason="Not Found")
+
+    monkeypatch.setattr(api, "patch_namespaced_custom_object_status", boom)
+
+    with pytest.raises(ApiException):
+        store.set_last_recycle_at(datetime(2026, 8, 18, 8, 0, 0, tzinfo=UTC))
+
+    assert (
+        _counter_value(metrics_module.STATUS_CONFLICTS_TOTAL) - before_conflicts
+    ) == 0
+    assert (
+        _counter_value(metrics_module.STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL) - before_exhausted
+    ) == 0
+
+
 # --- Pruning ---------------------------------------------------------------------
 
 
