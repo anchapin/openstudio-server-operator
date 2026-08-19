@@ -1430,7 +1430,7 @@ hpa_floor lines: (empty — #77 removal complete)
 `openstudio_operator_hpa_floor_adjustments_total` is no longer
 served by the operator — proving the #77 removal was complete (no
 orphan counter declaration, no orphan incrementer). All other
-counters in `EXPECTED_COUNTER_FAMILIES` are still served (8 counters,
+counters in `EXPECTED_COUNTER_FAMILIES` are still served (11 counters + 1 gauge,
 no orphans of any other kind):
 
 ```bash
@@ -1486,11 +1486,11 @@ HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
       `/metrics` confirms the counter is GONE at runtime (Section 6).
 - [x] **Unit and Kind validation tests pass without HPA floor
       reconciliation dependencies** — VERIFIED: `ruff check .` clean,
-      `pytest` 331 passed (post-#77 baseline; 373 - 42 deleted
-      hpa_floor tests = 331, no new regressions); the operator boots
+      `pytest` 343 passed across 17 files (current count per
+      `pytest --collect-only`); the operator boots
       end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
       drives scaling, and the operator's `/metrics` exposes the
-      remaining 8 counters (Section 6).
+      11 counters + 1 gauge (Section 6).
 
 ### Cleanup
 
