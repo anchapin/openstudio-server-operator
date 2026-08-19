@@ -21,6 +21,8 @@ A Kubernetes operator for [OpenStudio Server](https://github.com/NREL/OpenStudio
 - `develop` — default branch; commit directly there.
 - `main` — release branch, protected by ruleset `protect-main`: direct pushes, force pushes, and deletions are rejected for everyone (no bypass, including the owner); it only changes via a PR **from `develop`**. The required `guard-branch-pairing` CI check fails any PR into `main` whose source branch is not `develop`.
 - Never attempt to push `main` directly — it is rejected by design (verified).
+- **Develop CI gating (decided 2026-08-18, "Option C"):** ruleset `require-ci-on-develop-prs` requires the `lint` + `test` status checks on PR merges into `develop` (`guard-branch-pairing` stays required on `main` only, via `protect-main`). The owner (`anchapin`) is a bypass actor, so direct pushes to `develop` remain allowed — intentional; "commit directly there" above stays true for the owner.
+- **Outage bypass procedure:** when GitHub Actions is unavailable (outage/runner starvation), the owner may merge/push via admin bypass, with mitigations: every change locally verified on the branch (ruff + pytest green; `docker build` when Release/Docker files are touched) and a retroactive CI run on `develop` HEAD once runners recover.
 
 ## Commands
 
