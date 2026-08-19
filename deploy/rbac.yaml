@@ -12,10 +12,20 @@ metadata:
   name: openstudio-operator-role
   namespace: openstudio-server
 rules:
-  # Manage Custom Resources
+  # Manage Custom Resources — #228 enumerated verbs (drop wildcard).
+  # The CR itself is read-only from the operator: the singleton guard polls
+  # list_namespaced_custom_object, so get+list+watch is sufficient. The
+  # status subresource additionally needs patch+update for the StatusStore
+  # read-modify-write helper (get_namespaced_custom_object_status +
+  # patch_namespaced_custom_object_status). No delete/deletecollection/
+  # create/bind — a compromised operator pod cannot wholesale-delete the
+  # OSCM CR and bypass the singleton guard.
   - apiGroups: ["energy.nrel.gov"]
-    resources: ["openstudioclustermanagers", "openstudioclustermanagers/status"]
-    verbs: ["*"]
+    resources: ["openstudioclustermanagers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["energy.nrel.gov"]
+    resources: ["openstudioclustermanagers/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   # Manage Worker Deployments & Pod Restarts
   - apiGroups: ["apps"]
     resources: ["deployments"]

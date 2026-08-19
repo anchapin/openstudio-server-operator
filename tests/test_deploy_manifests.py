@@ -68,6 +68,54 @@ def test_operator_role_still_namespaced_enumerated_style():
     assert kinds == {"ServiceAccount", "Role", "RoleBinding"}
 
 
+def test_operator_role_no_wildcard_verbs_on_oscm():
+    """Issue #228 acceptance: `verbs: ["*"]` MUST NOT appear anywhere in
+    the operator Role — the wildcard includes delete/deletecollection/
+    create/bind, none of which the operator process ever invokes, and a
+    compromised operator pod could otherwise delete the OSCM CR
+    wholesale and bypass the singleton guard's passive policing.
+
+    AGENTS.md Working rule: 'Least-privilege RBAC — namespaced Role
+    only, never a ClusterRole. Verbs are enumerated; keep it that way.'
+    This is the regression fence that makes the rule self-enforcing."""
+    for rule in OPERATOR_ROLE["rules"]:
+        assert "*" not in rule["verbs"], (
+            f"rule grants wildcard verbs {rule['verbs']!r} on "
+            f"{rule['resources']!r}; enumerate the verbs instead "
+            "(issue #228)"
+        )
+
+
+def test_operator_role_oscm_verbs_are_enumerated_subset():
+    """Issue #228 acceptance #2: the OSCM CR + status-subresource rules
+    enumerate a least-privilege subset of {get, list, watch, patch,
+    update}. The CR itself is read-only from the operator (singleton
+    guard polls list_namespaced_custom_object) — get+list+watch is
+    sufficient. The status subresource additionally needs patch+update
+    for the StatusStore read-modify-write helper
+    (get_namespaced_custom_object_status +
+    patch_namespaced_custom_object_status)."""
+    allowed_for_cr = {"get", "list", "watch"}
+    allowed_for_status = {"get", "list", "watch", "patch", "update"}
+    offenders = []
+    for rule in OPERATOR_ROLE["rules"]:
+        if "energy.nrel.gov" not in rule["apiGroups"]:
+            continue
+        for resource in rule["resources"]:
+            verbs = set(rule["verbs"])
+            allowed = (
+                allowed_for_status if resource.endswith("/status")
+                else allowed_for_cr
+            )
+            excess = verbs - allowed
+            if excess:
+                offenders.append((resource, sorted(excess), sorted(verbs)))
+    assert not offenders, (
+        "OSCM rules grant verbs outside the least-privilege subset "
+        f"(issue #228): {offenders}"
+    )
+
+
 def test_prune_role_is_least_privilege_enumerated():
     """The new Role: exactly one tick's needs, no wildcards, no workload access."""
     assert PRUNE_ROLE["metadata"]["namespace"] == "openstudio-server"
