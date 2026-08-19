@@ -163,12 +163,6 @@ class SlaTickResult:
     escalated: list[str]
 
 
-class DeploymentReader(Protocol):
-    """Structural type of ``AppsV1Api`` as used here — tests fake exactly this."""
-
-    def read_namespaced_deployment(self, name: str, namespace: str, **_: object) -> object: ...
-
-
 class WorkerPodApi(Protocol):
     """Structural type of ``CoreV1Api`` as used here — tests fake exactly this."""
 
@@ -414,83 +408,6 @@ def _grace_and_escalate(
         )
         escalated.append(analysis_id)
     return soft_stopped, escalated
-
-
-def deployment_label_selector(
-    apps_api: DeploymentReader, deployment: str, namespace: str
-) -> str | None:
-    """Build a Kubernetes label-selector string from a Deployment's own ``spec.selector``.
-
-    Honors BOTH ``spec.selector.matchLabels`` AND ``spec.selector.matchExpressions``
-    — issue #44 gap fix. A ``matchExpressions``-only selector previously
-    silently fell back to an empty selector (the helper read ``match_labels``
-    only), which the label-selector API treats as "list every pod in the
-    namespace" — under the web_background_monitor's "worker fleet looks
-    fine" check (#13 leg C) that would falsely TRIP the deployment-wide
-    pod set, and under the SLA escalation (#9) it would broaden the IP
-    matching to non-worker pods.
-
-    Intersection semantics: when both ``matchLabels`` and
-    ``matchExpressions`` are set on the Deployment, the Kubernetes label
-    selector grammar requires the intersection (AND), which is what the
-    comma-separated ``label_selector=`` argument implements — every term
-    must match.
-
-    Supported ``matchExpressions`` operators: ``In``, ``NotIn``, ``Exists``,
-    ``DoesNotExist``. Anything exotic (e.g. ``Gt``, ``Lt`` — non-string
-    operators the label selector grammar does not cover) logs a WARNING
-    and falls back to ``matchLabels`` only — the Deployment is then
-    discovered with a deliberately narrower selector, which is the
-    conservative direction (the worst case is a missed-eviction, not a
-    false-eviction). Returns ``None`` only when neither is set.
-
-    The web_background_monitor imports this helper from analysis_sla (both
-    files already share the ``DeploymentReader`` Protocol via the existing
-    ``EventEmitter`` import — no new cross-module cycle introduced).
-    """
-    dep = apps_api.read_namespaced_deployment(deployment, namespace)
-    selector = getattr(getattr(dep, "spec", None), "selector", None)
-    match_labels = getattr(selector, "match_labels", None) or {}
-    match_expressions = list(getattr(selector, "match_expressions", None) or [])
-
-    terms: list[str] = [f"{key}={value}" for key, value in sorted(match_labels.items())]
-
-    for expr in match_expressions:
-        key = getattr(expr, "key", None)
-        operator = getattr(expr, "operator", None)
-        values = list(getattr(expr, "values", None) or [])
-        if not key or not operator:
-            continue
-        op = str(operator)
-        if op == "In":
-            terms.append(f"{key} in ({','.join(values)})")
-        elif op == "NotIn":
-            terms.append(f"{key} notin ({','.join(values)})")
-        elif op == "Exists":
-            terms.append(key)
-        elif op == "DoesNotExist":
-            terms.append(f"!{key}")
-        else:
-            # Unsupported in the label-selector grammar (e.g. Gt/Lt on numeric
-            # values). Conservative direction: fall back to matchLabels only
-            # and warn — a narrower selector cannot false-evict.
-            logger.warning(
-                "worker Deployment %s/%s declares matchExpressions operator %r "
-                "on key %r; the Kubernetes label-selector grammar does not "
-                "support this operator — falling back to matchLabels=%r "
-                "(#44: narrower selector = conservative direction)",
-                namespace,
-                deployment,
-                op,
-                key,
-                match_labels,
-            )
-            terms = [f"{key}={value}" for key, value in sorted(match_labels.items())]
-            break
-
-    if not terms:
-        return None
-    return ",".join(terms)
 
 
 def _resque_matched_worker_pods(

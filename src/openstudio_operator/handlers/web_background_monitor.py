@@ -94,9 +94,6 @@ from openstudio_operator.config import (
     OperatorConfig,
 )
 from openstudio_operator.events import EventEmitter
-from openstudio_operator.handlers.analysis_sla import (
-    deployment_label_selector,
-)
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_WORKERS_SEEN_MAX,
@@ -124,6 +121,7 @@ from openstudio_operator._constants import (
     LAYOUT_WARNING_GRACE_SECONDS,
     WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
 )
+from openstudio_operator._k8s import deployment_label_selector
 
 POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 
