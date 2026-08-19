@@ -94,6 +94,19 @@ spec:
         spec:
           serviceAccountName: openstudio-storage-pruner-sa
           restartPolicy: Never
+          # Issue #162 — pod-level defense-in-depth baseline (matches the
+          # operator Deployment at deploy/operator-deployment.yaml:48-56 and
+          # the rclone Job emitted by archival.py:225-232). runAsNonRoot +
+          # runAsUser block a compromised entrypoint from running as root;
+          # seccompProfile.runtime-default is the seccomp filter the operator
+          # and rclone Job already enforce. fsGroup 1000 makes the emptyDir
+          # /tmp mount writable by the non-root UID the container runs as.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+            fsGroup: 1000
           containers:
             - name: prune
               image: ghcr.io/anchapin/openstudio-server-operator:dev
@@ -111,11 +124,19 @@ spec:
                 limits:
                   cpu: 250m
                   memory: 256Mi
+              # Issue #162 — prune container hardening baseline. Mirrors the
+              # operator's #115 baseline so a pod compromised via the prune
+              # entrypoint cannot escalate, mount writable /, or escape the
+              # default seccomp filter. PSS `restricted` accepts this shape.
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
                 capabilities:
                   drop: ["ALL"]
+                runAsNonRoot: true
+                runAsUser: 1000
+                seccompProfile:
+                  type: RuntimeDefault
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp

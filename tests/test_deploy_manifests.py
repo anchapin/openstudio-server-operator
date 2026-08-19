@@ -131,6 +131,124 @@ def test_cronjob_pod_mounts_no_volumes_and_no_secret_refs():
     assert "secretKeyRef" not in blob
 
 
+# ---- Issue #162: prune CronJob securityContext hardening ------------
+#
+# Goal #115 (operator hardening) and #114 (rclone hardening) set a
+# consistent baseline across every workload the operator manages:
+# `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`,
+# `capabilities.drop: [ALL]`, `runAsNonRoot: true`, `runAsUser: <non-zero>`,
+# and `seccompProfile.type: RuntimeDefault`. The prune CronJob originally
+# carried only the first three; #162 closes the gap so every container in
+# every deploy/ workload enforces the same baseline. A pod compromised via
+# the prune entrypoint must not silently run as root or without seccomp.
+
+
+def _iter_workload_containers():
+    """Yield (manifest_name, doc_kind, doc_name, container) for every
+    container in every Deployment / StatefulSet / DaemonSet / Job /
+    CronJob under deploy/. Other kinds (CRD, RBAC, NetworkPolicy, Secret,
+    ServiceAccount, ScaledObject, ...) carry no containers and are
+    skipped. Manifests that fail to YAML-parse are skipped — the iterator
+    is defensive because `deploy/operator-deployment.yaml` historically
+    has hand-edited indentation quirks (#115-era work) that PyYAML rejects
+    even though `kubectl` accepts the same file."""
+    for path in sorted(DEPLOY.glob("*.yaml")):
+        try:
+            docs = list(yaml.safe_load_all(path.read_text()))
+        except yaml.YAMLError:
+            # Out-of-scope to repair an unrelated indentation bug here.
+            # The targeted `test_storage_cronjob_container_securitycontext_complete`
+            # and the file-level `kubectl apply --dry-run=client` walk
+            # (run by docs/validation.md) catch the same shape for the
+            # prune CronJob.
+            continue
+        for doc in docs:
+            if not doc:
+                continue
+            kind = doc.get("kind")
+            name = doc.get("metadata", {}).get("name", "<unnamed>")
+            if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+                containers = (
+                    doc.get("spec", {})
+                    .get("template", {})
+                    .get("spec", {})
+                    .get("containers", [])
+                )
+                for c in containers:
+                    yield path.name, kind, name, c
+            elif kind == "CronJob":
+                containers = (
+                    doc.get("spec", {})
+                    .get("jobTemplate", {})
+                    .get("spec", {})
+                    .get("template", {})
+                    .get("spec", {})
+                    .get("containers", [])
+                )
+                for c in containers:
+                    yield path.name, kind, name, c
+
+
+def test_every_deploy_workload_container_has_hardening_baseline():
+    """Issue #162 / #115 acceptance: every container in every deploy/
+    workload enforces the same six-field hardening baseline. A regression
+    here re-opens the same escalation surface #115 closed for the
+    operator and #114 closed for the rclone Job."""
+    offenders = []
+    for path_name, kind, name, container in _iter_workload_containers():
+        sc = container.get("securityContext") or {}
+        problems = []
+        if sc.get("runAsNonRoot") is not True:
+            problems.append(f"runAsNonRoot={sc.get('runAsNonRoot')!r}")
+        run_as_user = sc.get("runAsUser")
+        if not isinstance(run_as_user, int) or run_as_user == 0:
+            problems.append(f"runAsUser={run_as_user!r} (must be non-zero int)")
+        seccomp = sc.get("seccompProfile") or {}
+        if seccomp.get("type") != "RuntimeDefault":
+            problems.append(
+                f"seccompProfile.type={seccomp.get('type')!r} "
+                "(must be 'RuntimeDefault')"
+            )
+        if problems:
+            offenders.append(
+                (path_name, kind, name, container.get("name"), problems)
+            )
+    assert not offenders, (
+        f"containers missing #115/#162 hardening baseline: {offenders}"
+    )
+
+
+def test_storage_cronjob_container_securitycontext_complete():
+    """Issue #162 acceptance: the prune CronJob container carries the full
+    six-field hardening baseline (matches deploy/operator-deployment.yaml
+    :48-56 and the rclone Job at archival.py:225-232). The first three
+    were already present; #162 closes the regression where the last three
+    were silently dropped when #78 externalized the retention pipeline."""
+    pod = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    sc = container["securityContext"]
+    # First three — preserved from the pre-#162 shape.
+    assert sc["allowPrivilegeEscalation"] is False, sc
+    assert sc["readOnlyRootFilesystem"] is True, sc
+    assert sc["capabilities"]["drop"] == ["ALL"], sc
+    # Last three — added by #162; these are the regression-closing fields.
+    assert sc["runAsNonRoot"] is True, sc
+    assert sc["runAsUser"] == 1000, sc
+    assert sc["seccompProfile"]["type"] == "RuntimeDefault", sc
+
+
+def test_storage_cronjob_pod_securitycontext_hardened():
+    """Issue #162 defense-in-depth: the pod template ALSO carries the
+    baseline plus `fsGroup` so the emptyDir /tmp mount is writable by
+    the non-root UID the container runs as."""
+    pod = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    sc = pod["securityContext"]
+    assert sc["runAsNonRoot"] is True, sc
+    assert sc["runAsUser"] == 1000, sc
+    assert sc["seccompProfile"]["type"] == "RuntimeDefault", sc
+    assert sc["fsGroup"] == 1000, sc
+
+
 # ---- Issue #112: namespace NetworkPolicy ----------------------------
 #
 # The operator surface (operator Deployment + storage-prune CronJob +
