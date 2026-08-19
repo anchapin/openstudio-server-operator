@@ -21,9 +21,10 @@ retention, intervals) live in the CRD spec / ``config.py`` per AGENTS.md:
     * ``_BACKOFF_BASE_SECONDS`` — jittered exponential backoff between retries.
 
 Timestamps are tz-aware UTC ``datetime`` in Python and ISO-8601 strings only
-at the API boundary. This mirrors the ``_parse_timestamp`` convention of
-``openstudio_client``; that symbol is private there, so a small documented
-helper is duplicated here — keep the two in sync.
+at the API boundary. The parsing itself lives in
+:mod:`openstudio_operator._time` (``parse_iso_utc`` — issue #174, D12); this
+module's :func:`_parse_utc` is a thin wrapper that re-raises ``ValueError`` as
+:class:`StatusStoreError` with a per-call-site ``context`` prefix.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from typing import Any
 
 from kubernetes.client import ApiException, CustomObjectsApi
 
+from ._time import parse_iso_utc
 from .metrics import STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL, STATUS_CONFLICTS_TOTAL
 
 GROUP = "energy.nrel.gov"
@@ -83,18 +85,20 @@ def _to_utc(value: datetime) -> datetime:
 def _parse_utc(value: Any, context: str) -> datetime:
     """Parse an ISO-8601 timestamp at the API boundary; always tz-aware UTC.
 
-    Accepts ``Z`` suffixes, zone offsets and fractional seconds; naive input
-    is assumed UTC. Mirrors the (private) ``_parse_timestamp`` convention of
-    ``openstudio_client`` — keep both in sync.
+    Thin wrapper over :func:`openstudio_operator._time.parse_iso_utc` (D12
+    boundary, issue #174) that re-raises ``ValueError`` as
+    :class:`StatusStoreError` with the caller's ``context`` prefix so the
+    domain-specific exception type stays in this module's public contract.
+    ``None`` is not a valid input here — the call sites guard for it — so we
+    reject it explicitly with the same shape the legacy ``expected
+    ISO-8601 string`` error used.
     """
-    if not isinstance(value, str):
-        raise StatusStoreError(f"{context}: expected ISO-8601 string, got {type(value).__name__}")
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    if value is None:
+        raise StatusStoreError(f"{context}: expected ISO-8601 string, got NoneType")
     try:
-        parsed = datetime.fromisoformat(normalized)
+        return parse_iso_utc(value)
     except ValueError as exc:
-        raise StatusStoreError(f"{context}: unparseable timestamp {value!r}") from exc
-    return _to_utc(parsed)
+        raise StatusStoreError(f"{context}: {exc}") from exc
 
 
 def _required(raw: Mapping[str, Any], key: str, context: str) -> Any:
