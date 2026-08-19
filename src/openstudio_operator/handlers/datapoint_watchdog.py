@@ -68,6 +68,7 @@ from kubernetes.client import CustomObjectsApi
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import (
+    ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
     DATAPOINTS_REQUEUED_TOTAL,
     HANDLER_TICK_FAILURES_TOTAL,
@@ -150,6 +151,11 @@ def run_watchdog_tick(
     max_runtime = timedelta(minutes=config.datapoint_policy.max_datapoint_runtime_minutes)
     max_requeues = config.datapoint_policy.max_auto_requeues
     started_ids = _datapoint_ids(client.list_started_datapoints())
+    # Issue #179 — observe the per-CR datapoint budget observed by the
+    # watchdog's initial poll. Recorded once per tick (per-observation), no
+    # labels — the SLA monitor records the same family for the analyses
+    # view, sharing one chart on the operator's dashboard.
+    ANALYSIS_DATAPOINT_COUNT.observe(len(started_ids))
     live = set(started_ids)
     started_since = store.get_started_since_map()
 

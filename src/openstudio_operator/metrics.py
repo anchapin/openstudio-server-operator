@@ -18,7 +18,7 @@ import logging
 import threading
 
 import prometheus_client
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, Histogram
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,26 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
     "the WARNING log line in the wrapper records the same event for log "
     "forwarding.",
     labelnames=["module", "error_type"],
+)
+
+# Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
+# datapoint watchdog each iterate a count off the OpenStudio REST analysis
+# payload (or the equivalent summary endpoint) — the number of analyses per
+# tick for the SLA, the number of started datapoints per tick for the
+# watchdog — to decide whether to soft-stop, requeue, or escalate. The value
+# is a Counter-shaped integer that was never recorded, so an on-call SRE
+# investigating "why are SLA stops spiking?" had no way to correlate the
+# spike with a shift in analysis-size distribution. The Histogram is
+# bucket-capped at `[5, 10, 50, 100, 500, 1000, 5000]` so the
+# per-(analysis | datapoint) cardinality is bounded while still surfacing
+# the "we just started getting 5000-point analyses" shift (Goal 10, OSS
+# hardening). No labels: per-observation (one .observe() per observed count),
+# not per-CR — relabelling per analysis would multiply the series count by
+# the analysis count and defeat the bounded-cardinality design.
+ANALYSIS_DATAPOINT_COUNT = Histogram(
+    "openstudio_operator_analysis_datapoint_count",
+    "Datapoints per analysis observed by SLA / watchdog modules",
+    buckets=[5, 10, 50, 100, 500, 1000, 5000],
 )
 
 DEFAULT_METRICS_PORT = 9090

@@ -7,7 +7,7 @@ import textwrap
 from contextlib import closing
 
 import requests
-from prometheus_client import Counter, Gauge, generate_latest
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
 from openstudio_operator import metrics
 from openstudio_operator.metrics import start_metrics_server
@@ -36,6 +36,15 @@ EXPECTED_COUNTER_FAMILIES = (
 #: alert combined it with `AND queue depth > 0`).
 EXPECTED_GAUGE_FAMILIES = ("openstudio_operator_resque_workers_seen_max",)
 
+#: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
+#: datapoint watchdog each observe the count off the OpenStudio REST
+#: analysis payload (or the equivalent summary endpoint) once per tick:
+#: the SLA records ``len(analyses)`` from ``/analyses.json``; the watchdog
+#: records ``len(started_ids)`` from ``/data_points/status?status=1&jobs=
+#: started``. No labels — one observation per tick, bounded-cardinality
+#: at the histogram level rather than per analysis.
+EXPECTED_HISTOGRAM_FAMILIES = ("openstudio_operator_analysis_datapoint_count",)
+
 
 def _declared_counter_families():
     """Exposition family name for every Counter declared in metrics.py."""
@@ -49,12 +58,21 @@ def _declared_gauge_families():
     return [value._name for value in vars(metrics).values() if isinstance(value, Gauge)]
 
 
+def _declared_histogram_families():
+    """Exposition family name for every Histogram declared in metrics.py (issue #179)."""
+    return [value._name for value in vars(metrics).values() if isinstance(value, Histogram)]
+
+
 def test_declared_counters_match_expected_set():
     assert sorted(_declared_counter_families()) == sorted(EXPECTED_COUNTER_FAMILIES)
 
 
 def test_declared_gauges_match_expected_set():
     assert sorted(_declared_gauge_families()) == sorted(EXPECTED_GAUGE_FAMILIES)
+
+
+def test_declared_histograms_match_expected_set():
+    assert sorted(_declared_histogram_families()) == sorted(EXPECTED_HISTOGRAM_FAMILIES)
 
 
 def test_every_declared_counter_family_in_registry_exposition():
@@ -67,6 +85,17 @@ def test_every_declared_gauge_family_in_registry_exposition():
     exposition = generate_latest().decode()
     for name in _declared_gauge_families():
         assert f"# TYPE {name} gauge" in exposition
+
+
+def test_every_declared_histogram_family_in_registry_exposition():
+    # Issue #179 — Histogram, like a labelled Counter, only exposes its
+    # `# TYPE` family line after the first observation. The pre-touch
+    # below keeps the family-existence assertion self-contained
+    # (mirrors the labelled-counter pattern from #117).
+    metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    exposition = generate_latest().decode()
+    for name in _declared_histogram_families():
+        assert f"# TYPE {name} histogram" in exposition
 
 
 def _free_port():
@@ -109,6 +138,15 @@ def test_metrics_http_server_serves_all_declared_counters():
     for name in _declared_gauge_families():
         assert f"# TYPE {name} gauge" in response.text
         assert f"\n{name} " in response.text
+    # Issue #179: histogram exposed alongside counters and the gauge. The
+    # pre-touch above creates the sentinel SERIES for the labelled counter;
+    # the histogram is unlabelled, but it ALSO only emits its `# TYPE` line
+    # after the first observation. Pre-touch it here so the family-existence
+    # assertion is self-contained (mirrors the labelled-counter pattern).
+    metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
+    for name in _declared_histogram_families():
+        assert f"# TYPE {name} histogram" in response.text
 
     # idempotent: a second call must not start another server — it returns
     # the already-active port instead
