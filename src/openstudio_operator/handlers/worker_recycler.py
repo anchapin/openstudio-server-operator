@@ -55,6 +55,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException, AppsV1Api, CustomObjectsApi
 
+from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.handlers.analysis_sla import EventEmitter
 from openstudio_operator.metrics import (
@@ -95,24 +96,12 @@ TRIGGER_INTERVAL_ELAPSED = "interval-elapsed"
 
 _COMPLETED = "completed"
 
-# Cache-only (D04): one client session per server URL, never operator state.
-_client_cache: dict[str, OpenStudioClient] = {}
-
-
 class DeploymentPatcher(Protocol):
     """Structural type of ``AppsV1Api`` as used here — tests fake exactly this."""
 
     def patch_namespaced_deployment(
         self, name: str, namespace: str, body: dict, **_: object
     ) -> object: ...
-
-
-def _get_client(server_url: str) -> OpenStudioClient:
-    client = _client_cache.get(server_url)
-    if client is None:
-        client = OpenStudioClient(server_url)
-        _client_cache[server_url] = client
-    return client
 
 
 def _blocks_recycle(status: object) -> bool:
@@ -215,7 +204,7 @@ def worker_recycler(
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — worker recycler idle this tick")
         return
-    client = _get_client(config.server_url)
+    client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
     apps_api = AppsV1Api()
 

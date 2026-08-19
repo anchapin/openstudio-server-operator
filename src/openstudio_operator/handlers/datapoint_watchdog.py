@@ -66,6 +66,7 @@ from datetime import UTC, datetime, timedelta
 import kopf
 from kubernetes.client import CustomObjectsApi
 
+from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
@@ -98,24 +99,11 @@ DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
 #: recorder in tests (same seam as the analysis SLA monitor).
 EventEmitter = Callable[[str, str, str], None]
 
-# Cache-only (D04): one client session per server URL, never operator state.
-# Duplicated from analysis_sla (private there) rather than imported across
-# handler modules; a shared wiring module can absorb both later.
-_client_cache: dict[str, OpenStudioClient] = {}
-
 # Presentation-only (D04): datapoints whose exhaustion Warning has already
 # been emitted in this operator process — dedupes per-tick Event spam. Not a
 # source of truth: after a restart each still-exhausted datapoint re-emits
 # exactly once, and no mutating decision reads this set.
 _EXHAUSTED_WARNED: set[str] = set()
-
-
-def _get_client(server_url: str) -> OpenStudioClient:
-    client = _client_cache.get(server_url)
-    if client is None:
-        client = OpenStudioClient(server_url)
-        _client_cache[server_url] = client
-    return client
 
 
 def _datapoint_ids(docs: list[dict]) -> list[str]:
@@ -230,7 +218,7 @@ def zombie_datapoint_watchdog(
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — datapoint watchdog idle this tick")
         return
-    client = _get_client(config.server_url)
+    client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
 
     def emit(event_type: str, reason: str, message: str) -> None:

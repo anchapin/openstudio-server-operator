@@ -96,6 +96,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi
 
+from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
@@ -148,9 +149,6 @@ ESCALATION_DRY_RUN = "dry-run"
 #: recorder in tests. Shared by the soft-stop and escalation flows.
 EventEmitter = Callable[[str, str, str], None]
 
-# Cache-only (D04): one client session per server URL, never operator state.
-_client_cache: dict[str, OpenStudioClient] = {}
-
 
 @dataclass
 class SlaTickResult:
@@ -189,14 +187,6 @@ class RedisClientLike(Protocol):
     def workers_for_analysis(self, analysis_id: str) -> list[str]: ...
 
     def pod_name_for_worker(self, worker_id: str) -> str | None: ...
-
-
-def _get_client(server_url: str) -> OpenStudioClient:
-    client = _client_cache.get(server_url)
-    if client is None:
-        client = OpenStudioClient(server_url)
-        _client_cache[server_url] = client
-    return client
 
 
 def _status_is_started(client: OpenStudioClient, analysis_id: str) -> bool:
@@ -701,7 +691,7 @@ def analysis_sla_monitor(
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")
         return
-    client = _get_client(config.server_url)
+    client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, CustomObjectsApi())
     pod_api: WorkerPodApi = CoreV1Api()
     redis_client: RedisClientLike = _default_redis_client(config)
