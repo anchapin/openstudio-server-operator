@@ -61,7 +61,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 import kopf
-from kubernetes.client import ApiException, CustomObjectsApi
+from kubernetes.client import (
+    ApiException,
+    AppsV1Api,
+    BatchV1Api,
+    CoreV1Api,
+    CustomObjectsApi,
+)
 from kubernetes.config import ConfigException
 
 from openstudio_operator._time import parse_iso_utc
@@ -264,6 +270,28 @@ def set_guard(guard: SingletonGuard | None) -> None:
 _operator_custom_objects_api: CustomObjectsApi | None = None
 
 
+def _load_k8s_config() -> None:
+    """Load the operator pod's kubeconfig in-cluster first, ``kube_config`` fallback.
+
+    Issue #158 + #251 — the shared loader for every K8s client factory
+    below. In-cluster first (``KUBERNETES_SERVICE_HOST`` /
+    ``KUBERNETES_SERVICE_PORT`` envs + the pod's service-account token
+    mount); on ``ConfigException`` (bare ``kopf run`` dev sessions, no
+    service-account env vars) falls back to ``~/.kube/config``. Idempotent
+    in production — the loader is idempotent on the same source and the
+    factories below all check their cache before calling. Kept private
+    so the only entry point is one of the ``operator_*_api()`` factories
+    (the AST test in ``tests/test_singleton_registry_coverage.py`` gates
+    against inline ``*V1Api()`` construction outside those factories).
+    """
+    from kubernetes import config as kube_config
+
+    try:
+        kube_config.load_incluster_config()
+    except ConfigException:
+        kube_config.load_kube_config()
+
+
 def operator_custom_objects_api() -> CustomObjectsApi:
     """Return the process-wide :class:`CustomObjectsApi` (issue #158).
 
@@ -301,49 +329,175 @@ def operator_custom_objects_api() -> CustomObjectsApi:
 
     Tests that mock ``kubernetes.config.load_incluster_config`` use
     :func:`reset_operator_k8s_client` to drop the cache between cases so
-    the next call re-runs the load path with the freshly patched loader.
+    the next call to :func:`operator_custom_objects_api` re-runs the
+    load path with the freshly patched loader.
     """
     global _operator_custom_objects_api
     if _operator_custom_objects_api is None:
-        from kubernetes import config as kube_config
-
-        try:
-            kube_config.load_incluster_config()
-        except ConfigException:
-            kube_config.load_kube_config()
+        _load_k8s_config()
         _operator_custom_objects_api = CustomObjectsApi()
     return _operator_custom_objects_api
 
 
-def reset_operator_k8s_client() -> None:
-    """Drop the cached :class:`CustomObjectsApi` (test seam — issue #158).
+# Issue #251 — the operator's single ``AppsV1Api()`` / ``BatchV1Api()`` /
+# ``CoreV1Api()`` construction points. The CustomObjectsApi analogue
+# (:func:`operator_custom_objects_api`, issue #158) was the only centrally
+# constructed K8s client; the other three were built inline at their
+# call sites. The structural inconsistency (one K8s client centralised,
+# three not) is the issue's motivation: a future change to the loader
+# (kubeconfig Secret reference, network-proxy client, …) silently leaves
+# the inline callsites behind. The factories below retire every inline
+# ``*V1Api()`` site; the AST test in
+# ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
+# enforces "exactly one construction site per client type" so a future
+# regression that bypasses the factory fails the CI gate loudly.
+_operator_apps_api: AppsV1Api | None = None
+_operator_batch_api: BatchV1Api | None = None
+_operator_core_api: CoreV1Api | None = None
 
-    The production factory caches for the operator's lifetime; tests that
+
+def operator_apps_api() -> AppsV1Api:
+    """Return the process-wide :class:`AppsV1Api` (issue #251).
+
+    The SINGLE ``AppsV1Api()`` construction point in the operator. Every
+    handler that needs to read or patch a Deployment (the worker recycler
+    in :mod:`openstudio_operator.handlers.worker_recycler`, the
+    web_background monitor in
+    :mod:`openstudio_operator.handlers.web_background_monitor`) imports
+    this factory instead of instantiating ``AppsV1Api`` inline. The
+    factory loads the in-cluster / kubeconfig fallback via
+    :func:`_load_k8s_config` and caches the client for the operator's
+    lifetime, sharing the underlying :class:`kubernetes.client.ApiClient`
+    HTTP connection pool across every operator tick. Inline
+    ``AppsV1Api()`` calls outside this function are a regression; the
+    AST test in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
+    fails the CI gate loudly.
+    """
+    global _operator_apps_api
+    if _operator_apps_api is None:
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The AppsV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for AppsV1Api: returning placeholder client."
+            )
+        _operator_apps_api = AppsV1Api()
+    return _operator_apps_api
+
+
+def operator_batch_api() -> BatchV1Api:
+    """Return the process-wide :class:`BatchV1Api` (issue #251).
+
+    The SINGLE ``BatchV1Api()`` construction point in the operator. The
+    retention pipeline's archive Job create/read/delete
+    (:mod:`openstudio_operator.retention`) and the prune CronJob
+    (:mod:`openstudio_operator.prune_entrypoint`) import this factory
+    instead of instantiating ``BatchV1Api`` inline. The factory loads
+    the in-cluster / kubeconfig fallback via :func:`_load_k8s_config` and
+    caches the client for the operator's lifetime. Inline
+    ``BatchV1Api()`` calls outside this function are a regression; the
+    AST test in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
+    fails the CI gate loudly.
+    """
+    global _operator_batch_api
+    if _operator_batch_api is None:
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The BatchV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for BatchV1Api: returning placeholder client."
+            )
+        _operator_batch_api = BatchV1Api()
+    return _operator_batch_api
+
+
+def operator_core_api() -> CoreV1Api:
+    """Return the process-wide :class:`CoreV1Api` (issue #251).
+
+    The SINGLE ``CoreV1Api()`` construction point in the operator. The
+    SLA monitor's worker-pod-eviction path
+    (:mod:`openstudio_operator.handlers.analysis_sla`,
+    :func:`_escalate_analysis`), the web_background monitor's worker-pod
+    liveness check
+    (:mod:`openstudio_operator.handlers.web_background_monitor`), and the
+    prune CronJob's Event emitter
+    (:mod:`openstudio_operator.prune_entrypoint`) import this factory
+    instead of instantiating ``CoreV1Api`` inline. The factory loads the
+    in-cluster / kubeconfig fallback via :func:`_load_k8s_config` and
+    caches the client for the operator's lifetime. Inline
+    ``CoreV1Api()`` calls outside this function are a regression; the
+    AST test in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
+    fails the CI gate loudly.
+    """
+    global _operator_core_api
+    if _operator_core_api is None:
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The CoreV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for CoreV1Api: returning placeholder client."
+            )
+        _operator_core_api = CoreV1Api()
+    return _operator_core_api
+
+
+def reset_operator_k8s_client() -> None:
+    """Drop every cached K8s client (test seam — issues #158 + #251).
+
+    The production factories cache for the operator's lifetime; tests that
     swap ``kubernetes.config.load_incluster_config`` or
     ``kubernetes.config.load_kube_config`` need to clear the cache between
-    cases so the next call to :func:`operator_custom_objects_api` re-runs
+    cases so the next call to any ``operator_*_api()`` factory re-runs
     the load path with the freshly patched loader. Idempotent; harmless to
     call when nothing is cached.
     """
-    global _operator_custom_objects_api
+    global _operator_custom_objects_api, _operator_apps_api
+    global _operator_batch_api, _operator_core_api
     _operator_custom_objects_api = None
+    _operator_apps_api = None
+    _operator_batch_api = None
+    _operator_core_api = None
 
 
 def _get_guard() -> SingletonGuard:
     global _process_guard, _operator_custom_objects_api
     if _process_guard is None:
-        # Issue #158 — the guard-rebuild path also clears the K8s client
-        # cache so the new guard's client is built against the currently
-        # loaded (or freshly-loaded) kubeconfig. The reset is the test
-        # seam that keeps ``test_singleton_guard.py``'s config-loader
-        # mocks in effect across cases: the existing tests reset
-        # ``_process_guard`` to ``None`` between cases so a freshly patched
-        # ``load_incluster_config`` is honored — without this reset the
-        # factory would hand back a client built under a previous test's
-        # mocks and the new mocks would never fire. Production operators
-        # never reset ``_process_guard`` (the guard is built once at the
-        # first tick and reused for the process lifetime), so this only
-        # matters under test.
+        # Issue #158 + #251 — the guard-rebuild path also clears the K8s
+        # client caches so the new guard's client is built against the
+        # currently loaded (or freshly-loaded) kubeconfig. The reset is
+        # the test seam that keeps ``test_singleton_guard.py``'s
+        # config-loader mocks in effect across cases: the existing tests
+        # reset ``_process_guard`` to ``None`` between cases so a freshly
+        # patched ``load_incluster_config`` is honored — without this
+        # reset the factory would hand back a client built under a
+        # previous test's mocks and the new mocks would never fire.
+        # Production operators never reset ``_process_guard`` (the guard
+        # is built once at the first tick and reused for the process
+        # lifetime), so this only matters under test.
         _operator_custom_objects_api = None
         _process_guard = SingletonGuard(operator_custom_objects_api())
     return _process_guard
@@ -416,7 +570,25 @@ def install_singleton_guard(registry: object | None = None) -> int:
     the number of newly wrapped handlers. Uses kopf registry internals
     (``registry._spawning._handlers`` — kopf 1.37+); if the layout is not as
     expected, it warns loudly and gates nothing rather than failing silently.
+
+    Issue #250 — Python-level registry cross-check. Before wrapping each
+    OSCM timer, the gate verifies the handler is registered in
+    :mod:`openstudio_operator._oscm_handlers` (either via an explicit
+    ``register(handler_id, fn)`` call in the handler module or via the
+    legacy-id back-compat set). A new OSCM timer that forgot to register
+    is logged at ERROR level and SKIPPED — the test
+    ``tests/test_singleton_registry_coverage.py::test_python_registry_includes_all_oscm_spawning_handlers``
+    fails the build before the operator can boot with a silently
+    un-gated handler. The four existing handlers are pinned by
+    ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so this scope guard
+    ("do NOT modify the four existing handlers' registration paths") is
+    honored without updating their registration code.
     """
+    # Local import: avoiding a top-level dependency on the Python-level
+    # registry so the gate's import graph stays shallow (the registry is
+    # only consulted when wrapping OSCM timers, not at import time).
+    from openstudio_operator import _oscm_handlers
+
     reg = registry if registry is not None else kopf.get_default_registry()
     spawning = getattr(reg, "_spawning", None)
     handlers = getattr(spawning, "_handlers", None)
@@ -428,11 +600,33 @@ def install_singleton_guard(registry: object | None = None) -> int:
         return 0
 
     wrapped = 0
+    skipped_unregistered = 0
     for index, handler in enumerate(list(handlers)):
         if not _selector_matches_oscms(handler):
             continue
         fn = getattr(handler, "fn", None)
         if fn is None or getattr(fn, GUARD_MARKER, False):
+            continue
+        handler_id = getattr(handler, "id", "?")
+        # Issue #250 — cross-check the Python-level registry. A new OSCM
+        # timer that forgot to call register() is logged loudly and the
+        # wrap is SKIPPED so the test gate can fail before the operator
+        # boots with a silently un-gated handler. The four existing
+        # handlers are exempted by the legacy-id set.
+        if not _oscm_handlers.is_registered(handler_id):
+            logger.error(
+                "singleton guard (D05): OSCM timer %r is registered with kopf "
+                "but NOT in the Python-level registry (issue #250). New "
+                "handler modules MUST call "
+                "openstudio_operator._oscm_handlers.register(%r, fn) at "
+                "module import time. The handler is NOT gated this run — "
+                "the singleton guard (D05) will NOT fire on its ticks until "
+                "the registration is added. See "
+                "tests/test_singleton_registry_coverage.py.",
+                handler_id,
+                handler_id,
+            )
+            skipped_unregistered += 1
             continue
         try:
             handlers[index] = dataclasses.replace(handler, fn=_gated(fn))
@@ -448,6 +642,16 @@ def install_singleton_guard(registry: object | None = None) -> int:
             "singleton guard (D05) gating %d OSCM handler(s): %s",
             wrapped,
             ", ".join(str(getattr(h, "id", "?")) for h in handlers if _selector_matches_oscms(h)),
+        )
+    if skipped_unregistered:
+        # Promote the per-handler ERROR above to a loud summary so the
+        # operator on-call sees one line per boot, not N scattered logs.
+        logger.error(
+            "singleton guard (D05): %d OSCM timer(s) registered with kopf "
+            "but missing from the Python-level registry (issue #250) — "
+            "those handlers are NOT gated. See "
+            "tests/test_singleton_registry_coverage.py.",
+            skipped_unregistered,
         )
     return wrapped
 

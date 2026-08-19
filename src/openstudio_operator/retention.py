@@ -239,13 +239,20 @@ def _datapoint_ids_for(client: OpenStudioClient) -> Callable[[str], list[str]]:
     def ids_for(analysis_id: str) -> list[str]:
         nonlocal payload
         if payload is None:
-            # Issue #104 — `OpenStudioClient.get_datapoints_full()` was deleted
-            # from the public client surface (its only-escalation caller
-            # was the LEGACY ip_address path, dropped in #105). Retention
-            # still needs the per-analysis datapoint ID set for archival
-            # Job args, so we issue the equivalent REST call directly
-            # against the same `client._request_json` seam.
-            payload = client._request_json("GET", "/data_points.json")
+            # Issue #252 — the heavy ``GET /data_points.json`` poll is
+            # exposed as ``OpenStudioClient.list_datapoints()`` (public
+            # surface, same retry/backoff/timestamp-normalisation
+            # envelope as the rest of the client). The pre-#252 seam
+            # ``client._request_json("GET", "/data_points.json")`` was
+            # removed because (a) it reached into the underscored
+            # private method, and (b) a future refactor of
+            # ``_request_json`` (e.g. the bug-#104-driven deletion of
+            # ``get_datapoints_full``) silently broke the retention
+            # pipeline's heavy-poll. The CI AST test
+            # ``tests/test_openstudio_client.py::test_request_json_not_called_outside_openstudio_client``
+            # enforces "no caller outside ``openstudio_client.py``
+            # invokes ``_request_json``" so this seam never resurrects.
+            payload = client.list_datapoints()
         return [
             str(doc.get("_id"))
             for doc in payload

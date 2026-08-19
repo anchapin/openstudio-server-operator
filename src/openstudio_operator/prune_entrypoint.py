@@ -53,11 +53,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
-from kubernetes.client import (
-    ApiException,
-    BatchV1Api,
-    CoreV1Api,
-)
+from kubernetes.client import ApiException, BatchV1Api
 from kubernetes.config import ConfigException, load_incluster_config, load_kube_config
 
 from openstudio_operator import singleton
@@ -65,7 +61,11 @@ from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
-from openstudio_operator.singleton import operator_custom_objects_api
+from openstudio_operator.singleton import (
+    operator_batch_api,
+    operator_core_api,
+    operator_custom_objects_api,
+)
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION, StatusStore, StatusStoreError
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,16 @@ def build_event_emitter(
 
 
 def _load_kube_config() -> None:
-    """In-cluster first, kubeconfig fallback (dev/kind parity with singleton)."""
+    """In-cluster first, kubeconfig fallback (dev/kind parity with singleton).
+
+    Issue #251 — kept for the prune entrypoint's load-once posture; the
+    K8s client factories below (``operator_batch_api``,
+    ``operator_core_api``, ``operator_custom_objects_api``) all call the
+    same loader internally on first use, so this explicit call is
+    redundant for the operator's process lifetime. Retained as a
+    pre-#251 audit seam: a maintainer reading the entrypoint should see
+    the loader path explicitly, not implicitly behind a factory call.
+    """
     try:
         load_incluster_config()
     except ConfigException:
@@ -177,10 +186,21 @@ def main(
     namespace = str(namespace)
 
     if custom_api is None or batch_api is None or core_api is None:
+        # Issue #251 — every K8s client is built via the operator's
+        # central factory (singleton.operator_*_api()), which loads the
+        # in-cluster / kubeconfig fallback and caches the result for the
+        # process lifetime. The factory itself calls the kubeconfig
+        # loader on first use; the explicit ``_load_kube_config()`` here
+        # is retained for the ``ConfigException`` fallback path that
+        # the entrypoint still owns (the factories catch the same
+        # exception internally, but doing the load once at the top
+        # ensures the factories find the kubeconfig already loaded —
+        # belt + braces, plus it preserves the historical pre-#251
+        # ordering for the CustomObjectsApi construction).
         _load_kube_config()
         custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
-        batch_api = batch_api if batch_api is not None else BatchV1Api()
-        core_api = core_api if core_api is not None else CoreV1Api()
+        batch_api = batch_api if batch_api is not None else operator_batch_api()
+        core_api = core_api if core_api is not None else operator_core_api()
 
     try:
         crs = _list_crs(custom_api, namespace)

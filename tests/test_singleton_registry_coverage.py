@@ -39,6 +39,7 @@ from openstudio_operator.redis_client import (
     OperatorConfigError,
     RedisClientError,
 )
+from openstudio_operator.status_store import GROUP, PLURAL
 
 # Every handler module the operator ships under ``openstudio_operator.handlers/``
 # registers exactly one ``@kopf.timer`` for the OSCM resource
@@ -752,3 +753,282 @@ def test_only_one_custom_objects_api_construction_point() -> None:
         f"singleton.py (the factory); found it at {path}:{lineno}. "
         f"See issue #158."
     )
+
+
+# --- Issue #251 — exactly one construction site per ``*V1Api()`` factory -------
+#
+# Issue #251: the single-construction-point pattern audited in
+# ``test_only_one_custom_objects_api_construction_point`` (issue #158) was
+# applied only to ``CustomObjectsApi`` in
+# ``singleton.operator_custom_objects_api()``. The companion K8s clients
+# the operator and the prune CronJob use were constructed inline:
+# ``prune_entrypoint.py`` called ``BatchV1Api()`` and ``CoreV1Api()``
+# directly; ``analysis_sla.py`` called ``CoreV1Api()`` inline as the
+# default for ``pod_api``; ``web_background_monitor.py`` called
+# ``AppsV1Api()`` and ``CoreV1Api()`` inline; ``worker_recycler.py``
+# called ``AppsV1Api()`` inline. The structural inconsistency (one K8s
+# client centralised, three not) is the issue's motivation: a future
+# change to the loader (kubeconfig Secret reference, network-proxy
+# client, …) silently leaves the inline callsites behind.
+#
+# The fix: ``singleton.operator_apps_api()``, ``operator_batch_api()``,
+# and ``operator_core_api()`` factories built from the same
+# ``kubernetes.config.load_incluster_config / load_kube_config`` path.
+# These tests pin the "exactly one construction site per client type"
+# invariant at the source level via AST scan: if a maintainer adds a
+# new ``*V1Api()`` call outside the factory, the CI gate fails loudly.
+#
+# Companion runtime contract tests live in
+# ``tests/test_k8s_clients.py`` (caching + load-once behaviour).
+#
+# Scan scope: every ``.py`` file under ``src/openstudio_operator/``;
+# the factory's own file (``singleton.py``) is the allowed construction
+# site for each client type. Type annotations like ``batch_api: BatchV1Api``
+# are not ``ast.Call`` nodes and are silently ignored by the walker —
+# the test pins the construction-site invariant, not the type-import
+# invariant. The latter is satisfied by the import block in
+# ``singleton.py`` and the call sites (factories return instances of
+# the imported classes, so the types don't need to be re-imported
+# from ``kubernetes.client``).
+
+
+#: The four K8s client types the operator uses, paired with the factory
+#: that constructs them. Issue #251 picks the user's spelling as the
+#: canonical name; we keep these together so the test enforces a
+#: one-to-one mapping.
+_V1_API_FACTORIES: dict[str, str] = {
+    "CustomObjectsApi": "operator_custom_objects_api",
+    "AppsV1Api": "operator_apps_api",
+    "BatchV1Api": "operator_batch_api",
+    "CoreV1Api": "operator_core_api",
+}
+
+
+def _find_v1_api_constructions(
+    client_name: str,
+) -> list[tuple[str, int]]:
+    """Return ``(relative_path, lineno)`` for every ``{client_name}()`` call.
+
+    Walks the operator's production source tree (``src/openstudio_operator/``),
+    parses each ``.py`` file with :mod:`ast`, and locates ``Call`` nodes
+    whose function is a bare ``client_name`` name (e.g. ``CoreV1Api``,
+    ``BatchV1Api``, ``AppsV1Api``). The bare-name match excludes qualified
+    calls like ``kubernetes.client.CoreV1Api()`` (which would already be a
+    regression — the factory should be the only construction point
+    regardless of how it's spelled).
+    """
+    src_root = Path(singleton.__file__).parent
+    found: list[tuple[str, int]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != client_name:
+                continue
+            if node.args or node.keywords:
+                # The factory calls ``CoreV1Api()`` with no args; any
+                # other signature (kwargs, positional) would be a
+                # different construction site worth surfacing separately.
+                continue
+            found.append((str(py.relative_to(src_root.parent)), node.lineno))
+    return found
+
+
+def test_only_one_v1_api_construction_point_per_factory() -> None:
+    """Issue #251: every K8s client type is constructed in exactly one place.
+
+    ``singleton.py`` is the operator's only legitimate construction site
+    for each ``*V1Api()`` type. Any inline ``*V1Api()`` outside the
+    factory is a regression: the handler bypasses the in-cluster /
+    kubeconfig fallback loader, so a future change to that loader
+    silently leaves the inline callsite behind. The companion runtime
+    contract tests live in ``tests/test_k8s_clients.py`` (caching +
+    load-once behaviour).
+    """
+    src_root = Path(singleton.__file__).parent
+    for client_name, factory_name in _V1_API_FACTORIES.items():
+        found = _find_v1_api_constructions(client_name)
+        assert len(found) == 1, (
+            f"Expected exactly ONE {client_name}() construction in "
+            f"src/openstudio_operator/; found {len(found)}: {found}. "
+            f"Every handler must use "
+            f"openstudio_operator.singleton.{factory_name}() "
+            f"instead of constructing the client inline. See issue #251."
+        )
+        path, lineno = found[0]
+        assert path.endswith("openstudio_operator/singleton.py"), (
+            f"{client_name}() must be constructed only in singleton.py "
+            f"(the factory); found it at {path}:{lineno}. See issue #251."
+        )
+    # Sanity: scan root must be the same one as the existing #158 test
+    # uses — defensive in case the source-root heuristic ever changes.
+    assert src_root.name == "openstudio_operator", (
+        f"AST scan root drifted: expected 'openstudio_operator', got {src_root.name!r}. "
+        f"Update both #158 and #251 tests in lockstep."
+    )
+
+
+# --- Issue #250 — Python-level registry cross-check ----------------------------
+#
+# Issue #250: ``EXPECTED_OSCM_TIMER_HANDLER_IDS`` (the frozenset above) was
+# the ONLY enforcement of the "every new OSCM handler is gated" invariant
+# in production code. A maintainer who added a new handler module but
+# forgot to extend the test set would pass CI trivially. The fix:
+# introduce a Python-level registry
+# (:mod:`openstudio_operator._oscm_handlers`) that new handler modules
+# call at module import time via ``register(handler_id, fn)``, and
+# cross-check the kopf registry against the Python registry at gate
+# time inside ``install_singleton_guard``. The four existing handlers
+# (analysis_sla_monitor, zombie_datapoint_watchdog, web_background_monitor,
+# worker_recycler) are exempt from the explicit ``register()`` call
+# (issue scope guard: "do NOT modify the four existing handlers'
+# registration paths"); their IDs are listed in
+# ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so the cross-check
+# passes for them. A new OSCM timer that forgets to register fails this
+# test loudly.
+
+
+def test_python_registry_includes_all_oscm_spawning_handlers() -> None:
+    """Issue #250: every OSCM timer must be in the Python-level registry.
+
+    The Python-level registry
+    (:mod:`openstudio_operator._oscm_handlers`) is the declarative
+    seam: new handler modules call ``register(handler_id, fn)`` at
+    module import time, and the singleton guard cross-checks the
+    Python registry against the kopf registry at gate time. A new
+    OSCM timer that forgot to register would silently slip past the
+    gate (the gate wraps every OSCM timer in the kopf registry; the
+    Python registry is what the test pins here). The four existing
+    handlers are exempt from the explicit ``register()`` call via
+    ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so the scope
+    guard ("do NOT modify the four existing handlers' registration
+    paths") is honored.
+    """
+    from openstudio_operator import _oscm_handlers
+
+    _ensure_handler_modules_loaded()
+
+    registry = kopf.get_default_registry()
+    _spawning_handlers_list(registry)  # boundary check: fails loudly if internals moved
+    oscm = _oscm_spawning_handlers(registry)
+    kopf_timer_ids = {getattr(h, "id", "?") for h in oscm}
+
+    # The Python-level registry is the union of the explicit registry
+    # entries (new handler modules) AND the legacy-id set (the four
+    # pre-#250 handlers exempted from the explicit ``register()`` call).
+    python_registry_ids = (
+        set(_oscm_handlers.REGISTRY.keys())
+        | set(_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS)
+    )
+
+    missing = kopf_timer_ids - python_registry_ids
+    assert not missing, (
+        f"OSCM timer(s) registered with kopf but NOT in the Python-level "
+        f"registry (issue #250): {sorted(missing)}. New handler modules "
+        f"MUST call "
+        f"openstudio_operator._oscm_handlers.register(handler_id, fn) "
+        f"at module import time. See "
+        f"tests/test_singleton_registry_coverage.py and issue #250."
+    )
+
+    # Guard against accidental expansion: a future maintainer who adds
+    # an explicit ``register()`` call for a legacy handler would
+    # silently expand the Python registry. That is harmless per se
+    # (the cross-check is membership-based, not value-based), but the
+    # legacy-id set is the canonical "no extra wiring needed" seal — a
+    # double-registration is a hint that the legacy handler is now
+    # meeting the new-style contract and could be removed from the
+    # legacy set in a follow-up. The test reports this so the
+    # maintainer can clean up.
+    explicit_legacy = (
+        set(_oscm_handlers.REGISTRY.keys())
+        & set(_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS)
+    )
+    assert not explicit_legacy, (
+        f"OSCM timer(s) in the legacy-id set ALSO have an explicit "
+        f"register() entry (issue #250): {sorted(explicit_legacy)}. "
+        f"Either remove the redundant register() call from the handler "
+        f"module, OR remove the id from "
+        f"_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS — pick one."
+    )
+
+
+def test_install_singleton_guard_skips_unregistered_oscm_handler(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #250: a new OSCM timer that forgot to register is LOUDLY skipped.
+
+    The gate's cross-check fires an ERROR log and skips the wrap when
+    an OSCM timer is in the kopf registry but NOT in the Python-level
+    registry. The wrapping is skipped so the test gate
+    (``test_python_registry_includes_all_oscm_spawning_handlers``)
+    catches the regression before the operator can boot with a
+    silently un-gated handler. This test wires the cross-check
+    directly: inject a fake OSCM handler into the kopf registry,
+    call ``install_singleton_guard`` against a clean registry, and
+    assert the wrapping was skipped and the error log recorded.
+    """
+    from openstudio_operator import _oscm_handlers
+
+    class _FakeRegistry:
+        class _spawning:
+            _handlers: list[object]
+
+    class _FakeSelector:
+        group = GROUP
+        any_name = None
+        plural = PLURAL
+
+    class _FakeHandler:
+        id = "_oscm_handler_that_forgot_to_register"
+        selector = _FakeSelector()
+
+        def __init__(self) -> None:
+            self.fn = lambda *args, **kwargs: None
+
+    fake_registry = _FakeRegistry()
+    fake_registry._spawning._handlers = [_FakeHandler()]
+
+    # Save and restore the Python registry around the call so the test
+    # is hermetic against the suite-wide singleton-import side effect.
+    saved_registry = dict(_oscm_handlers.REGISTRY)
+    saved_legacy = _oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS
+    try:
+        _oscm_handlers.REGISTRY.clear()
+        with caplog.at_level(logging.ERROR, logger=singleton.logger.name):
+            wrapped = singleton.install_singleton_guard(registry=fake_registry)
+        assert wrapped == 0, (
+            f"Expected install_singleton_guard to wrap 0 handlers when the "
+            f"OSCM timer is missing from the Python registry; got "
+            f"{wrapped}. The cross-check regression-fence broke."
+        )
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and "Python-level registry" in r.getMessage()
+        ]
+        assert len(error_records) >= 1, (
+            f"Expected at least one ERROR log naming the Python-level "
+            f"registry cross-check; got {len(error_records)}. The "
+            f"loud-fail contract regressed — see issue #250."
+        )
+        # The kopf-side handler.fn must NOT be the wrapped fn (the
+        # gate skipped wrapping because the registry cross-check failed).
+        assert not getattr(fake_registry._spawning._handlers[0].fn, singleton.GUARD_MARKER, False), (
+            "The kopf handler's fn was wrapped despite the cross-check "
+            "failing. The regression-fence broke — the operator would "
+            "boot with a silently un-gated handler."
+        )
+    finally:
+        _oscm_handlers.REGISTRY.clear()
+        _oscm_handlers.REGISTRY.update(saved_registry)
+        # KNOWN_LEGACY_OSCM_HANDLER_IDS is a frozenset; defensively
+        # reassign in case a future maintainer makes it mutable.
+        assert _oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS is saved_legacy, (
+            "KNOWN_LEGACY_OSCM_HANDLER_IDS is not a frozenset (it was "
+            "replaced by the test seam). Update the gate's cross-check "
+            "and the test in lockstep."
+        )
+

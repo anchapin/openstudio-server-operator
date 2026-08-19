@@ -37,12 +37,25 @@ the only place it is invoked globally — per-file fixtures in
 ``tests/test_k8s_clients.py`` and ``tests/test_timer_wrapper_failures.py``
 keep their existing local resets (they're cheaper and add no behaviour
 beyond this one).
+
+Issue #251 — the three new K8s client factories
+(``operator_apps_api``, ``operator_batch_api``, ``operator_core_api``)
+also cache their constructed clients for the process lifetime. The
+``reset_operator_k8s_client`` seam (issues #158 + #251) drops all four
+caches in one call. The ``Configuration._default`` reset is the
+client-python equivalent: ``load_kube_config`` (the fallback when
+``load_incluster_config`` raises in a CI environment) mutates the
+global default, and a handler test that triggered the factory (e.g.
+``run_sla_tick(..., pod_api=None)`` → ``operator_core_api()``) would
+leave the default populated for the next test, defeating the
+``default_configuration_restored`` snapshot in ``test_singleton_guard.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Generator
 
+import kubernetes.client
 import pytest
 
 from openstudio_operator import handlers, singleton
@@ -67,9 +80,20 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     with the post-#234 ``handlers`` module — they are no-ops today and
     will be no-ops forever if #234 stays in, or active again if a future
     refactor reintroduces similarly-named globals.
+
+    Issue #251 — also drops ``kubernetes.client.Configuration._default``
+    so a test that triggered the kubeconfig fallback
+    (``load_kube_config`` mutates the global) does not leave a real
+    host installed for the next test. The
+    ``default_configuration_restored`` fixture in ``test_singleton_guard.py``
+    only restores the snapshot it took at fixture setup — if a previous
+    test populated ``Configuration._default`` with a real host, the
+    snapshot is the polluted state. Resetting in conftest is the actual
+    root-cause cleanup.
     """
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
+    kubernetes.client.Configuration._default = None
     for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
         queue = getattr(handlers, legacy_queue_attr, None)
         if queue is not None and hasattr(queue, "clear"):
@@ -77,6 +101,7 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     yield
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
+    kubernetes.client.Configuration._default = None
     for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
         queue = getattr(handlers, legacy_queue_attr, None)
         if queue is not None and hasattr(queue, "clear"):
