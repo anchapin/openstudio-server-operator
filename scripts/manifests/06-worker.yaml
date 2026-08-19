@@ -17,6 +17,9 @@
 # apply the ScaledObject. See docs/kind-validation.md step 4 for the
 # end-to-end recipe. The pre-#77 chart overlay that previously left the
 # HPA in place is no longer needed.
+# Digest pinning (issue #172): see `04-web.yaml` for the rationale; the
+# `nrel/openstudio-server:3.11.0@…` digest is the same across web /
+# web-background / worker so the three pods always pull the same image.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -38,7 +41,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: nrel/openstudio-server:3.11.0
+          image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/start-workers"]
           env:

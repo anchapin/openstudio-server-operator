@@ -1,11 +1,15 @@
 # MongoDB — stand-in for the helm chart's `db` Deployment (develop branch).
 # Image, root credentials, Service name and port mirror the chart defaults:
-#   db.container.image          = mongo:6.0.7
+#   db.container.image          = mongo:7.0.40 (chart default is 6.0.7 — EOL July 2025)
 #   db.username/password        = openstudio / openstudio
 #   db.container.ports.db_port  = 27017
 # APPENDIX (approximation vs production): the chart uses a 100Gi PVC; here it
 # is an emptyDir. Mongo data does not survive pod restarts. Acceptable for
 # REST API shape validation; NOT a persistence test.
+# Digest pinning (issue #172): the kind recipe is the project's validation
+# target (D13); image-boundary digests are pinned to close the supply-chain
+# drift gap that #113/#124 closed for the operator / rclone / python images.
+# Renew via `docker buildx imagetools inspect mongo:7.0.40`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,7 +29,7 @@ spec:
     spec:
       containers:
         - name: mongo-db
-          image: mongo:6.0.7
+          image: mongo:7.0.40@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 27017

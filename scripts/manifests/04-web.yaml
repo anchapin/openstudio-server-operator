@@ -1,6 +1,11 @@
 # Web — mirrors the helm chart's `web` Deployment + `web` Service (:80).
 # Image is pinned to nrel/openstudio-server:3.11.0 — the version the operator
 # targets (AGENTS.md; the chart default 3.8.0-1 is NOT the target).
+# Digest pinning (issue #172): the kind recipe is the project's validation
+# target (D13); image-boundary digests are pinned to close the supply-chain
+# drift gap that #113/#124 closed for the operator / rclone / python images.
+# Tag stays at 3.11.0 (operator contract); only the digest moves. Renew via
+# `docker buildx imagetools inspect nrel/openstudio-server:3.11.0`.
 #
 # Env/command replicated from the chart's web-deploy.yaml (develop branch):
 #   command: bash -c "/usr/local/bin/rails-entrypoint && /usr/local/bin/start-server"
@@ -37,7 +42,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nrel/openstudio-server:3.11.0
+          image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
           imagePullPolicy: IfNotPresent
           command: ["bash", "-c", "/usr/local/bin/rails-entrypoint && /usr/local/bin/start-server"]
           ports:

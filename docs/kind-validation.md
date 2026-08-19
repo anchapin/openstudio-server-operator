@@ -1,5 +1,26 @@
 # kind validation environment — OpenStudio Server 3.11.0 (issue #19, decision D13)
 
+> **Image digest pinning (issue #172).** Every `image:` line in
+> `scripts/manifests/*.yaml` is pinned as `name:tag@sha256:…`, including the
+> upstream `mongo` and `redis` images. The chart's defaults (`mongo:6.0.7`,
+> `redis:6.0.9`) are EOL with unfixed CVEs (CVE-2024-31449 / CVE-2024-46981
+> family in Redis, CVE-2024-1351 in Mongo); the kind recipe bumps to the
+> supported 7.x lines:
+>
+> | Image | Recipe tag (was) | Recipe tag (now) | Digest |
+> |---|---|---|---|
+> | mongo | `6.0.7` (EOL Jul 2025) | `7.0.40` | `sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b` |
+> | redis | `6.0.9` (EOL since 2021) | `7.4.10` | `sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73` |
+> | nrel/openstudio-server | `3.11.0` (unchanged) | `3.11.0` | `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` |
+>
+> The `nrel/openstudio-server:3.11.0` tag is fixed by the operator contract
+> (the operator targets 3.11.0; see AGENTS.md Fixed identifiers); only the
+> digest moves. The digest is the image-index digest — the kubelet resolves
+> the right platform digest (`linux/amd64` for kind control-plane nodes).
+> Renew via `docker buildx imagetools inspect <image>:<tag>`; the kind
+> recipe is the project's validation target (D13), so a stack with
+> image-derived CVEs is not a clean signal for the dryRun walkthrough.
+
 Reproducible recipe for standing up a single-node [kind](https://kind.sigs.k8s.io/)
 cluster running the real `nrel/openstudio-server:3.11.0` stack, capturing REST
 API fixtures against the operator's contract, and smoke-testing Phase 1 with
@@ -40,7 +61,7 @@ host and load instead:
 ```bash
 docker pull nrel/openstudio-server:3.11.0
 kind load docker-image nrel/openstudio-server:3.11.0 --name os-operator-validation
-# (same for mongo:6.0.7 / redis:6.0.9)
+# (same for mongo:7.0.40 / redis:7.4.10 — see the digest-pinning table above)
 ```
 
 ## What gets deployed (topology parity vs the helm chart)
@@ -50,12 +71,12 @@ Names are load-bearing — the operator targets them by fixed identifier
 
 | Chart object (develop) | kind manifest | Parity notes |
 |---|---|---|
-| Deployment `db` (mongo:6.0.7) + Service `db:27017` | `scripts/manifests/01-mongo.yaml` | same image/creds (`openstudio`/`openstudio`, auth_source `admin`); persistence emptyDir |
-| Deployment `redis` (redis:6.0.9) + Service `queue:6379` | `scripts/manifests/02-redis.yaml` | same image/password (`--requirepass openstudio`); persistence emptyDir |
+| Deployment `db` (mongo:7.0.40@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b) + Service `db:27017` | `scripts/manifests/01-mongo.yaml` | same image/creds (`openstudio`/`openstudio`, auth_source `admin`); persistence emptyDir; **chart default is 6.0.7 (EOL) — bumped to 7.0.40 here for CVE hygiene (#172)** |
+| Deployment `redis` (redis:7.4.10@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73) + Service `queue:6379` | `scripts/manifests/02-redis.yaml` | same image/password (`--requirepass openstudio`); persistence emptyDir; **chart default is 6.0.9 (EOL) — bumped to 7.4.10 here for CVE hygiene (#172)** |
 | PVC `nfs-pvc` (RWX, storageClass `nfs`) | `scripts/manifests/03-nfs-hostpath.yaml` | **hostPath stand-in** on the kind node (`/tmp/openstudio-kind-nfs`) |
-| Deployment `web` + Service `web:80` | `scripts/manifests/04-web.yaml` | image pinned **3.11.0** (chart default 3.8.0-1 is NOT the target); same command/env (`QUEUES=analysis_wrappers`, `REDIS_URL`, `MONGO_USER/PASSWORD`, `SECRET_KEY_BASE` chart default); mounts `nfs-pvc` at `/mnt/openstudio` |
-| Deployment `web-background` | `scripts/manifests/05-web-background.yaml` | same command (`resque:workers` scaled by `COUNT`); `OS_SERVER_NUMBER_OF_WORKERS` tuned 30→2; mounts `nfs-pvc` |
-| Deployment `worker` (no HPA post-#77) | `scripts/manifests/06-worker.yaml` | scaled-minimal: replicas **1** (the ScaledObject scales it from 0–5 per Redis backlog; chart's HPA `worker-hpa` REMOVED — two autoscalers fight one Deployment, #77); `QUEUES=requeued,simulations`; emptyDir scratch at `/mnt/openstudio`; preStop hook + `terminationGracePeriodSeconds: 5200` kept |
+| Deployment `web` + Service `web:80` | `scripts/manifests/04-web.yaml` | image pinned **3.11.0** (chart default 3.8.0-1 is NOT the target); same command/env (`QUEUES=analysis_wrappers`, `REDIS_URL`, `MONGO_USER/PASSWORD`, `SECRET_KEY_BASE` chart default); mounts `nfs-pvc` at `/mnt/openstudio`; image **digest-pinned** to `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
+| Deployment `web-background` | `scripts/manifests/05-web-background.yaml` | same command (`resque:workers` scaled by `COUNT`); `OS_SERVER_NUMBER_OF_WORKERS` tuned 30→2; mounts `nfs-pvc`; image **digest-pinned** to the same `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
+| Deployment `worker` (no HPA post-#77) | `scripts/manifests/06-worker.yaml` | scaled-minimal: replicas **1** (the ScaledObject scales it from 0–5 per Redis backlog; chart's HPA `worker-hpa` REMOVED — two autoscalers fight one Deployment, #77); `QUEUES=requeued,simulations`; emptyDir scratch at `/mnt/openstudio`; preStop hook + `terminationGracePeriodSeconds: 5200` kept; image **digest-pinned** to the same `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
 | LoadBalancer, cluster-autoscaler, rserve, priority classes | — | intentionally omitted |
 
 ## Approximations vs production
@@ -504,6 +525,15 @@ via `scripts/deploy-openstudio-stack.sh` (all `deploy/web`, `deploy/worker`,
 side-loaded with `kind load docker-image` (GitHub Actions runners were down —
 the `:dev` image was NOT pulled from ghcr). Redis password per the manifest:
 `openstudio`. All `redis-cli` output below is verbatim.
+
+> **Note (issue #172, post-2026-08-18).** The captures below used the
+> pre-#172 image tags (`mongo:6.0.7`, `redis:6.0.9`); the live recipe now
+> pins `mongo:7.0.40` and `redis:7.4.10` (see the digest-pinning table
+> above). The Resque layout (R1) and the worker selector (R3) are
+> invariant across the bump — Resque 2.x and the Mongoid selector shape
+> did not change between 6.x and 7.x. The R1.5 DBSIZE number is
+> workload-dependent (key count, not version) and would need to be
+> re-captured if the live cluster state is rebuilt from scratch.
 
 ### R1 — verdict: MISMATCH FOUND AND FIXED (the pre-live constants were wrong)
 
