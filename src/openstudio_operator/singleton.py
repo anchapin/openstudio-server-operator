@@ -399,6 +399,63 @@ def _check(namespace: str | None, logger: logging.Logger) -> None:
             type(exc).__name__,
             exc,
         )
+    # Issue #116 — emit a one-time Warning per CR whose ``spec.redisUrl``
+    # is empty. The operator cannot service Modules 3/5 (worker
+    # recycling, web_background stall) without a Redis URL, and the
+    # historical default ``redis://:openstudio@queue...`` was a
+    # secret-leak that the empty default now explicitly rejects. The
+    # single-callback cache is keyed on ``(namespace, name)`` so the
+    # message is at most once per CR per operator restart.
+    _emit_redis_url_guard_events(items, logger=logger)
+
+
+_redis_url_warned: set[tuple[str, str]] = set()
+
+
+def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
+    for item in items:
+        # Items may be raw OSCM dicts (``apiVersion``/``kind`` + ``metadata``
+        # envelope) or the inner ``metadata`` already-extracted dict, depending
+        # on the caller. Use a tolerant accessor.
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
+        ns = str(meta.get("namespace") or "")
+        nm = str(meta.get("name") or "")
+        if not ns or not nm:
+            logger.debug(
+                "redis URL guard: skipping nameless item (got keys=%s)", sorted(item.keys()),
+            )
+            continue
+        if (ns, nm) in _redis_url_warned:
+            continue
+        spec = item.get("spec") or {}
+        if str(spec.get("redisUrl") or "") == "":
+            _redis_url_warned.add((ns, nm))
+            logger.warning(
+                "OSCM %s/%s has empty spec.redisUrl — issue #116: the operator "
+                "cannot service Modules 3/5 (worker recycler + web_background "
+                "stall). Set spec.redisUrl explicitly to redis://<user>:<pwd>"
+                "@queue.<namespace>.svc.cluster.local:6379 (or set the URL via "
+                "the helm-chart values override). The previous default "
+                "`redis://:openstudio@queue...` baked a public-facing password "
+                "into every published CRD and has been removed.",
+                ns, nm,
+            )
+            try:
+                from openstudio_operator.handlers import _emit_redis_warning_event
+
+                _emit_redis_warning_event(
+                    namespace=ns, name=nm,
+                    message=(
+                        "spec.redisUrl is empty (issue #116). Operator Modules "
+                        "3/5 (worker recycler + web_background stall) will be "
+                        "no-ops until you set this field explicitly. The "
+                        "previous default exposed the kind-recipe password "
+                        "`openstudio` and has been removed; helm-chart users "
+                        "should derive the URL from the Redis-secret KeyRef."
+                    ),
+                )
+            except ImportError as exc:  # pragma: no cover — defensive
+                logger.debug("redis URL guard Event emit import failed: %s", exc)
 
 
 @kopf.on.startup()

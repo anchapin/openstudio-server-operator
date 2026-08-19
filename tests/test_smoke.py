@@ -80,10 +80,13 @@ def test_version():
 def test_config_defaults_match_crd():
     cfg = OperatorConfig()
     assert cfg.server_url == ""
-    assert cfg.redis_url == DEFAULT_REDIS_URL
-    assert (
-        DEFAULT_REDIS_URL == "redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379"
-    )
+    # Issue #116 — DEFAULT_REDIS_URL is now empty by design (the
+    # historical `redis://:openstudio@queue....` baked the kind-recipe
+    # password into every published CRD; see AGENTS.md / #116 for the
+    # rationale + the Redis-URL-guard Event the operator emits when
+    # this stays empty).
+    assert cfg.redis_url == ""
+    assert DEFAULT_REDIS_URL == ""
     assert cfg.dry_run is False
     assert cfg.target_worker_deployment == ""
     assert cfg.target_web_background_deployment == ""
