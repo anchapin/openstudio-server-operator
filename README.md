@@ -117,8 +117,11 @@ curl -s localhost:9090/metrics | grep '^openstudio_operator_handler_tick_failure
 ├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
+│   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
+│   ├── _time.py                # tz-aware UTC parser (`parse_utc`); None-safe; replaces three byte-equivalent duplicates (#174)
 │   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
 │   ├── openstudio_client.py    # OpenStudio REST client (verified against v3.11.0)
+│   ├── client_factory.py       # `lru_cache`-keyed factories for `OpenStudioClient` + `ReadOnlyRedisClient`; a mutated `spec.serverUrl` / `spec.redisUrl` invalidates by a different key (#168, #235)
 │   ├── status_store.py         # CR .status RMW helper (D04 durable store, 409-safe)
 │   ├── redis_client.py         # read-only Redis client (queue depths + Resque liveness)
 │   ├── archival.py             # rclone archival Job manifest generator (backend-agnostic)
@@ -126,6 +129,7 @@ curl -s localhost:9090/metrics | grep '^openstudio_operator_handler_tick_failure
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
 │   ├── metrics.py              # Prometheus counters + /metrics endpoint
+│   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py
