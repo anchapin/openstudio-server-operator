@@ -251,7 +251,13 @@ def _datapoint_ids_for(client: OpenStudioClient) -> Callable[[str], list[str]]:
     def ids_for(analysis_id: str) -> list[str]:
         nonlocal payload
         if payload is None:
-            payload = client.get_datapoints_full()
+            # Issue #104 — `OpenStudioClient.get_datapoints_full()` was deleted
+            # from the public client surface (its only-escalation caller
+            # was the LEGACY ip_address path, dropped in #105). Retention
+            # still needs the per-analysis datapoint ID set for archival
+            # Job args, so we issue the equivalent REST call directly
+            # against the same `client._request_json` seam.
+            payload = client._request_json("GET", "/data_points.json")
         return [
             str(doc.get("_id"))
             for doc in payload

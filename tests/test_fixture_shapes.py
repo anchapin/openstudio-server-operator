@@ -30,9 +30,8 @@ LIVE_DIR = FIXTURES_DIR / "live"
 OPERATOR_ENDPOINT_SLUGS = {
     "get_analyses",
     "get_analysis_status",
-    "get_analysis_page_data",
-    "get_data_points_status",
     "get_data_points",
+    "get_data_points_status",
     "get_analysis_soft_stop",
     "post_analysis_action",
     "post_datapoint_requeue",
@@ -83,10 +82,7 @@ def test_sample_fixture_conforms(name):
     assert spec is not None, f"no contract shape for sample '{slug}'"
     verdict = CHECKER.check_envelope(base_slug, envelope, spec)
     assert verdict.problems == []
-    if slug == "get_analysis_page_data_notfound":
-        assert verdict.outcome == "ERROR"
-    else:
-        assert verdict.outcome == "PASS"
+    assert verdict.outcome == "PASS"
 
 
 def test_live_fixtures_conform_or_skip():
@@ -111,10 +107,10 @@ def test_live_fixtures_conform_or_skip():
 
 
 def test_checker_rejects_missing_required_key():
-    envelope = _sample("get_analysis_page_data.json")
+    envelope = _sample("get_analysis_status.json")
     del envelope["body"]["analysis"]["data_points"]
     verdict = CHECKER.check_envelope(
-        "get_analysis_page_data", envelope, _load_shapes()["get_analysis_page_data"]
+        "get_analysis_status", envelope, _load_shapes()["get_analysis_status"]
     )
     assert any("missing required key 'data_points'" in p for p in verdict.problems)
 

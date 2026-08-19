@@ -251,7 +251,7 @@ dev machine with kubeconfig pointed at kind:
    from openstudio_operator.openstudio_client import OpenStudioClient
    c = OpenStudioClient("http://localhost:8080")
    print(c.list_analyses())
-   print(c.get_analysis_page_data("<an-analysis-id>"))
+   print(c.get_analysis_status("<an-analysis-id>"))
    EOF
    ```
 

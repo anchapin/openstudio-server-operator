@@ -174,7 +174,6 @@ fi
 echo "Using ANALYSIS_ID=$ANALYSIS_ID"
 
 capture get_analysis_status GET "/analyses/$ANALYSIS_ID/status.json"
-capture get_analysis_page_data GET "/analyses/$ANALYSIS_ID/page_data.json"
 capture get_data_points_status GET "/data_points/status?status=1&jobs=started"
 capture get_data_points GET "/data_points.json"
 
@@ -192,7 +191,6 @@ echo "Using DATA_POINT_ID=$DATA_POINT_ID"
 # captured). Live v3.11.0 truth: mongoid.yml sets raise_not_found_error:
 # false, so these do NOT 404 — page_data returns {analysis: null} and status
 # returns an empty {analyses: []}, both over HTTP 200.
-capture get_analysis_page_data_notfound GET "/analyses/$SENTINEL_ID/page_data.json"
 capture get_analysis_status_notfound GET "/analyses/$SENTINEL_ID/status.json"
 
 if [[ $DO_MUTATE -eq 1 ]]; then

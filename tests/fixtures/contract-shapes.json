@@ -32,21 +32,6 @@
       },
       "error_shape": {"http_status": [404, 422, 500]}
     },
-    "get_analysis_page_data": {
-      "request": {"method": "GET", "path": "/analyses/{id}/page_data.json"},
-      "response": {
-        "http_status": [200],
-        "required_keys": ["analysis"],
-        "nested": {
-          "analysis": {
-            "required_keys": ["name", "data_points", "results", "output_variables"],
-            "item_expected_keys": ["analysis_type", "status", "start_time", "end_time", "seed_zip", "run_start_time", "run_end_time"]
-          }
-        },
-        "notes": "SLA clock anchor: analysis.start_time is derived from the first job and is ABSENT (nil-omitted by as_json) until then. Live-verified minimal analysis serializes as {name, data_points, results, output_variables} only."
-      },
-      "error_shape": {"http_status": [404, 422, 500], "null_key": "analysis"}
-    },
     "get_data_points_status": {
       "request": {"method": "GET", "path": "/data_points/status?status=1&jobs=started"},
       "response": {
