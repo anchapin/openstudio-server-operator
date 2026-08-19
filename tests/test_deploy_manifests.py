@@ -773,3 +773,58 @@ def test_operator_pod_template_carries_union_of_network_policy_matchlabels():
         "operator pod template is missing labels required by these "
         f"NetworkPolicies (#224): {offenders}"
     )
+
+
+# ---- Issue #225: API-server egress must not use kube-dns placeholder --
+#
+# Pre-fix, the FIRST egress block in `openstudio-operator-allow-egress`
+# used `namespaceSelector: kubernetes.io/metadata.name: default` +
+# `podSelector: k8s-app: kube-dns` on port 443 as a "placeholder" for the
+# API server. The kube-dns pods live in `kube-system`, not `default`, so
+# the rule was structurally pointless AND opened a credential-exfiltration
+# path: an attacker who can create a pod in the `default` namespace with
+# the `k8s-app: kube-dns` label gets the operator talking to it on port
+# 443. NetworkPolicy entries are additive — both the mislabeled block AND
+# the correct `component: kube-apiserver` block applied.
+#
+# Scope guard: the legitimate DNS egress allow (`openstudio-operator-
+# allow-dns`) uses the SAME `k8s-app: kube-dns` selector pair but with
+# `namespaceSelector: kube-system` and ports 53 (UDP+TCP) — that allow is
+# the actual legitimate target and must remain. The bug pattern is the
+# SPECIFIC combination of port 443 (the API server port) + the kube-dns
+# selector. We assert on that combination so the legitimate DNS allow is
+# preserved but the misconfiguration cannot silently recur.
+
+
+def test_no_port_443_egress_block_uses_kube_dns_placeholder_selector():
+    """Issue #225 regression fence: no NetworkPolicy egress block in
+    deploy/network-policy.yaml targets port 443 (the API server port) using
+    `k8s-app: kube-dns` as a podSelector. Pre-fix, the FIRST egress block in
+    `openstudio-operator-allow-egress` used namespaceSelector: default +
+    podSelector: k8s-app: kube-dns on port 443 as a "placeholder" for the
+    API server. Kube-dns pods live in kube-system, not default, so the
+    rule was structurally pointless AND opened a credential-exfiltration
+    path. The fix removes the mislabeled first egress block; this test
+    pins that removal by catching any port-443 egress block using the
+    kube-dns selector — i.e. any block pretending kube-dns is on port 443.
+
+    Scoped to port 443 because that is the API server port and the bug
+    pattern; the legitimate DNS allow on port 53 (UDP+TCP) is preserved
+    and intentionally not flagged by this test."""
+    offenders = []
+    for policy in NETPOL_DOCS:
+        egress_rules = policy["spec"].get("egress") or []
+        for rule_idx, rule in enumerate(egress_rules):
+            ports = {p.get("port") for p in rule.get("ports", [])}
+            if 443 not in ports:
+                continue
+            for to_idx, to in enumerate(rule.get("to", [])):
+                pod_labels = to.get("podSelector", {}).get("matchLabels", {})
+                if pod_labels.get("k8s-app") == "kube-dns":
+                    offenders.append(
+                        (policy["metadata"]["name"], rule_idx, to_idx)
+                    )
+    assert not offenders, (
+        f"port-443 egress blocks use k8s-app: kube-dns placeholder "
+        f"selector (#225 regression): {offenders}"
+    )

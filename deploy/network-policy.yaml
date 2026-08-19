@@ -117,17 +117,6 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
-        # In-cluster API server
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: default
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns  # placeholder; real selector by DNS below
-      ports:
-        - protocol: TCP
-          port: 443
-    - to:
         # API server (the proper selector)
         - podSelector:
             matchLabels:
@@ -151,13 +140,6 @@ spec:
       ports:
         - protocol: TCP
           port: 6379
-  # NOTE: The first `egress` block uses the kube-dns label as a placeholder
-  # for the API server. The real production selector (component=kube-apiserver)
-  # is the second block; the first block is harmless on most clusters and
-  # ensures the policy applies even when the API server uses pod selectors
-  # other operators in the cluster rely on. Operators are expected to
-  # tighten this on their cluster by editing the first block label.
-  # See ARCH_NOTE at the top of the file.
 ---
 # Egress allow for the storage-prune CronJob and the archival Jobs it spawns.
 #
