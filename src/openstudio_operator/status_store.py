@@ -37,6 +37,8 @@ from typing import Any
 
 from kubernetes.client import ApiException, CustomObjectsApi
 
+from .metrics import STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL, STATUS_CONFLICTS_TOTAL
+
 GROUP = "energy.nrel.gov"
 VERSION = "v1alpha1"
 PLURAL = "openstudioclustermanagers"
@@ -290,12 +292,20 @@ class StatusStore:
             except ApiException as exc:
                 if exc.status != 409:
                     raise
+                # Issue #119 — count the conflict at the moment we observe it,
+                # BEFORE the backoff sleep. A sustained burst reads as N+1
+                # in a single tick.
+                STATUS_CONFLICTS_TOTAL.inc()
                 conflict = exc
                 if attempt < MAX_CONFLICT_RETRIES:
                     _sleep(_conflict_backoff(attempt))
                 continue
             self._cache = None
             return
+        # Issue #119 — count exhaustion just before raising so an SRE alerting
+        # on `rate(... _exhausted_total[5m]) > 0` can fire on "real"
+        # (retry-budgeted-out) contention, distinct from per-attempt conflicts.
+        STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL.inc()
         raise StatusStoreConflictError(
             f"status patch for {self._namespace}/{self._name} conflicted (409) "
             f"{MAX_CONFLICT_RETRIES} times"

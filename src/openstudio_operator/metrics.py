@@ -90,6 +90,28 @@ RESQUE_WORKERS_SEEN_MAX = Gauge(
     "monotonic max — survives worker disappearance within process lifetime",
 )
 
+# Issue #119 — observability surface for the status-store 409 retry loop.
+# The retention pipeline + the prune CronJob both write to the same
+# `.status.archivedAnalyses` map (see retention.py:517); their RMW cycle is
+# only safe because status_store._mutate retries on 409 up to
+# `MAX_CONFLICT_RETRIES` times. Without these counters a sustained conflict
+# storm is invisible: the operator keeps responding healthy on /metrics and
+# the only signal is a SLOW tick.
+STATUS_CONFLICTS_TOTAL = Counter(
+    "openstudio_operator_status_conflicts_total",
+    "Per-attempt 409 responses from the Kubernetes API Server during "
+    "status-store RMW cycles (incremented inside _mutate's except branch "
+    "for each 409 before the backoff sleep; #119)",
+)
+
+STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
+    "openstudio_operator_status_conflict_retries_exhausted_total",
+    "Status-store RMW cycles that exhausted the 409 retry budget and "
+    "raised StatusStoreConflictError; the tick that hit this counter was "
+    "skipped (the failure surfaces as a WARNING log + no .status write). "
+    "Issued by status_store._mutate just before raising; #119.",
+)
+
 DEFAULT_METRICS_PORT = 9090
 
 _start_lock = threading.Lock()
