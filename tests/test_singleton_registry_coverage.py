@@ -404,10 +404,11 @@ def test_redis_key_layout_handler_invokes_validate_key_layout(
         calls.append(("ReadOnlyRedisClient", redis_url))
         return _StubClient()
 
-    # Patch the symbol at the import site of handlers/__init__.py so the
-    # handler's closed-over ReadOnlyRedisClient is redirected to the stub.
+    # Patch the factory symbol at the import site of handlers/__init__.py so
+    # the handler's closed-over get_read_only_redis_client (issue #235 — the
+    # centralized ReadOnlyRedisClient factory) is redirected to the stub.
     monkeypatch.setattr(
-        "openstudio_operator.handlers.ReadOnlyRedisClient", _stub_factory
+        "openstudio_operator.handlers.get_read_only_redis_client", _stub_factory
     )
 
     body = {

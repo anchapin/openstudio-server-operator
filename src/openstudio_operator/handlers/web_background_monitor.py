@@ -88,6 +88,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException, AppsV1Api, CoreV1Api
 
+from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
     OperatorConfig,
@@ -157,13 +158,15 @@ RESQUE_KEY_LAYOUT_UNKNOWN_EVENT = "ResqueKeyLayoutUnknown"
 #: :data:`openstudio_operator._constants.LAYOUT_WARNING_GRACE_SECONDS`.
 _LAYOUT_WARNING_GRACE_SECONDS = LAYOUT_WARNING_GRACE_SECONDS
 
-#: Module-level cache (D04-clean): one Redis client session per redis URL,
-#: never operator state — mirrors the REST client caches of the sibling
-#: handlers. Plus three process-lifetime flags for the leg-2 safeguard:
-#: the high-water mark of distinct workers ever observed (drives the
-#: monotonic gauge), the first tick the empty-registry state began (for
-#: the grace-period check), and a one-shot warning emission flag.
-_redis_client_cache: dict[str, ReadOnlyRedisClient] = {}
+#: Process-lifetime flags for the leg-2 safeguard (issue #44): the
+#: high-water mark of distinct workers ever observed (drives the monotonic
+#: gauge), the first tick the empty-registry state began (for the
+#: grace-period check), and a one-shot warning emission flag.
+#:
+#: The Redis client cache that used to live here was retired in #235 — one
+#: ``lru_cache`` in :mod:`openstudio_operator.client_factory` now serves
+#: every callsite (this handler, the SLA monitor's escalation lookup and the
+#: boot-time key-layout probe), mirroring what #168 did for the REST client.
 _max_workers_seen: int = 0
 _empty_registry_since: datetime | None = None
 _resque_layout_warning_emitted: bool = False
@@ -185,11 +188,11 @@ def reset_leg2_safeguard_state() -> None:
 
 _RUNNING = "Running"
 
-# Note: ``_redis_client_cache``, ``_max_workers_seen``,
-# ``_empty_registry_since``, and ``_resque_layout_warning_emitted`` live at
-# the top of this module alongside ``RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`` —
-# colocating the issue #44 safeguard state with the constants it gates
-# keeps the leg-2 fix auditable in one place.
+# Note: ``_max_workers_seen``, ``_empty_registry_since``, and
+# ``_resque_layout_warning_emitted`` live at the top of this module
+# alongside ``RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`` — colocating the issue #44
+# safeguard state with the constants it gates keeps the leg-2 fix auditable
+# in one place.
 
 
 class WorkerDeploymentApi(Protocol):
@@ -292,14 +295,6 @@ def _get_tracker(namespace: str, name: str) -> StallWindowTracker:
         tracker = StallWindowTracker()
         _tracker_cache[(namespace, name)] = tracker
     return tracker
-
-
-def _get_redis_client(redis_url: str) -> ReadOnlyRedisClient:
-    client = _redis_client_cache.get(redis_url)
-    if client is None:
-        client = ReadOnlyRedisClient(redis_url)
-        _redis_client_cache[redis_url] = client
-    return client
 
 
 def _worker_pods_healthy(
@@ -557,7 +552,7 @@ def web_background_monitor(
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — web_background monitor idle this tick")
         return
-    redis_client = _get_redis_client(config.redis_url)
+    redis_client = get_read_only_redis_client(config.redis_url)
     store = StatusStore(namespace, name, operator_custom_objects_api())
     apps_api = AppsV1Api()
     pods_api = CoreV1Api()

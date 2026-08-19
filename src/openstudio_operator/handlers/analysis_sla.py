@@ -95,7 +95,10 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException, CoreV1Api
 
-from openstudio_operator.client_factory import get_openstudio_client
+from openstudio_operator.client_factory import (
+    get_openstudio_client,
+    get_read_only_redis_client,
+)
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
@@ -590,7 +593,7 @@ def _escalate_analysis(
     if pod_api is None:
         pod_api = CoreV1Api()
     if redis_client is None:
-        redis_client = _default_redis_client(config)
+        redis_client = get_read_only_redis_client(config.redis_url)
     victims = _resque_matched_worker_pods(
         redis_client,
         pod_api,
@@ -663,20 +666,6 @@ def _escalate_analysis(
     return outcome
 
 
-def _default_redis_client(config: OperatorConfig) -> RedisClientLike:
-    """Construct the production Redis client (issue #12 + #83 D2).
-
-    Imported lazily so the analysis_sla module can be imported without
-    dragging in the redis client (the fakeredis tests don't need it for
-    the SLA-only suites). Falls back to the operator's ``config.redis_url``
-    (the CRD `spec.redisUrl` field, default
-    ``redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379``).
-    """
-    from openstudio_operator.redis_client import ReadOnlyRedisClient
-
-    return ReadOnlyRedisClient(config.redis_url)
-
-
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
 def analysis_sla_monitor(
     body: dict,
@@ -694,7 +683,7 @@ def analysis_sla_monitor(
     client = get_openstudio_client(config.server_url)
     store = StatusStore(namespace, name, operator_custom_objects_api())
     pod_api: WorkerPodApi = CoreV1Api()
-    redis_client: RedisClientLike = _default_redis_client(config)
+    redis_client: RedisClientLike = get_read_only_redis_client(config.redis_url)
     # Issue #164 — single source of truth for Event emission. The class
     # encapsulates the dry-run gate (D11) and the suppressed counter; the
     # ``__call__`` shim keeps the ``emit("Warning", REASON, message)``
