@@ -76,6 +76,14 @@ jobs:
               echo "::error::deploy/ or scripts/ contains a TODO(phase N) marker — these were initial-scaffold placeholders that should have been resolved by now (issue #152)"
               exit 1
           fi
+      # Issue #150 — fail the build if the legacy kind-recipe Redis password
+      # literal `openstudio` re-appears as a password value in source.
+      # Parses YAML structurally so comments / image names / namespace labels
+      # are NOT flagged.
+      - name: Check no legacy Redis password literal (issue #150)
+        run: |
+          pip install pyyaml  # the guard script uses yaml.safe_load
+          bash scripts/check_redis_password_unique.sh
 
   test:
     runs-on: ubuntu-latest

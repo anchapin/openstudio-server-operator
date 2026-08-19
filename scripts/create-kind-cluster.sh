@@ -5,6 +5,23 @@
 #
 # Requires on PATH: docker, kind, kubectl.
 # If kind/kubectl are missing, see docs/kind-validation.md for one-line installs.
+#
+# Redis password convention (issue #150): this script only creates the kind
+# cluster — it does NOT apply any OpenStudio manifests. The kind recipe's
+# committed Redis password is the placeholder `openstudio-rotated` (the
+# legacy literal `openstudio` was rotated out of source in #150). A fresh
+# install MUST generate a per-cluster random password before applying
+# `scripts/deploy-openstudio-stack.sh`, otherwise the web/worker/web-background
+# pods will fail to authenticate to Redis:
+#
+#   scripts/rotate_redis_password.sh        # generates + substitutes + applies
+#   scripts/deploy-openstudio-stack.sh      # then apply the rest of the stack
+#
+# Running `scripts/rotate_redis_password.sh` with no flags picks a fresh
+# random password per invocation, so two clusters created back-to-back from
+# this script will not share Redis credentials. The CI guard
+# `scripts/check_redis_password_unique.sh` fails the build if the legacy
+# `openstudio` literal ever re-appears as a Redis password in source.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

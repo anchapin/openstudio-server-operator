@@ -33,9 +33,12 @@
 # reference; the ScaledObject references it. KEDA's metrics adapter
 # reads the password at query time. The operator never sees it.
 #
-# If you change the Redis password, update the `openstudio` Secret in
+# If you change the Redis password, update the `openstudio-redis` Secret in
 # the `openstudio-server` namespace and the TriggerAuthentication will
-# pick it up on the next poll.
+# pick it up on the next poll. (Issue #150: the committed default was rotated
+# from the legacy `openstudio` literal to `openstudio-rotated`. For a fresh
+# cluster, run `scripts/rotate_redis_password.sh` to install a per-cluster
+# random password.)
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:

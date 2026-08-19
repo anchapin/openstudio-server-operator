@@ -335,7 +335,10 @@ Planned Event (per handler docstring / plan doc): **`DatapointRequeued`**
    logs.
 2. Post-flip (Phase D): the real requeue lands on the `requeued` Resque
    queue — verify via Redis (read-only, #12 client semantics):
-   `redis-cli -h queue.openstudio-server -a openstudio llen requeued`.
+   `redis-cli -h queue.openstudio-server -a openstudio-rotated llen requeued`
+   (issue #150 — was the legacy literal `openstudio` until #150; for a fresh
+    cluster, run `scripts/rotate_redis_password.sh` to install a per-cluster
+    random password and substitute it here).
    Mind quirk 3: only datapoints **with** `job_id` requeue; a jobless dp
    500s — the handler must never select one.
 3. Bound proof: keep the dp zombie past `maxAutoRequeues` (default 3) —

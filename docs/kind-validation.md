@@ -72,7 +72,7 @@ Names are load-bearing — the operator targets them by fixed identifier
 | Chart object (develop) | kind manifest | Parity notes |
 |---|---|---|
 | Deployment `db` (mongo:7.0.40@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b) + Service `db:27017` | `scripts/manifests/01-mongo.yaml` | same image/creds (`openstudio`/`openstudio`, auth_source `admin`); persistence emptyDir; **chart default is 6.0.7 (EOL) — bumped to 7.0.40 here for CVE hygiene (#172)** |
-| Deployment `redis` (redis:7.4.10@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73) + Service `queue:6379` | `scripts/manifests/02-redis.yaml` | same image/password (`--requirepass openstudio`); persistence emptyDir; **chart default is 6.0.9 (EOL) — bumped to 7.4.10 here for CVE hygiene (#172)** |
+| Deployment `redis` (redis:7.4.10@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73) + Service `queue:6379` | `scripts/manifests/02-redis.yaml` | same image; password committed as the placeholder `openstudio-rotated` (issue #150 — was the publicly-known `openstudio` literal until #150; run `scripts/rotate_redis_password.sh` to install a per-cluster random one before applying); persistence emptyDir; **chart default is 6.0.9 (EOL) — bumped to 7.4.10 here for CVE hygiene (#172)** |
 | PVC `nfs-pvc` (RWX, storageClass `nfs`) | `scripts/manifests/03-nfs-hostpath.yaml` | **hostPath stand-in** on the kind node (`/tmp/openstudio-kind-nfs`) |
 | Deployment `web` + Service `web:80` | `scripts/manifests/04-web.yaml` | image pinned **3.11.0** (chart default 3.8.0-1 is NOT the target); same command/env (`QUEUES=analysis_wrappers`, `REDIS_URL`, `MONGO_USER/PASSWORD`, `SECRET_KEY_BASE` chart default); mounts `nfs-pvc` at `/mnt/openstudio`; image **digest-pinned** to `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
 | Deployment `web-background` | `scripts/manifests/05-web-background.yaml` | same command (`resque:workers` scaled by `COUNT`); `OS_SERVER_NUMBER_OF_WORKERS` tuned 30→2; mounts `nfs-pvc`; image **digest-pinned** to the same `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
@@ -523,8 +523,14 @@ via `scripts/deploy-openstudio-stack.sh` (all `deploy/web`, `deploy/worker`,
 `deploy/web-background` 1/1 Ready), operator image built locally
 (`docker build -t ghcr.io/anchapin/openstudio-server-operator:dev .`) and
 side-loaded with `kind load docker-image` (GitHub Actions runners were down —
-the `:dev` image was NOT pulled from ghcr). Redis password per the manifest:
-`openstudio`. All `redis-cli` output below is verbatim.
+the `:dev` image was NOT pulled from ghcr). Redis password at capture time:
+the legacy literal `openstudio` (post-#150, the committed default is
+`openstudio-rotated`; see the new `scripts/rotate_redis_password.sh`). The
+`redis-cli -a openstudio` invocations in the verbatim captures below are
+historical evidence from this pre-#150 run — they worked because the
+manifest's password was that literal at the time. Fresh clusters should
+use `openstudio-rotated` (the committed placeholder) or the value
+`scripts/rotate_redis_password.sh` prints.
 
 > **Note (issue #172, post-2026-08-18).** The captures below used the
 > pre-#172 image tags (`mongo:6.0.7`, `redis:6.0.9`); the live recipe now
