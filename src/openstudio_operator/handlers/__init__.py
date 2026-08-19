@@ -26,7 +26,7 @@ from openstudio_operator.handlers import (  # noqa: F401
     web_background_monitor,
     worker_recycler,
 )
-from openstudio_operator.metrics import start_metrics_server
+from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS, start_metrics_server
 from openstudio_operator.redis_client import (
     OperatorConfigError,
     RedisClientError,
@@ -116,15 +116,26 @@ def _check_redis_key_layout_for_cr(
     DNS failure, refused connection, timeout) does NOT crash the boot —
     the operator continues in degraded mode and retries on the next tick,
     per the issue's "silent-misbehavior risk" counter-spec.
+
+    Issue #253 — every return path updates the cluster-wide
+    ``openstudio_operator_redis_key_layout_status`` Gauge: ``1.0`` on
+    ``ok`` (the most recent validator run succeeded) and ``0.0`` for
+    every other terminal status (``degraded`` | ``unreachable`` |
+    ``error`` | ``skipped``). The gauge is a cluster-wide latest-observation
+    signal — no per-CR labels, so cardinality stays bounded regardless of
+    CR count.
     """
     if not isinstance(item, dict):
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "skipped"
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
     if not isinstance(meta, dict):
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "skipped"
     ns = str(meta.get("namespace") or "")
     nm = str(meta.get("name") or "")
     if not ns or not nm:
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "skipped"
     spec = item.get("spec") or {}
     redis_url = str(spec.get("redisUrl") or "")
@@ -136,6 +147,7 @@ def _check_redis_key_layout_for_cr(
             ns,
             nm,
         )
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "skipped"
     try:
         get_read_only_redis_client(redis_url).validate_key_layout()
@@ -162,6 +174,7 @@ def _check_redis_key_layout_for_cr(
                 "the constants (see issue #44 / docs/kind-validation.md)."
             ),
         )
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "degraded"
     except (RedisClientError, OSError) as exc:
         # Redis connectivity failure (refused, DNS, timeout) — wire-level,
@@ -174,6 +187,7 @@ def _check_redis_key_layout_for_cr(
             nm,
             exc,
         )
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "unreachable"
     except Exception as exc:  # noqa: BLE001 — defensive last-resort (see web_background_monitor.py)
         logger.warning(
@@ -183,12 +197,14 @@ def _check_redis_key_layout_for_cr(
             type(exc).__name__,
             exc,
         )
+        REDIS_KEY_LAYOUT_STATUS.set(0.0)
         return "error"
     logger.info(
         "redis_key_layout=ok namespace=%s name=%s",
         ns,
         nm,
     )
+    REDIS_KEY_LAYOUT_STATUS.set(1.0)
     return "ok"
 
 

@@ -39,6 +39,7 @@ import kopf
 
 from openstudio_operator.metrics import (
     EVENTS_DRY_RUN_SUPPRESSED_TOTAL,
+    EVENTS_EMIT_FAILURES_TOTAL,
     EVENTS_EMITTED_TOTAL,
 )
 
@@ -135,7 +136,23 @@ class EventEmitter:
         # ``rate(events_emitted_total) / rate(events_dry_run_suppressed_total)``
         # is the headline SLO for an audit-only install.
         EVENTS_EMITTED_TOTAL.labels(reason=reason).inc()
-        kopf.event(self._body, type=event_type, reason=reason, message=message)
+        try:
+            kopf.event(self._body, type=event_type, reason=reason, message=message)
+        except Exception:  # defensive: increment counter, re-raise unchanged
+            # Issue #255 — observability surface for kopf.event posting
+            # failures. The handler wrapper would otherwise catch the
+            # raised ``ApiException`` via
+            # ``handler_tick_failures_total{module,error_type}`` and
+            # collapse "Event posting down" into the same counter as
+            # "REST API down" (both ``ApiException``). Increment the
+            # dedicated counter BEFORE re-raising so a sustained
+            # ``ApiException`` storm from the event posting path is its
+            # own /metrics signal — labelled by ``reason`` so a dashboard
+            # can tell WHICH handler path's Event emission failed.
+            # Cardinality matches ``events_emitted_total`` so the failure
+            # series can be rate-correlated with the success series.
+            EVENTS_EMIT_FAILURES_TOTAL.labels(reason=reason).inc()
+            raise
 
     def __call__(self, event_type: str, reason: str, message: str) -> None:
         """Backwards-compat shim: ``emit("Warning", REASON, msg)`` syntax.

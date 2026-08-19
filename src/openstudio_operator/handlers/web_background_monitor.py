@@ -96,7 +96,9 @@ from openstudio_operator.config import (
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
+    RESQUE_QUEUE_DEPTH,
     RESQUE_WORKERS_SEEN_MAX,
+    STALL_WINDOW_ELAPSED_SECONDS,
     WEB_BACKGROUND_RESTARTS_TOTAL,
 )
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
@@ -382,7 +384,17 @@ def _stall_condition_holds(
         _max_workers_seen = len(registered)
         RESQUE_WORKERS_SEEN_MAX.set(_max_workers_seen)
     # Leg A: work is queued (either managed Resque queue).
+    # Issue #238 — surface the operator's authoritative LLEN reads as a
+    # Prometheus Gauge before the leg evaluation runs, so the metric is
+    # populated on every sensing tick (matching the #87 unconditional
+    # worker observation pattern: cheap path, no failure mode, advance
+    # the gauge on every successful Redis read). The Leg-A cheap-fail
+    # below still returns early when both depths are zero — the gauges
+    # are already populated, so the operator's authoritative reading
+    # remains visible to a scraper even on a perfectly idle fleet.
     depths = redis_client.queue_depths()
+    for queue_name, depth in depths.items():
+        RESQUE_QUEUE_DEPTH.labels(queue=queue_name).set(depth)
     if not any(depth > 0 for depth in depths.values()):
         return False
     # Leg B: nobody is processing — every registered heartbeat is stale
@@ -484,6 +496,12 @@ def run_stall_tick(
         # Blind gap: a failed read is no evidence the condition held —
         # restart the window so skip-and-retry cannot stitch across it.
         tracker.reset()
+        # Issue #254 — mirror the tracker reset on the gauge so a blind
+        # gap does not leave the gauge pointing at a stale elapsed
+        # value. The next successful tick (post-recovery) will start a
+        # fresh observation window and the gauge will advance from 0
+        # again.
+        STALL_WINDOW_ELAPSED_SECONDS.set(0.0)
         raise
 
     # Issue #44 — leg-2 non-vacuity safeguard. Best-effort: a failure to
@@ -494,7 +512,22 @@ def run_stall_tick(
     except Exception as exc:  # noqa: BLE001 — defensive only (diagnostic emit)
         logger.debug("leg-2 safeguard emit failed: %s", exc)
 
-    if not tracker.observe(holds, now, window):
+    sustained = tracker.observe(holds, now, window)
+    # Issue #254 — expose the tracker's accumulated state as a Gauge so
+    # SREs have an early-warning signal between the first sustained
+    # observation and the eventual ``web_background_restarts_total``
+    # increment. The gauge reads the elapsed seconds when the condition
+    # holds this tick (``tracker.first_observed`` was set by observe()
+    # on the holding tick); 0 when it breaks (matching the tracker's own
+    # reset semantics — a broken condition clears ``first_observed`` and
+    # the gauge is cleared in lockstep). Set AFTER ``tracker.observe()``
+    # so the value reflects the post-observe tracker state exactly.
+    if holds and tracker.first_observed is not None:
+        elapsed = (now - tracker.first_observed).total_seconds()
+        STALL_WINDOW_ELAPSED_SECONDS.set(max(elapsed, 0.0))
+    else:
+        STALL_WINDOW_ELAPSED_SECONDS.set(0.0)
+    if not sustained:
         return False
 
     deployment = config.target_web_background_deployment or DEFAULT_WEB_BACKGROUND_DEPLOYMENT

@@ -73,6 +73,153 @@ ANALYSES_DELETED_TOTAL = Counter(
     "delete and the increment)",
 )
 
+# Issue #238 — per-queue Resque depth Gauge. The operator reads
+# ``LLEN resque:queue:simulations`` and ``LLEN resque:queue:requeued`` on every
+# web_background_monitor tick (cheapest leg-A signal in
+# ``_stall_condition_holds``) but never exposed the readings as a metric —
+# the only view was KEDA's external metrics API, and the operator's own
+# readings are the authoritative cross-check for a centralized-constants /
+# live v3.11.0 layout drift (#44/#66/#67): if the operator's depth reads
+# disagree with KEDA's, the Resque key constants are wrong. Labelled by
+# ``queue`` so a Grafana panel can render both series on the same axis;
+# cardinality is bounded (one series per managed queue — 2 total). Set in
+# ``web_background_monitor._stall_condition_holds`` immediately after the
+# ``queue_depths()`` read so the gauge advances on every tick, even the
+# ones that bail before the stall-condition evaluation runs (cheap path).
+RESQUE_QUEUE_DEPTH = Gauge(
+    "openstudio_operator_resque_queue_depth",
+    "Resque queue depth observed by web_background_monitor (LLEN "
+    "``resque:queue:simulations`` / ``resque:queue:requeued``) on every "
+    "sensing tick (issue #238). Labelled by queue name; cardinality is "
+    "bounded to the two managed queues — surfaces the operator's "
+    "authoritative reading as a cross-check against KEDA's external "
+    "metrics view and a debuggable signal when the centralized Resque key "
+    "constants drift from the live v3.11.0 layout.",
+    labelnames=["queue"],
+)
+
+# Issue #239 — singleton-guard election outcomes. The guard (D05, issue #14)
+# emits Warning ``SingletonConflict`` on losers and Normal
+# ``SingletonActive`` on the winner when > 1 CRs exist, plus a single info
+# log on transition to zero CRs ("operator idle"). When the guard is
+# silently bypassed — the kopf registry internals change shape so
+# ``install_singleton_guard`` returns 0 and the AST coverage test does not
+# fail — the operator ticks against multiple CRs without any
+# ``SingletonConflict`` Warning Events: the corruption is silent on the
+# dashboard. A Counter on the three enforcement outcomes (idle | active |
+# conflict) lets an SRE alert on ``rate(openstudio_operator_singleton_
+# election_total{outcome="conflict"}[5m]) > 0`` and notice the silent
+# bypass even if no Warning Event fires. Incremented at the three
+# post-decode branches in ``SingletonGuard.enforce`` (issue #239
+# explicitly allows ``the equivalent post-decode site`` as an alternative
+# to ``singleton_guard._check``); only fires on STATE CHANGES (matches
+# the existing change-gated log/Event noise channel — steady state is
+# silent both for Events and for this counter).
+SINGLETON_ELECTION_TOTAL = Counter(
+    "openstudio_operator_singleton_election_total",
+    "Singleton-guard election outcomes (issue #239). Incremented at the "
+    "three branches in SingletonGuard.enforce: outcome=idle when no "
+    "OSCM CRs exist in the namespace; outcome=active when exactly one "
+    "CR exists and is served; outcome=conflict when >1 CRs exist and the "
+    "oldest is served (the others get ``SingletonConflict`` Warning "
+    "Events). Only fires on state changes (mirrors the existing log/Event "
+    "noise gate) so steady state is silent. Alert on sustained nonzero "
+    "rate on outcome=conflict — a multi-CR namespace is a singleton-guard "
+    "violation (D05).",
+    labelnames=["outcome"],
+)
+
+# Issue #253 — Redis key-layout validation status as a Gauge. The boot-time
+# validator (#163) returns one of ``ok | degraded | unreachable | error |
+# skipped`` and emits a structured log line per CR; the Warning Event on the
+# ``degraded`` branch is the only third-party signal today. A Gauge lets the
+# on-call tell ``validator has not run yet`` from ``validator found a
+# layout drift`` from a /metrics scrape: the gauge reads ``1.0`` while the
+# most recent validation succeeded, ``0.0`` for every other terminal status
+# (degraded | unreachable | error | skipped). The
+# ``resque_workers_seen_max`` gauge is the related diagnostic but only
+# asserts worker presence in a candidate key prefix; this gauge asserts the
+# validator itself returned ok. Set at every call to
+# ``handlers/_check_redis_key_layout_for_cr`` so the metric reflects the
+# latest operator boot observation per CR — without labels to keep
+# cardinality bounded (one series for the cluster-wide validator state,
+# not per-CR).
+REDIS_KEY_LAYOUT_STATUS = Gauge(
+    "openstudio_operator_redis_key_layout_status",
+    "Redis key-layout validation status (issue #253). 1.0 when the most "
+    "recent ``validate_key_layout()`` call returned ``ok``; 0.0 for every "
+    "other terminal status (``degraded`` | ``unreachable`` | ``error`` | "
+    "``skipped``). Surfaces the post-#44 failure mode — a v3.11.0 layout "
+    "drift takes ``resque_workers_seen_max`` silent and the stall "
+    "condition fires vacuously — as a Prometheus signal so an SRE can "
+    "alert on ``openstudio_operator_redis_key_layout_status == 0`` "
+    "instead of correlating logs. Set in "
+    "``handlers/_check_redis_key_layout_for_cr`` for every CR on every "
+    "OSCM watch event (cluster-wide latest observation, not per-CR — "
+    "the validator outcome is process-wide).",
+)
+
+# Issue #254 — sustained-window elapsed seconds for the web_background
+# stall. ``StallWindowTracker`` records the first tick the stall condition
+# was observed and counts elapsed seconds against
+# ``stallWindowMinutes``. The action is gated on reaching the window, but
+# the only metric that fires today is
+# ``web_background_restarts_total`` AFTER the window expires — an on-call
+# has no early-warning signal that the stall is accumulating. Three
+# Redis/K8s-leg ticks could be quietly accumulating toward a restart with
+# nothing on the dashboard between them. A Gauge of elapsed seconds (0
+# when the condition breaks, ``(now - first_observed).total_seconds()``
+# when it holds) gives SREs a heads-up display: rate > 0 means the window
+# is accumulating, exact value shows how close to action. Set in
+# ``run_stall_tick`` immediately after ``tracker.observe()`` — the same
+# site that already issues the action, so the gauge tracks the tracker
+# state exactly.
+STALL_WINDOW_ELAPSED_SECONDS = Gauge(
+    "openstudio_operator_stall_window_elapsed_seconds",
+    "Sustained-window elapsed seconds for the web_background stall "
+    "(issue #254). Set in ``run_stall_tick`` after ``tracker.observe()`` "
+    "to the elapsed seconds when the stall condition held this tick, or "
+    "0 when it broke (the tracker resets). Rate > 0 means the window is "
+    "accumulating toward a ``web_background_restarts_total`` increment; "
+    "exact value shows how close to action (the action fires at "
+    "``stallWindowMinutes``). Gives SREs a heads-up display between the "
+    "first sustained observation and the eventual restart — without this "
+    "gauge, three or more Redis/K8s-leg ticks can accumulate toward a "
+    "restart with nothing on the dashboard until the gate trips.",
+)
+
+# Issue #255 — ``kopf.event`` emission failure counter. ``EventEmitter``
+# routes every Event through ``kopf.event`` (issue #164). When the
+# apiserver is unreachable, kopf's event posting raises; the exception
+# propagates up through the handler wrapper and is caught by
+# ``handler_tick_failures_total{module,error_type}`` (issue #117). Today
+# the on-call cannot distinguish "REST API down" from "Event posting
+# down" — ``error_type`` captures ``ApiException`` for both, with no
+# granularity for the kopf event path. This Counter is incremented inside
+# the try/except that wraps the ``kopf.event`` call in ``EventEmitter.emit``,
+# BEFORE re-raising, so a sustained ``ApiException`` storm from the event
+# posting path is a distinct /metrics signal. Labelled by ``reason`` —
+# the warning-event reasons the call site passes to ``kopf.event``
+# (``AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued``
+# | ``DatapointRequeueExhausted`` | ``WorkerRecycled`` |
+# ``WebBackgroundRestarted`` | ``ResqueKeyLayoutUnknown`` | …) — so a
+# dashboard can tell WHICH event the operator failed to post. Cardinality
+# is bounded to the same vocabulary as ``events_emitted_total``; no
+# labels beyond what the call site already carries.
+EVENTS_EMIT_FAILURES_TOTAL = Counter(
+    "openstudio_operator_events_emit_failures_total",
+    "``kopf.event`` emission failures caught by EventEmitter.emit "
+    "(issue #255). Incremented inside the try/except wrapping the "
+    "``kopf.event`` call BEFORE re-raising — a sustained nonzero rate "
+    "means the operator cannot post Kubernetes Events to the apiserver "
+    "(independent of the REST/Redis/K8s API signals that surface via "
+    "``handler_tick_failures_total``). Labelled by ``reason`` — the "
+    "warning-event reason the call site was attempting to post — so a "
+    "dashboard can tell WHICH handler path's Event emission failed "
+    "(same vocabulary as ``events_emitted_total``).",
+    labelnames=["reason"],
+)
+
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard; issue #87 —
 #: unconditional emission. Monotonic max of distinct Resque worker ids the
 #: operator has EVER observed in process lifetime (web_background_monitor,
