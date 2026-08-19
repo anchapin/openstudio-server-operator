@@ -292,6 +292,56 @@ Verified against v3.11.0:
 
 Full ground truth: [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./contracts/openstudio-server-v3.11.0-rest.md).
 
+### Redis password is not a fixed literal (#150)
+
+The kind recipe (`scripts/manifests/02-redis.yaml`) and
+`deploy/redis-credentials-secret.yaml` no longer ship the
+publicly-known `openstudio` literal (rotated to the placeholder
+`openstudio-rotated`). The matching `REDIS_URL` env vars in the
+manifests for `web`, `web_background`, and `worker` were rotated in
+lockstep.
+
+Fresh installs MUST run `scripts/rotate_redis_password.sh` first —
+it generates a per-cluster 32-character random password, substitutes
+it into the five manifests at apply time, and updates the live
+`openstudio-redis` Secret so the helm chart's `web` / `web_background`
+/ `worker` Deployments pick it up. The companion CI guard
+`scripts/check_redis_password_unique.sh` fails the build if the
+legacy `openstudio` literal re-appears as a Redis password in any of
+the five manifest files (#150 was a real incident; this is the
+regression fence).
+
+### `/metrics` ingress is namespace-scoped (#166)
+
+The plaintext Prometheus endpoint (`metrics.py`'s
+`prometheus_client.start_http_server(port, addr="0.0.0.0")` +
+`deploy/operator-deployment.yaml` `containerPort: 9090`) has **no
+authN, no authZ, no TLS**. `deploy/network-policy.yaml` therefore
+ships an Ingress policy `openstudio-operator-metrics-ingress`
+(`policyTypes: [Ingress]`) that allows TCP/9090 to the operator pod
+only from:
+
+- a namespace labeled `kubernetes.io/metadata.name: prometheus` (the
+  default scraper namespace for stock `kube-prometheus-stack`), AND
+- any same-namespace peer in `openstudio-server` (sidecar or
+  colocated scraper, identified by an empty `podSelector`).
+
+A cluster whose Prometheus runs in a differently-named namespace
+(`monitoring`, `kube-prometheus-stack`, `observability`, etc.) MUST
+edit the `namespaceSelector` label match in that policy before
+applying. Otherwise the operator's metrics (queue depths,
+status-conflict retries, `resque_workers_seen_max`,
+`status_map_caps_total`, the dry-run gate counters) **silently
+become unreadable** — there is no other failure signal.
+
+The enforcement test
+[`tests/test_deploy_manifests.py::test_network_policy_metrics_ingress_has_prometheus_and_peer_allow`](../../tests/test_deploy_manifests.py)
+asserts both peers are present and fails CI on either removal. The
+unrelated no-custom-autoscaling rule above (#77) keeps the operator
+process from owning any autoscaling surface; #166 governs which
+**external** scrapers can reach the `/metrics` endpoint it does
+emit.
+
 ### Other rules worth knowing
 
 - **Policy values** belong in `config.py` / the CRD `spec`. No hardcoded

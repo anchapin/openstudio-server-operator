@@ -1466,8 +1466,11 @@ hpa_floor lines: (empty — #77 removal complete)
 `openstudio_operator_hpa_floor_adjustments_total` is no longer
 served by the operator — proving the #77 removal was complete (no
 orphan counter declaration, no orphan incrementer). All other
-counters in `EXPECTED_COUNTER_FAMILIES` are still served (11 counters + 1 gauge,
-no orphans of any other kind):
+counters in `EXPECTED_COUNTER_FAMILIES` are still served (12 counters +
+1 gauge + 1 histogram — the +1 counter is the post-#171
+`status_map_caps_total` defensive cap, the +1 histogram is the post-#179
+`analysis_datapoint_count` per-CR datapoint-budget distribution; no orphans
+of any other kind):
 
 ```bash
 $ kubectl -n openstudio-server exec deploy/openstudio-operator -- \
@@ -1522,11 +1525,14 @@ HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
       `/metrics` confirms the counter is GONE at runtime (Section 6).
 - [x] **Unit and Kind validation tests pass without HPA floor
       reconciliation dependencies** — VERIFIED: `ruff check .` clean,
-      `pytest` 343 passed across 17 files (current count per
+      `pytest` 493 passed across 26 files (current count per
       `pytest --collect-only`); the operator boots
       end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
       drives scaling, and the operator's `/metrics` exposes the
-      11 counters + 1 gauge (Section 6).
+      12 counters + 1 gauge + 1 histogram (Section 6) — the +1 counter
+      over the pre-#171 baseline is the `status_map_caps_total` defensive
+      cap, and the +1 histogram is the post-#179
+      `analysis_datapoint_count` per-CR datapoint-budget distribution.
 
 ### Cleanup
 
