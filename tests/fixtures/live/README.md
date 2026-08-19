@@ -14,7 +14,6 @@ seeding routes are documented in `docs/kind-validation.md`).
 Two files are documented **error shapes** (the drift checker reports them
 as ERROR — allowed, not FAIL):
 
-- `get_analysis_page_data_notfound.json` — 200 `{analysis: null}` for an
   unknown id (`mongoid.yml` `raise_not_found_error: false` — no 404s).
 - `post_datapoint_requeue.json` — 500 on a datapoint that never had a
   Resque job (requeue only dps with a `job_id`).

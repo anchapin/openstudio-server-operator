@@ -85,23 +85,6 @@ def test_list_analyses_returns_raw_docs_with_utc_timestamps(client):
 
 
 @responses.activate
-def test_get_analysis_page_data_normalizes_sla_anchor(client):
-    responses.get(
-        f"{BASE}/analyses/a1/page_data.json",
-        json={
-            "analysis": {
-                "status": "started",
-                "start_time": "2026-08-18T08:00:00-06:00",
-                "run_flag": True,
-            }
-        },
-    )
-    page = client.get_analysis_page_data("a1")
-    assert page["analysis"]["start_time"] == datetime(2026, 8, 18, 14, 0, 0, tzinfo=UTC)
-    assert page["analysis"]["status"] == "started"
-
-
-@responses.activate
 def test_get_analysis_status_returns_singular_wrapper(client):
     """Issue #83 D1: ``/status.json`` is the new SLA clock anchor source.
 
@@ -216,26 +199,6 @@ def test_list_started_datapoints_uses_status_and_jobs_params(client):
 
 
 @responses.activate
-def test_get_datapoints_full_returns_ip_address_and_utc_times(client):
-    responses.get(
-        f"{BASE}/data_points.json",
-        json=[
-            {
-                "_id": "dp1",
-                "status": "started",
-                "ip_address": "10.244.0.17",
-                "run_start_time": "2026-08-18T08:00:00-06:00",
-                "updated_at": "2026-08-18T09:30:00Z",
-            }
-        ],
-    )
-    docs = client.get_datapoints_full()
-    assert docs[0]["ip_address"] == "10.244.0.17"
-    assert docs[0]["run_start_time"] == datetime(2026, 8, 18, 14, 0, 0, tzinfo=UTC)
-    assert docs[0]["updated_at"] == datetime(2026, 8, 18, 9, 30, 0, tzinfo=UTC)
-    assert "status=" not in responses.calls[0].request.url
-
-
 # --- Actions ------------------------------------------------------------
 
 
@@ -307,9 +270,9 @@ def test_exhausts_retries_with_backoff_schedule_then_raises(client, sleeps):
 
 @responses.activate
 def test_4xx_raises_immediately_without_retry(client, sleeps):
-    responses.get(f"{BASE}/analyses/a1/page_data.json", status=404, body="{}")
+    responses.get(f"{BASE}/analyses/a1/status.json", status=404, body="{}")
     with pytest.raises(OpenStudioApiError, match="404"):
-        client.get_analysis_page_data("a1")
+        client.get_analysis_status("a1")
     assert len(responses.calls) == 1
     assert sleeps == []
 

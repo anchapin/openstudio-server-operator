@@ -162,29 +162,14 @@ class OpenStudioClient:
     # --- Reads -----------------------------------------------------------
 
     def list_analyses(self) -> list[dict]:
-        """GET /analyses.json — raw Mongoid docs.
+        """GET /analyses.json — full list of analysis documents (id, name, status, etc.).
 
-        Fields include ``status``, ``run_flag``, ``created_at``, ``updated_at`` (Mongoid
-        timestamps, ISO8601 with zone, normalized to tz-aware UTC at this boundary). No
-        derived methods: ``start_time`` is NOT included — anchor the SLA clock on
-        ``get_analysis_page_data`` instead.
+        Raw docs omit nil fields on a fresh analysis (live v3.11.0 contract §2).
+        For per-analysis derived fields (start_time, point counts, output variables),
+        use ``get_analysis_status`` — it is the live-verified source-of-truth for
+        status and reliably reflects the analysis lifecycle.
         """
         return self._request_json("GET", "/analyses.json")
-
-    def get_analysis_page_data(self, analysis_id: str) -> dict:
-        """GET /analyses/{id}/page_data.json — ``{analysis: {status, start_time, end_time,
-        run_flag?, ...}}``.
-
-        ``start_time`` is derived from the first job and is the historical SLA clock
-        anchor. **Live-verified issue #83 D1**: on v3.11.0, ``as_json(only:)`` drops nil
-        fields — a minimal analysis serializes as only
-        ``{name, data_points, results, output_variables}``, so ``start_time`` is ABSENT
-        (not null) until the first job. The SLA clock now anchors on
-        :meth:`get_analysis_status` + CR ``.status`` first-sight timestamps instead.
-        This endpoint is still useful for derived fields (point counts, output
-        variables), but the clock anchor moved to status.json.
-        """
-        return self._request_json("GET", f"/analyses/{analysis_id}/page_data.json")
 
     def get_analysis_status(self, analysis_id: str) -> dict:
         """GET /analyses/{id}/status.json — derived view, the SLA clock anchor (#83 D1).
@@ -219,15 +204,6 @@ class OpenStudioClient:
             "GET", "/data_points/status", params={"status": 1, "jobs": "started"}
         )
         return payload.get("data_points", []) if isinstance(payload, dict) else []
-
-    def get_datapoints_full(self) -> list[dict]:
-        """GET /data_points.json — full ``DataPoint.all`` docs; heavy payload, escalation-only.
-
-        Used for the datapoint ``ip_address`` lookup behind Kubernetes-side pod eviction.
-        Query params are ignored server-side (no server-side status filter), so none are
-        sent.
-        """
-        return self._request_json("GET", "/data_points.json")
 
     # --- Actions ---------------------------------------------------------
 
