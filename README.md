@@ -191,6 +191,8 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 ├── src/openstudio_operator/
 │   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
 │   ├── _time.py                # tz-aware UTC parser (`parse_utc`); None-safe; replaces three byte-equivalent duplicates (#174)
+│   ├── _k8s.py                 # Shared Kubernetes API helpers (`DeploymentReader`, `deployment_label_selector`); neutral home for cross-handler K8s surface (#236, #250)
+│   ├── _oscm_handlers.py       # Python-level OSCM handler registry; new handlers call `register()` at import; singleton guard cross-checks against the kopf registry at gate time (#250)
 │   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
 │   ├── openstudio_client.py    # OpenStudio REST client (verified against v3.11.0)
 │   ├── client_factory.py       # `lru_cache`-keyed factories for `OpenStudioClient` + `ReadOnlyRedisClient`; a mutated `spec.serverUrl` / `spec.redisUrl` invalidates by a different key (#168, #235)
@@ -200,9 +202,10 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + /metrics endpoint
+│   ├── metrics.py              # Prometheus counters + gauges + histogram + /metrics endpoint (16+4+1)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
+│   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py

@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (331 tests post-#77 removal)
+ruff check . && pytest                       # both green (529 tests across 28 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,14 +230,19 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **12
-counters + 1 gauge + 1 histogram** — is asserted by `tests/test_metrics_endpoint.py`'s
+local; the scrape is in-cluster). The exhaustive inventory — **16
+counters + 4 gauges + 1 histogram** — is asserted by `tests/test_metrics_endpoint.py`'s
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES`:
 drift in either direction fails CI before it ships, so any new metric added to
 this codebase MUST be added to both the table below and the matching
 `EXPECTED_*` tuple in the same PR (the `hpa_floor_adjustments_total`
 counter, removed in #77, is the canonical "you forgot" example — see
-`docs/kind-validation.md` step 4.7).
+`docs/kind-validation.md` step 4.7). The 12+1+1 → 16+4+1 expansion was
+landed in the auto-improvement-loop iteration 2 sweep (#237 dry-run
+gate Prometheus surface + emitted companion counter, #238 Resque queue
+depth Gauge, #239 singleton-guard election outcomes, #253 Redis
+key-layout validation status, #254 sustained-window elapsed seconds
+Gauge, #255 kopf.event emission failure counter).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -269,14 +274,18 @@ stays self-contained.
 | `openstudio_operator_status_conflict_retries_exhausted_total` | `status_store` (#119) | RMW cycle that exhausted the 409 retry budget and raised `StatusStoreConflictError` (tick skipped, anchor NOT written) | n/a — terminal failure of an anchor write |
 | `openstudio_operator_handler_tick_failures_total` | `handlers/*` timer wrappers (#117) | Tick failure caught by a timer wrapper (catch-and-skip path). **Labelled by `(module, error_type)`** — `module` ∈ {`analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor`}; `error_type` ∈ {`OpenStudioApiError`, `StatusStoreError`, `ApiException`, `RedisClientError`} | n/a — observability for the wrapper catch-and-skip path (the tick was suppressed, no anchor was written) |
 | `openstudio_operator_status_map_caps_total` | `status_store` (#171) | Defensive cap hit on a CR `.status` map — one increment per actual eviction (post-RMW, retry-stable — not per 409 attempt). **Labelled by `map_name`** — `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`}. When a map hits `STATUS_MAP_MAX_ENTRIES = 10000`, `status_store._set_map_entry` evicts the **oldest entries first** (sorted by key — the operator's keys are UUIDs, so the sort order is deterministic but not age-aware) before adding the new entry; the cap fires before etcd's 1.5 MB object-size limit can blow up a tick's read + JSON-parse + merge-patch. | n/a — defensive cap on the (otherwise unbounded) `.status` map; not a decision counter. The companion Warning Event (`StatusMapCapped`) is emitted from the same code path so the on-call has both a log/Event and a Prometheus signal to correlate (`rate(...[5m]) > 0` fires once per cap hit). |
+| `openstudio_operator_events_dry_run_suppressed_total` | `events` (`EventEmitter.emit` dry-run branch) (#237) | Kubernetes Events suppressed by the dry-run gate (D11) — incremented at the same site as `EventEmitter.suppressed_count`, inside `EventEmitter.emit` when `dry_run=True`. **Labelled by `reason`** mirroring the warning-event vocabulary (`AnalysisSoftStopped` \| `AnalysisEscalated` \| `DatapointRequeued` \| `DatapointRequeueExhausted` \| `WorkerRecycled` \| `WebBackgroundRestarted` \| `ResqueKeyLayoutUnknown`). | n/a — observability for the dry-run path (the substitution observable was previously in-process only). Companion to `events_emitted_total`; the emitted-vs-suppressed rate ratio is the headline SLO for an audit-only install. |
+| `openstudio_operator_events_emitted_total` | `events` (`EventEmitter.emit` non-dry-run branch) (#237) | Companion to `events_dry_run_suppressed_total` — every successful `kopf.event` call from `EventEmitter` (`dry_run=False`). Same `reason` label vocabulary. | n/a — observability for the Event path; `rate(events_emitted_total) / rate(events_dry_run_suppressed_total)` is the headline SLO for an audit-only install (a non-trivial suppressed rate with zero emitted rate is the intended steady state; the inverse drift — suppressed > emitted during a non-dry-run deploy — is the alert signal). |
+| `openstudio_operator_singleton_election_total` | `singleton` (`SingletonGuard.enforce` post-decode branches) (#239) | Singleton-guard election outcomes (D05). **Labelled by `outcome`** — `outcome` ∈ {`idle`, `active`, `conflict`}; only fires on STATE CHANGES (mirrors the existing change-gated log/Event noise channel — steady state is silent). | n/a — observability for the silent-bypass failure mode (when the kopf registry internals change shape and `install_singleton_guard` returns 0 without the AST coverage test catching it, the corruption is silent on the dashboard without this counter). Alert on sustained nonzero rate on `outcome=conflict` (a multi-CR namespace is a singleton-guard violation). |
+| `openstudio_operator_events_emit_failures_total` | `events` (`EventEmitter.emit` try/except wrapper) (#255) | `kopf.event` posting failures caught by `EventEmitter.emit`'s try/except wrapper BEFORE re-raising. **Labelled by `reason`** — same vocabulary as `events_emitted_total` — so a dashboard can tell WHICH handler path's Event emission failed. Sustained nonzero rate means the operator cannot post Kubernetes Events to the apiserver, **distinct from** the REST/Redis/K8s API signals that surface via `handler_tick_failures_total`. | n/a — observability for the Event posting path; complements `handler_tick_failures_total` (which captures `ApiException` for all three paths under one label and cannot distinguish "REST API down" from "Event posting down"). |
 
 **Labelled convention (#117).** `handler_tick_failures_total` is the
 first labelled counter in the registry and the canonical pattern for
 any future "which module is degraded" metric: one labelled family,
 `module × error_type`, with one increment per observation. A future
 maintainer wiring a new mutation that can fail in catch-and-skip paths
-SHOULD extend the same `module` label set (rather than introducing a
-new unlabelled counter) so the dashboard's per-module degradation view
+SHOULD extend the same `module` label set (rather than introducing
+a new unlabelled counter) so the dashboard's per-module degradation view
 stays comparable across error sources — reinventing a non-comparable
 unlabelled counter here is exactly the regression #181 guards against.
 
@@ -285,6 +294,9 @@ unlabelled counter here is exactly the regression #181 guards against.
 | Gauge | Module | Sets / Meaning | Notes |
 |---|---|---|---|
 | `openstudio_operator_resque_workers_seen_max` | `web_background_monitor` (#44/#87) | Monotonic max of distinct Resque worker ids ever observed in process lifetime (`SMEMBERS resque:workers`, emitted every poll regardless of queue depth) | #44 — Resque key-layout leg-2 non-vacuity safeguard; #87 dropped the original `AND queue depth > 0` alert conjunction so the gauge populates on a healthy idle fleet. `0` with a reachable Redis unambiguously means no workers are registered — alert on `== 0`. Not a decision counter — does not follow the §2 anchor pairing convention. |
+| `openstudio_operator_resque_queue_depth` | `web_background_monitor` (`_stall_condition_holds` leg-A read) (#238) | LLEN of the two managed Resque queues (`resque:queue:simulations` and `resque:queue:requeued`) on **every** sensing tick (same path the stall-condition leg-A reads, no separate cost). **Labelled by `queue`** (cardinality bounded to the two managed queues — 2 total). | n/a — surfaces the operator's authoritative reading as a cross-check against KEDA's external metrics view (a centralized-constants / live v3.11.0 layout drift (#44/#66/#67) shows up as the operator's depths disagreeing with KEDA's). Alert on `simulations` > 0 sustained while `resque_workers_seen_max == 0` (the dangerous silent misbehavior signature). |
+| `openstudio_operator_redis_key_layout_status` | `handlers` (`_check_redis_key_layout_for_cr` per-CR check) (#253) | Cluster-wide latest observation of the boot-time Redis key-layout validator (#163). `1.0` when the most recent `validate_key_layout()` call returned `ok`; `0.0` for every other terminal status (`degraded` \| `unreachable` \| `error` \| `skipped`). One series for the cluster-wide validator state (no per-CR labels — cardinality stays bounded regardless of CR count). | n/a — observability for the post-#44 failure mode (a v3.11.0 layout drift takes `resque_workers_seen_max` silent, the stall condition fires vacuously, and the operator periodic-restarts `web_background` while everything looks healthy). Alert on `== 0` without log scraping. |
+| `openstudio_operator_stall_window_elapsed_seconds` | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) (#254) | Sustained-window elapsed seconds for the web_background stall. Set after `tracker.observe()` to the elapsed seconds when the stall condition held this tick, or `0` when it broke (the tracker resets). | n/a — heads-up display between the first sustained observation and the eventual `web_background_restarts_total` increment. Without this gauge, three or more Redis/K8s-leg ticks can accumulate toward a restart with nothing on the dashboard until the gate trips. Rate > 0 means the window is accumulating; exact value shows how close to action (the action fires at `stallWindowMinutes`). |
 
 ### Histogram
 
