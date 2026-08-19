@@ -46,9 +46,15 @@ spec:
             - name: REDIS_URL
               value: redis://:openstudio-rotated@queue:6379
             - name: MONGO_USER
-              value: openstudio
+              valueFrom:
+                secretKeyRef:
+                  name: openstudio-mongo
+                  key: username
             - name: MONGO_PASSWORD
-              value: openstudio
+              valueFrom:
+                secretKeyRef:
+                  name: openstudio-mongo
+                  key: password
           volumeMounts:
             - name: nfs
               mountPath: /mnt/openstudio
