@@ -8,7 +8,7 @@ A Kubernetes operator that automates day-2 operations for [OpenStudio Server](ht
 
 | Module | Plan phase | Purpose |
 |---|---|---|
-| Analysis SLA / soft-stop | 1 | Soft-stop analyses exceeding `maxDurationMinutes`; after `gracefulStopTimeoutMinutes`, surgically evict worker pods whose IP matches a started datapoint's `ip_address` (gated by `analysisPolicy.forceDeleteOnEscalation`) |
+| Analysis SLA / soft-stop | 1 | Soft-stop analyses exceeding `maxDurationMinutes`; after `gracefulStopTimeoutMinutes`, surgically evict the worker pods currently processing the analysis (resolved via the Resque worker registry → pod name, since v3.11.0 datapoint `ip_address` is always null — issue #83 D2). Gated by `analysisPolicy.forceDeleteOnEscalation`. |
 | Zombie datapoint watchdog | 2 | Auto-requeue datapoints stalled past `maxDatapointRuntimeMinutes` (bounded by `maxAutoRequeues`) |
 | Worker recycler | 2 | Rolling-restart the worker Deployment after analyses / on interval |
 | web_background watchdog | 2 | Detect Resque queue stalls; restart the `web_background` Deployment |
