@@ -1,7 +1,11 @@
-# Operator image is published by .github/workflows/release.yml on pushes to develop.
-# This Deployment manifest is what runs the operator in production; the dryRun
-# walkthrough evidence lives in docs/kind-validation.md and the securityContext
-# hardening is in line with the prune CronJob's (deploy/storage-cronjob.yaml:114).
+# Operator image is published by .github/workflows/release.yml on pushes to develop
+# and pinned to its SHA256 digest there (issue #149). Editing this `image:` line
+# back to a tag (e.g. `:dev`) would re-open the immutable-deploy guarantee the
+# release.yml digest-pin step establishes — release.yml rewrites it on every
+# develop push. This Deployment manifest is what runs the operator in production;
+# the dryRun walkthrough evidence lives in docs/kind-validation.md and the
+# securityContext hardening is in line with the prune CronJob's
+# (deploy/storage-cronjob.yaml:114).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,7 +40,14 @@ spec:
         fsGroup: 1000
       containers:
         - name: operator
-          image: ghcr.io/anchapin/openstudio-server-operator:dev
+          # Issue #149 — pinned by SHA256 digest, not a mutable tag. re-pinned
+          # automatically by release.yml on every develop push; the `.bak`
+          # rewrite keeps the install idempotent and the kubectl pull
+          # unambiguous. Last re-pinned against digest sha256:6681d2545970
+          # ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e on the
+          # pre-issue-149 baseline; subsequent develop pushes will overwrite
+          # this line via the workflow's sed.
+          image: ghcr.io/anchapin/openstudio-server-operator@sha256:6681d2545970ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e
           args:
             - kopf
             - run
