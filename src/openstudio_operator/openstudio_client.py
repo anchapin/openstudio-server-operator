@@ -22,10 +22,14 @@ Actions:
 Non-existent / legacy (do NOT use): `GET /cluster.json`, `kill`/`hard_stop` actions,
 `PUT /analyses/{id}/action` (route is POST), `/compute_nodes.json` on K8s.
 
-Client discipline (D12): every timestamp is normalized to timezone-aware UTC at this boundary;
-transient failures (5xx, connection errors, timeouts) are retried with jittered exponential
-backoff (~1s/2s/4s) before `OpenStudioApiError` is raised — callers skip the tick and retry
-naturally on the next poll.
+Client discipline (D12): every timestamp is normalized to timezone-aware UTC at this boundary.
+For ``GET`` methods, transient failures (5xx, connection errors, timeouts) are retried with
+jittered exponential backoff (~1s/2s/4s) before ``OpenStudioApiError`` is raised — callers
+skip the tick and retry naturally on the next poll. For non-GET methods (POST/PUT/DELETE/PATCH),
+a single attempt is made; a 5xx response propagates immediately to the caller (issue #226:
+RFC 9110 §9.2.2 makes POST non-idempotent by default, and the v3.11.0 contract documents GET
+as the only safely-retryable verb — re-firing a POST on a 504 that followed a server-side
+commit would double-burn the operator's accounting).
 """
 
 from __future__ import annotations
@@ -79,11 +83,18 @@ class OpenStudioApiError(RuntimeError):
 class OpenStudioClient:
     """REST client for OpenStudio Server v3.11.0.
 
-    One initial attempt plus up to ``max_retries`` retries on transient failures (HTTP 5xx,
-    connection errors, timeouts) with jittered exponential backoff: sleep before retry N is
-    ``backoff_base_seconds * 2**(N-1) scaled by a random 0.5–1.5 jitter (~1s/2s/4s by
-    default), then ``OpenStudioApiError`` is raised. HTTP 4xx raises immediately (not
-    transient). Timestamps in returned documents are normalized to timezone-aware UTC.
+    For ``GET`` requests, one initial attempt plus up to ``max_retries`` retries on transient
+    failures (HTTP 5xx, connection errors, timeouts) with jittered exponential backoff: sleep
+    before retry N is ``backoff_base_seconds * 2**(N-1)`` scaled by a random 0.5–1.5 jitter
+    (~1s/2s/4s by default), then ``OpenStudioApiError`` is raised. HTTP 4xx raises immediately
+    (not transient). Timestamps in returned documents are normalized to timezone-aware UTC.
+
+    For non-GET requests (POST/PUT/DELETE/PATCH), a single attempt is made. Any non-2xx
+    response — including 5xx — raises ``OpenStudioApiError`` immediately (issue #226). The
+    v3.11.0 contract documents GET as the only safely-retryable verb; a 504 returned AFTER the
+    server processed a requeue / stop / delete may have left the server-side cascade
+    partially executed, so re-firing risks double-burning operator accounting. Call sites that
+    need retry-safe mutating calls must opt in with their own idempotency-key design.
     """
 
     def __init__(
@@ -130,6 +141,19 @@ class OpenStudioClient:
             if response.status_code < 500:
                 raise OpenStudioApiError(
                     f"{method} {path} returned HTTP {response.status_code}: "
+                    f"{response.text[:200]}"
+                )
+            # Issue #226: 5xx retries are GET-only. POST/PUT/DELETE/PATCH are non-idempotent
+            # by default (RFC 9110 §9.2.2); a 504 that follows a server-side commit must NOT
+            # re-fire the same request. ``DELETE /analyses/{id}`` is documented as idempotent
+            # in practice, but a 504 mid-cascade returns the operator to a tick where the
+            # cascade may have partially executed — the safer default is no retry, and any
+            # call site that wants retry-safe mutating behavior must opt in with its own
+            # idempotency-key design rather than inherit it from this client.
+            if method.upper() != "GET":
+                raise OpenStudioApiError(
+                    f"{method} {path} returned HTTP {response.status_code} (no retry: "
+                    f"non-GET verb is non-idempotent per RFC 9110 §9.2.2, see issue #226): "
                     f"{response.text[:200]}"
                 )
             last_error = f"HTTP {response.status_code}"

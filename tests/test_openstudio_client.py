@@ -318,6 +318,77 @@ def test_4xx_raises_immediately_without_retry(client, sleeps):
     assert sleeps == []
 
 
+# --- Non-GET 5xx must NOT retry (issue #226) ---------------------------
+
+
+@responses.activate
+def test_post_5xx_does_not_retry(client, sleeps):
+    """Issue #226: ``POST /data_points/{id}/requeue`` returning 504 must NOT be retried.
+
+    RFC 9110 §9.2.2 makes POST non-idempotent by default, and the v3.11.0 contract only
+    documents GET as safely-retryable. Re-firing on a 504 that follows a server-side
+    commit would double-burn ``status.requeues[dp].count`` past ``maxAutoRequeues``. A
+    single attempt is made; the 504 propagates immediately as ``OpenStudioApiError``.
+    """
+    responses.post(f"{BASE}/data_points/dp1/requeue", status=504, body="gateway timeout")
+    with pytest.raises(OpenStudioApiError, match="504") as excinfo:
+        client.requeue_datapoint("dp1")
+    assert "non-GET verb is non-idempotent" in str(excinfo.value)
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.method == "POST"
+    assert sleeps == []
+
+
+@responses.activate
+def test_delete_5xx_does_not_retry(client, sleeps):
+    """Issue #226: ``DELETE /analyses/{id}`` returning 500 must NOT be retried either.
+
+    DELETE is idempotent in practice (RFC 9110 §9.2.2), but a 504/500 mid-cascade is risky:
+    the server may have partially executed ``before_destroy :queue_delete_files`` +
+    ``data_points dependent: :destroy`` before the failure. Re-firing could leave the
+    server in a state where the operator's accounting diverges from reality. Single
+    attempt; the 5xx propagates immediately.
+    """
+    responses.delete(f"{BASE}/analyses/a1", status=500, body="internal error")
+    with pytest.raises(OpenStudioApiError, match="500") as excinfo:
+        client.delete_analysis("a1")
+    assert "non-GET verb is non-idempotent" in str(excinfo.value)
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.method == "DELETE"
+    assert sleeps == []
+
+
+@responses.activate
+def test_put_5xx_does_not_retry(client, sleeps):
+    """Issue #226: PUT is also non-idempotent by default and must not retry on 5xx.
+
+    The v3.11.0 contract does not expose a PUT route today, but the retry policy is
+    verb-based; this locks the asymmetry for any future PUT-shaped action the operator
+    might add.
+    """
+    responses.put(f"{BASE}/analyses/a1/action", status=503, body="unavailable")
+    with pytest.raises(OpenStudioApiError, match="503"):
+        client._request("PUT", "/analyses/a1/action")
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.method == "PUT"
+    assert sleeps == []
+
+
+@responses.activate
+def test_get_5xx_still_retries(client, sleeps):
+    """Issue #226 regression fence: GET retry behavior is preserved (D12 envelope).
+
+    The change is verb-asymmetric — only the 5xx retry is dropped for non-GET. GET keeps
+    its full 3x retry / jitter envelope; this test pins the asymmetry so a future
+    "always retry" refactor cannot regress the SLA-clock polls that ride this path.
+    """
+    responses.get(f"{BASE}/analyses.json", status=502)
+    responses.get(f"{BASE}/analyses.json", status=200, json=[])
+    assert client.list_analyses() == []
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
 @responses.activate
 def test_invalid_json_raises_api_error(client):
     responses.get(f"{BASE}/analyses.json", body="<html>gateway</html>", status=200)
