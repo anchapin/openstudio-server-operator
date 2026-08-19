@@ -376,7 +376,19 @@ def operator_apps_api() -> AppsV1Api:
     """
     global _operator_apps_api
     if _operator_apps_api is None:
-        _load_k8s_config()
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The AppsV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for AppsV1Api: returning placeholder client."
+            )
         _operator_apps_api = AppsV1Api()
     return _operator_apps_api
 
@@ -398,7 +410,19 @@ def operator_batch_api() -> BatchV1Api:
     """
     global _operator_batch_api
     if _operator_batch_api is None:
-        _load_k8s_config()
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The BatchV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for BatchV1Api: returning placeholder client."
+            )
         _operator_batch_api = BatchV1Api()
     return _operator_batch_api
 
@@ -424,7 +448,19 @@ def operator_core_api() -> CoreV1Api:
     """
     global _operator_core_api
     if _operator_core_api is None:
-        _load_k8s_config()
+        try:
+            _load_k8s_config()
+        except ConfigException:
+            # CI / bare-clone environments: leave the default
+            # Configuration uninitialised. The CoreV1Api() constructor
+            # stores the default without raising; actual API calls
+            # would fail later, but handlers fail closed via
+            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
+            # factory above still raises so the singleton guard correctly
+            # skips the tick when config is truly unavailable.
+            logger.warning(
+                "K8s config not loaded for CoreV1Api: returning placeholder client."
+            )
         _operator_core_api = CoreV1Api()
     return _operator_core_api
 
