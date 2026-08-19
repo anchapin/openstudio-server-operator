@@ -1,0 +1,83 @@
+"""Process-wide reset fixture for the operator's module-level singletons (issue #247).
+
+The operator builds a small set of module-level singletons lazily on the
+first tick and reuses them for the process's lifetime:
+
+* :data:`openstudio_operator.singleton._process_guard` — the
+  :class:`~openstudio_operator.singleton.SingletonGuard` instance kopf
+  handlers consult on every tick to decide which OSCM CR is the active
+  one (D05, issue #14). Built on first access; replaced/reset only by
+  this fixture (and by explicit tests that opt in).
+* :data:`openstudio_operator.singleton._operator_custom_objects_api`
+  — the cached :class:`kubernetes.client.CustomObjectsApi` the
+  :func:`~openstudio_operator.singleton.operator_custom_objects_api`
+  factory returns (issue #158). Built on first access by loading the
+  in-cluster (or ``kube_config``) configuration; tests that swap the
+  loaders need to drop this cache between cases.
+
+Two additional module-level globals — the legacy
+``handlers._NOTIFY_QUEUE`` / ``_REDIS_KEY_LAYOUT_QUEUE`` /
+``_STATUS_MAP_CAP_QUEUE`` Warning-Event queues that the original
+acceptance text of #247 named — were collapsed into a single
+:class:`openstudio_operator.events_sinks.QueuedKopfEventSink` by
+issue #234, so this fixture no longer has anything to clear there. The
+defensive ``getattr(..., None)`` guards below are preserved verbatim in
+case a future refactor reintroduces a similarly-named module-level
+queue on the handlers package; the fixture becomes a no-op for those
+attributes rather than blowing up at import time.
+
+Without this fixture a test that left ``_process_guard`` pointing at a
+``FakeCustomObjectsApi`` would silently gate every subsequent test's
+wrapper invocation as "not active" — the failure surfaces only on the
+NEXT test, far from its cause, and only because the guarded wrapper
+returns ``None`` instead of crashing. The autouse pre+post reset is the
+documented seam (see the ``SingletonGuard`` / ``operator_custom_objects_api``
+docstrings in :mod:`openstudio_operator.singleton`); this conftest is
+the only place it is invoked globally — per-file fixtures in
+``tests/test_k8s_clients.py`` and ``tests/test_timer_wrapper_failures.py``
+keep their existing local resets (they're cheaper and add no behaviour
+beyond this one).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+
+import pytest
+
+from openstudio_operator import handlers, singleton
+
+
+@pytest.fixture(autouse=True)
+def _reset_operator_module_state() -> Generator[None, None, None]:
+    """Drop the operator's module-level singletons before AND after each test.
+
+    Pre-reset: a cached ``_process_guard`` or ``_operator_custom_objects_api``
+    from a previous test cannot leak into the current case.
+
+    Post-reset (defensive): if a test crashes mid-run, monkeypatch's atexit
+    reverts do not touch the module-level globals — the explicit reset
+    keeps the suite hermetic for the next test, and prevents the next
+    case from inheriting a half-built cache that would force
+    :func:`singleton._get_guard` to rebuild against whatever kubeconfig
+    the crashed test left in place.
+
+    The legacy queue-clear calls (``handlers._NOTIFY_QUEUE.clear()`` etc.)
+    are guarded with :func:`getattr` so the fixture remains compatible
+    with the post-#234 ``handlers`` module — they are no-ops today and
+    will be no-ops forever if #234 stays in, or active again if a future
+    refactor reintroduces similarly-named globals.
+    """
+    singleton.set_guard(None)
+    singleton.reset_operator_k8s_client()
+    for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
+        queue = getattr(handlers, legacy_queue_attr, None)
+        if queue is not None and hasattr(queue, "clear"):
+            queue.clear()
+    yield
+    singleton.set_guard(None)
+    singleton.reset_operator_k8s_client()
+    for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
+        queue = getattr(handlers, legacy_queue_attr, None)
+        if queue is not None and hasattr(queue, "clear"):
+            queue.clear()

@@ -14,6 +14,9 @@ venv/
 coverage.xml
 htmlcov/
 
+# Hypothesis property-based test artifact cache (#246)
+.hypothesis/
+
 # Environment / secrets — never commit
 .env
 .env.*
