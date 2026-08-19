@@ -3,6 +3,12 @@
 # (resque:workers scaled by COUNT). OS_SERVER_NUMBER_OF_WORKERS is tuned down
 # from the chart's 30 to 2 for kind. Mounts the nfs-pvc stand-in like the
 # chart does.
+# Digest pinning (issue #172): see `04-web.yaml` for the rationale; the
+# `nrel/openstudio-server:3.11.0@…` digest is the same across web /
+# web-background / worker so the three pods always pull the same image.
+# (resque:workers scaled by COUNT). OS_SERVER_NUMBER_OF_WORKERS is tuned down
+# from the chart's 30 to 2 for kind. Mounts the nfs-pvc stand-in like the
+# chart does.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,7 +30,7 @@ spec:
     spec:
       containers:
         - name: web-background
-          image: nrel/openstudio-server:3.11.0
+          image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash

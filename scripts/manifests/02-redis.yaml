@@ -1,7 +1,7 @@
 # Redis — stand-in for the helm chart's `redis` Deployment behind Service
 # `queue` (develop branch). Image, password, args and Service name mirror the
 # chart defaults:
-#   redis.container.image = redis:6.0.9
+#   redis.container.image = redis:7.4.10 (chart default is 6.0.9 — EOL since 2021)
 #   redis.password        = openstudio
 #   redis_svc.name        = queue   (port 6379)
 #   args                  = redis-server --appendonly yes --requirepass ... --maxclients 10000
@@ -10,6 +10,10 @@
 # APPENDIX (approximation vs production): chart uses a 100Gi PVC; here an
 # emptyDir — queue state does not survive pod restarts. Fine for API
 # validation.
+# Digest pinning (issue #172): the kind recipe is the project's validation
+# target (D13); image-boundary digests are pinned to close the supply-chain
+# drift gap that #113/#124 closed for the operator / rclone / python images.
+# Renew via `docker buildx imagetools inspect redis:7.4.10`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,7 +33,7 @@ spec:
     spec:
       containers:
         - name: redis
-          image: redis:6.0.9
+          image: redis:7.4.10@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 6379
