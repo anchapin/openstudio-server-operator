@@ -135,4 +135,27 @@ jobs:
             echo "::error::AGENTS.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, AGENTS.md says '$CLAIM'"
             exit 1
           fi
+      # Issue #220 — parallel guard for docs/onboarding.md, which carries the
+      # same "N tests across M files" claim but uses a plain prose form (no
+      # `# ` prefix). Mirrors the #151 guard; if onboarding drifts in the
+      # future, this step fails the CI job with the actual count so a
+      # one-line bump brings it back in sync.
+      - name: Verify onboarding.md test-count claim (#220)
+        run: |
+          set -euo pipefail
+          ACTUAL_TESTS=$(pytest --collect-only 2>/dev/null | tail -1 | awk '{print $1}')
+          ACTUAL_FILES=$(ls tests/test_*.py | wc -l | tr -d ' ')
+          CLAIM=$(grep -oE '[0-9]+ tests across [0-9]+ files' docs/onboarding.md | head -1)
+          if [ -z "$CLAIM" ]; then
+            echo "::error::docs/onboarding.md is missing the 'N tests across M files' claim"
+            exit 1
+          fi
+          EXPECTED_TESTS=$(echo "$CLAIM" | awk '{print $1}')
+          EXPECTED_FILES=$(echo "$CLAIM" | awk '{print $4}')
+          echo "onboarding.md claim: $CLAIM"
+          echo "Actual:              $ACTUAL_TESTS tests across $ACTUAL_FILES files"
+          if [ "$ACTUAL_TESTS" != "$EXPECTED_TESTS" ] || [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
+            echo "::error::docs/onboarding.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, onboarding.md says '$CLAIM'"
+            exit 1
+          fi
 
