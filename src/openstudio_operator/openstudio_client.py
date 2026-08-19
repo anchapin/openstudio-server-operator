@@ -34,6 +34,7 @@ commit would double-burn the operator's accounting).
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from datetime import datetime
@@ -110,6 +111,17 @@ class OpenStudioClient:
         self._backoff_base_seconds = backoff_base_seconds
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
+        # Issue #242: pin ``verify=True`` explicitly (requests default) AND honor
+        # ``OPENSTUDIO_TLS_CA_BUNDLE`` for clusters whose API server / inter-service
+        # traffic is fronted by a custom CA (corporate PKI roots, air-gapped
+        # clusters with their own internal CA). When the env var is unset or
+        # empty the session falls through to the system trust store — never to
+        # ``False``. The acceptance criterion calls for
+        # ``os.environ.get('OPENSTUDIO_TLS_CA_BUNDLE', True)`` semantics; the
+        # empty-string branch below preserves that without ruff's PLW1508
+        # (``True`` default on ``os.environ.get`` is a string-returning API).
+        ca_bundle = os.environ.get("OPENSTUDIO_TLS_CA_BUNDLE")
+        self._session.verify = ca_bundle if ca_bundle else True
 
     def _jittered_backoff(self, retry: int) -> float:
         return random.uniform(0.5, 1.5) * self._backoff_base_seconds * 2 ** (retry - 1)
