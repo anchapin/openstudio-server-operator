@@ -104,6 +104,31 @@ STATUS_CONFLICTS_TOTAL = Counter(
     "for each 409 before the backoff sleep; #119)",
 )
 
+# Issue #171 — defensive cap on the four CR .status maps (``softStops``,
+# ``requeues``, ``startedSince``, ``archivedAnalyses``). The CRD schema
+# accepts unbounded maps (preserved-unknown-fields), so a CR with
+# ``update`` on the status subresource can grow any of them to etcd's 1.5
+# MB object-size limit; the operator then reads + JSON-parses + merge-patches
+# the full map on every timer tick. status_store._set_map_entry enforces a
+# per-map cap (STATUS_MAP_MAX_ENTRIES = 10000) by dropping the oldest entries
+# (sorted by key — the operator's keys are UUIDs, so the sort order is
+# deterministic but not age-aware) before adding a new entry. This counter
+# is incremented once per actual eviction (post-RMW, retry-stable), not per
+# 409 attempt, so an alert on ``rate(...[5m]) > 0`` fires once per cap hit.
+# ``map_name`` label values: softStops | requeues | startedSince |
+# archivedAnalyses. The companion Warning Event (``StatusMapCapped``) is
+# emitted from the same code path so the on-call has both a log/Event and
+# a Prometheus signal to correlate.
+STATUS_MAP_CAPS_TOTAL = Counter(
+    "openstudio_operator_status_map_caps_total",
+    "Defensive cap evictions issued by status_store when a CR .status map "
+    "hits STATUS_MAP_MAX_ENTRIES (incremented once per actual cap hit, after "
+    "the successful RMW — retry-stable, not per 409 attempt; #171). "
+    "Labelled by map_name (softStops | requeues | startedSince | "
+    "archivedAnalyses).",
+    labelnames=["map_name"],
+)
+
 STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
     "openstudio_operator_status_conflict_retries_exhausted_total",
     "Status-store RMW cycles that exhausted the 409 retry budget and "

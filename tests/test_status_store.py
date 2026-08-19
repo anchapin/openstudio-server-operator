@@ -482,3 +482,202 @@ def test_cache_is_invalidated_on_write_and_never_authoritative(store, api):
     assert store.cache == {}  # populated by the read, cache-only (D04)
     store.set_started_since("dp1", datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC))
     assert store.cache is None  # invalidated: next decision must re-read
+
+
+# --- Issue #171 — defensive cap on the CR .status maps --------------------------
+#
+# The CRD schema accepts unbounded maps (every field is `x-kubernetes-preserve-unknown-fields`
+# with no `maxProperties`), so a CR with `update` on the status subresource can
+# grow any of the four maps toward etcd's 1.5 MB object-size limit; the
+# operator then reads + JSON-parses + merge-patches the full map on every
+# timer tick. status_store._set_map_entry enforces a per-map cap
+# (STATUS_MAP_MAX_ENTRIES = 10000) by dropping the oldest entries (sorted by
+# key — the operator's keys are UUIDs, so the sort order is deterministic but
+# not age-aware) before adding a new entry. These tests pin the cap behavior:
+# the eviction is deterministic, the oldest entry goes first, the new entry
+# is present, the Warning Event + counter fire exactly once per cap hit, and
+# re-writing an existing key with the same value does NOT evict (the read
+# path is short-circuited before the cap fires).
+
+
+def _fill_map_to_cap(api, field: str) -> None:
+    """Pre-populate ``api.obj['status'][field]`` to exactly STATUS_MAP_MAX_ENTRIES.
+
+    Keys are deterministically sortable strings (``a00000``, ``a00001``, …)
+    so the eviction test can assert which key was dropped. The cap value
+    (10000) is large enough that creating the dict is cheap (under 100ms
+    on a modern CPU) and the eviction patch is a single in-memory merge.
+    """
+    cap = status_store.STATUS_MAP_MAX_ENTRIES
+    api.obj["status"] = {
+        field: {f"a{i:05d}": make_soft_stop().to_dict() for i in range(cap)}
+    }
+
+
+@pytest.fixture()
+def status_event_sink():
+    """Install a recorder for cap-eviction events and restore on teardown.
+
+    The default sink is a no-op (avoids coupling status_store to kopf); the
+    handlers package installs the production kopf-backed sink at operator
+    startup. Tests that want to observe the Warning Event install a recorder
+    via :func:`status_store.set_event_sink`, then restore the default here
+    so subsequent tests see a clean module-level state.
+    """
+    events: list[tuple[str, str, str, str]] = []
+    status_store.set_event_sink(
+        lambda namespace, name, reason, message: events.append(
+            (namespace, name, reason, message)
+        )
+    )
+    yield events
+    status_store.set_event_sink(None)
+
+
+def test_status_map_cap_drops_oldest_entries(api, store):
+    """A map at the cap shrinks by one oldest entry when a new key is added.
+
+    Pre-fills ``softStops`` to exactly STATUS_MAP_MAX_ENTRIES, adds one new
+    key, and asserts:
+      * the new key is present,
+      * the smallest sorted key (the deterministic "oldest") was evicted,
+      * the map size is back to the cap (not below — the cap is the steady
+        state, not a one-shot shrink).
+    """
+    _fill_map_to_cap(api, "softStops")
+    cap = status_store.STATUS_MAP_MAX_ENTRIES
+
+    store.set_soft_stop("new-key", make_soft_stop())
+
+    stops = store.get_soft_stops()
+    assert "new-key" in stops
+    # "a00000" is the smallest sortable key — the deterministic "oldest".
+    assert "a00000" not in stops
+    # The cap is a steady-state bound, not a one-shot shrink.
+    assert len(stops) == cap
+    # The next-smallest original key is now the smallest — the eviction
+    # removed exactly one entry, not more.
+    assert min(stops.keys()) == "a00001"
+
+
+def test_status_map_cap_emits_warning_event_when_hit(api, store, status_event_sink):
+    """A cap hit records a Warning Event with reason ``StatusMapCapped``.
+
+    The recorder is installed via the module-level sink hook; the event
+    carries the CR namespace, name, the cap reason, and a message that
+    names the map (the task spec: "a message naming which map was trimmed").
+    """
+    _fill_map_to_cap(api, "softStops")
+
+    store.set_soft_stop("new-key", make_soft_stop())
+
+    assert len(status_event_sink) == 1
+    namespace, name, reason, message = status_event_sink[0]
+    assert namespace == NAMESPACE
+    assert name == NAME
+    assert reason == status_store.STATUS_MAP_CAPPED_EVENT
+    assert "softStops" in message
+    assert str(status_store.STATUS_MAP_MAX_ENTRIES) in message
+    assert "new-key" in message
+
+
+def test_status_map_cap_increments_counter(api, store):
+    """The labelled counter ``status_map_caps_total{map_name="softStops"}``
+    increments by exactly 1 per cap hit — retry-stable, not per 409 attempt.
+
+    Pre-touches the labelled series so the before/after delta is observable
+    (a labelled Counter with no observations does not expose the series
+    until ``.labels(...).inc()`` has been called once). The increment fires
+    AFTER the successful RMW (post-eviction), so a 409 burst that eventually
+    succeeds still reads as a single increment.
+    """
+    from openstudio_operator import metrics as metrics_module
+
+    counter = metrics_module.STATUS_MAP_CAPS_TOTAL
+    # Pre-touch the series so the before-value is observable (see the
+    # get_started_since counter pattern in test_metrics_endpoint.py).
+    counter.labels(map_name="softStops").inc(0)
+    per_series = getattr(counter, "_metrics", {})
+    soft_stops_key = ("softStops",)
+    snapshot = per_series.get(soft_stops_key)
+    assert snapshot is not None
+    before = _counter_value(snapshot)
+
+    _fill_map_to_cap(api, "softStops")
+    store.set_soft_stop("new-key", make_soft_stop())
+
+    after = _counter_value(per_series[soft_stops_key])
+    assert after - before == 1
+
+
+def _counter_value(snapshot):
+    """Read a prometheus_client Counter snapshot's value (test helper).
+
+    Mirrors the existing unlabelled-Counter helper above; duplicated here
+    so the labelled-counter test does not need to reach into the test
+    module's private name. The snapshot is a child ``Counter`` instance
+    whose ``_value`` is a ``MutexValue`` (or a list of samples in older
+    prometheus_client versions) — see the existing helper for the full
+    shape.
+    """
+    raw = snapshot._value.get()
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        samples = list(raw)
+    except TypeError:
+        return float(raw)
+    return float(samples[0].value) if samples else 0.0
+
+
+def test_status_map_cap_does_not_evict_when_key_already_holds_same_value(api, store, status_event_sink):
+    """Re-writing an existing key with the SAME value must not evict.
+
+    The cap is in the "add a new entry" path, not in every write. If the
+    map is at the cap and the operator is just refreshing an existing
+    anchor (e.g. re-asserting a soft stop that was already recorded
+    earlier), the read-path short-circuit (``current == encoded``) returns
+    None BEFORE the cap fires — no eviction, no counter increment, no
+    event. This pins the boundary so a future refactor doesn't accidentally
+    widen the eviction trigger.
+    """
+    from openstudio_operator import metrics as metrics_module
+
+    counter = metrics_module.STATUS_MAP_CAPS_TOTAL
+    counter.labels(map_name="softStops").inc(0)
+    per_series = getattr(counter, "_metrics", {})
+    snapshot = per_series.get(("softStops",))
+    before = _counter_value(snapshot)
+
+    _fill_map_to_cap(api, "softStops")
+    record = make_soft_stop()
+
+    # The map already has 'a00000' with a record that differs by timestamp
+    # (every SoftStopRecord fixture has the same issued_at, but the
+    # reconstruction is identical to make_soft_stop's output). Re-write
+    # an existing key with the same value — must be a no-op.
+    store.set_soft_stop("a00001", record)
+
+    # No eviction, no event, no counter increment.
+    assert status_event_sink == []
+    after = _counter_value(per_series[("softStops",)])
+    assert after == before
+    # The map is still at the cap (no entries added or removed).
+    assert len(store.get_soft_stops()) == status_store.STATUS_MAP_MAX_ENTRIES
+
+
+def test_status_map_cap_does_not_evict_on_clear(api, store, status_event_sink):
+    """Clearing a key writes ``None`` and must not evict.
+
+    The cap guard's ``encoded is not None`` check keeps the deletion path
+    (clear_soft_stop / clear_started_since / clear_archived_analysis) out
+    of the eviction path. A map at the cap stays at the cap after a clear
+    — the operator's natural bound is preserved, not gamed by churn.
+    """
+    _fill_map_to_cap(api, "softStops")
+
+    store.clear_soft_stop("a00042")
+
+    assert status_event_sink == []
+    assert len(store.get_soft_stops()) == status_store.STATUS_MAP_MAX_ENTRIES - 1
+    assert "a00042" not in store.get_soft_stops()

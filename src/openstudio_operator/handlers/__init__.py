@@ -9,7 +9,7 @@ polling loop.
 
 import kopf  # used by the Redis-URL-guard on-event handler below.
 
-from openstudio_operator import singleton
+from openstudio_operator import singleton, status_store
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
     datapoint_watchdog,
@@ -62,6 +62,76 @@ def _drain_redis_warning_queue(
         )
     _NOTIFY_QUEUE[:] = [
         msg for msg in _NOTIFY_QUEUE if not (msg[0] == namespace and msg[1] == name)
+    ]
+
+
+# Issue #171 — install the production kopf-backed Warning-Event sink for
+# the status-store defensive cap. The status_store is a library module
+# that does NOT import kopf directly (it lives below the handler layer);
+# the handlers package is the entrypoint and installs the sink at module
+# load time. Every StatusStore instance picks up the installed sink via
+# the module-level hook in status_store._emit_status_map_event.
+#
+# The sink uses the same queue/deferral pattern as the redis-URL guard
+# above: it enqueues the (ns, name, reason, message) tuple, and the
+# @kopf.on.event handler below drains the queue and emits the kopf
+# event on the next OSCM watch tick. kopf 1.44+ requires a populated
+# ``settings_var`` ContextVar to enqueue events (the posting engine
+# reads it to know whether posting is enabled), which is only set
+# inside an active kopf handler — queueing + deferring sidesteps that
+# constraint for the status_store RMW path, which is a regular Python
+# method call (not a kopf callback).
+_STATUS_MAP_CAP_QUEUE: list[tuple[str, str, str, str]] = []
+
+
+def _emit_status_map_cap_event(
+    namespace: str, name: str, reason: str, message: str
+) -> None:
+    """Enqueue a cap-eviction Warning Event for the next OSCM watch tick.
+
+    Counterpart to :func:`status_store._emit_status_map_event` (the
+    module-level sink hook). The status_store calls this from inside
+    its RMW cycle; the actual kopf.event emit happens on the matching
+    @kopf.on.event drain handler below — same architecture as the
+    redis-URL guard above.
+    """
+    _STATUS_MAP_CAP_QUEUE.append((namespace, name, reason, message))
+
+
+status_store.set_event_sink(_emit_status_map_cap_event)
+
+
+@kopf.on.event("energy.nrel.gov", "v1alpha1", "openstudioclustermanagers")
+def _drain_status_map_cap_queue(
+    name: str, namespace: str, **_kwargs: object
+) -> None:
+    """Drain any queued cap-eviction Warnings for THIS CR, then clear.
+
+    Counterpart to :func:`_emit_status_map_cap_event`. Fires once per
+    OSCM watch event; idempotent because the queue is fully drained
+    per matching CR and an empty queue is a no-op.
+    """
+    pending = [
+        msg
+        for msg in _STATUS_MAP_CAP_QUEUE
+        if msg[0] == namespace and msg[1] == name
+    ]
+    if not pending:
+        return
+    for _ns, _nm, reason, message in pending:
+        # kopf 1.44+ renamed ``body`` to ``objs`` (positional). The
+        # body dict is the OSCM reference, resolved by kopf from the
+        # (namespace, name) in the watch event.
+        kopf.event(
+            {"metadata": {"namespace": namespace, "name": name}},
+            type="Warning",
+            reason=reason,
+            message=message,
+        )
+    _STATUS_MAP_CAP_QUEUE[:] = [
+        msg
+        for msg in _STATUS_MAP_CAP_QUEUE
+        if not (msg[0] == namespace and msg[1] == name)
     ]
 
 # Operator startup wiring: ``kopf run --module openstudio_operator.handlers``
