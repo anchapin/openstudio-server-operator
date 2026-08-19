@@ -42,13 +42,14 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - `src/openstudio_operator/archival.py` — pure rclone archival Job manifest generator (backend-agnostic `s3|gcs|azure`, `envFrom`-only creds).
 - `src/openstudio_operator/retention.py` + `src/openstudio_operator/prune_entrypoint.py` — retention pipeline + Job entrypoint invoked by `deploy/storage-cronjob.yaml` (`#78`); the operator process owns no storage polling loop.
 - `src/openstudio_operator/metrics.py` — Prometheus counters + `/metrics` HTTP server (port 9090).
-- `deploy/crd.yaml` · `deploy/rbac.yaml` · `deploy/operator-deployment.yaml` — CRD, namespaced **Role** only (verbs enumerated; no `horizontalpodautoscalers`, no `batch` post-`#77`/`#78`), operator Deployment.
+- `deploy/crd.yaml` · `deploy/rbac.yaml` · `deploy/operator-deployment.yaml` — CRD, namespaced **Role** only (verbs enumerated; no `horizontalpodautoscalers`, no `batch` post-`#77`/`#78`), operator Deployment (single-replica `Recreate`, hardened `securityContext` post-`#115`).
 - `deploy/keda-scaledobject.yaml` · `deploy/redis-credentials-secret.yaml` — KEDA ScaledObject + TriggerAuthentication + Redis password Secret (cluster-admin install; operator-managed? no — see Working rules).
 - `deploy/storage-cronjob.yaml` — prune CronJob (`#78`; uses `openstudio_operator.prune_entrypoint`).
+- `deploy/network-policy.yaml` — default-deny egress + per-actor allow-lists for the operator surface (`#112`): deny-all + DNS allow + operator-only egress + storage-egress (HTTPS-only, RFC1918 excepted).
 - `tests/fixtures/` — `contract-shapes.json` + `samples/` (synthetic) + `live/` (captured from a real v3.11.0 cluster).
 - `tests/golden/` — snapshot tests for generated rclone Job manifests.
 - `.github/workflows/ci.yml` — `lint` + `test` + `guard-branch-pairing`; keep that job name stable — it is a **required status check on `main`**.
-- `.github/workflows/release.yml` — publishes `ghcr.io/anchapin/openstudio-server-operator:dev` on every push to `develop`; `v*` tags publish a versioned image and create a GitHub Release (`linux/amd64` only).
+- `.github/workflows/release.yml` — publishes `ghcr.io/anchapin/openstudio-server-operator:dev` on every push to `develop`; `v*` tags publish a versioned image and create a GitHub Release (`linux/amd64` only). Both jobs enable SLSA provenance (`mode=max`) + SPDX SBOM as OCI attestations and cosign-keyless sign the published digest (`#113`); CI guards on `cosign verify-attestation --type slsaprovenance`. `Dockerfile` pins `python:3.12-slim` by digest (`#113`).
 
 ## Fixed identifiers (exact spelling matters)
 
