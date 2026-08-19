@@ -18,7 +18,7 @@ spec:
         app: openstudio-operator
     spec:
       serviceAccountName: openstudio-operator-sa
-      containers:
+containers:
         - name: operator
           image: ghcr.io/anchapin/openstudio-server-operator:dev
           args:
@@ -39,7 +39,19 @@ spec:
           ports:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with
-              # metrics.DEFAULT_METRICS_PORT (issue #17)
+            # metrics.DEFAULT_METRICS_PORT (issue #17)
+          # Issue #115 — operator hardening matching deploy/storage-cronjob.yaml:114-118.
+          # readOnlyRootFilesystem requires writable /tmp for kopf / log buffering —
+          # the emptyDir volume below provides it.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             requests:
               cpu: 100m
@@ -47,3 +59,9 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
