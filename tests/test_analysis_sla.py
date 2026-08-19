@@ -1352,7 +1352,7 @@ def handler_tick_failures_total(module: str, error_type: str) -> float:
 
 import pytest
 
-from openstudio_operator.handlers.analysis_sla import deployment_label_selector
+from openstudio_operator._k8s import deployment_label_selector
 from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
 
 
