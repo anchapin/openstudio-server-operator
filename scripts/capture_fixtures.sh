@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Capture OpenStudio Server REST API fixtures from a live 3.11.0 instance
 # (issue #19). Curls every endpoint in the operator's API contract
-# (.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md)
+# (docs/contracts/openstudio-server-v3.11.0-rest.md — verified v3.11.0 contract;
+#  the file used to live at an external `.agents/skills/...` path until #48
+#  vendored it in-repo. README.md/AGENTS.md also point at this in-repo path.)
 # and writes one JSON envelope per endpoint under tests/fixtures/live/.
 #
 # Read endpoints are always captured. MUTATING endpoints (soft_stop, action,
