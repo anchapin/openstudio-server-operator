@@ -63,7 +63,7 @@ restart. The scrape target is the operator Pod on port 9090 (matches the
 `tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES` and
 `EXPECTED_GAUGE_FAMILIES` exactly — the test asserts `declared == expected`
 on every CI run, so adding a counter here without adding it there (or vice
-versa) fails CI loudly. **Current shape: 11 counters + 1 gauge.**
+versa) fails CI loudly. **Current shape: 12 counters + 1 gauge (post-#171 status-map defensive cap).**
 
 | Family | Type | Module / issue origin | Meaning for an on-call |
 |---|---|---|---|
@@ -78,6 +78,7 @@ versa) fails CI loudly. **Current shape: 11 counters + 1 gauge.**
 | `openstudio_operator_status_conflicts_total` | counter | `status_store` (RMW helper) · #119 | Per-attempt 409 responses from the Kubernetes API Server during CR `.status` RMW cycles (incremented inside `_mutate` for each 409 before the backoff sleep). Sustained nonzero rate means multiple operators are racing; investigate the singleton guard (#14). |
 | `openstudio_operator_status_conflict_retries_exhausted_total` | counter | `status_store` (RMW helper) · #119 | RMW cycles that exhausted the 409 retry budget and raised `StatusStoreConflictError` — the tick that hit this counter was skipped (WARNING log line, no `.status` write). Alert: a CR status write was lost. |
 | `openstudio_operator_handler_tick_failures_total{module,error_type}` | counter (labelled) | all four timer wrappers (`analysis_sla` / `datapoint_watchdog` / `worker_recycler` / `web_background_monitor`) · #117 | Per-tick failures caught by the timer wrappers. Increment-by-1 per tick suppressed. Labelled by `module` and `error_type` (`OpenStudioApiError` \| `StatusStoreError` \| `ApiException` \| `RedisClientError`). Sustained nonzero per `(module, error_type)` tells you which downstream — REST, Redis, k8s API — is degraded. |
+| `openstudio_operator_status_map_caps_total{map_name}` | counter (labelled) | `status_store` (`_set_map_entry` cap path) · #171 | Evictions triggered by the per-map defensive cap (drop-oldest when a map reaches `STATUS_MAP_MAX_ENTRIES = 10_000`). Labelled by `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`}. Sustained nonzero means something is filling the maps faster than they drain (e.g. an admin batch-`create` of 10k+ draft analyses) — investigate the upstream cause, don't raise the cap. |
 | `openstudio_operator_resque_workers_seen_max` | gauge | `web_background_monitor` (Module 4) · #44 / #87 | Monotonic max of distinct Resque worker ids ever observed in process lifetime (SMEMBERS `resque:workers` cardinality, read on **every** sensing tick since #87 regardless of queue depth). **`== 0` with reachable Redis means no workers are registered** — the leg-2 non-vacuity safeguard is then vacuously true and the operator will periodic-restart `web_background` while everything looks healthy. Alert on `== 0`. |
 
 The one labelled counter (`handler_tick_failures_total`) emits one series per
