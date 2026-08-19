@@ -24,8 +24,16 @@ Stall condition — all three legs simultaneously (D07):
   label guess. Unhealthy/absent pods mean K8s already knows something is
   wrong, so the "queue is lying" inference collapses and nothing fires.
 
-A→B→C are checked cheapest-first with fail-fast, so a healthy cluster pays
-two LLENs per tick and nothing else.
+Worker observation (issue #87): every sensing tick FIRST reads the Resque
+worker set (SMEMBERS + heartbeat HGETALL through ``worker_heartbeats()``)
+and advances the monotonic ``resque_workers_seen_max`` gauge —
+unconditionally, even when both queues are empty — so a healthy idle fleet
+shows a non-zero gauge within one poll and ``0`` with a reachable Redis
+unambiguously means "no workers registered". A Redis failure on that read
+raises before any gauge write: the tick is skipped (D12) and the gauge is
+untouched, exactly the pre-#87 scrape-error path. The legs are then checked
+cheapest-first with fail-fast, so a healthy cluster pays the worker read
+plus two LLENs per tick and nothing else.
 
 Sustained window — THE key design point: transient blips below
 ``webBackgroundPolicy.stallWindowMinutes`` NEVER trigger. The full
@@ -286,6 +294,14 @@ def _stall_condition_holds(
 ) -> bool:
     """The full D07 condition, cheapest leg first with fail-fast. Pure read.
 
+    Issue #87 — the worker set is read FIRST, before leg A, on every
+    sensing tick: the ``RESQUE_WORKERS_SEEN_MAX`` gauge advances even when
+    both queues are empty, so an idle-but-healthy fleet is visible within
+    one poll. Pre-#87 the gauge only moved under backlog, making ``0.0``
+    ambiguous between "Redis unreachable / no workers / wrong keys" and
+    "idle" (the ambiguity that cost real debugging time in the #66/#67
+    live sessions).
+
     The leg-2 safeguard (#44): tracks distinct workers observed in
     process lifetime and the first tick an empty registry began. If an
     empty registry persists for :data:`_LAYOUT_WARNING_GRACE_SECONDS` with
@@ -304,17 +320,26 @@ def _stall_condition_holds(
     during the grace window, the timer resets and no warning fires.
     """
     global _max_workers_seen, _empty_registry_since
+    # Issue #87 — unconditional worker observation: read the worker set on
+    # EVERY tick that successfully reads Redis and advance the monotonic
+    # gauge before any leg evaluation, so a healthy idle fleet (empty
+    # queues, workers heartbeating) shows a non-zero gauge within one
+    # poll. A Redis failure here raises BEFORE any gauge write — the tick
+    # is skipped (D12) and the gauge stays untouched (scrape-error path
+    # unchanged).
+    registered = redis_client.worker_heartbeats()
+    # Track the high-water mark of distinct workers seen (#44 safeguard).
+    if len(registered) > _max_workers_seen:
+        _max_workers_seen = len(registered)
+        RESQUE_WORKERS_SEEN_MAX.set(_max_workers_seen)
     # Leg A: work is queued (either managed Resque queue).
     depths = redis_client.queue_depths()
     if not any(depth > 0 for depth in depths.values()):
         return False
     # Leg B: nobody is processing — every registered heartbeat is stale
     # (vacuously true for an empty registry: no worker is processing either).
-    registered = redis_client.worker_heartbeats()
-    # Track the high-water mark of distinct workers seen (#44 safeguard).
-    if len(registered) > _max_workers_seen:
-        _max_workers_seen = len(registered)
-        RESQUE_WORKERS_SEEN_MAX.set(_max_workers_seen)
+    # The #44 grace tracking stays leg-A-gated: the layout warning must only
+    # ever fire under real load, never on an idle empty fleet.
     if not registered:
         if _empty_registry_since is None:
             _empty_registry_since = now

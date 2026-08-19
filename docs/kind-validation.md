@@ -636,6 +636,12 @@ openstudio_operator_resque_workers_seen_max 0.0
   `resque_workers_seen_max` only moves on a tick where a queue is NON-EMPTY —
   "idle-but-alive workers" do NOT populate the gauge; a queued batch (or any
   enqueued job) is REQUIRED for R2.1.
+
+  > **Post-#66 update (2026-08-18, issue #87):** the queue-conditional
+  > emission described above is fixed — the gauge now advances on every
+  > sensing tick regardless of queue depth. See
+  > [Issue #87](#issue-87---resque_workers_seen_max-emitted-unconditionally-2026-08-18)
+  > below.
 * **R2.2 / R2.3 — [BLOCKED: vacuous]**. `kubectl get events
   --field-selector reason=ResqueKeyLayoutUnknown` returns none
   ("No resources found") — but with the operator unable to run any handler,
@@ -925,6 +931,43 @@ served throughout — guard is read-only):
   during healthy operation.
 * **R2.4 ✓ (bonus)** after the SIGSTOP freeze the gauge **stayed 4.0**
   (heartbeats stale, registry frozen) — high-water-mark, not current.
+
+### Issue #87 — `resque_workers_seen_max` emitted unconditionally (2026-08-18)
+
+**Semantics fix.** Before #87 the gauge only advanced on ticks where a
+Resque queue was NON-EMPTY — the worker-set read sat after leg A's early
+return in `_stall_condition_holds`. That is why the #66 session scraped
+`0.0` with 4 workers heartbeating but zero jobs queued (the R2.1 note
+above), and why this session only saw `4.0` once the real batch was
+submitted: an idle-but-healthy fleet was indistinguishable from "Redis
+unreachable / no workers / wrong keys". #87 moves the worker-set read
+(`SMEMBERS resque:workers` cardinality via `worker_heartbeats()`) BEFORE
+leg A, so the monotonic high-water gauge advances on EVERY sensing tick
+that successfully reads Redis:
+
+- healthy idle fleet → non-zero within one poll tick (≤ 60 s);
+- `0` with a reachable Redis = no workers registered — unambiguous;
+- Redis unreachable → tick raises and is skipped (D12), gauge untouched
+  (scrape-error path unchanged);
+- metric name and monotonic-max semantics preserved (option (b) split
+  metrics rejected — telemetry continuity);
+- the #44 `ResqueKeyLayoutUnknown` warning stays leg-A-gated (real load
+  only) — the unconditional read changes the gauge, not the warning.
+
+**Fakeredis-level demonstration** (the idle-fleet row the #66/#67 live
+sessions could not produce; CI proves it in
+`tests/test_web_background_monitor.py` — `test_gauge_populates_on_idle_fleet_empty_queues`,
+`test_gauge_correct_with_workers_and_backlog`,
+`test_gauge_untouched_when_redis_unreachable`):
+
+| Scenario | Queue depth | Workers heartbeating | Gauge after one tick |
+|---|---|---|---|
+| idle fleet (#66's R2.1 shape) | 0 / 0 | 4 fresh | `4.0` |
+| busy fleet (this session's live shape) | 11 queued | 4 fresh | `4.0` |
+| Redis unreachable | — | — | unchanged (tick skipped, D12) |
+
+> Live idle-fleet capture lands with the #83 kind-session evidence (that
+> session runs later in this orchestration).
 
 ### Zero-mutation cross-check: VERIFIED
 

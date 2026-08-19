@@ -641,7 +641,15 @@ def test_sensing_failure_raises_resets_tracker_and_is_retried():
     assert tracker.first_observed == NOW
 
     class FlakyRedis:
-        """Leg A read fails — the kind of transient the wrapper must skip."""
+        """Sensing read fails — the kind of transient the wrapper must skip.
+
+        Since #87 the worker-set read runs FIRST (unconditional gauge), so
+        the failure surfaces on ``worker_heartbeats`` before leg A ever
+        reads the queue depths.
+        """
+
+        def worker_heartbeats(self) -> dict[str, float | None]:
+            raise RedisClientError("SMEMBERS failed: connection reset")
 
         def queue_depths(self) -> dict[str, int]:
             raise RedisClientError("LLEN failed: connection reset")
@@ -896,6 +904,104 @@ def test_gauge_tracks_high_water_mark_of_workers_seen():
         redis=make_redis(NOW + minute(2), simulations=1),
     )
     assert workers_seen_max() == 3.0
+
+
+# --- Issue #87: gauge emitted unconditionally, every sensing tick -----------------
+
+
+def test_gauge_populates_on_idle_fleet_empty_queues():
+    """#87: empty queues + workers heartbeating → gauge reads the worker
+    count within ONE tick (the #66 live shape: 4 workers, zero jobs —
+    previously scraped an ambiguous 0.0)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    epoch = NOW.timestamp()
+    fired, events = tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(
+            NOW,
+            simulations=0,
+            requeued=0,
+            heartbeats={"w1": epoch - 5, "w2": epoch - 10, "w3": epoch - 15, "w4": epoch - 20},
+        ),
+    )
+
+    assert fired is False
+    assert events == []
+    assert workers_seen_max() == 4.0  # idle fleet, non-zero within one poll
+    # Idle sensing observes workers but never corroborates pods (leg A's
+    # fail-fast returns before leg C's Deployment/pod reads).
+    assert apps.reads == []
+    assert apps.patches == []
+
+
+def test_gauge_correct_with_workers_and_backlog():
+    """#87: busy fleet — workers present + backlog → still the worker count
+    (the pre-#87 queue-conditional behavior is preserved under load)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    epoch = NOW.timestamp()
+    fired, events = tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(
+            NOW,
+            simulations=11,  # the #84 live shape: 11 dps queued
+            heartbeats={"w1": epoch - 5, "w2": epoch - 10, "w3": epoch - 15, "w4": epoch - 20},
+        ),
+    )
+
+    assert fired is False  # fresh heartbeats: leg B broken, no stall
+    assert events == []
+    assert workers_seen_max() == 4.0
+
+
+def test_gauge_untouched_when_redis_unreachable():
+    """#87: Redis unreachable on the worker read → the tick raises (D12
+    skip) and the gauge is untouched — the scrape-error path is unchanged."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # A good idle tick first, so the gauge holds a non-zero high-water mark.
+    epoch = NOW.timestamp()
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(NOW, heartbeats={"w1": epoch - 5, "w2": epoch - 5, "w3": epoch - 5}),
+    )
+    assert workers_seen_max() == 3.0
+    tracker.first_observed = NOW  # prove the blind-gap reset too
+
+    class UnreachableRedis:
+        def worker_heartbeats(self) -> dict[str, float | None]:
+            raise RedisClientError("SMEMBERS failed: connection refused")
+
+    with pytest.raises(RedisClientError):
+        tick(api, apps, pods, now=NOW + minute(1), tracker=tracker, redis=UnreachableRedis())
+
+    assert workers_seen_max() == 3.0  # untouched by the failed tick
+    assert tracker.first_observed is None  # blind gap restarted the window
 
 
 def test_gauge_observable_via_metrics_endpoint():

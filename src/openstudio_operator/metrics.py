@@ -77,22 +77,24 @@ HPA_FLOOR_ADJUSTMENTS_TOTAL = Counter(
     "increment too, matching SOFT_STOPS_TOTAL)",
 )
 
-#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Monotonic max
-#: of distinct Resque worker ids the operator has EVER observed in process
-#: lifetime (web_background_monitor, #13). If this stays at 0 after the
-#: operator has been running for >1 minute under a real workload, the
-#: centralized Resque key constants likely do not match the live v3.11.0
-#: layout — the empty-registry branch of the stall-condition leg 2 is
+#: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard; issue #87 —
+#: unconditional emission. Monotonic max of distinct Resque worker ids the
+#: operator has EVER observed in process lifetime (web_background_monitor,
+#: #13). Since #87 the worker set is read on EVERY sensing tick regardless
+#: of queue depth (SMEMBERS ``resque:workers`` cardinality), so a healthy
+#: idle fleet — empty queues, workers heartbeating — populates the gauge
+#: within one poll. ``0`` with a reachable Redis therefore unambiguously
+#: means no workers are registered: either the fleet is really gone or the
+#: centralized Resque key constants do not match the live v3.11.0 layout —
+#: the empty-registry branch of the stall-condition leg 2 is then
 #: vacuously true, and the operator will periodic-restart web_background
 #: while everything looks healthy. Surface this as a Prometheus signal so
-#: an SRE can alert on ``openstudio_operator_resque_workers_seen_max == 0``
-#: AND a non-zero queue depth.
+#: an SRE can alert on ``openstudio_operator_resque_workers_seen_max == 0``.
 RESQUE_WORKERS_SEEN_MAX = Gauge(
     "openstudio_operator_resque_workers_seen_max",
-    "Maximum distinct Resque worker ids observed in process lifetime "
-    "(monotonic — survives worker disappearance; 0 = the operator has "
-    "never seen a worker heartbeat, which combined with non-zero queue "
-    "depth is the issue #44 silent-misbehavior signature)",
+    "Resque workers seen in the worker set, emitted every poll regardless "
+    "of queue depth (0 with a reachable Redis = no workers registered); "
+    "monotonic max — survives worker disappearance within process lifetime",
 )
 
 DEFAULT_METRICS_PORT = 9090
