@@ -27,6 +27,11 @@ From a clean checkout, the minimum loop is:
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
+# Runtime deps come from the hash-pinned lockfile (#173) — verify hashes,
+# then install the operator + dev extras. --require-hashes fails the install
+# on the first byte mismatch, so a corrupted or stale `requirements.lock`
+# shows up here before pytest can run.
+pip install --require-hashes -r requirements.lock
 pip install -e '.[dev]'
 
 # guard against wave-orchestration drift (#71) — see "Venv drift guard" below
@@ -50,7 +55,8 @@ existing handler module as a template, and start editing.
 | Tool | Version | Notes |
 |------|---------|-------|
 | Python | **3.12** | `Dockerfile` pins `python:3.12-slim` by digest (`#113`); local dev should match. `pyproject.toml` allows `>=3.11` but 3.12 is what CI and the container image use. |
-| `pip` | latest | only used once: `pip install -e '.[dev]'` |
+| `pip` | latest | used to install from `requirements.lock` (hash-pinned, `--require-hashes`) and then the editable package. |
+| `requirements.lock` | pinned | the source of truth for runtime deps (`#173`). Every package is pinned to an exact version with `--hash=sha256:...` annotations. Generated with `pip-compile --generate-hashes --output-file=requirements.lock pyproject.toml` (requires `pip-tools`); see `requirements.lock` header for the exact invocation. Never edit by hand. |
 | `ruff` | **`>=0.16`** | pinned in `pyproject.toml` `[project.optional-dependencies].dev`. Local floor must match CI's floor — the `#68` incident (TRY004 + RUF059) was caused by an old local ruff that activated new CI rules. If `ruff --version` reports `<0.16`, upgrade before committing. |
 | `pytest` | `>=8.0` | installed by `pip install -e '.[dev]'`. **Use the venv pytest, not the system one** — the system pytest cannot resolve the `openstudio_operator` package import and reports `ModuleNotFoundError` for almost every test. |
 | `kubectl` + a cluster | for live validation only | `kopf run --module openstudio_operator.handlers` needs the CRD applied and the namespace `openstudio-server` reachable. The unit-test loop does NOT require a cluster. |
@@ -125,9 +131,10 @@ runners); this check exists for local and wave workflows.
 Before running tests or lint against a new checkout, either:
 
 ```bash
-pip install -e '.[dev]'        # re-pin the venv to THIS checkout
+pip install --require-hashes -r requirements.lock  # re-pin runtime deps (#173)
+pip install -e '.[dev]'                              # re-pin the venv to THIS checkout
 # OR
-bash scripts/check_editable_install.sh          # verify without re-installing
+bash scripts/check_editable_install.sh               # verify without re-installing
 ```
 
 `scripts/check_editable_install.sh` exits `0` when the active venv
