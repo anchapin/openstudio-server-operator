@@ -34,6 +34,11 @@ import kopf
 import pytest
 
 from openstudio_operator import singleton
+from openstudio_operator.handlers import _check_redis_key_layout_for_cr
+from openstudio_operator.redis_client import (
+    OperatorConfigError,
+    RedisClientError,
+)
 
 # Every handler module the operator ships under ``openstudio_operator.handlers/``
 # registers exactly one ``@kopf.timer`` for the OSCM resource
@@ -431,6 +436,234 @@ def test_redis_key_layout_handler_invokes_validate_key_layout(
         f"Expected structured log line 'redis_key_layout=ok' not found. "
         f"Captured: {caplog.text!r}. See issue #163."
     )
+
+
+# --- Issue #233 — five-branch coverage for ``_check_redis_key_layout_for_cr`` ----
+#
+# The companion :func:`test_redis_key_layout_handler_invokes_validate_key_layout`
+# exercises the ``ok`` path only (the synthetic body + validate_key_layout()
+# stub succeeds). The four other branches the function returns — ``degraded``
+# (OperatorConfigError → log line + queued ``RedisKeyLayoutDrift`` Warning
+# Event), ``unreachable`` (RedisClientError or OSError → log line, no event),
+# ``error`` (any other Exception → log line, no event), and ``skipped`` (empty
+# ``spec.redisUrl`` or nameless item → debug log, no event) — had no directly
+# testing the call → return-string contract.
+#
+# Issue #233 pins those branches at the callsite gate so that a regression
+# that drops the unreachable catch (e.g. someone "fixes" the try/except by
+# removing OSError) fails this test LOUDLY rather than silently degrading
+# the boot-path Redis layout check into a crash on DNS failure — exactly the
+# issue #163 failure mode the handler was added to prevent.
+#
+# Scope guard: do NOT modify ``_check_redis_key_layout_for_cr`` — only
+# additions. Inject via :func:`openstudio_operator.client_factory.get_read_only_redis_client`
+# (the factory symbol the operator closes over since issue #235), not by
+# constructing ``ReadOnlyRedisClient`` directly — the AST gate
+# :func:`tests.test_client_factory.test_only_one_read_only_redis_client_construction_point`
+# rejects any second construction site outside the factory.
+@pytest.mark.parametrize(
+    ("branch", "exc_to_raise", "redis_url", "item_overrides", "expected_status",
+     "expected_log_substring", "expects_warning_event"),
+    [
+        # ok: validate_key_layout() returns cleanly → INFO log, no event.
+        pytest.param(
+            "ok",
+            None,
+            "redis://:pw@queue.test:6379",
+            {},
+            "ok",
+            "redis_key_layout=ok",
+            False,
+            id="ok",
+        ),
+        # degraded: OperatorConfigError → WARNING log + queued RedisKeyLayoutDrift.
+        pytest.param(
+            "degraded",
+            OperatorConfigError("synthetic layout drift (#233)"),
+            "redis://:pw@queue.test:6379",
+            {},
+            "degraded",
+            "redis_key_layout=degraded",
+            True,
+            id="degraded",
+        ),
+        # unreachable via RedisClientError: WARNING log, no event. Pin both
+        # wire-error classes (#233 acceptance criterion 1a/1b) because the
+        # except clause catches both with the same body.
+        pytest.param(
+            "unreachable_redis_client_error",
+            RedisClientError("Connection refused at boot (#233)"),
+            "redis://:pw@queue.test:6379",
+            {},
+            "unreachable",
+            "redis_key_layout=unreachable",
+            False,
+            id="unreachable_redis_client_error",
+        ),
+        pytest.param(
+            "unreachable_os_error",
+            OSError("DNS failure simulated (#233)"),
+            "redis://:pw@queue.test:6379",
+            {},
+            "unreachable",
+            "redis_key_layout=unreachable",
+            False,
+            id="unreachable_os_error",
+        ),
+        # error: any other Exception → WARNING log carrying the type name,
+        # no event. Regression fence against someone "fixing" the try/except
+        # by removing RedisClientError / OSError and re-raising.
+        pytest.param(
+            "error",
+            RuntimeError("unexpected boom (#233)"),
+            "redis://:pw@queue.test:6379",
+            {},
+            "error",
+            "redis_key_layout=error",
+            False,
+            id="error",
+        ),
+        # skipped via empty redisUrl: debug log, no warning, no event.
+        # Empty URL is the URL-guard's territory (#116); the layout check
+        # must NOT short-circuit on it.
+        pytest.param(
+            "skipped_empty_redis_url",
+            None,
+            "",
+            {},
+            "skipped",
+            "redis_key_layout skip",
+            False,
+            id="skipped_empty_redis_url",
+        ),
+        # skipped via nameless item: same outcome, different entry point.
+        pytest.param(
+            "skipped_nameless_item",
+            None,
+            "redis://:pw@queue.test:6379",
+            {"metadata": {}},
+            "skipped",
+            "",
+            False,
+            id="skipped_nameless_item",
+        ),
+    ],
+)
+def test_check_redis_key_layout_for_cr_covers_all_status_branches(
+    *,
+    branch: str,
+    exc_to_raise: Exception | None,
+    redis_url: str,
+    item_overrides: dict,
+    expected_status: str,
+    expected_log_substring: str,
+    expects_warning_event: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #233: every return branch of ``_check_redis_key_layout_for_cr`` is exercised.
+
+    The five return values are ``ok``, ``degraded``, ``unreachable``,
+    ``error``, and ``skipped``. This parametrised test injects the
+    :func:`openstudio_operator.client_factory.get_read_only_redis_client`
+    factory symbol at its import site (``handlers/__init__.py`` — the same
+    monkeypatch site used by the existing companion tests) and asserts
+    the contract for each branch:
+
+    1. the expected status string is returned,
+    2. the matching structured log line is emitted,
+    3. the Warning Event is queued iff the branch expects it (degraded only),
+    4. the function never re-raises — the boot path must survive even on
+       the exception-bearing branches.
+
+    Two cases for ``unreachable`` (RedisClientError, OSError) and two for
+    ``skipped`` (empty redisUrl, nameless item) cover each entry path the
+    function exposes, so the test gate covers not just the except clauses
+    but also the precondition guards.
+    """
+    import openstudio_operator.handlers as handlers_pkg
+
+    class _StubClient:
+        """Fake ``ReadOnlyRedisClient`` returned by the patched factory.
+
+        The stub records the construction call so a regression that
+        bypasses the factory entirely is caught by the existing
+        :func:`test_redis_key_layout_handler_invokes_validate_key_layout`
+        sibling; here we only need :meth:`validate_key_layout` to
+        either return cleanly or raise the parametrized exception.
+        """
+        def validate_key_layout(self) -> None:
+            if exc_to_raise is not None:
+                raise exc_to_raise
+
+    construction_calls: list[str] = []
+
+    def _stub_factory(redis_url: str, **_kwargs: object) -> _StubClient:
+        construction_calls.append(redis_url)
+        return _StubClient()
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.get_read_only_redis_client", _stub_factory
+    )
+
+    item: dict = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": redis_url},
+    }
+    item.update(item_overrides)
+
+    handlers_pkg._sink.clear()
+
+    with caplog.at_level(
+        logging.DEBUG, logger="openstudio_operator.handlers"
+    ):
+        # MUST NOT raise — that is the contract of all five branches.
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == expected_status, (
+        f"Branch {branch!r}: expected status={expected_status!r}; "
+        f"got {status!r}. Captured: {caplog.text!r}. See issue #233."
+    )
+
+    if expected_log_substring:
+        assert expected_log_substring in caplog.text, (
+            f"Branch {branch!r}: expected log substring {expected_log_substring!r} "
+            f"missing. Captured: {caplog.text!r}. See issue #233."
+        )
+
+    # Each non-skipped branch must reach the factory (skipped guards short-circuit
+    # before construction).
+    if branch != "skipped_nameless_item" and redis_url:
+        assert construction_calls == [redis_url], (
+            f"Branch {branch!r}: factory call mismatch {construction_calls!r}; "
+            f"expected exactly one call with {redis_url!r}. See issue #233."
+        )
+
+    # The Warning Event is queued iff the branch expects it. Critical:
+    # unreachable and error MUST NOT queue — alerting on a wire-level
+    # outage or a generic exception is operator-on-call noise.
+    pending = [
+        msg for msg in handlers_pkg._sink.queued
+        if msg[0] == "test-ns" and msg[1] == "test-osc"
+    ]
+    if expects_warning_event:
+        assert len(pending) == 1, (
+            f"Branch {branch!r}: expected exactly one queued "
+            f"RedisKeyLayoutDrift event; got {len(pending)}. See issue #233."
+        )
+        assert pending[0][2] == "RedisKeyLayoutDrift", (
+            f"Branch {branch!r}: expected reason='RedisKeyLayoutDrift'; "
+            f"got {pending[0][2]!r}. See issue #233."
+        )
+    else:
+        assert not pending, (
+            f"Branch {branch!r}: expected NO queued Warning Event; "
+            f"got {pending!r}. The operator would noise on "
+            f"{'wire-level outages' if branch.startswith('unreachable') else branch} "
+            f"and drown the degraded signal. See issue #233."
+        )
 
 
 # --- Issue #158 — exactly one ``CustomObjectsApi()`` construction site ----------
