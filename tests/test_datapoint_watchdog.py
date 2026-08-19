@@ -15,6 +15,7 @@ import responses
 from prometheus_client import REGISTRY
 
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.datapoint_watchdog import (
     DATAPOINT_REQUEUE_EXHAUSTED_EVENT,
     DATAPOINT_REQUEUED_EVENT,
@@ -407,3 +408,62 @@ def test_dry_run_suppresses_rest_call_and_burns_budget_like_real():
     assert requeued3 == []
     assert calls_to("/requeue") == 1
     assert events3[0][1] == DATAPOINT_REQUEUE_EXHAUSTED_EVENT
+
+
+# --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
+
+
+import types
+
+
+@responses.activate
+def test_run_watchdog_tick_accepts_mappingview_body_in_event_emitter():
+    """Issue #232 — MappingView (types.MappingProxyType) body end-to-end.
+
+    kopf >=1.4x delivers ``body`` to timer handlers as a MappingView subclass
+    (not a dict subclass). This regression test wires
+    ``types.MappingProxyType`` into ``EventEmitter``, drives
+    ``run_watchdog_tick`` through its requeue emit path, and asserts:
+
+    1. ``EventEmitter.dry_run`` gate still records the suppression through
+       ``EventEmitter.suppressed_count`` (D11 end-to-end);
+    2. ``body.get('metadata')`` introspection keeps working — the access
+       shape ``kopf.event`` and any status-update helper rely on.
+
+    No production code change; the test fails the day a kopf upgrade makes
+    the body shape incompatible with ``EventEmitter``. Scope guard: handler /
+    guard untouched.
+    """
+    spec = {**SPEC, "dryRun": True}
+    over = NOW - timedelta(minutes=60)
+    api = FakeCustomObjectsApi(
+        make_cr(spec, status={"startedSince": {"d1": over.isoformat()}})
+    )
+    register_started("d1")
+
+    # CR body as kopf 1.4x would deliver it: a MappingView, not a dict subclass.
+    cr_body = make_cr(spec)
+    proxy_body = types.MappingProxyType(cr_body)
+    assert not isinstance(proxy_body, dict)  # the shape this regression exists for
+    # (2) body.get('metadata') still resolves through the proxy.
+    assert proxy_body.get("metadata") == cr_body["metadata"]
+
+    # (1) Wire the production EventEmitter (not the test closure stub) — the
+    # D11 gate under test lives here.
+    emitter = EventEmitter(body=proxy_body, dry_run=True)
+    config = OperatorConfig.from_spec(spec)
+    store = StatusStore(NAMESPACE, NAME, api)
+
+    requeued = run_watchdog_tick(
+        OpenStudioClient(BASE),
+        store,
+        config,
+        now=NOW,
+        emit=emitter,
+        exhausted_seen=set(),
+    )
+
+    assert requeued == ["d1"]
+    # Dry-run gate still records exactly the one requeue Normal Event.
+    assert emitter.suppressed_count == 1
+    assert emitter.dry_run is True

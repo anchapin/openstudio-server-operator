@@ -15,6 +15,7 @@ import responses
 from prometheus_client import REGISTRY
 
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.worker_recycler import (
     DEFAULT_WORKER_DEPLOYMENT,
     MERGE_PATCH_CONTENT_TYPE,
@@ -494,3 +495,63 @@ def test_dry_run_suppresses_patch_marks_event_and_advances_last_recycle_at():
     assert events2 == []
     assert workers_recycled_total() - metric_before == 1
     assert api.obj["status"]["lastRecycleAt"] == NOW.isoformat()
+
+
+# --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
+
+
+import types
+
+
+@responses.activate
+def test_run_recycler_tick_accepts_mappingview_body_in_event_emitter():
+    """Issue #232 — MappingView (types.MappingProxyType) body end-to-end.
+
+    kopf >=1.4x delivers ``body`` to timer handlers as a MappingView subclass
+    (not a dict subclass). This regression test wires
+    ``types.MappingProxyType`` into ``EventEmitter``, drives
+    ``run_recycler_tick`` through its recycle emit path, and asserts:
+
+    1. ``EventEmitter.dry_run`` gate still records the suppression through
+       ``EventEmitter.suppressed_count`` (D11 end-to-end);
+    2. ``body.get('metadata')`` introspection keeps working — the access
+       shape ``kopf.event`` and any status-update helper rely on.
+
+    No production code change; the test fails the day a kopf upgrade makes
+    the body shape incompatible with ``EventEmitter``. Scope guard: handler /
+    guard untouched.
+    """
+    spec = {**SPEC, "dryRun": True}
+    api = FakeCustomObjectsApi(make_cr(spec))
+    apps = FakeAppsV1Api()
+    register_analyses(analyses_payload("completed"))
+
+    # CR body as kopf 1.4x would deliver it: a MappingView, not a dict subclass.
+    cr_body = make_cr(spec)
+    proxy_body = types.MappingProxyType(cr_body)
+    assert not isinstance(proxy_body, dict)  # the shape this regression exists for
+    # (2) body.get('metadata') still resolves through the proxy.
+    assert proxy_body.get("metadata") == cr_body["metadata"]
+
+    # (1) Wire the production EventEmitter (not the test closure stub) — the
+    # D11 gate under test lives here.
+    emitter = EventEmitter(body=proxy_body, dry_run=True)
+    config = OperatorConfig.from_spec(spec)
+    store = StatusStore(NAMESPACE, NAME, api)
+
+    trigger = run_recycler_tick(
+        OpenStudioClient(BASE),
+        store,
+        config,
+        apps,
+        namespace=NAMESPACE,
+        now=NOW,
+        emit=emitter,
+    )
+
+    assert trigger == TRIGGER_ANALYSIS_COMPLETED
+    # Dry-run gate still records exactly the one WorkerRecycled Normal Event;
+    # the Deployment patch is suppressed (mutation off, Event on).
+    assert apps.patches == []
+    assert emitter.suppressed_count == 1
+    assert emitter.dry_run is True
