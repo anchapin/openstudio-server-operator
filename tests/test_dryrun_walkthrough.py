@@ -318,7 +318,6 @@ def test_dryrun_soft_stop_is_strict_suppression():
         emit=emit_first,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
-        apps_api=FakeApps(),
         redis_client=redis_dry,
     )
     assert events_first == []
@@ -334,7 +333,6 @@ def test_dryrun_soft_stop_is_strict_suppression():
         emit=emit_dry,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
-        apps_api=FakeApps(),
         redis_client=redis_dry,
     )
     assert calls_to("/soft_stop") == 0
@@ -361,7 +359,6 @@ def test_dryrun_soft_stop_is_strict_suppression():
         emit=emit_first,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
-        apps_api=FakeApps(),
         redis_client=redis_real,
     )
     before = metric("openstudio_operator_soft_stops_total")
@@ -374,7 +371,6 @@ def test_dryrun_soft_stop_is_strict_suppression():
         emit=emit_real,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
-        apps_api=FakeApps(),
         redis_client=redis_real,
     )
     assert calls_to("/soft_stop") == 1
@@ -410,7 +406,6 @@ def test_dryrun_escalation_is_strict_suppression():
         _escalation_path_responses(analysis_id)
         api = FakeCO(make_cr(spec, status=anchored))
         pods = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
-        apps = FakeApps()
         redis_client = _FakeRedisForDryRun(
             {"worker-1:1:requeued,simulations": [analysis_id]}
         )
@@ -426,7 +421,6 @@ def test_dryrun_escalation_is_strict_suppression():
             emit=emit,
             namespace=NAMESPACE,
             pod_api=pods,
-            apps_api=apps,
             redis_client=redis_client,
         )
         return api, pods, events, metric("openstudio_operator_worker_pods_evicted_total") - before
@@ -1020,7 +1014,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     # Module 1 (soft-stop) — first tick: first sight of started → no
     # soft-stop, anchor written as ``watching`` (issue #83 D1).
     pods_api = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
-    apps_api = FakeApps()
     redis_client = _FakeRedisForDryRun({"worker-1:1:requeued,simulations": [analysis_id]})
     events, emit = make_emit()
     run_sla_tick(
@@ -1031,7 +1024,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         emit=emit,
         namespace=NAMESPACE,
         pod_api=pods_api,
-        apps_api=apps_api,
         redis_client=redis_client,
     )
     assert store.get_soft_stops()[analysis_id].outcome == "watching"
@@ -1045,7 +1037,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         emit=emit,
         namespace=NAMESPACE,
         pod_api=pods_api,
-        apps_api=apps_api,
         redis_client=redis_client,
     )
     soft_stop_events = [e for e in events if e[1] == ANALYSIS_SOFT_STOPPED_EVENT]
@@ -1080,7 +1071,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         emit=emit,
         namespace=NAMESPACE,
         pod_api=pods_api,
-        apps_api=apps_api,
         redis_client=redis_client,
     )
     escal_events = [e for e in events if e[1] == ANALYSIS_ESCALATED_EVENT]

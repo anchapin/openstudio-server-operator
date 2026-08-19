@@ -313,7 +313,6 @@ def tick(
     client=None,
     *,
     pod_api=None,
-    apps_api=None,
     redis_client=None,
     now=NOW,
 ):
@@ -328,7 +327,6 @@ def tick(
         emit=emit,
         namespace=NAMESPACE,
         pod_api=pod_api,
-        apps_api=apps_api,
         redis_client=redis_client if redis_client is not None else FakeRedisClient(),
     )
     return result, events
@@ -471,37 +469,6 @@ def test_anchor_survives_operator_restart():
 
 
 # --- Clock anchor: status.json is the source of truth (D1) -------------------
-
-
-@responses.activate
-def test_uses_status_json_not_page_data_start_time():
-    """Pre-#83 anchored on page_data.start_time; post-#83 on operator first sight.
-
-    The new flow polls ``/status.json`` (which IS reliable on v3.11.0) and
-    IGNORES ``page_data.start_time`` (which is absent on v3.11.0). This
-    test stages a started analysis with a deliberately MISSING
-    ``start_time`` field — the operator must still find it via
-    ``status.json`` and write the anchor.
-    """
-    api = FakeCustomObjectsApi(make_cr())
-    register_analyses_index("a1")
-    register_analysis_status("a1")
-    # No `start_time` field at all in the page_data response — proves
-    # the operator does not anchor on it. (No responses mock is
-    # registered for page_data; if the operator ever asked for it the
-    # call would raise out of the tick — observable in the test as a
-    # connection error.)
-    responses.get(
-        f"{BASE}/analyses/a1/page_data.json",
-        json={"analysis": {"status": "started"}},  # no start_time
-    )
-
-    result, events = tick(api)
-
-    assert result.soft_stopped == []
-    assert result.escalated == []
-    assert events == []
-    assert api.obj["status"]["softStops"]["a1"]["outcome"] == "watching"
 
 
 @responses.activate
@@ -673,14 +640,12 @@ def test_grace_not_yet_elapsed_waits_even_after_restart():
     register_analyses_index("a1")
     register_analysis_status("a1")
     pod_api = FakeCoreV1Api([make_pod("worker-1")])
-    apps = FakeAppsV1Api()
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=apps,
         redis_client=redis_client,
         client=OpenStudioClient(BASE),
     )
@@ -688,7 +653,6 @@ def test_grace_not_yet_elapsed_waits_even_after_restart():
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
     assert pod_api.deletes == []
-    assert apps.reads == []
     assert api.patch_calls == 0  # nothing written — the anchor simply waits
     assert pods_evicted_total() - metric_before == 0
     # Resque wasn't consulted — the grace check short-circuited.
@@ -724,7 +688,6 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -789,7 +752,6 @@ def test_escalation_uses_resque_worker_identity_not_ip_matching():
     result, _ = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -835,7 +797,6 @@ def test_escalation_skips_workers_with_no_matching_pod_in_namespace():
     result, _ = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -873,7 +834,6 @@ def test_escalation_with_no_matching_workers_records_no_match():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -907,7 +867,6 @@ def test_default_delete_passes_no_grace_seconds():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -946,7 +905,6 @@ def test_force_delete_passes_grace_zero():
         api,
         spec=force_spec,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -981,7 +939,6 @@ def test_double_escalation_impossible():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1016,7 +973,6 @@ def test_analysis_completed_during_grace_prunes_anchor_without_escalating():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1049,7 +1005,6 @@ def test_analysis_vanished_from_api_prunes_anchor():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1085,7 +1040,6 @@ def test_dry_run_suppresses_pod_deletes_and_marks_event():
         api,
         spec=spec,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1127,7 +1081,6 @@ def test_escalated_anchor_skips_grace_phase_entirely():
     result, events = tick(
         api,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1164,7 +1117,6 @@ def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
         api,
         spec=spec,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
@@ -1331,7 +1283,6 @@ def test_escalate_analysis_uses_redis_resolved_pod_set():
         emit=emit,
         namespace=NAMESPACE,
         pod_api=pod_api,
-        apps_api=FakeAppsV1Api(),
         redis_client=redis_client,
     )
 
