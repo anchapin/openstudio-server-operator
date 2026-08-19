@@ -7,8 +7,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Auto-improvement-loop iteration 2 (post-0.2.0): 34 new issues opened
+(`#224`–`#257`), 38 total closed (4 pre-existing + 34 new) across 14
+priority-ordered waves with dependency-aware merging. Major themes:
+critical `NetworkPolicy` gaps (`#224` `#225`), least-privilege
+`verbs:[*]` violation on the OSCM CR (`#228`), Mongo credential rotation
+(`#219`), `OpenStudioClient` hardening (`#227` `#226` `#242`), structured
+JSON log emission (`#256`), `/metrics` expansion 12+1+1 → 16+4+1
+(`#237` `#238` `#239` `#253` `#254` `#255`), operator-side `events_sinks.py`
+collapse + Redis factory centralization + handler registry + k8s client
+factories + public `list_datapoints()` (`#234` `#235` `#250` `#251`
+`#252`), per-handler exception coverage + live-fixture drift + Hypothesis
+edge cases (`#246` `#247` `#248` `#249`).
+
 ### Added
-- (no entries yet — all changes since 0.1.0 are in [0.2.0])
+- **`#256`** — structured JSON logs from the operator process (and the
+  prune `CronJob`). `:func:`openstudio_operator.logging_setup.install_json_logging``
+  installs a stdlib `logging.Formatter` subclass that emits one JSON
+  object per log line (`timestamp` ISO-8601 UTC, `level`, `logger`,
+  `message`, `module`, `funcName`, `lineno`, plus kopf-injected
+  `namespace` / `name` when present). Invoked from `handlers/__init__.py`
+  (operator process) and `prune_entrypoint.py::main` (CronJob). Documented
+  in `README.md#logs`.
+- **`#237`** — Prometheus surface for the dry-run gate on
+  `EventEmitter` (`#164`). `openstudio_operator_events_dry_run_suppressed_total{reason}`
+  + companion `openstudio_operator_events_emitted_total{reason}` (both
+  labelled by the warning-event vocabulary). Headline SLO for an
+  audit-only install: emitted-vs-suppressed rate ratio.
+- **`#238`** — `openstudio_operator_resque_queue_depth{queue}` Gauge
+  surfaces the operator's authoritative `LLEN` reads on every sensing
+  tick. Cross-check against KEDA's external metrics view; the operator's
+  depths disagreeing with KEDA's is the centralized-constants drift
+  signal.
+- **`#239`** — `openstudio_operator_singleton_election_total{outcome}`
+  Counter at the three `SingletonGuard.enforce` post-decode branches
+  (`idle` | `active` | `conflict`). Surfaces the silent-bypass failure
+  mode when the kopf registry internals change shape and
+  `install_singleton_guard` returns 0 without the AST coverage test
+  catching it.
+- **`#253`** — `openstudio_operator_redis_key_layout_status` Gauge
+  (1.0=`ok`, 0.0=any-other). Surfaces the boot-time validator outcome
+  (`#163`) as a cluster-wide latest-observation signal so an SRE can
+  alert on `== 0` without log scraping. The post-`#44` failure mode
+  (v3.11.0 layout drift takes `resque_workers_seen_max` silent, the
+  stall condition fires vacuously) is observable here.
+- **`#254`** — `openstudio_operator_stall_window_elapsed_seconds` Gauge
+  tracks the `StallWindowTracker` state between the first sustained
+  observation and the eventual `web_background_restarts_total` increment.
+  Heads-up display that gives SREs time to react before the gate trips.
+- **`#255`** — `openstudio_operator_events_emit_failures_total{reason}`
+  Counter inside `EventEmitter.emit`'s try/except wrapper (BEFORE
+  re-raising). Distinguishes "Event posting down" from "REST API down"
+  — `handler_tick_failures_total{error_type=ApiException}` previously
+  captured both under one label.
+- **`#250`** — Python-level OSCM handler registry in
+  `src/openstudio_operator/_oscm_handlers.py`. New handler modules MUST
+  call `:func:`openstudio_operator._oscm_handlers.register`` at module
+  import time; the singleton guard (`#14`) cross-checks the Python
+  registry against the kopf registry at gate time. The four pre-existing
+  handlers (`analysis_sla`, `datapoint_watchdog`, `web_background_monitor`,
+  `worker_recycler`) remain registered with kopf directly; their IDs are
+  listed in `KNOWN_LEGACY_OSCM_HANDLER_IDS` so the cross-check passes
+  for them without retrofitting a `register()` call.
+- **`#251`** — `:func:`openstudio_operator._k8s.deployment_label_selector``
+  + `:class:`openstudio_operator._k8s.DeploymentReader`` shared K8s
+  helpers. The previously cross-imported `deployment_label_selector`
+  from `analysis_sla` is the canonical home now (`#236`); the singleton
+  guard's `AppsV1Api` slice is rebuilt here too. Tests live in
+  `tests/test_k8s_clients.py`.
+- **`#234`** — `QueuedKopfEventSink` in `src/openstudio_operator/events_sinks.py`
+  collapses the three near-identical queue/drain mechanisms from
+  `handlers/__init__.py` (the `#116` redis-URL guard, the `#163`
+  Resque key-layout guard, and the `#171` status-map-cap guard) into a
+  single class. Each emitted Warning Event is queued in-process and
+  flushed on the next OSCM watch event by a single `@kopf.on.event`
+  drain handler installed by `handlers/__init__.py`.
+- **`#252`** — `:func:`openstudio_operator.openstudio_client.list_datapoints``
+  is the new public surface that `retention.py` uses; replaces the
+  private `OpenStudioClient._request_json` reach-in. No behaviour change
+  to the client itself.
+- **`#242`** — `OpenStudioClient` session gets explicit TLS verification
+  (default `True`; `verify=True` configurable via `tls_verify=False` in
+  the `OpenStudioClient` constructor for self-signed cert scenarios).
+- **`#227`** — `OpenStudioClient` mutating endpoints now send
+  `Accept: application/json` (mirrors the GET surfaces). Without the
+  header, mutating responses return `text/html` and the JSON parse path
+  raises.
+- **`#228`** — operator `Role` no longer grants `verbs: [*]` on the OSCM
+  CR. The least-privilege verb set is enumerated explicitly:
+  `get,list,watch,update,patch` on `openstudioclustermanagers` (the
+  `update`/`patch` are the singleton guard's reconcile path on
+  `.metadata.labels`, NOT status mutations — those go through the
+  status subresource and remain `get,update,patch` on
+  `openstudioclustermanagers/status`). AST CI gate in
+  `tests/test_deploy_manifests.py` fails the build on any future
+  `verbs: ['*']` reintroduction.
+- **`#241`** — archival Jobs no longer inherit the ServiceAccount token
+  (`automountServiceAccountToken: false` on the Job pod template); the
+  archival pipeline never needs K8s API access, and the token would be
+  a lateral-movement surface if the rclone Job were compromised.
+- **`#240`** — `storagePolicy.secretRef` constrained by CEL validation
+  to a name-matching allowlist (the operator-managed `rclone-credentials`
+  Secret). Prevents a tainted `storagePolicy.bucket` from pointing at
+  an arbitrary user Secret in the namespace.
+- **`#219`** — kind-recipe Mongo credentials rotated from the
+  publicly-known `openstudio` literal to `mongo-rotated-<random>` in
+  `scripts/manifests/{01-mongo,04-web,05-web-background,06-worker}.yaml`.
+  Fresh installs MUST run `scripts/rotate_mongo_credentials.sh` first;
+  the `scripts/check_mongo_credentials_unique.sh` CI guard fails the
+  build if the legacy literal re-appears.
+- **`#225`** — allow-egress `NetworkPolicy` no longer mislabels the API
+  server as `kube-dns`. The operator-to-apiserver egress now targets
+  the apiserver's actual Service label, not the placeholder.
+- **`#224`** — operator pod template gains
+  `app.kubernetes.io/managed-by: openstudio-operator` so every
+  `NetworkPolicy` selector in `deploy/network-policy.yaml` matches the
+  actual pod. (The prune `CronJob` was already labelled correctly.)
+- **`#246`** — Hypothesis property-based tests for
+  `:func:`openstudio_operator._time.parse_utc`` edge cases
+  (`tests/test_time_parsing.py`).
+- **`#247`** — `tests/conftest.py` autouse fixture resets
+  `singleton._process_guard` and the event-queue globals between tests
+  so handler-boundary tests can run in any order without leaking state.
+- **`#248`** — `tests/test_live_fixture_drift.py` value-level diff
+  between the captured live v3.11.0 fixtures (`tests/fixtures/live/`)
+  and the synthetic samples (`tests/fixtures/samples/`). Catches the
+  drift mode where live and synthetic still parse to the same shape but
+  diverge on enum values / status strings.
+- **`#249`** — `tests/test_timer_wrapper_failures.py` direct tests for
+  the four `@kopf.timer` wrappers (`analysis_sla`, `datapoint_watchdog`,
+  `worker_recycler`, `web_background_monitor`) — per-handler exception
+  tuple coverage of `handler_tick_failures_total{module, error_type}`
+  rather than relying on `run_*_tick` end-to-end paths.
+- **`#231`** — direct tests for the four `@kopf.timer` wrappers (not
+  just `run_*_tick`). Complements `#249`'s exception-tuple coverage.
+- **`#232`** — `tests/test_handler_boundaries.py` exercises the kopf 1.4x
+  `MappingView` body end-to-end through `EventEmitter` + `run_*_tick` —
+  the change in kopf 1.4x where handler `body` parameters became
+  `MappingView` rather than `dict` is now a CI gate, not a "look the
+  other way" assumption.
+- **`#233`** — `tests/test_redis_client.py` covers the `redis_key_layout`
+  degraded / unreachable / error / skipped branches (the validator path
+  the boot-time check fires on `#163`).
+- **`#257`** — `pytest` `slow` marker + duration budget to catch
+  test-suite regressions before they land.
 
 ### Changed
 - **`#235`** — `ReadOnlyRedisClient` construction is now centralized in
@@ -25,6 +167,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   liveness). New AST CI gate
   `tests/test_client_factory.py::test_only_one_read_only_redis_client_construction_point`
   fails on any inline `ReadOnlyRedisClient(` outside the factory.
+- **`#226`** — `OpenStudioClient` mutating POSTs no longer retry on 5xx
+  by default (retries on 5xx without idempotency keys risk duplicate
+  state mutations); the retry policy is now keyed on the method
+  (GET → retry on 5xx, POST/PATCH/DELETE → no retry without an explicit
+  idempotency key). The behaviour is configurable per-instance for
+  callers that can guarantee idempotency.
+- **`#183`** (refresh) — `/metrics` surface enumeration in `README.md`
+  and `AGENTS.md` updated to **16 counters + 4 gauges + 1 histogram**
+  (was 11+1+0 / 12+1+1 at the 0.2.0 release). The drift that was
+  caught in iteration 2 — every `metric.py` increment had landed in
+  the registry but the docs/README/AGENTS still cited pre-`#171`
+  numbers — is the canonical "drift in three places at once" failure
+  mode and is now CI-gated by `tests/test_metrics_endpoint.py`.
+- **`#181`** (refresh) — audit `Appendix D` counter / gauge / histogram
+  table refreshed to match the 16+4+1 registry
+  (`EVENTS_DRY_RUN_SUPPRESSED_TOTAL`, `EVENTS_EMITTED_TOTAL`,
+  `SINGLETON_ELECTION_TOTAL`, `EVENTS_EMIT_FAILURES_TOTAL`,
+  `RESQUE_QUEUE_DEPTH`, `REDIS_KEY_LAYOUT_STATUS`,
+  `STALL_WINDOW_ELAPSED_SECONDS`, plus `STATUS_MAP_CAPS_TOTAL`).
+- **`#220` / `#243`** — drift closeout: `AGENTS.md` + `docs/onboarding.md`
+  test count claim aligned to `529 tests across 28 files` (was 342/17
+  pre-`#178`); `docs/kind-validation.md` acceptance criteria refreshed
+  to the current 16+4+1 metric surface and the current test count.
+- **`#244`** — `README.md` + `AGENTS.md` Repository layout sections
+  list the four new shared-utility modules (`events_sinks.py`, `_k8s.py`,
+  `_oscm_handlers.py`, `logging_setup.py`).
 
 ### Removed
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])
