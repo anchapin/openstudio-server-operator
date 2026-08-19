@@ -206,10 +206,17 @@ def test_every_dispatched_command_string_is_in_the_allowlist():
 
 
 def test_module_source_contains_no_write_command_call_syntax():
+    """Guard: no Redis write command is ever invoked through any path.
+
+    The grep deliberately excludes ``append`` — too generic; the only
+    ``append`` in this module (added in #83 D2 by
+    ``workers_for_analysis``) operates on a Python list of matches, not
+    on a Redis client. Every other write command on the list is Redis-only.
+    """
     write_call = re.compile(
         r"\.\s*(?:set|hset|hmset|hdel|lpush|rpush|lpop|rpop|lrem|sadd|srem|spop|zadd|"
         r"delete|unlink|expire|persist|pexpire|rename|move|setex|setnx|getset|getdel|"
-        r"append|incr|decr|incrby|decrby|publish|flushall|flushdb|mset|eval|"
+        r"incr|decr|incrby|decrby|publish|flushall|flushdb|mset|eval|"
         r"script_load|config_set|client_setname|execute_command|pipeline)\s*\(",
         re.IGNORECASE,
     )
@@ -217,7 +224,9 @@ def test_module_source_contains_no_write_command_call_syntax():
 
 
 def test_allowlist_is_exactly_the_reads_and_intersects_no_write_command():
-    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "HGETALL", "SCAN"}
+    """Issue #83 D2 added GET for the per-worker record read; assert the
+    canonical allowlist is exactly the read-only set."""
+    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"}
     assert READ_ONLY_COMMANDS & WRITE_COMMANDS == set()
 
 
@@ -339,3 +348,152 @@ def test_redis_errors_are_wrapped_as_client_errors(fake, client, monkeypatch):
     monkeypatch.setattr(fake, "smembers", _boom)
     with pytest.raises(RedisClientError, match="SMEMBERS failed"):
         client.worker_heartbeats()
+
+
+# --- Issue #83 D2: workers_for_analysis + pod_name_for_worker -----------------
+
+
+def _seed_worker_payload(fake, worker_id: str, payload_args: list | None) -> None:
+    """Seed ``resque:worker:{worker_id}`` with a JSON payload.
+
+    The live Resque 2.x layout stores the worker record as a JSON STRING
+    whose shape is ``{host, pid, queues, payload, run_at}`` (issue #83 D2
+    verified on kind/v3.11.0). When ``payload_args`` is None the worker
+    is recorded as idle (no current job); the operator's
+    ``workers_for_analysis`` must not match it.
+    """
+    import json as _json
+
+    if payload_args is None:
+        record = {"host": worker_id.split(":")[0], "pid": 0, "queues": []}
+    else:
+        record = {
+            "host": worker_id.split(":")[0],
+            "pid": 1,
+            "queues": ["requeued", "simulations"],
+            "payload": {"class": "RunSimulateDataPoint", "args": payload_args},
+            "run_at": "2026-08-18T20:00:00+00:00",
+        }
+    fake.set(f"resque:worker:{worker_id}", _json.dumps(record))
+
+
+def test_workers_for_analysis_matches_payload_args_0(fake, client):
+    """Live Resque convention: ``RunSimulateDataPoint`` job passes
+    ``[analysis_id, datapoint_id, ...]`` — args[0] is the analysis id."""
+    fake.sadd("resque:workers", "worker-a:1:requeued,simulations", "worker-b:2:requeued,simulations")
+    _seed_worker_payload(fake, "worker-a:1:requeued,simulations", ["a1", "dp1"])
+    _seed_worker_payload(fake, "worker-b:2:requeued,simulations", ["a2", "dp2"])
+
+    matches = client.workers_for_analysis("a1")
+
+    assert matches == ["worker-a:1:requeued,simulations"]
+
+
+def test_workers_for_analysis_matches_any_arg_position(fake, client):
+    """Defensive: a future job class may rearrange args — the helper
+    matches ``analysis_id`` in any position, not just ``args[0]``."""
+    fake.sadd("resque:workers", "worker-x:1:requeued,simulations")
+    _seed_worker_payload(
+        fake, "worker-x:1:requeued,simulations", ["dp1", "a1", "options-hash"]
+    )
+
+    matches = client.workers_for_analysis("a1")
+
+    assert matches == ["worker-x:1:requeued,simulations"]
+
+
+def test_workers_for_analysis_skips_idle_workers(fake, client):
+    """A worker with no current payload (``payload: null``) is never a match."""
+    fake.sadd("resque:workers", "worker-idle:1:requeued,simulations", "worker-busy:2:requeued,simulations")
+    _seed_worker_payload(fake, "worker-idle:1:requeued,simulations", None)
+    _seed_worker_payload(fake, "worker-busy:2:requeued,simulations", ["a1"])
+
+    matches = client.workers_for_analysis("a1")
+
+    assert matches == ["worker-busy:2:requeued,simulations"]
+
+
+def test_workers_for_analysis_skips_workers_with_no_record(fake, client):
+    """A registered worker whose ``resque:worker:{id}`` STRING is absent
+    is treated as idle (not an error). The helper skips it gracefully —
+    fakeredis returns ``None`` for an unset key, and we accept that as
+    "no payload, no match"."""
+    fake.sadd("resque:workers", "worker-ghost:1:requeued,simulations")
+    # No _seed_worker_payload call for worker-ghost.
+
+    matches = client.workers_for_analysis("a1")
+
+    assert matches == []
+
+
+def test_workers_for_analysis_raises_on_garbage_record(fake, client):
+    """Unparseable JSON in a worker's record is loud, never silently absent.
+
+    The escalation path is safety-critical; registry garbage must surface
+    as :class:`RedisClientError` so the SLA tick skips the tick (D12) and
+    the next poll retries naturally. A swallowed failure here would
+    silently no-match and never escalate."""
+
+    fake.sadd("resque:workers", "worker-bad:1:requeued,simulations")
+    fake.set("resque:worker:worker-bad:1:requeued,simulations", "not-valid-json{")
+
+    with pytest.raises(RedisClientError, match="unparseable worker record"):
+        client.workers_for_analysis("a1")
+
+
+def test_workers_for_analysis_empty_registry(fake, client):
+    assert client.workers_for_analysis("a1") == []
+
+
+def test_pod_name_for_worker_extracts_hostname_segment():
+    """Live Resque 2.x: ``{hostname}:{pid}:{queues}`` — first segment IS the
+    K8s pod name (pods default ``hostname`` to the pod name)."""
+    from openstudio_operator.redis_client import ReadOnlyRedisClient
+
+    assert (
+        ReadOnlyRedisClient.pod_name_for_worker(
+            ReadOnlyRedisClient, "worker-5f49c94875-sngm2:35:requeued,simulations"
+        )
+        == "worker-5f49c94875-sngm2"
+    )
+
+
+def test_pod_name_for_worker_returns_none_for_malformed_id():
+    """Defensive: a worker id with fewer than 3 colon segments (or an
+    empty first segment) returns ``None`` — the caller must skip, not
+    mistakenly try to delete a pod named ``''`` or ``':'``."""
+    from openstudio_operator.redis_client import ReadOnlyRedisClient
+
+    assert ReadOnlyRedisClient.pod_name_for_worker(ReadOnlyRedisClient, "too-few-segments") is None
+    assert ReadOnlyRedisClient.pod_name_for_worker(ReadOnlyRedisClient, ":1:queues") is None
+    assert ReadOnlyRedisClient.pod_name_for_worker(ReadOnlyRedisClient, "") is None
+
+
+def test_workers_for_analysis_uses_only_read_only_commands(fake):
+    """The D2 helper must dispatch only allowlisted commands. SMEMBERS
+    reads the registry; GET reads each per-worker record. Both are
+    strictly reads — never a write command."""
+    recorder = RecordingRedis(fake)
+    client = ReadOnlyRedisClient(
+        "redis://:pw@queue.test:6379", connection=recorder, now_fn=lambda: NOW
+    )
+    fake.sadd("resque:workers", "worker-a:1:requeued,simulations")
+    _seed_worker_payload(fake, "worker-a:1:requeued,simulations", ["a1"])
+
+    client.workers_for_analysis("a1")
+
+    assert set(recorder.commands) <= READ_ONLY_COMMANDS
+    assert "SMEMBERS" in recorder.commands
+    assert "GET" in recorder.commands
+
+
+# --- allowlist change (issue #83 D2 adds GET) --------------------------------
+
+
+def test_allowlist_includes_get_for_worker_records():
+    """Issue #83 D2 added GET to the read-only allowlist so the per-worker
+    record read at ``resque:worker:{worker_id}`` can be served by the
+    dispatch chokepoint. This test is a regression guard for the
+    allowlist mutation."""
+    assert "GET" in READ_ONLY_COMMANDS
+    assert "GET" not in WRITE_COMMANDS  # GET is strictly a read command

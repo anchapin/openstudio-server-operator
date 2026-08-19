@@ -1,12 +1,17 @@
 """REST client for the OpenStudio Server API, verified against NREL/OpenStudio-server v3.11.0.
 
-Ground truth: `.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md`.
+Ground truth: `docs/contracts/openstudio-server-v3.11.0-rest.md`.
 
 Reads:
     GET    /analyses.json                               raw Mongoid docs (status, run_flag, created_at, updated_at)
-    GET    /analyses/{id}/page_data.json                derived `start_time` — the SLA clock anchor
+    GET    /analyses/{id}/status.json                   derived view: status + dp counts (the SLA clock anchor post-#83)
+    GET    /analyses/{id}/page_data.json                derived `start_time` — the historical SLA clock anchor
+                                                        (no longer authoritative on v3.11.0; status is absent
+                                                        on a started analysis until the first job, see #83 D1)
     GET    /data_points/status?status=1&jobs=started    light watchdog poll (no timestamps)
-    GET    /data_points.json                            full docs, heavy — escalation-only (ip_address)
+    GET    /data_points.json                            full docs, heavy — escalation-only (ip_address; v3.11.0
+                                                        always-null on K8s, see #83 D2 — escalation re-sources
+                                                        to Resque-worker-identity)
 
 Actions:
     GET    /analyses/{id}/soft_stop                     cooperative stop, does NOT wait for in-flight runs
@@ -170,11 +175,37 @@ class OpenStudioClient:
         """GET /analyses/{id}/page_data.json — ``{analysis: {status, start_time, end_time,
         run_flag?, ...}}``.
 
-        ``start_time`` is derived from the first job and is the SLA clock anchor: poll the
-        analyses index for candidates, fetch page_data for ``status == "started"`` only;
-        never anchor on ``created_at``.
+        ``start_time`` is derived from the first job and is the historical SLA clock
+        anchor. **Live-verified issue #83 D1**: on v3.11.0, ``as_json(only:)`` drops nil
+        fields — a minimal analysis serializes as only
+        ``{name, data_points, results, output_variables}``, so ``start_time`` is ABSENT
+        (not null) until the first job. The SLA clock now anchors on
+        :meth:`get_analysis_status` + CR ``.status`` first-sight timestamps instead.
+        This endpoint is still useful for derived fields (point counts, output
+        variables), but the clock anchor moved to status.json.
         """
         return self._request_json("GET", f"/analyses/{analysis_id}/page_data.json")
+
+    def get_analysis_status(self, analysis_id: str) -> dict:
+        """GET /analyses/{id}/status.json — derived view, the SLA clock anchor (#83 D1).
+
+        Live-verified v3.11.0: the only endpoint that reports the real analysis
+        status. Returns ``{analysis: {...}}`` for exactly one match (count-based
+        wrapping — see contract §7); ``{analyses: [...]}`` for zero or many; the
+        ``analysis`` payload carries ``status``, ``run_flag``, ``jobs`` (per-job
+        status), and ``data_points`` (counts by status).
+
+        Uniqueness-of-the-1-match wrapper is the data the SLA clock needs: a
+        started analysis yields ``{analysis: {status: "started", jobs: [...],
+        ...}}`` and the operator-observed first sight of ``status == "started"``
+        becomes the CR ``.status.softStops[aid].issuedAt`` anchor (D04). The
+        ``jobs`` list and per-dp counts surface here too, but the SLA clock only
+        reads the top-level ``status``.
+
+        Unknown ids answer 200 ``{analyses: []}`` (the ``where()`` path never
+        raises — contract §1); the SLA flow treats that body as "no candidate".
+        """
+        return self._request_json("GET", f"/analyses/{analysis_id}/status.json")
 
     def list_started_datapoints(self) -> list[dict]:
         """GET /data_points/status?status=1&jobs=started — light view, returns the inner list.

@@ -189,7 +189,14 @@ class FakePodApi:
         self.deletes: list[dict] = []
 
     def list_namespaced_pod(self, namespace, label_selector=None, **_kw):
-        wanted = (label_selector or "").split(",") if label_selector else []
+        # Issue #83 D2: the new escalation path calls list_namespaced_pod
+        # with no label_selector to verify that each Resque-resolved
+        # candidate pod name actually exists in the namespace. An empty
+        # selector matches every pod in the namespace (Kubernetes
+        # semantics).
+        if not label_selector:
+            return SimpleNamespace(items=list(self.pods))
+        wanted = label_selector.split(",")
         items = [
             pod
             for pod in self.pods
@@ -224,56 +231,121 @@ def _make_pod(name: str, ip: str | None):
     )
 
 
-def _soft_stop_path_responses(analysis_id: str, start_time: datetime) -> None:
+def _soft_stop_path_responses(analysis_id: str) -> None:
+    """Stage the responses for the new (issue #83 D1) soft-stop path.
+
+    Pre-#83 used ``page_data.start_time`` as the SLA clock anchor and
+    fetched it in a single tick. Post-#83 D1 the anchor is the
+    operator-observed first sight of the analysis in ``started`` via
+    ``/status.json``; the soft-stop fires on the SECOND tick (when the
+    anchor's age exceeds ``maxDurationMinutes``). The pre-existing
+    ``start_time`` argument is kept for call-site compatibility but
+    no longer used in the path.
+    """
     responses.get(
         f"{BASE}/analyses.json",
-        json=[{"_id": analysis_id, "status": "started", "created_at": "2026-07-01T00:00:00Z"}],
+        json=[{"_id": analysis_id, "created_at": "2026-07-01T00:00:00Z"}],
     )
     responses.get(
-        f"{BASE}/analyses/{analysis_id}/page_data.json",
-        json={"analysis": {"status": "started", "start_time": start_time.isoformat()}},
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
+    )
+    responses.get(
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
     )
     responses.get(f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "ok"})
 
 
 def _escalation_path_responses(analysis_id: str) -> None:
+    """Stage responses for the new (issue #83 D2) escalation path.
+
+    Pre-#83 escalation matched started-datapoint ``ip_address`` against
+    worker pod IPs (heavy ``/data_points.json``). Post-#83 D2 the SLA
+    tick asks Redis (here a fake client) for the workers currently
+    processing the analysis and maps each worker id's hostname segment
+    back to a pod; ``/data_points.json`` is no longer consulted.
+    """
     responses.get(
         f"{BASE}/analyses.json",
-        json=[{"_id": analysis_id, "status": "started", "created_at": "2026-07-01T00:00:00Z"}],
+        json=[{"_id": analysis_id, "created_at": "2026-07-01T00:00:00Z"}],
     )
     responses.get(
-        f"{BASE}/data_points.json",
-        json=[
-            {"_id": "dp-1", "analysis_id": analysis_id, "status": "started", "ip_address": "10.0.0.1"}
-        ],
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
     )
+
+
+class _FakeRedisForDryRun:
+    """Minimal Resque client fake for the walkthrough tests (#83 D2).
+
+    The walkthrough's escalation test stages a single Resque worker
+    whose payload references the analysis; the operator's
+    ``workers_for_analysis`` returns that worker id, and the matching
+    pod is the one named in the worker id's hostname segment.
+    """
+
+    def __init__(self, workers: dict[str, list[str]] | None = None) -> None:
+        self._workers = dict(workers if workers is not None else {})
+
+    def workers_for_analysis(self, analysis_id: str) -> list[str]:
+        return [wid for wid, aids in self._workers.items() if analysis_id in aids]
+
+    def pod_name_for_worker(self, worker_id: str) -> str | None:
+        from openstudio_operator.redis_client import ReadOnlyRedisClient
+
+        return ReadOnlyRedisClient.pod_name_for_worker(self, worker_id)
 
 
 @responses.activate
 def test_dryrun_soft_stop_is_strict_suppression():
-    """D11 contract: only the soft_stop REST call flips; event/metric/anchor are otherwise identical."""
+    """D11 contract: only the soft_stop REST call flips; event/metric/anchor are otherwise identical.
+
+    Issue #83 D1: the soft-stop fires on the SECOND tick (when the
+    first-sight anchor is past ``maxDurationMinutes``). Tick 1 writes
+    the ``watching`` anchor; tick 2 (4h later) fires the soft-stop.
+    Both tickers see the same D11 contract: only the REST call flips,
+    event/metric/anchor are otherwise identical.
+    """
     analysis_id = "a1"
     spec_dry = {**SLA_SPEC, "dryRun": True}
     spec_real = {**SLA_SPEC, "dryRun": False}
-    start = NOW - timedelta(hours=4)
     cos_before = metric("openstudio_operator_soft_stops_total")
 
-    # dryRun=True path
-    _soft_stop_path_responses(analysis_id, start)
+    # dryRun=True path: two ticks
+    _soft_stop_path_responses(analysis_id)
     api_dry = FakeCO(make_cr(spec_dry))
-    before = metric("openstudio_operator_soft_stops_total")
     store_dry = StatusStore(NAMESPACE, NAME, api_dry)
     cfg_dry = OperatorConfig.from_spec(spec_dry)
-    events_dry, emit_dry = make_emit()
+    redis_dry = _FakeRedisForDryRun({"worker-1:1:requeued,simulations": []})
+    # Tick 1: first sight — no event, anchor written as `watching`.
+    events_first, emit_first = make_emit()
     run_sla_tick(
         OpenStudioClient(BASE),
         store_dry,
         cfg_dry,
         now=NOW,
+        emit=emit_first,
+        namespace=NAMESPACE,
+        pod_api=FakePodApi([]),
+        apps_api=FakeApps(),
+        redis_client=redis_dry,
+    )
+    assert events_first == []
+    assert api_dry.obj["status"]["softStops"][analysis_id]["outcome"] == "watching"
+    before = metric("openstudio_operator_soft_stops_total")
+    # Tick 2: 4h later, anchor past maxDuration → soft-stop.
+    events_dry, emit_dry = make_emit()
+    run_sla_tick(
+        OpenStudioClient(BASE),
+        store_dry,
+        cfg_dry,
+        now=NOW + timedelta(hours=4),
         emit=emit_dry,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
         apps_api=FakeApps(),
+        redis_client=redis_dry,
     )
     assert calls_to("/soft_stop") == 0
     assert len(events_dry) == 1
@@ -283,23 +355,37 @@ def test_dryrun_soft_stop_is_strict_suppression():
     assert metric("openstudio_operator_soft_stops_total") - before == 1
     assert api_dry.obj["status"]["softStops"][analysis_id]["outcome"] == "dry-run"
 
-    # dryRun=False path with the same setup: SAME one event, SAME metric, but
-    # the mutation actually happened and the anchor's outcome is 'issued'.
-    _soft_stop_path_responses(analysis_id, start)
+    # dryRun=False path: same two-tick shape, same one event, same
+    # metric, but the mutation actually happened.
+    _soft_stop_path_responses(analysis_id)
     api_real = FakeCO(make_cr(spec_real))
-    before = metric("openstudio_operator_soft_stops_total")
     store_real = StatusStore(NAMESPACE, NAME, api_real)
     cfg_real = OperatorConfig.from_spec(spec_real)
-    events_real, emit_real = make_emit()
+    redis_real = _FakeRedisForDryRun({"worker-1:1:requeued,simulations": []})
+    events_first, emit_first = make_emit()
     run_sla_tick(
         OpenStudioClient(BASE),
         store_real,
         cfg_real,
         now=NOW,
+        emit=emit_first,
+        namespace=NAMESPACE,
+        pod_api=FakePodApi([]),
+        apps_api=FakeApps(),
+        redis_client=redis_real,
+    )
+    before = metric("openstudio_operator_soft_stops_total")
+    events_real, emit_real = make_emit()
+    run_sla_tick(
+        OpenStudioClient(BASE),
+        store_real,
+        cfg_real,
+        now=NOW + timedelta(hours=4),
         emit=emit_real,
         namespace=NAMESPACE,
         pod_api=FakePodApi([]),
         apps_api=FakeApps(),
+        redis_client=redis_real,
     )
     assert calls_to("/soft_stop") == 1
     assert len(events_real) == 1
@@ -309,13 +395,20 @@ def test_dryrun_soft_stop_is_strict_suppression():
     assert metric("openstudio_operator_soft_stops_total") - before == 1
     assert api_real.obj["status"]["softStops"][analysis_id]["outcome"] == "issued"
 
-    # Net metric delta across both ticks: 2 (one per decision)
+    # Net metric delta across both tickers' tick-2 fires: 2 (one per decision)
     assert metric("openstudio_operator_soft_stops_total") - cos_before == 2
 
 
 @responses.activate
 def test_dryrun_escalation_is_strict_suppression():
-    """D11 contract (escalation): only pod delete flips; event/metric/anchor otherwise identical."""
+    """D11 contract (escalation): only pod delete flips; event/metric/anchor otherwise identical.
+
+    Issue #83 D2: the escalation resolves victim pods through the
+    Resque worker set, not datapoint ``ip_address`` matching. The test
+    stages a single Resque worker for the analysis; the matching pod
+    is the worker id's hostname segment. ``/data_points.json`` is
+    no longer consulted.
+    """
     analysis_id = "a1"
     base = {**SLA_SPEC, "analysisPolicy": {**SLA_SPEC["analysisPolicy"], "gracefulStopTimeoutMinutes": GRACE_MIN}}
     spec_dry = {**base, "dryRun": True}
@@ -328,6 +421,9 @@ def test_dryrun_escalation_is_strict_suppression():
         api = FakeCO(make_cr(spec, status=anchored))
         pods = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
         apps = FakeApps()
+        redis_client = _FakeRedisForDryRun(
+            {"worker-1:1:requeued,simulations": [analysis_id]}
+        )
         before = metric("openstudio_operator_worker_pods_evicted_total")
         store = StatusStore(NAMESPACE, NAME, api)
         cfg = OperatorConfig.from_spec(spec)
@@ -341,6 +437,7 @@ def test_dryrun_escalation_is_strict_suppression():
             namespace=NAMESPACE,
             pod_api=pods,
             apps_api=apps,
+            redis_client=redis_client,
         )
         return api, pods, events, metric("openstudio_operator_worker_pods_evicted_total") - before
 
@@ -988,21 +1085,28 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
 
     # Module 1 (soft-stop) tick: pre-existing completed analysis for the
     # recycler + the over-runtime started analysis for the SLA tick.
+    # Issue #83 D1: the SLA clock anchor is the operator's first sight of
+    # the analysis in ``started`` via ``/status.json``; the soft-stop fires
+    # on the SECOND tick (when the anchor's age exceeds the 180m
+    # ``maxDurationMinutes``).
     responses.get(
         f"{BASE}/analyses.json",
         json=[
-            {"_id": analysis_id, "status": "started", "created_at": "2026-07-01T00:00:00Z"},
-            {"_id": "a-done", "status": "completed", "created_at": "2026-07-01T00:00:00Z"},
+            {"_id": analysis_id, "created_at": "2026-07-01T00:00:00Z"},
+            {"_id": "a-done", "created_at": "2026-07-01T00:00:00Z"},
         ],
     )
     responses.get(
-        f"{BASE}/analyses/{analysis_id}/page_data.json",
-        json={
-            "analysis": {
-                "status": "started",
-                "start_time": (NOW - timedelta(hours=4)).isoformat(),
-            }
-        },
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
+    )
+    responses.get(
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
+    )
+    responses.get(
+        f"{BASE}/analyses/a-done/status.json",
+        json={"analysis": {"_id": "a-done", "id": "a-done", "status": "completed"}},
     )
     responses.get(
         f"{BASE}/data_points/status",
@@ -1015,10 +1119,11 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     cfg = OperatorConfig.from_spec(spec_dry)
     store = StatusStore(NAMESPACE, NAME, api)
 
-    # Module 1 (soft-stop) — first tick: no anchor yet, so the soft-stop
-    # path fires and writes the anchor.
+    # Module 1 (soft-stop) — first tick: first sight of started → no
+    # soft-stop, anchor written as ``watching`` (issue #83 D1).
     pods_api = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
     apps_api = FakeApps()
+    redis_client = _FakeRedisForDryRun({"worker-1:1:requeued,simulations": [analysis_id]})
     events, emit = make_emit()
     run_sla_tick(
         OpenStudioClient(BASE),
@@ -1029,6 +1134,21 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         namespace=NAMESPACE,
         pod_api=pods_api,
         apps_api=apps_api,
+        redis_client=redis_client,
+    )
+    assert store.get_soft_stops()[analysis_id].outcome == "watching"
+    # Second tick: 4h later, anchor past maxDuration → soft-stop.
+    events, emit = make_emit()
+    run_sla_tick(
+        OpenStudioClient(BASE),
+        store,
+        cfg,
+        now=NOW + timedelta(hours=4),
+        emit=emit,
+        namespace=NAMESPACE,
+        pod_api=pods_api,
+        apps_api=apps_api,
+        redis_client=redis_client,
     )
     soft_stop_events = [e for e in events if e[1] == ANALYSIS_SOFT_STOPPED_EVENT]
     assert len(soft_stop_events) == 1
@@ -1036,6 +1156,8 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     assert "soft stop issued" not in soft_stop_events[0][2]
     assert pods_api.deletes == []
     assert store.get_soft_stops()[analysis_id].outcome == "dry-run"
+    # Module 1b (escalation) — pre-seed the anchor at PAST_GRACE so the
+    # grace check fires the same tick (matches the pre-#83 test).
     anchored = {
         "softStops": {
             analysis_id: {"issuedAt": PAST_GRACE.isoformat(), "outcome": "issued"}
@@ -1045,18 +1167,11 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     api.obj["status"] = copy.deepcopy(anchored)
     responses.get(
         f"{BASE}/analyses.json",
-        json=[{"_id": analysis_id, "status": "started", "created_at": "2026-07-01T00:00:00Z"}],
+        json=[{"_id": analysis_id, "created_at": "2026-07-01T00:00:00Z"}],
     )
     responses.get(
-        f"{BASE}/data_points.json",
-        json=[
-            {
-                "_id": "dp-1",
-                "analysis_id": analysis_id,
-                "status": "started",
-                "ip_address": "10.0.0.1",
-            }
-        ],
+        f"{BASE}/analyses/{analysis_id}/status.json",
+        json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
     )
     events, emit = make_emit()
     run_sla_tick(
@@ -1068,6 +1183,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         namespace=NAMESPACE,
         pod_api=pods_api,
         apps_api=apps_api,
+        redis_client=redis_client,
     )
     escal_events = [e for e in events if e[1] == ANALYSIS_ESCALATED_EVENT]
     assert len(escal_events) == 1
