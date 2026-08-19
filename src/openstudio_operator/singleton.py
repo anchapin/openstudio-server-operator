@@ -64,6 +64,7 @@ import kopf
 from kubernetes.client import ApiException, CustomObjectsApi
 from kubernetes.config import ConfigException
 
+from openstudio_operator._time import parse_iso_utc
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
@@ -88,21 +89,20 @@ class SingletonGuardError(Exception):
 def _parse_utc(value: Any, context: str) -> datetime:
     """Parse an ISO-8601 timestamp at the API boundary; always tz-aware UTC.
 
-    Mirrors the (private) ``_parse_utc`` of ``status_store`` and
-    ``_parse_timestamp`` of ``openstudio_client`` — keep all copies in sync.
+    Thin wrapper over :func:`openstudio_operator._time.parse_iso_utc` (D12
+    boundary, issue #174) that re-raises ``ValueError`` as
+    :class:`SingletonGuardError` with the caller's ``context`` prefix so the
+    domain-specific exception type stays in this module's public contract.
+    ``None`` is not a valid input here — the call sites guard for it — so we
+    reject it explicitly with the same shape the legacy ``expected
+    ISO-8601 string`` error used.
     """
-    if not isinstance(value, str):
-        raise SingletonGuardError(
-            f"{context}: expected ISO-8601 string, got {type(value).__name__}"
-        )
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    if value is None:
+        raise SingletonGuardError(f"{context}: expected ISO-8601 string, got NoneType")
     try:
-        parsed = datetime.fromisoformat(normalized)
+        return parse_iso_utc(value)
     except ValueError as exc:
-        raise SingletonGuardError(f"{context}: unparseable timestamp {value!r}") from exc
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+        raise SingletonGuardError(f"{context}: {exc}") from exc
 
 
 def _meta(obj: object) -> Mapping:

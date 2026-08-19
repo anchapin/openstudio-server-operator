@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import random
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import requests
+
+from ._time import parse_iso_utc
 
 _TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 
@@ -44,20 +46,12 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _parse_timestamp(value: str) -> datetime:
-    """Normalize an ISO8601 string to a timezone-aware UTC datetime.
-
-    Mongoid emits ISO8601 with zone (e.g. ``2026-08-18T08:00:00-06:00`` or a ``Z`` suffix).
-    A naive input is assumed UTC rather than rejected so a degraded server response still
-    yields an anchorable datetime.
-    """
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"unparseable timestamp {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+# Single source of truth for ISO-8601 → tz-aware UTC parsing (D12 boundary,
+# issue #174). Re-exported under the historical name so the existing
+# ``tests/test_openstudio_client.py`` direct import keeps working unchanged.
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """Backward-compatible alias for :func:`openstudio_operator._time.parse_iso_utc`."""
+    return parse_iso_utc(value)
 
 
 def _normalize_timestamps(obj: Any) -> Any:
@@ -68,7 +62,7 @@ def _normalize_timestamps(obj: Any) -> Any:
     """
     if isinstance(obj, dict):
         return {
-            key: _parse_timestamp(val)
+            key: parse_iso_utc(val)
             if isinstance(val, str) and key.endswith(("_at", "_time"))
             else _normalize_timestamps(val)
             for key, val in obj.items()
