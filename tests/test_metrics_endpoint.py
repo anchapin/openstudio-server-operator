@@ -26,6 +26,8 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_status_conflict_retries_exhausted_total",
     # Issue #117 — handler tick failures (per module + error_type).
     "openstudio_operator_handler_tick_failures_total",
+    # Issue #171 — defensive cap evictions on the CR .status maps.
+    "openstudio_operator_status_map_caps_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
@@ -118,18 +120,28 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.HANDLER_TICK_FAILURES_TOTAL.labels(
         module="__metrics_test_sentinel__", error_type="OpenStudioApiError"
     ).inc()
+    # Issue #171 — same pattern for the defensive-cap eviction counter.
+    metrics.STATUS_MAP_CAPS_TOTAL.labels(
+        map_name="__metrics_test_sentinel__"
+    ).inc()
 
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
     for name in _declared_counter_families():
         assert f"# TYPE {name} counter" in response.text
-        # Labelled counters (issue #117's ``handler_tick_failures_total``) emit
-        # ``<name>{<labels>} value``; non-labelled emit ``<name> value``. The
-        # sentinel increment above pre-touches the labelled series; check the
-        # labelled form for it, the bare form for the rest.
+        # Labelled counters (issue #117's ``handler_tick_failures_total``,
+        # issue #171's ``status_map_caps_total``) emit
+        # ``<name>{<labels>} value``; non-labelled emit ``<name> value``.
+        # The sentinel increments above pre-touch the labelled series;
+        # check the labelled form for them, the bare form for the rest.
         if name == "openstudio_operator_handler_tick_failures_total":
             assert (
                 'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",module="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_status_map_caps_total":
+            assert (
+                'openstudio_operator_status_map_caps_total{map_name="__metrics_test_sentinel__"}'
                 in response.text
             )
         else:

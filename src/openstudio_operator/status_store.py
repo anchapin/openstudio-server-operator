@@ -39,7 +39,11 @@ from typing import Any
 from kubernetes.client import ApiException, CustomObjectsApi
 
 from ._time import parse_iso_utc
-from .metrics import STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL, STATUS_CONFLICTS_TOTAL
+from .metrics import (
+    STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL,
+    STATUS_CONFLICTS_TOTAL,
+    STATUS_MAP_CAPS_TOTAL,
+)
 
 GROUP = "energy.nrel.gov"
 VERSION = "v1alpha1"
@@ -56,6 +60,58 @@ MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
 
 MAX_CONFLICT_RETRIES = 5
 _BACKOFF_BASE_SECONDS = 1.0
+
+# Issue #171 — defensive cap on the four CR .status maps. The CRD schema
+# accepts unbounded maps (every field is ``x-kubernetes-preserve-unknown-fields``
+# with no ``maxProperties``), so an actor with ``update`` on the status
+# subresource can grow any of the four maps to etd's 1.5 MB object-size limit;
+# the operator then reads + JSON-parses + merge-patches the full map on every
+# timer tick. The cap is enforced OPERATOR-SIDE in :meth:`StatusStore._set_map_entry`
+# so the operator's own writes are bounded AND a malicious/buggy external write
+# is clipped on the next operator-owned RMW. The cap value (10_000) is sized
+# so an average ~100-byte entry keeps the largest map at ~1 MB — well under
+# etcd's 1.5 MB default and enough headroom for the other three maps plus
+# CR-level metadata.
+STATUS_MAP_MAX_ENTRIES = 10_000
+
+#: Issue #171 — event reason for the cap-eviction Warning Event. A single
+#: short string so dashboard filters / alert rules can match it.
+STATUS_MAP_CAPPED_EVENT = "StatusMapCapped"
+
+#: ``(namespace, name, reason, message)`` — kopf-backed sink in production,
+#: recorder in tests. The StatusStore instance knows its own ``namespace``/
+#: ``name`` and calls the sink with the CR body so the production sink can
+#: emit a kopf event on the right CR. The default is a no-op so the
+#: status_store is usable as a pure library (e.g. from test fixtures that
+#: don't care about Events). The ``handlers/__init__.py`` entrypoint
+#: installs the production kopf-backed sink at operator startup; tests
+#: install a recorder via :func:`set_event_sink`.
+EmitStatusEvent = Callable[[str, str, str, str], None]
+
+
+def _emit_status_map_event(_namespace: str, _name: str, _reason: str, _message: str) -> None:
+    """Default no-op sink. Replaced by handlers package at operator startup.
+
+    Kept as a module-level symbol (not a closure inside the method) so that
+    the per-instance method-count and the test seam both agree on the same
+    function name; the hot path stays a single attribute lookup on the
+    module.
+    """
+
+
+def set_event_sink(sink: EmitStatusEvent | None) -> None:
+    """Install/replace the map-cap event sink.
+
+    ``None`` restores the default no-op. The handlers package installs the
+    kopf-backed sink at operator startup; tests install a recorder via
+    ``monkeypatch.setattr`` or by calling this directly. Idempotent.
+    """
+    global _emit_status_map_event
+    _emit_status_map_event = sink if sink is not None else _noop_event_sink
+
+
+def _noop_event_sink(_namespace: str, _name: str, _reason: str, _message: str) -> None:
+    """Default sink when ``set_event_sink(None)`` is called. Pure no-op."""
 
 
 class StatusStoreError(Exception):
@@ -322,14 +378,80 @@ class StatusStore:
         return dict(raw)
 
     def _set_map_entry(self, field: str, key: str, encoded: Any) -> None:
+        # Closure populated by `build_patch` on a successful eviction, read
+        # after `_mutate` returns to emit the per-eviction observability
+        # (counter + Warning Event) exactly once per actual cap hit. The
+        # retry-stable emission is intentional: the counter is NOT bumped
+        # per 409 attempt — see STATUS_MAP_CAPS_TOTAL docs in metrics.py.
+        evicted_keys: list[str] = []
+
         def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal evicted_keys
             current_field = status.get(field)
-            current = current_field.get(key) if isinstance(current_field, Mapping) else None
+            is_mapping = isinstance(current_field, Mapping)
+            current = current_field.get(key) if is_mapping else None
+
+            # Issue #171 — defensive cap. When the map is at the cap AND the
+            # call is actually adding a new value (encoded is not None,
+            # value-changed), drop the oldest entries by sorted key to make
+            # room. The key sort is a deterministic proxy for "oldest" —
+            # the operator's keys are UUIDs, so the sort order is unique
+            # but not age-aware. A map that is already at the cap but is
+            # being re-written with the same value, or being cleared (None),
+            # does not evict: the eviction is in the path that adds a new
+            # entry, not in every write.
+            #
+            # Merge-patch semantics (RFC 7386, mirrored by the API Server):
+            # a dict at the field level is merged per-key, not replaced as a
+            # whole. To remove a key we MUST send its full patch with None
+            # (the same shape the existing ``prune`` uses for completion
+            # exits). The new entry goes in as the usual ``{key: encoded}``
+            # pair. The resulting patch is therefore ``{evicted: None, ...,
+            # new_key: encoded}`` — every entry we want to keep PLUS the
+            # explicit-null for each evicted key.
+            if (
+                encoded is not None
+                and is_mapping
+                and len(current_field) >= STATUS_MAP_MAX_ENTRIES
+                and current != encoded
+            ):
+                num_to_drop = len(current_field) - STATUS_MAP_MAX_ENTRIES + 1
+                sorted_keys = sorted(current_field.keys())
+                evicted_keys = sorted_keys[:num_to_drop]
+                evicted_set = set(evicted_keys)
+                patch_field: dict[str, Any] = {k: None for k in evicted_keys}
+                for k, v in current_field.items():
+                    if k not in evicted_set:
+                        patch_field[k] = v
+                patch_field[key] = encoded
+                return {"status": {field: patch_field}}
+
             if current == encoded:
                 return None
             return {"status": {field: {key: encoded}}}
 
         self._mutate(build_patch)
+
+        # Per-eviction observability: emit AFTER the successful RMW so the
+        # counter + Event fire exactly once per actual cap hit, not per 409
+        # attempt. The eviction logic above is purely data (the new map
+        # shape), so the side effects live here — outside the retry loop.
+        if evicted_keys:
+            STATUS_MAP_CAPS_TOTAL.labels(map_name=field).inc()
+            preview = ", ".join(repr(k) for k in evicted_keys[:5])
+            if len(evicted_keys) > 5:
+                preview += f" (+{len(evicted_keys) - 5} more)"
+            _emit_status_map_event(
+                self._namespace,
+                self._name,
+                STATUS_MAP_CAPPED_EVENT,
+                f"status.{field} size capped at {STATUS_MAP_MAX_ENTRIES}: "
+                f"dropped {len(evicted_keys)} oldest entries ({preview}) to "
+                f"make room for key {key!r}. Defensive cap (issue #171); "
+                f"the underlying status map is the operator's only durable "
+                f"state, and an unbounded map would amplify RMW cost on "
+                f"every tick.",
+            )
 
     def _get_scalar(self, field: str) -> datetime | None:
         raw = self._read_status().get(field)
