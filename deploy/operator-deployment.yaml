@@ -75,6 +75,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Issue #242 — optional hook for clusters whose API server /
+            # inter-service traffic is fronted by a custom CA. Mount the CA
+            # bundle as a Secret volume and set this env var to its
+            # in-container path; when unset the client uses the system
+            # trust store (``verify=True`` is pinned explicitly regardless).
+            # Default empty (regression fence — see Working rules in AGENTS.md):
+            # operators MUST opt in per-cluster rather than inherit a baked-in
+            # bundle path that would mask a misconfigured in-cluster CA.
+            - name: OPENSTUDIO_TLS_CA_BUNDLE
+              value: ""
           ports:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with

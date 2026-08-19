@@ -401,3 +401,60 @@ def test_unparseable_timestamp_in_doc_raises_api_error(client):
     responses.get(f"{BASE}/analyses.json", json=[{"_id": "a1", "created_at": "not-a-date"}])
     with pytest.raises(OpenStudioApiError, match="unparseable timestamp"):
         client.list_analyses()
+
+
+# --- TLS verification (issue #242) -------------------------------------
+
+
+def test_session_default_verify_is_pinned_true(monkeypatch):
+    """Issue #242: ``verify=True`` must be set explicitly on the session.
+
+    ``requests.Session()`` defaults to ``verify=True`` already, but the
+    acceptance criterion pins it explicitly so a future ``Session()``
+    subclass or transport swap cannot silently downgrade the operator's
+    TLS posture (e.g. by inheriting ``verify=False`` from an
+    ``HTTPAdapter`` mount).
+    """
+    monkeypatch.delenv("OPENSTUDIO_TLS_CA_BUNDLE", raising=False)
+    client = OpenStudioClient(BASE)
+    assert client._session.verify is True
+
+
+def test_session_verify_honors_ca_bundle_env_var(monkeypatch):
+    """Issue #242: when ``OPENSTUDIO_TLS_CA_BUNDLE`` is set, the session
+    uses the bundle path instead of the system trust store.
+
+    Clusters fronted by a custom CA (corporate PKI, air-gapped internal
+    roots) mount the bundle as a Secret volume and set this env var so
+    the operator can verify the API server's certificate against the
+    cluster-controlled trust anchor instead of the host's ca-certificates.
+    """
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "/etc/ssl/certs/custom-ca.pem")
+    client = OpenStudioClient(BASE)
+    assert client._session.verify == "/etc/ssl/certs/custom-ca.pem"
+
+
+@responses.activate
+def test_tls_error_propagates_as_api_error(client, monkeypatch, sleeps):
+    """Issue #242: a TLS handshake failure (e.g. unknown CA, expired cert)
+    surfaces as ``OpenStudioApiError`` after the retry envelope, not as a
+    silent 200 or an unhandled ``SSLError`` that escapes the tick.
+
+    ``responses`` cannot directly synthesize an ``SSLError``, so we patch
+    the session's request method to raise one. The retry loop treats it
+    as a transient error (same family as ``ConnectionError``) and the
+    exhaustion raises ``OpenStudioApiError`` from the final ``last_exc`` —
+    this test pins that path so an SSL misconfiguration cannot degrade
+    into a hang or an unhandled exception.
+    """
+    monkeypatch.setattr(
+        client._session,
+        "request",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            requests.exceptions.SSLError("certificate verify failed: unable to get local issuer certificate")
+        ),
+    )
+    with pytest.raises(OpenStudioApiError, match="failed after 4 attempts") as excinfo:
+        client.list_analyses()
+    assert isinstance(excinfo.value.__cause__, requests.exceptions.SSLError)
+    assert len(sleeps) == 3
