@@ -213,6 +213,25 @@ class StallWindowTracker:
     """
 
     def __init__(self) -> None:
+        """Construct a per-CR sustained-window clock.
+
+        Singleton-guard key invariant (issue #167, D05):
+
+        Per-namespace state keyed by ``(namespace, name)``. The D05
+        singleton guard (``openstudio_operator.singleton``) ensures only
+        ONE OSCM CR per namespace, so this tuple uniquely identifies the
+        active CR. Adding a second CR (e.g. for canary testing of the
+        operator's logic) would cause the tracker to silently share state
+        between the two — this is a known limitation until the
+        singleton-guard is relaxed.
+
+        Test of record for the singleton-guard invariant:
+        ``tests/test_singleton_registry_coverage.py``
+        (``test_all_oscm_spawning_handlers_are_singleton_guarded`` —
+        fails loudly if a new ``@kopf.timer``/``@kopf.daemon`` is added
+        without going through :func:`singleton.install_singleton_guard`,
+        which is what enforces the one-CR-per-namespace rule).
+        """
         self.first_observed: datetime | None = None
 
     def reset(self) -> None:
@@ -229,11 +248,40 @@ class StallWindowTracker:
 
 
 _tracker_cache: dict[tuple[str, str], StallWindowTracker] = {}
+# Keyed by ``(namespace, name)``. The D05 singleton guard (see
+# ``openstudio_operator.singleton`` and the invariant captured in
+# ``StallWindowTracker.__init__``'s docstring) ensures at most one OSCM
+# CR per namespace, so this tuple uniquely identifies the active CR.
+# See ``tests/test_singleton_registry_coverage.py`` for the test that
+# fails loudly if the singleton guard is bypassed by a new handler.
+# Issue #167.
 
 
 def _get_tracker(namespace: str, name: str) -> StallWindowTracker:
     tracker = _tracker_cache.get((namespace, name))
     if tracker is None:
+        # D05 invariant — surface (don't raise) if the singleton guard has
+        # been bypassed. The tracker would otherwise silently share state
+        # between the two CRs, which is the bug the invariant guards
+        # against. We warn-log rather than raise so a canary deploy that
+        # legitimately wants two CRs in one namespace (e.g. to A/B the
+        # operator's logic) doesn't crash the operator — they get the
+        # warning, we keep ticking. See
+        # ``tests/test_singleton_registry_coverage.py`` for the upstream
+        # invariant; issue #167.
+        other_names = sorted(n for ns, n in _tracker_cache if ns == namespace)
+        if other_names and other_names[0] != name:
+            logger.warning(
+                "StallWindowTracker cache already holds a tracker for "
+                "namespace %s under name(s) %r — D05 singleton guard has "
+                "been bypassed (a second OSCM CR is being serviced in this "
+                "namespace). The new CR (%r) will share state with the "
+                "existing one until the process restarts. See issue #167 "
+                "and tests/test_singleton_registry_coverage.py.",
+                namespace,
+                other_names,
+                name,
+            )
         tracker = StallWindowTracker()
         _tracker_cache[(namespace, name)] = tracker
     return tracker
