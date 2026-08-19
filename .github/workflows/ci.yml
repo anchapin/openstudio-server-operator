@@ -26,6 +26,35 @@ jobs:
             exit 1
           fi
 
+  # Issue #159: independent CI gate on the published `:dev` image. The
+  # `Verify provenance exists` step in release.yml is a self-verification
+  # of the same workflow that just signed the image — a malicious edit to
+  # release.yml that removes the sign + attest steps would not be caught
+  # because the verify step is removed in the same edit. This job runs
+  # after every push to develop and (via the workflow-level
+  # `on.pull_request.branches: [develop, main]`) on every PR into develop
+  # or main, fetches the latest `:dev` digest from GHCR, and runs
+  # `cosign verify-attestation` against the published image. The job
+  # fails when the published `:dev` image lacks a SLSA provenance
+  # attestation signed by the pinned release workflow identity.
+  cosign-verify-dev-image:
+    name: cosign verify :dev image provenance
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Verify :dev image provenance
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect ghcr.io/anchapin/openstudio-server-operator:dev --raw | jq -r '.digest')
+          cosign verify-attestation \
+            --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --type slsaprovenance \
+            "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
+
   lint:
     runs-on: ubuntu-latest
     steps:
