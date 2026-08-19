@@ -57,12 +57,24 @@ spec:
                   description: "Name of web_background Deployment."
                 analysisPolicy:
                   type: object
+                  # Issue #170: grace period must be strictly less than the SLA
+                  # budget, otherwise escalation is unreachable. Enforced via
+                  # CEL so the API server rejects a CR with
+                  # gracefulStopTimeoutMinutes >= maxDurationMinutes at apply
+                  # time. The `has()` guard means an unset field (the API
+                  # server falls back to the defaults below) doesn't trip the
+                  # rule.
+                  x-kubernetes-validations:
+                    - rule: "!has(self.maxDurationMinutes) || !has(self.gracefulStopTimeoutMinutes) || self.gracefulStopTimeoutMinutes < self.maxDurationMinutes"
+                      message: "spec.analysisPolicy.gracefulStopTimeoutMinutes must be strictly less than spec.analysisPolicy.maxDurationMinutes (issue #170)."
                   properties:
                     maxDurationMinutes:
                       type: integer
+                      minimum: 1
                       default: 180
                     gracefulStopTimeoutMinutes:
                       type: integer
+                      minimum: 1
                       default: 15
                     autoSoftStop:
                       type: boolean
@@ -76,21 +88,28 @@ spec:
                   properties:
                     maxDatapointRuntimeMinutes:
                       type: integer
+                      minimum: 1
                       default: 45
                     maxAutoRequeues:
                       type: integer
+                      # Issue #170: zero requeues is a documented valid setting
+                      # (operators may opt to disable auto-requeue entirely);
+                      # negative would be a bug. Floor is 0, not 1.
+                      minimum: 0
                       default: 3
                 workerPolicy:
                   type: object
                   properties:
                     recycleWorkerIntervalHours:
                       type: integer
+                      minimum: 1
                       default: 12
                     recycleAfterAnalysis:
                       type: boolean
                       default: true
                     minRecycleIntervalMinutes:
                       type: integer
+                      minimum: 1
                       default: 30
                       description: "Minimum spacing between worker recycles. Default 30."
                 webBackgroundPolicy:
@@ -99,6 +118,7 @@ spec:
                   properties:
                     stallWindowMinutes:
                       type: integer
+                      minimum: 1
                       default: 10
                       description: "Minutes without queue progress before a web_background restart is considered. Default 10."
                 storagePolicy:
@@ -120,6 +140,11 @@ spec:
                       description: "Name of a Secret in this namespace; mounted into archival Jobs via envFrom — never read by the operator."
                     retentionDays:
                       type: integer
+                      # Issue #170: 0 is the documented "archive immediately"
+                      # sentinel (deliberate); negatives widen the eligibility
+                      # window to the past and create a one-way data-loss path
+                      # through the archival-then-delete pipeline. Floor is 0.
+                      minimum: 0
                       default: 7
                       description: "Days a completed analysis is retained before archival. Default 7; 0 = archive immediately."
                     purgeCompletedNFSFiles:
