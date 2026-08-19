@@ -224,16 +224,33 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 
 ## Appendix D — Prometheus metrics registry (issue #17; #50 decision)
 
-Counters live in `src/openstudio_operator/metrics.py`, are module-level
+Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). Every counter below corresponds to a
-mutation or a decision whose dry-run path is documented in §1 and
-increments identically in dry-run (D11-exempt category — in-process
-metrics, not cluster state). Coverage is exhaustive: there is no metric
-declared in code without an incrementer, and there is no incrementer
-without a metric. This invariant is what makes "no permanently-zero
-metric" true.
+local; the scrape is in-cluster). The exhaustive inventory — **11
+counters + 1 gauge** — is asserted by `tests/test_metrics_endpoint.py`'s
+`EXPECTED_COUNTER_FAMILIES` and `EXPECTED_GAUGE_FAMILIES`: drift in
+either direction fails CI before it ships, so any new metric added to
+this codebase MUST be added to both the table below and the matching
+`EXPECTED_*` tuple in the same PR (the `hpa_floor_adjustments_total`
+counter, removed in #77, is the canonical "you forgot" example — see
+`docs/kind-validation.md` step 4.7).
+
+Counters and the gauge follow the same in-process, dryRun-transparent
+convention (D11-exempt category — in-process metrics, not cluster
+state): none of them is suppressed by `spec.dryRun`, and the dry-run
+substituted tick still increments identically (the gauge is observed
+every poll regardless of dry-run — see #87). Coverage is exhaustive:
+there is no metric declared in code without an incrementer / setter,
+and there is no incrementer / setter without a metric. This invariant
+is what makes "no permanently-zero metric" true — with the documented
+nuance that a labelled counter family (`handler_tick_failures_total`,
+#117) exposes its `# TYPE` line only after the first observation;
+zero-observation series are normal when no tick is failing, and the
+test pre-touches a sentinel series so the family-existence assertion
+stays self-contained.
+
+### Counters
 
 | Counter | Module | Increments on | Anchor pairing |
 |---|---|---|---|
@@ -245,6 +262,25 @@ metric" true.
 | `openstudio_operator_web_background_restarts_total` | `web_background_monitor` (#13) | web_background restart issued (or dry-run) | `status.lastWebBackgroundRestart` |
 | `openstudio_operator_analyses_archived_total` | `retention` (#16; prune CronJob since #78) | Archival Job observed Complete (adopted completions included) | `status.archivedAnalyses[id].verified_at` |
 | `openstudio_operator_analyses_deleted_total` | `retention` (#16; prune CronJob since #78) | `DELETE /analyses/{id}` issued post-verification (suppressed by `spec.dryRun`) | `status.archivedAnalyses[id].verified_at` |
+| `openstudio_operator_status_conflicts_total` | `status_store` (#119) | Per-attempt 409 from the K8s API Server inside `_mutate`'s except branch (one increment per 409, before the backoff sleep) | n/a — conflict counter, not a decision counter |
+| `openstudio_operator_status_conflict_retries_exhausted_total` | `status_store` (#119) | RMW cycle that exhausted the 409 retry budget and raised `StatusStoreConflictError` (tick skipped, anchor NOT written) | n/a — terminal failure of an anchor write |
+| `openstudio_operator_handler_tick_failures_total` | `handlers/*` timer wrappers (#117) | Tick failure caught by a timer wrapper (catch-and-skip path). **Labelled by `(module, error_type)`** — `module` ∈ {`analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor`}; `error_type` ∈ {`OpenStudioApiError`, `StatusStoreError`, `ApiException`, `RedisClientError`} | n/a — observability for the wrapper catch-and-skip path (the tick was suppressed, no anchor was written) |
+
+**Labelled convention (#117).** `handler_tick_failures_total` is the
+first labelled counter in the registry and the canonical pattern for
+any future "which module is degraded" metric: one labelled family,
+`module × error_type`, with one increment per observation. A future
+maintainer wiring a new mutation that can fail in catch-and-skip paths
+SHOULD extend the same `module` label set (rather than introducing a
+new unlabelled counter) so the dashboard's per-module degradation view
+stays comparable across error sources — reinventing a non-comparable
+unlabelled counter here is exactly the regression #181 guards against.
+
+### Gauge
+
+| Gauge | Module | Sets / Meaning | Notes |
+|---|---|---|---|
+| `openstudio_operator_resque_workers_seen_max` | `web_background_monitor` (#44/#87) | Monotonic max of distinct Resque worker ids ever observed in process lifetime (`SMEMBERS resque:workers`, emitted every poll regardless of queue depth) | #44 — Resque key-layout leg-2 non-vacuity safeguard; #87 dropped the original `AND queue depth > 0` alert conjunction so the gauge populates on a healthy idle fleet. `0` with a reachable Redis unambiguously means no workers are registered — alert on `== 0`. Not a decision counter — does not follow the §2 anchor pairing convention. |
 
 ### D.1 Removed counter — `STORAGE_FREED_BYTES` (issue #50)
 
