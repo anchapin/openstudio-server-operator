@@ -8,13 +8,188 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- (future)
+- (no entries yet — all changes since 0.1.0 are in [0.2.0])
 
 ### Changed
-- (future)
+- (no entries yet — all changes since 0.1.0 are in [0.2.0])
 
 ### Removed
-- (future)
+- (no entries yet — all changes since 0.1.0 are in [0.2.0])
+
+## [0.2.0] - 2026-08-19
+
+Auto-improvement-wave 10 consolidation: 32 issues closed in the recent
+post-0.1.0 sweep across operator hardening, observability, CI gating,
+RBAC, security, and developer ergonomics. This entry curates the
+behaviour-changing deltas; the GitHub auto-generated release body is
+otherwise a raw commit-list dump with no narrative of intent. The
+detailed v3.11.0 contract work and architectural pivots (KEDA,
+CronJob extraction, SLA re-source) remain anchored on 0.1.0; this
+release is the cleanup / docs / observability / CI pass that landed
+on the same day.
+
+### Added
+
+- **`#180`** — prune `CronJob` inherits the `#116` `redisUrl`-empty
+  guard: emits a `Warning` Event and exits with code `3` when
+  `spec.redisUrl` arrives empty at the prune actor. Closes the
+  parity gap between operator and pruner redisUrl handling.
+- **`#183`** — `/metrics` surface enumeration in `README.md` and
+  `AGENTS.md` (11 counters + 1 gauge); test invariant updated in
+  `tests/test_metrics_endpoint.py` to fail loudly on drift.
+- **`#178`** — first-time-contributor onboarding doc
+  (`docs/onboarding.md`): setup, single-test / full-suite commands,
+  venv-drift guard (`#71`), the 5-step "add a new OSCM timer
+  handler" pattern, Working-rules-that-bite, audit-doc update
+  rules, branch / PR conventions, good-first-PR candidates.
+- **`#182`** — `docs/kind-validation.md` test / counter count
+  refresh (343 → 427).
+- **`#177`** — `CHANGELOG.md` (this entry's parent).
+- **`#176`** — `docs/architecture-plan.md` §7 RBAC example aligned
+  with `deploy/rbac.yaml`.
+- **`#181`** — audit Appendix D counter / gauge table refreshed
+  (8 → 11+1) to match the post-`#119` / post-`#117` metric families.
+- **`#175`** — audit doc references rewritten
+  (`storage_pruner` → `retention`; `STORAGE_FREED_BYTES` removed in
+  `#50`).
+- **`#174`** — unify tz-aware UTC parsing in
+  `src/openstudio_operator/_time.py` (D12 boundary).
+- **`#179`** — `openstudio_operator_analysis_datapoint_count`
+  Histogram (per-observation distribution).
+- **`#173`** — `requirements.lock` with `--hash=sha256:` pinning
+  + CI verify.
+- **`#172`** — kind-recipe upstream images pinned by SHA256 digest
+  + EOL bumps (mongo `6.0` → `7.0`, redis `6.0` → `7.4`).
+- **`#171`** — `status_map` defensive cap (drop oldest + `Warning`
+  Event + counter).
+- **`#169`** — cosign verify-attestation identity pinned to
+  `release.yml@refs/(heads/develop|tags/v*)`.
+- **`#168`** — centralize `OpenStudioClient` factory in
+  `client_factory.py`.
+- **`#170`** — CRD minimum constraints + CEL validation for
+  numeric policy fields.
+- **`#167`** — `StallWindowTracker` documents the singleton-guard
+  key invariant.
+- **`#166`** — `NetworkPolicy` restricting `/metrics` ingress to
+  the `prometheus` namespace (and same-namespace peer). Plaintext
+  Prometheus endpoint has no authN/authZ/TLS so a cluster whose
+  scraper namespace is differently-named must edit the
+  `namespaceSelector` label match before applying — otherwise the
+  operator's metrics silently become unreadable.
+- **`#165`** — centralize operator-behavior constants in
+  `_constants.py`.
+- **`#164`** — `EventEmitter` moved to
+  `openstudio_operator/events.py`.
+- **`#163`** — `validate_key_layout()` wired into operator boot
+  (D05 / D13 invariant).
+- **`#162`** — storage `CronJob` container + pod `securityContext`
+  (`runAsNonRoot`, `runAsUser`, `seccompProfile`, `fsGroup`).
+- **`#160`** — CRD `target*Deployment` + `serverUrl` pattern + CEL
+  validation.
+- **`#159`** — CI cosign verify-attestation gate for the `:dev`
+  image provenance.
+- **`#161`** — pod-level `securityContext` on operator Deployment
+  + archival Jobs.
+- **`#158`** — centralize K8s client construction in
+  `singleton.operator_custom_objects_api()`.
+- **`#155`** — `release.yml` generates the SLSA predicate inline
+  (no missing-file reference; addressed the `#157` root cause).
+- **`#154`** — narrow deny-egress `NetworkPolicy` selector (was
+  matching every pod, breaking helm-chart egress).
+- **`#151`** — CI guard for `AGENTS.md` test-count claim vs
+  `pytest --collect-only`.
+- **`#152`** — CI guard for `deploy/` + `scripts/`
+  `TODO(phase N)` markers.
+- **`#150`** — rotate kind-recipe Redis password out of public
+  manifests. Fresh installs MUST run
+  `scripts/rotate_redis_password.sh` first; the
+  `scripts/check_redis_password_unique.sh` CI guard fails the
+  build if the legacy `openstudio` literal re-appears as a
+  Redis password in any of the five affected manifest files.
+- **`#149`** — `release.yml` pins the operator image by SHA256
+  digest at build time.
+
+### Changed
+
+- **KEDA migration** (`#77`) — replaces the custom Redis
+  HPA-floor adjuster (`handlers/hpa_floor.py`) with a standard
+  KEDA `ScaledObject`. KEDA ≥ 2.20 in namespace `keda` is a
+  cluster prerequisite; two autoscalers on the same Deployment
+  oscillate. The operator's Role carries no
+  `horizontalpodautoscalers` verbs.
+- **Storage / archival pipeline extracted to native primitives**
+  (`#78`) — NFS pruning becomes a Kubernetes `CronJob`
+  (`deploy/storage-cronjob.yaml`) invoking
+  `openstudio_operator.prune_entrypoint`. Operator process owns
+  **no** storage polling loop. Archival remains the same
+  backend-agnostic rclone Job manifest generator
+  (`archival.py` — `s3|gcs|azure`, `envFrom`-only creds,
+  verified-upload gate). RBAC shrunk: no `batch` verbs on the
+  operator's Role (the `CronJob` has its own ServiceAccount).
+- **SLA clock + escalation re-sourced against verified v3.11.0**
+  (`#83`, `#105`, `#104`) — Module 1 SLA clock anchors on
+  operator-observed state transitions (first sight of `started`
+  via `/analyses/{id}/status.json` plus CR `.status` timestamps);
+  Module 4 escalation matches Resque worker identity → pod name
+  instead of dp `ip_address` → pod IP. Dead `OpenStudioClient`
+  methods (`get_analysis_page_data`, `get_datapoints_full`)
+  trimmed.
+- **RBAC narrowed** — operator's Role is namespaced with
+  enumerated verbs: no `horizontalpodautoscalers` post-`#77`, no
+  `batch` post-`#78`. Autoscaling lives entirely in KEDA's
+  ServiceAccount; storage lives entirely in the prune-`CronJob`
+  ServiceAccount. `deploy/rbac.yaml` is the source of truth
+  (`#111` aligned the plan doc's §7 RBAC snippet to match).
+
+### Removed
+
+- **`src/openstudio_operator/handlers/hpa_floor.py`** (`#77`,
+  `#50`) and its tests (`tests/test_hpa_floor.py`),
+  `horizontalpodautoscalers` verbs in `deploy/rbac.yaml`, the
+  `openstudio_operator_hpa_floor_adjustments_total` counter, and
+  `DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS` from `config.py` /
+  `deploy/crd.yaml`.
+- **`openstudio_operator_storage_freed_bytes` counter** (`#50`)
+  — zero-information; the storage-pipeline move to native
+  `CronJob`s (`#78`) further removes its source.
+
+### Fixed
+
+- **Singleton guard building bare `CustomObjectsApi`** (`#79`) —
+  guard now uses in-cluster config; the operator was functionally
+  dead in-cluster prior to the fix.
+- **Release workflow cosign predicate missing** (`#157`) —
+  `release.yml` referenced `release-slsa.json` that did not exist;
+  the cosign-signed SLSA attestation is now attached to the
+  published digest.
+- **Storage pruner `redisUrl` parity** (`#180`) — extends the
+  `#116` redisUrl-empty guard into `prune_entrypoint.py` so the
+  prune actor also emits a `Warning` Event on a misconfigured
+  `spec.redisUrl`.
+- **Venv drift in wave-orchestration worktrees** (`#71`,
+  `#147`) — `scripts/check_editable_install.sh` checks that
+  `openstudio_operator` resolves against the active checkout
+  before running tests; the script's test-file path list covers
+  the six-plus new test files added across waves.
+- **Stale `TODO(phase 1)` in `deploy/operator-deployment.yaml:2`**
+  (`#146`) — removed; replaced with manifest comments
+  referencing the validation and hardening work.
+- **`scripts/kind-config.yaml` is single-node on purpose**
+  (`#86`) — the prior "local 3-node kind" claim was misleading;
+  AGENTS.md / scripts clarified the deliberate single-node
+  choice (one node runs the whole stack, image pull is direct
+  from Docker Hub).
+- **`README.md` Status sentence** (`#85`, `#145`, `#100`) — live
+  kind-cluster validation evidence replaces the "tracked in
+  #83" placeholder.
+
+### Security
+
+- See `Added` → cosign verify-attestation gate (`#159`, `#169`),
+  pod-level `securityContext` (`#161`, `#162`), `NetworkPolicy`
+  `/metrics` ingress restriction (`#166`), digest pinning
+  (`#149`, `#172`), rotation of the kind-recipe Redis password
+  (`#150`).
 
 ## [0.1.0] - 2026-08-19
 
@@ -214,5 +389,6 @@ pipeline moves.
   (`#115`), archival Job hardening (`#114`), NetworkPolicy (`#112`,
   `#156`), and redisUrl-guard (`#116`, `#180`).
 
-[Unreleased]: https://github.com/anchapin/openstudio-server-operator/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/anchapin/openstudio-server-operator/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/anchapin/openstudio-server-operator/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/anchapin/openstudio-server-operator/releases/tag/v0.1.0
