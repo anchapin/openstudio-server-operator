@@ -133,7 +133,7 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
 |---|---|---|
 | Namespace | `openstudio-server` | manifests must be updated from `openstudio` |
 | Web Service | `web` :80 | `serverUrl` default `http://web.openstudio-server.svc.cluster.local` |
-| Worker Deployment | `worker` | HPA `worker-hpa` (CPU, 2–20, **unconditional** — no enable flag) |
+| Worker Deployment | `worker` | HPA `worker-hpa` (CPU, 2–20) — **DISABLED post-#77** via `--set worker.autoscaling.enabled=false` (or `kubectl delete hpa worker-hpa --ignore-not-found` on existing clusters); replaced by KEDA ScaledObject `keda-hpa-worker` driven by the Resque `simulations`+`requeued` queue depth — see `deploy/keda-scaledobject.yaml` and the KEDA prerequisite section in `docs/validation.md` |
 | web_background Deployment | `web-background` | 1 replica |
 | Redis Service | `queue` :6379 | |
 | NFS PVC | `nfs-pvc` | RWX, storageClass `nfs`; mounted **only by web** at `/mnt/openstudio` |
