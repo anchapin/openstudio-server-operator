@@ -72,8 +72,30 @@ def test_factory_returns_singleton_instance() -> None:
     module level and survives for the operator's lifetime; tests reset
     it via the autouse fixture above.
     """
-    first = singleton.operator_custom_objects_api()
-    second = singleton.operator_custom_objects_api()
+    import kubernetes.client
+    import kubernetes.config as kube_config
+
+    # CI environments lack both in-cluster service-account env vars AND
+    # a `~/.kube/config` file, so the factory's loader chain would
+    # ConfigException. Stub both loaders so the test is hermetic.
+    def fake_load_incluster() -> None:
+        cfg = kubernetes.client.Configuration()
+        cfg.host = "https://apiserver.incluster.example:6443"
+        kubernetes.client.Configuration.set_default(cfg)
+
+    def fake_load_kube() -> None:
+        fake_load_incluster()  # same sentinel host
+
+    original_inc = kube_config.load_incluster_config
+    original_kube = kube_config.load_kube_config
+    kube_config.load_incluster_config = fake_load_incluster  # type: ignore[assignment]
+    kube_config.load_kube_config = fake_load_kube  # type: ignore[assignment]
+    try:
+        first = singleton.operator_custom_objects_api()
+        second = singleton.operator_custom_objects_api()
+    finally:
+        kube_config.load_incluster_config = original_inc  # type: ignore[assignment]
+        kube_config.load_kube_config = original_kube  # type: ignore[assignment]
 
     assert first is second, (
         "operator_custom_objects_api() must return the SAME instance on "
