@@ -231,8 +231,8 @@ Analysis states (verified v3.11.0): na \-\> init \-\> queued \-\> started \-\> p
 
 ### **Phase 4: Production Hardening & Autoscaling (Week 6\)**
 
-* Integrate **KEDA (Kubernetes Event-driven Autoscaling)** targeting MongoDB queue size or custom metrics from /analyses/{id}/status.json.  
-* Implement Prometheus metrics endpoint (/metrics) inside the operator to track total soft-stops, auto-requeues, and storage freed.  
+* **Worker autoscaling — KEDA `ScaledObject` (issue #77; supersedes the #18 HPA-floor adjuster).** Standard KEDA scaler driving the `worker` Deployment from the Resque `simulations` + `requeued` queue depths (Resque 2.x key format `resque:queue:<name>`, verified in #44). The ScaledObject's `value` expression sums the two queue `LLEN`s; the value translates 1:1 into replicas (one worker per pending job), bounded by `minReplicaCount: 0` and `maxReplicaCount: 5` (raise in production). The chart's unconditional CPU HPA (`worker-hpa`) is disabled — the kind recipe's `scripts/manifests/06-worker.yaml` no longer includes it. KEDA's metrics adapter is the sole autoscaler for `worker`; the operator's only role is the ScaledObject's existence (it does not install KEDA or manage the ScaledObject — both are cluster-admin tasks). The custom HPA-floor reconciliation loop and its D10 design rationale (the chart's unconditional HPA forced an in-operator minReplicas patcher) are GONE — see `docs/kind-validation.md` for the live scale-up/scale-down evidence. The original #18 HPA-floor design is documented in the git history of `src/openstudio_operator/handlers/hpa_floor.py` (deleted) for reference.
+* Implement Prometheus metrics endpoint (/metrics) inside the operator to track total soft-stops, auto-requeues, and storage freed.
 * Restrict operator ServiceAccount RBAC permissions.
 
 ## **7\. RBAC & Security Deployment Specification**

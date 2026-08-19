@@ -4,7 +4,8 @@
 **Date:** 2026-08-18
 **Scope:** all merged modules — `analysis_sla` (#8/#9), `datapoint_watchdog` (#10),
 `worker_recycler` (#11), `redis_client` (#12), `web_background_monitor` (#13),
-`singleton` (#14), `archival` (#15), `storage_pruner` (#16), `metrics` (#17), `hpa_floor` (#18)
+`singleton` (#14), `archival` (#15), `storage_pruner` (#16), `metrics` (#17);
+`hpa_floor` (#18) REMOVED in favor of KEDA ScaledObject (#77).
 **Method:** full code walk of `src/openstudio_operator/` + mechanical sweeps
 (grep for every mutating call site; AST scan of every numeric/string literal) +
 test-name verification. `ruff check .` and `pytest` green (273 → 274 tests).
@@ -50,7 +51,7 @@ longer performs any storage mutation.
 | K3 | K8s web-background Deployment `restartedAt` patch — `patch_namespaced_deployment` | `handlers/web_background_monitor.py:310` | `dry_run = config.dry_run` / `if not dry_run:` (web_background_monitor.py:305-306) | message suffix `"— patch suppressed (spec.dryRun)"` + `WebBackgroundRestarted` Warning Event (web_background_monitor.py:322-324); `lastWebBackgroundRestart` advances (pacing choice) | GATED |
 | K4 | K8s archival Job spawn — `create_namespaced_job` | `retention.py:481` (actor: prune CronJob since #78) | `dry_run = config.dry_run` / `if not dry_run:` (retention.py:479-480) | message suffix `"— Job spawn suppressed (spec.dryRun)"` + `AnalysisArchivalStarted` Normal Event; dry-run marker record (`jobName=None`) written | GATED |
 | K5 | K8s failed-archival-Job cleanup delete — `delete_namespaced_job` | `retention.py:474` (actor: prune CronJob since #78) | `if not config.dry_run:` (retention.py:473) | **was un-gated** — see §1.2 | **WAS UNGATED → fixed (#42)** |
-| K6 | K8s HPA `minReplicas` patch — `patch_namespaced_horizontalpodautoscaler` | `handlers/hpa_floor.py:319` | `if not dry_run:` (hpa_floor.py:318); `dry_run=config.dry_run` threaded explicitly through `run_hpa_floor_tick` (hpa_floor.py:269, 377) | message suffix `"— patch suppressed (spec.dryRun)"` + `HpaFloorRaised`/`HpaFloorDecayed` Event (hpa_floor.py:330-333); cooldown advances (pacing choice); decay floor is chart-derived (`resolve_baseline_min_replicas`, hpa_floor.py:205 — issue #46) | GATED |
+| K6 | K8s HPA `minReplicas` patch — `patch_namespaced_horizontalpodautoscaler` | REMOVED in #77 — was `handlers/hpa_floor.py:319` (file deleted) | n/a — the operator no longer mutates the HPA; autoscaling is owned by a KEDA ScaledObject (deploy/keda-scaledobject.yaml) whose controller runs OUTSIDE the operator process and is not gated by `spec.dryRun` (intentional — cluster autoscaling is not a per-CR operator policy). The HPA mutations this row once gated are now zero — there is nothing to suppress. | n/a (no operator-side mutation) | **REMOVED (#77)** |
 
 ### 1.2 Finding: un-gated Job cleanup delete (filed as #42, fixed here)
 
@@ -114,15 +115,16 @@ documented per module).
 | **Archival in-flight dedup** | `status.archivedAnalyses[id]` (`ArchivedAnalysisRecord`) | retention.py `run_retention_tick` (prune CronJob since #78) — spawn only for ids NOT in the tracked snapshot; adopt paths (:405-449) adopt an existing deterministic-named Job instead of double-spawning | Restart resumes WATCHING the Job named in the persisted record rather than respawning (`test_restart_midflight_resumes_watching_rather_than_respawning`); a lost record write after Job create is healed by read-first adoption. Dry-run marker (`jobName=None`) makes suppression once-per-analysis; the dryRun-lift reconcile clears it. | `test_spawn_creates_deterministic_job_writes_inflight_record_and_events`, `test_orphan_inflight_job_without_record_is_adopted_not_respawned`, `test_restart_midflight_resumes_watching_rather_than_respawning`, `test_dry_run_suppresses_spawn_and_delete_with_observable_tracking` |
 | **Deterministic archival Job names** | `archival_job_name(id)` — pure function (`oscm-archive-<sanitized>-<sha256-8>`) | retention.py `_spawn_archival` (prune CronJob since #78) — same id ⇒ same name ⇒ re-create conflicts (409) rather than suffix-littering | Pure function of the analysis id; survives restarts trivially. Failed-Job retry frees the name via the (now dryRun-gated, #42) cleanup delete. | `test_job_name_deterministic_per_analysis` (tests/test_archival.py), `test_job_failure_retains_analysis_warns_and_retries_next_tick`, `test_dry_run_suppresses_failed_job_cleanup_delete` |
 | **Verified-then-delete** (cardinal rule) | `ArchivedAnalysisRecord.verified_at` — written ONLY on observed Job `Complete` | retention.py `_reconcile_tracked`/`_delete_verified` (prune CronJob since #78) — retry-delete only for verified; `delete_analysis` unreachable without it | Verification is durable in CR status; a restart re-reads it and retries the delete exactly once per tick. | `test_job_success_verifies_then_deletes_and_prunes_status`, `test_cardinal_never_deleted_without_verified_success`, `test_verified_record_deletion_failure_retries_delete_next_tick`, `test_dry_run_suppresses_delete_of_verified_analysis` |
-| **HPA-floor cooldown** | `HpaFloorState` (in-memory per CR) — **documented deviation: no v1alpha1 status scalar exists for this module** | hpa_floor.py:191 (`gate_open`) — after a successful backlog read; `record_adjustment` at :338 (advances in dry-run too) | Restart-conservative by construction: a fresh process anchors `first_observed_at` on its first SUCCESSFUL read and keeps the gate closed one full cooldown — a restart can only DELAY an adjustment, never accelerate one; a crash-looping operator cannot flap the floor at all. (Tradeoff documented in hpa_floor.py:51-65.) The chart-derived baseline (issue #46, `resolve_baseline_min_replicas`, hpa_floor.py:205) is process-lifetime stable: a fresh process captures the HPA's `minReplicas` once per namespace and holds it; decay below the captured value is impossible without an explicit per-call override. | `test_cooldown_blocks_opposite_signal_until_elapsed`, `test_fresh_process_waits_out_one_cooldown_of_observation`, `test_failed_sensing_never_anchors_the_gate`, `test_dry_run_suppresses_patch_but_paces_like_real`, `test_decay_to_chart_baseline_not_fallback_when_chart_is_higher`, `test_decay_below_chart_baseline_is_impossible_without_override` |
+| **HPA-floor cooldown** | `HpaFloorState` (in-memory per CR) — **documented deviation: no v1alpha1 status scalar exists for this module** | REMOVED in #77 — was hpa_floor.py:191 (`gate_open`); file deleted. The replacement KEDA ScaledObject owns the cooldown via its own `cooldownPeriod` field (deploy/keda-scaledobject.yaml: scaling 0→N uses KEDA's polling interval, scale-down uses the HPA's own stabilization window). KEDA is the system of record for autoscaling state. | n/a (no longer operator-side) |
 | **Singleton guard** (not an action, but gating) | none — stateless | `resolve_active_cr` recomputes oldest from `metadata.creationTimestamp` on EVERY tick/event (singleton.py:171-174, 243-245) | Nothing persisted, nothing in memory decides the winner; the only memory (`_last_state`) is an Event-noise gate. Fail-closed on API errors. | `test_gated_wrapper_serves_only_oldest`, `test_gated_wrapper_fails_closed_on_api_error` |
 | **StatusStore itself** | n/a | read-modify-write with 409-restart, patches recomputed from fresh reads (status_store.py:263-302) | Mutation is a pure function of its arguments; same-value writes are no-ops. | `test_set_same_value_twice_writes_once`, `test_mark_soft_stop_escalated_is_idempotent`, `test_clear_started_since_is_idempotent` |
 
-**Gaps:** none blocking. Two in-memory conservative caches (stall-window
-tracker, HPA-floor cooldown) intentionally lack CR anchors — both are
-documented D04-clean because a restart can only delay action, never
-false-fire, and the v1alpha1 schema offers no status field for them
-(follow-up only if tuning ever demands it).
+**Gaps:** none blocking. The HPA-floor module (#18) is removed in #77
+(see K6 row above) — its in-memory cooldown cache went with it. The
+stall-window tracker remains as the single in-memory conservative
+cache, with the same documented D04-clean property: a restart can only
+delay action, never false-fire, and the v1alpha1 schema offers no status
+field for it (follow-up only if tuning ever demands it).
 
 ---
 
@@ -137,28 +139,32 @@ threshold reads `config.<policy>.<field>` at its use site.
 All policy numbers live in `config.py`: dataclass defaults +
 `from_spec` fallbacks (`180`/`15`/`45`/`3`/`12`/`30`/`10`/`7` …,
 config.py:24-113, mirroring `deploy/crd.yaml`) and the module-level wiring
-defaults `DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0` (config.py:21,
-imported by web_background_monitor at :84 — not re-declared) and
-`DEFAULT_HPA_FLOOR_POLICY`/`DEFAULT_HPA_FLOOR_TIERS`/`DEFAULT_HPA_BASELINE_MIN_REPLICAS`/
-`DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS` (config.py:155-212, imported by hpa_floor
-at :99-100 — the handler contains no mapping numbers of its own).
-`DEFAULT_HPA_BASELINE_MIN_REPLICAS` is the **fallback** for the chart-derived
-runtime baseline (issue #46) — only consulted when the HPA cannot be read
-at startup; the production chart's `minReplicas` (2) is captured live and
-wins over this fallback when observable.
+default `DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0` (config.py:21,
+imported by web_background_monitor at :84 — not re-declared). The
+HPA-floor policy constants (`DEFAULT_HPA_FLOOR_POLICY` and friends) were
+REMOVED in #77 — the corresponding handler module was deleted and the
+CRD has no HPA-floor spec field, so the policy values are no longer
+carried in any CR and are no longer imported anywhere. KEDA
+autoscaling parameters (queue trigger, `minReplicaCount`, `maxReplicaCount`,
+`pollingInterval`, `cooldownPeriod`) live in `deploy/keda-scaledobject.yaml`
+— a manifest owned by the cluster admin (same convention as the storage
+prune CronJob's `*/10` schedule in #78), not in `config.py`.
 
 ### 3.2 Sweep proof (AST scan of every numeric/string literal, all of `src/openstudio_operator/`)
 
 Every literal found outside `config.py` falls into an exempt class:
 
 1. **Poll cadences** (`POLL_INTERVAL_SECONDS`): `30.0` analysis_sla, `60.0`
-   datapoint_watchdog / web_background_monitor / hpa_floor, `300.0`
+   datapoint_watchdog / web_background_monitor, `300.0`
    worker_recycler — each documented in-file as plan-mandated operator
-   behavior, not cluster policy. (The `600.0` storage_pruner cadence left
-   the operator with #78: it is now the storage-prune CronJob's
-   `*/10 * * * *` schedule in `deploy/storage-cronjob.yaml` — a manifest
-   property owned by the cluster admin, outside this sweep by the same
-   logic as the operator Deployment's own manifest settings.)
+   behavior, not cluster policy. (The `60.0` hpa_floor cadence was
+   removed in #77; the `600.0` storage_pruner cadence left the operator
+   with #78: it is now the storage-prune CronJob's `*/10 * * * *`
+   schedule in `deploy/storage-cronjob.yaml` — a manifest property
+   owned by the cluster admin, outside this sweep by the same logic as
+   the operator Deployment's own manifest settings. KEDA's `pollingInterval`
+   (15 s) lives in `deploy/keda-scaledobject.yaml` for the same
+   reason.)
 2. **Transport mechanics** — appendix A.
 3. **K8s API protocol tokens** — HTTP status codes (`400`/`500`/`404`/`409`,
    `200`-char slice), job-condition strings (`"Complete"`/`"Failed"`),
@@ -196,20 +202,23 @@ policy knob, and AGENTS.md's fixed-identifiers section sanctions it.
 (`analysis_sla._DEFAULT_WORKER_DEPLOYMENT`, `worker_recycler.DEFAULT_WORKER_DEPLOYMENT`,
 `web_background_monitor.DEFAULT_WORKER_DEPLOYMENT`; the analysis_sla copy
 documents the import-cycle rationale); `web-background` Deployment fallback;
-`worker-hpa` HPA name (hpa_floor.py:121); `nfs-pvc` + `/mnt/openstudio`
-(archival.py:58-59); `kubectl.kubernetes.io/restartedAt` annotation key
-(worker_recycler/web_background_monitor); K8s default `minReplicas` when
-unspecified (hpa_floor.py:127). All are AGENTS.md "fixed identifiers" or K8s
-protocol facts — none tunable policy.
+`nfs-pvc` + `/mnt/openstudio` (archival.py:58-59);
+`kubectl.kubernetes.io/restartedAt` annotation key
+(worker_recycler/web_background_monitor). All are AGENTS.md "fixed
+identifiers" or K8s protocol facts — none tunable policy. The pre-#77
+`worker-hpa` HPA name (hpa_floor.py:121) and the K8s default
+`minReplicas` constant (hpa_floor.py:127) are GONE — the chart's HPA
+was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (274 tests post-fix)
+ruff check . && pytest                       # both green (331 tests post-#77 removal)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
-delete_namespaced_job|patch_namespaced_horizontalpodautoscaler|\
-patch_namespaced_custom_object_status' src/                    # §1.1 table
+delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
+# After #77 the operator no longer contains any
+# `patch_namespaced_horizontalpodautoscaler` call site — K6 row removed.
 # AST literal sweep for §3.2 (numeric + string constants per file, parent-contexted)
 ```
 
@@ -236,7 +245,6 @@ metric" true.
 | `openstudio_operator_web_background_restarts_total` | `web_background_monitor` (#13) | web_background restart issued (or dry-run) | `status.lastWebBackgroundRestart` |
 | `openstudio_operator_analyses_archived_total` | `retention` (#16; prune CronJob since #78) | Archival Job observed Complete (adopted completions included) | `status.archivedAnalyses[id].verified_at` |
 | `openstudio_operator_analyses_deleted_total` | `retention` (#16; prune CronJob since #78) | `DELETE /analyses/{id}` issued post-verification (suppressed by `spec.dryRun`) | `status.archivedAnalyses[id].verified_at` |
-| `openstudio_operator_hpa_floor_adjustments_total` | `hpa_floor` (#18) | HPA-floor adjustment issued (raise + decay; dry-run counts too) | `HpaFloorState` (in-memory, documented D04 deviation) |
 
 ### D.1 Removed counter — `STORAGE_FREED_BYTES` (issue #50)
 

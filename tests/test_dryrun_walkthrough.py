@@ -32,13 +32,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import fakeredis
-import pytest
 import responses
 from prometheus_client import REGISTRY
 
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import (
-    DEFAULT_HPA_FLOOR_POLICY,
     OperatorConfig,
 )
 from openstudio_operator.handlers.analysis_sla import (
@@ -49,11 +47,6 @@ from openstudio_operator.handlers.analysis_sla import (
 from openstudio_operator.handlers.datapoint_watchdog import (
     DATAPOINT_REQUEUED_EVENT,
     run_watchdog_tick,
-)
-from openstudio_operator.handlers.hpa_floor import (
-    HPA_FLOOR_RAISED_EVENT,
-    HpaFloorState,
-    run_hpa_floor_tick,
 )
 from openstudio_operator.handlers.web_background_monitor import (
     WEB_BACKGROUND_RESTARTED_EVENT,
@@ -167,9 +160,6 @@ def fresh_cos() -> dict[str, float]:
         ),
         "openstudio_operator_analyses_deleted_total": metric(
             "openstudio_operator_analyses_deleted_total"
-        ),
-        "openstudio_operator_hpa_floor_adjustments_total": metric(
-            "openstudio_operator_hpa_floor_adjustments_total"
         ),
     }
 
@@ -941,97 +931,6 @@ def test_dryrun_web_background_restart_is_strict_suppression():
     assert metric("openstudio_operator_web_background_restarts_total") - cos_before == 2
 
 
-# --- Module 7 (Phase 4): HPA-floor adjuster -----------------------------------
-
-
-HPA_WORKER_HPA = "worker-hpa"
-HPA_SPEC = {**WBM_SPEC, "redisUrl": "redis://:pw@queue.test:6379"}
-
-
-class FakeAutoscaling:
-    def __init__(self, min_replicas: int = 1, max_replicas: int = 20) -> None:
-        self.spec = SimpleNamespace(min_replicas=min_replicas, max_replicas=max_replicas)
-        self.patches: list[dict] = []
-
-    def read_namespaced_horizontal_pod_autoscaler(self, name, namespace, **_kw):
-        return SimpleNamespace(spec=self.spec)
-
-    def patch_namespaced_horizontalpodautoscaler(self, name, namespace, body, **kwargs):
-        self.patches.append({"name": name, "namespace": namespace, "body": body, "kwargs": kwargs})
-        self.spec.min_replicas = body["spec"]["minReplicas"]
-        return {}
-
-
-def _hpa_redis(simulations: int) -> ReadOnlyRedisClient:
-    fake = fakeredis.FakeStrictRedis(decode_responses=True)
-    for i in range(simulations):
-        fake.rpush(SIMULATIONS_QUEUE, f"j{i}")
-    return ReadOnlyRedisClient("redis://:pw@queue.test:6379", connection=fake)
-
-
-@pytest.fixture(autouse=True)
-def _reset_baseline_cache():
-    """The hpa_floor process-lifetime baseline cache must be fresh per test."""
-    from openstudio_operator.handlers.hpa_floor import reset_captured_baseline_cache
-
-    reset_captured_baseline_cache()
-    yield
-    reset_captured_baseline_cache()
-
-
-def _hpa_anchor_state() -> HpaFloorState:
-    """A state whose restart-conservative observation gate has fully opened."""
-    state = HpaFloorState()
-    cooldown = timedelta(seconds=DEFAULT_HPA_FLOOR_POLICY.cooldown_seconds)
-    assert state.gate_open(NOW - 2 * cooldown, cooldown) is False
-    assert state.gate_open(NOW - cooldown, cooldown) is True
-    return state
-
-
-def test_dryrun_hpa_floor_adjust_is_strict_suppression():
-    """D11 contract: only the HPA patch flips; event/metric/cooldown otherwise identical."""
-    cos_before = metric("openstudio_operator_hpa_floor_adjustments_total")
-
-    def run_one(dry_run: bool):
-        api = FakeAutoscaling(min_replicas=1, max_replicas=20)
-        state = _hpa_anchor_state()
-        before = metric("openstudio_operator_hpa_floor_adjustments_total")
-        events, emit = make_emit()
-        run_hpa_floor_tick(
-            _hpa_redis(300),
-            api,
-            namespace=NAMESPACE,
-            policy=DEFAULT_HPA_FLOOR_POLICY,
-            now=NOW,
-            emit=emit,
-            state=state,
-            dry_run=dry_run,
-            effective_baseline_min_replicas=1,
-        )
-        return api, events, metric("openstudio_operator_hpa_floor_adjustments_total") - before, state
-
-    api_dry, events_dry, delta_dry, state_dry = run_one(dry_run=True)
-    assert api_dry.patches == []
-    assert len(events_dry) == 1
-    assert events_dry[0][:2] == ("Normal", HPA_FLOOR_RAISED_EVENT)
-    assert "suppressed (spec.dryRun)" in events_dry[0][2]
-    assert delta_dry == 1
-    assert state_dry.last_adjusted_at == NOW
-
-    api_real, events_real, delta_real, state_real = run_one(dry_run=False)
-    assert len(api_real.patches) == 1
-    assert api_real.patches[0]["name"] == HPA_WORKER_HPA
-    assert api_real.patches[0]["kwargs"]["_content_type"] == MERGE_PATCH_CONTENT_TYPE
-    assert api_real.patches[0]["body"] == {"spec": {"minReplicas": 8}}
-    assert len(events_real) == 1
-    assert events_real[0][:2] == ("Normal", HPA_FLOOR_RAISED_EVENT)
-    assert "suppressed (spec.dryRun)" not in events_real[0][2]
-    assert delta_real == 1
-    assert state_real.last_adjusted_at == NOW
-
-    assert metric("openstudio_operator_hpa_floor_adjustments_total") - cos_before == 2
-
-
 # --- End-to-end walkthrough: all modules in one tick ---------------------------
 
 
@@ -1053,7 +952,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     * Module 3   recycle:      ``openstudio_operator_workers_recycled_total`` +1
     * Module 4   archival:     tracker record w/o jobName (no metric, +1 on Complete)
     * Module 5   web_bg:       ``openstudio_operator_web_background_restarts_total`` +1
-    * Phase 4    hpa_floor:    ``openstudio_operator_hpa_floor_adjustments_total`` +1
     """
     analysis_id = "a-phase1"
     dp_id = "dp-phase1"
@@ -1286,26 +1184,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     record = api.obj["status"]["archivedAnalyses"][archive_analysis_id]
     assert "jobName" not in record  # dry-run marker
 
-    # Phase 4 (HPA-floor adjuster)
-    hpa_api = FakeAutoscaling(min_replicas=1, max_replicas=20)
-    state = _hpa_anchor_state()
-    events, emit = make_emit()
-    run_hpa_floor_tick(
-        _hpa_redis(300),
-        hpa_api,
-        namespace=NAMESPACE,
-        policy=DEFAULT_HPA_FLOOR_POLICY,
-        now=NOW,
-        emit=emit,
-        state=state,
-        dry_run=True,
-        effective_baseline_min_replicas=1,
-    )
-    hpa_events = [e for e in events if e[1] == HPA_FLOOR_RAISED_EVENT]
-    assert len(hpa_events) == 1
-    assert "suppressed (spec.dryRun)" in hpa_events[0][2]
-    assert hpa_api.patches == []
-
     # Cumulative invariants after the full walkthrough with dryRun=True:
     # every decision counted (D11: metrics are decisions, not mutations),
     # every mutation-suppressed Event carried the marker, every state
@@ -1339,10 +1217,6 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
             "openstudio_operator_analyses_deleted_total"
         )
         - cos["openstudio_operator_analyses_deleted_total"],
-        "openstudio_operator_hpa_floor_adjustments_total": metric(
-            "openstudio_operator_hpa_floor_adjustments_total"
-        )
-        - cos["openstudio_operator_hpa_floor_adjustments_total"],
     }
     assert diffs == {
         "openstudio_operator_soft_stops_total": 1,
@@ -1352,5 +1226,4 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         "openstudio_operator_web_background_restarts_total": 1,
         "openstudio_operator_analyses_archived_total": 0,  # no Complete observed
         "openstudio_operator_analyses_deleted_total": 0,  # nothing verified
-        "openstudio_operator_hpa_floor_adjustments_total": 1,
     }

@@ -70,13 +70,6 @@ ANALYSES_DELETED_TOTAL = Counter(
     "delete and the increment)",
 )
 
-HPA_FLOOR_ADJUSTMENTS_TOTAL = Counter(
-    "openstudio_operator_hpa_floor_adjustments_total",
-    "worker-hpa minReplicas adjustments issued by the HPA-floor adjuster "
-    "(raises and decays; incremented by #18; counts decisions — dry-run ticks "
-    "increment too, matching SOFT_STOPS_TOTAL)",
-)
-
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard; issue #87 —
 #: unconditional emission. Monotonic max of distinct Resque worker ids the
 #: operator has EVER observed in process lifetime (web_background_monitor,

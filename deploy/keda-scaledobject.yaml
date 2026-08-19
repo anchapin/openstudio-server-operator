@@ -1,0 +1,131 @@
+# KEDA ScaledObject (issue #77) — replaces the operator's custom
+# HPA-floor adjuster (#18, removed). Standard Redis-list trigger on the
+# Resque `simulations` + `requeued` queues (LIVE-VERIFIED v3.11.0 layout
+# in #44; Resque 2.x key format `resque:queue:<name>`).
+#
+# PREREQUISITES (the operator no longer enforces either of these — they
+# are cluster-admin steps; see docs/kind-validation.md step 4 and
+# docs/validation.md#keda-cluster-prerequisite):
+#   1. KEDA installed in namespace `keda` (scripts/install-keda.sh)
+#   2. The chart's `worker-hpa` HPA DELETED (or never applied) — two
+#      autoscalers fighting one Deployment oscillate. On kind, this means
+#      `kubectl -n openstudio-server delete hpa worker-hpa --ignore-not-found`
+#      AFTER `scripts/manifests/06-worker.yaml` no longer includes it.
+#      The kind recipe's 06-worker.yaml is the post-render mechanism.
+#
+# Sizing:
+#   minReplicaCount: 0     — the worker pool can scale to zero when the
+#                            queue is empty. Safe on a fresh cluster; on
+#                            a production cluster you may want minReplicaCount: 1
+#                            to keep one worker warm.
+#   maxReplicaCount: 5     — bounded; raise for production traffic.
+#   pollingInterval: 15    — KEDA's Redis query cadence. Lower = faster
+#                            scale-up at the cost of more Redis reads.
+#   cooldownPeriod: 60     — seconds to wait before scaling down after
+#                            the trigger reports 0. Anti-flap gate.
+#   value: "sum(llen(resque:queue:simulations), llen(resque:queue:requeued))"
+#                          — backlog is the SUM of both queues (workers
+#                            subscribe to QUEUES=requeued,simulations; the
+#                            fleet's outstanding work is the total pending,
+#                            not the max).
+#
+# Auth: TriggerAuthentication holds the Redis password in a Secret
+# reference; the ScaledObject references it. KEDA's metrics adapter
+# reads the password at query time. The operator never sees it.
+#
+# If you change the Redis password, update the `openstudio` Secret in
+# the `openstudio-server` namespace and the TriggerAuthentication will
+# pick it up on the next poll.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: openstudio-redis-auth
+  namespace: openstudio-server
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: openstudio-redis
+      key: password
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  pollingInterval: 15
+  cooldownPeriod: 60
+  idleReplicaCount: 0  # the formal name of minReplicaCount=0 in KEDA >= 2.10
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  # Fallback: a Failed ScaledObject must not block worker startup. If KEDA
+  # cannot reach Redis (e.g. queue pod down), the Deployment is held at
+  # minReplicaCount (0) — the existing worker Deployment's replicas field
+  # (1) is the safer fallback for kind/validation; switch to 0 only after
+  # confirming the Redis trigger is healthy.
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  advanced:
+    # Sum of the two triggers' LLENs, divided by target=1 → 1 replica per
+    # pending job (workers process Resque jobs serially, one at a time;
+    # the SUM is the right operator-side mapping — see the comment on
+    # the triggers block below). The redis-list trigger exposes exactly
+    # one list per trigger (it has no `listNames` plural nor a multi-list
+    # value expression in 2.20), so we declare two triggers named
+    # `simulations` and `requeued` and use the `scalingModifiers.formula`
+    # to add them — the ScaledObject's effective backlog = SUM, matching
+    # the #18 adjuster's "sum of simulations + requeued" (the documented
+    # successor behavior).
+    scalingModifiers:
+      formula: "simulations + requeued"
+      target: "1"
+      activationTarget: "0"
+      metricType: "AverageValue"
+    horizontalPodAutoscalerConfig:
+      behavior:
+        # Aggressive scale-up: add up to 4 pods per 30s when backlog > 0.
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 30
+        # Conservative scale-down: remove at most 1 pod per 60s.
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: redis
+      name: simulations
+      authenticationRef:
+        name: openstudio-redis-auth
+      metadata:
+        # `address` is the in-cluster Service DNS, port 6379.
+        address: queue.openstudio-server.svc.cluster.local:6379
+        # `listName` is the Resque `simulations` queue key. The
+        # operator's read-only Redis client (#12, LIVE-VERIFIED) uses
+        # the same key (redis_client.SIMULATIONS_QUEUE →
+        # "resque:queue:simulations"; Resque 2.x layout, #44). The
+        # redis-list trigger returns LLEN / listLength; with listLength=1
+        # the trigger's value is exactly the queue depth.
+        listName: resque:queue:simulations
+        listLength: "1"
+    - type: redis
+      name: requeued
+      authenticationRef:
+        name: openstudio-redis-auth
+      metadata:
+        address: queue.openstudio-server.svc.cluster.local:6379
+        listName: resque:queue:requeued
+        listLength: "1"

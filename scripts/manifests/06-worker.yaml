@@ -8,11 +8,15 @@
 # chart are kept — the operator's surgical pod-eviction escalation (#9) and
 # the worker recycler (#11) delete worker pods, so the shutdown path matters.
 #
-# worker-hpa: included for TOPOLOGY PARITY ONLY. The chart's HPA is
-# unconditional (2–20, CPU 50%); the operator's Phase-4 HPA-floor adjuster
-# (#18) patches its minReplicas. kind ships no metrics-server, so this HPA
-# will never scale on CPU — it stays at minReplicas, which is exactly what
-# patch-target validation needs (the object exists with the right name).
+# Autoscaling (issue #77): the chart's `worker-hpa` HorizontalPodAutoscaler
+# was REMOVED from this manifest. Two autoscalers fighting over the same
+# Deployment oscillate (chart HPA is unconditional CPU; ScaledObject
+# scales on Redis backlog). Standard KEDA ScaledObject
+# (deploy/keda-scaledobject.yaml) is the sole autoscaler for `worker`
+# post-#77; install KEDA first (`scripts/install-keda.sh`) and then
+# apply the ScaledObject. See docs/kind-validation.md step 4 for the
+# end-to-end recipe. The pre-#77 chart overlay that previously left the
+# HPA in place is no longer needed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -83,23 +87,3 @@ spec:
       volumes:
         - name: osdata-worker
           emptyDir: {}
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: worker-hpa
-  namespace: openstudio-server
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: worker
-  minReplicas: 1
-  maxReplicas: 2
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 50

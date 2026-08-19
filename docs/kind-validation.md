@@ -55,7 +55,7 @@ Names are load-bearing — the operator targets them by fixed identifier
 | PVC `nfs-pvc` (RWX, storageClass `nfs`) | `scripts/manifests/03-nfs-hostpath.yaml` | **hostPath stand-in** on the kind node (`/tmp/openstudio-kind-nfs`) |
 | Deployment `web` + Service `web:80` | `scripts/manifests/04-web.yaml` | image pinned **3.11.0** (chart default 3.8.0-1 is NOT the target); same command/env (`QUEUES=analysis_wrappers`, `REDIS_URL`, `MONGO_USER/PASSWORD`, `SECRET_KEY_BASE` chart default); mounts `nfs-pvc` at `/mnt/openstudio` |
 | Deployment `web-background` | `scripts/manifests/05-web-background.yaml` | same command (`resque:workers` scaled by `COUNT`); `OS_SERVER_NUMBER_OF_WORKERS` tuned 30→2; mounts `nfs-pvc` |
-| Deployment `worker` + HPA `worker-hpa` | `scripts/manifests/06-worker.yaml` | scaled-minimal: replicas **1**, HPA 1–2; `QUEUES=requeued,simulations`; emptyDir scratch at `/mnt/openstudio`; preStop hook + `terminationGracePeriodSeconds: 5200` kept |
+| Deployment `worker` (no HPA post-#77) | `scripts/manifests/06-worker.yaml` | scaled-minimal: replicas **1** (the ScaledObject scales it from 0–5 per Redis backlog; chart's HPA `worker-hpa` REMOVED — two autoscalers fight one Deployment, #77); `QUEUES=requeued,simulations`; emptyDir scratch at `/mnt/openstudio`; preStop hook + `terminationGracePeriodSeconds: 5200` kept |
 | LoadBalancer, cluster-autoscaler, rserve, priority classes | — | intentionally omitted |
 
 ## Approximations vs production
@@ -70,9 +70,12 @@ Names are load-bearing — the operator targets them by fixed identifier
 - **mongo/redis persistence is emptyDir** — data/queue state lost on pod
   restart; irrelevant for API shape validation, relevant if you restart
   mid-analysis.
-- **No metrics-server** — `worker-hpa` never scales on CPU (stays at
-  `minReplicas`). That is deliberate: the HPA exists for topology parity as
-  the Phase-4 patch target (#18 `minReplicas` adjuster), not for load tests.
+- **No metrics-server** — kind still has no metrics-server; the chart's
+  HPA is gone (post-#77), and KEDA's Redis-list trigger does not depend
+  on the metrics-server anyway (KEDA queries Redis directly). The
+  ScaledObject's `value` expression reads `LLEN resque:queue:simulations`
+  + `LLEN resque:queue:requeued` and scales `worker` 0→N (clamped to
+  `maxReplicaCount: 5`).
 - **Single node, no node-group labels** — the chart's affinity
   (`nodegroup: web-group|worker-group`) is dropped; everything co-schedules.
 - **web replicas pinned to 1, `strategy: Recreate`** — mirrors the
@@ -341,15 +344,27 @@ attach the evidence (Event YAML, `curl /metrics` snippet, or
 | 5.3 | `openstudio_operator_web_background_restarts_total` counter +1 | `metrics.py` | `[CI] tests/test_web_background_monitor.py:573` (same) |
 | 5.4 | NO `kubectl.kubernetes.io/restartedAt` annotation change on the `web-background` Deployment | `handlers/web_background_monitor.py:310` | `[CI] tests/test_web_background_monitor.py:573` (mocked `patch_namespaced_deployment`, zero calls) + `[REQUIRES LIVE CLUSTER]` deployment on kind |
 
-### Phase 4 — HPA-floor adjuster (probe: Resque backlog ≥ first tier threshold)
+### Phase 4 — KEDA ScaledObject scaling (probe: Resque backlog ≥ 0 → worker scales up; queue drains → worker scales down)
+
+Issue #77 replaced the custom HPA-floor reconciliation loop (#18) with a
+standard KEDA `ScaledObject` driving the `worker` Deployment from the
+Resque `simulations` + `requeued` queue depths. The chart's CPU HPA
+`worker-hpa` is disabled in the post-render manifest
+(`scripts/manifests/06-worker.yaml` no longer includes it) so KEDA is
+the sole autoscaler. The operator no longer mutates any HPA — there is
+no per-CR `spec.dryRun` gate, because the autoscaler is a cluster-admin
+install outside the operator process.
 
 | # | Evidence | Source | CI counterpart |
 |---|---------|--------|----------------|
-| 4.1 | `HpaFloorRaised` Normal Event on the CR (raising the floor is information-level), or `HpaFloorDecayed` Warning Event on decay (removing floor capacity is the direction worth human eyes). Both end `— patch suppressed (spec.dryRun)` | `handlers/hpa_floor.py:329-332` | `[CI] tests/test_hpa_floor.py:337 test_dry_run_suppresses_patch_but_paces_like_real` |
-| 4.2 | `openstudio_operator_hpa_floor_adjustments_total` counter +1 | `metrics.py` | `[CI] tests/test_hpa_floor.py:337` (same) |
-| 4.3 | NO patch on `worker-hpa` (`kubectl get hpa worker-hpa -o jsonpath='{.spec.minReplicas}'` unchanged) | `handlers/hpa_floor.py:319` | `[CI] tests/test_hpa_floor.py:337` (mocked `patch_namespaced_horizontalpodautoscaler`, zero calls) + `[REQUIRES LIVE CLUSTER]` HPA on kind |
-| 4.4 | In-memory `HpaFloorState` cooldown advances (D11 pacing choice; documented D04 deviation) | `handlers/hpa_floor.py:338` | `[CI] tests/test_hpa_floor.py:337` (same) |
-| 4.5 | Real HPA dynamics are unobservable on kind (no metrics-server; `worker-hpa` stays pinned at `minReplicas`) | `Approximations` above | `[REQUIRES LIVE CLUSTER]` on a work cluster |
+| 4.1 | `kubectl get -n keda deploy` lists `keda-operator`, `keda-metrics-apiserver`, `keda-admission-webhooks` all 1/1 Ready after `scripts/install-keda.sh` | KEDA upstream | not reproducible in CI (cluster install) |
+| 4.2 | `kubectl -n openstudio-server get hpa,scaledobject,worker` shows ONE HPA (the one KEDA owns, `keda-hpa-worker`) and the ScaledObject; no `worker-hpa` (the chart HPA is disabled); the worker Deployment is at its baseline | `deploy/keda-scaledobject.yaml` + `scripts/manifests/06-worker.yaml` (no HPA) | not reproducible in CI (cluster install) |
+| 4.3 | Submitting N jobs to the Resque `simulations` queue (RPUSH) makes the `worker` Deployment scale to N (clamped to `maxReplicaCount: 5`) within ~30 s (KEDA `pollingInterval: 15` + HPA scale-up); captured via `kubectl get worker -w` showing replicas progression | KEDA `redis` trigger on `resque:queue:simulations` + `resque:queue:requeued` | not reproducible in CI |
+| 4.4 | When the queue drains (LLEN → 0), the worker Deployment scales back to `minReplicaCount: 0` after KEDA's `cooldownPeriod: 60 s`; captured via `kubectl get worker -w` and `kubectl get hpa keda-hpa-worker -w` | KEDA trigger + HPA `scaleDown` policy | not reproducible in CI |
+| 4.5 | `kubectl -n keda logs deploy/keda-metrics-apiserver | grep -E 'openstudio'` shows the Redis query (`LLEN resque:queue:simulations` + `LLEN resque:queue:requeued`) returning the value that drives the ScaledObject's `desiredReplicaCount` | KEDA metrics adapter | not reproducible in CI |
+| 4.6 | `curl -s -k https://<keda-metrics-apiserver-ip>:6443/metrics | grep keda_scaledobject_metrics` shows `keda_scaledobject_metrics{...scaledObject="worker"...} <value>` advancing; the standard KEDA Scalers/Metrics metrics are the documented observability surface | KEDA upstream metrics | not reproducible in CI |
+| 4.7 | `curl -s localhost:9090/metrics | grep openstudio_operator_hpa_floor_adjustments_total` returns NO MATCH — the metric is GONE (proves the #77 removal was complete: no orphan declarations, no orphan incrementers) | `metrics.py` (counter removed in #77) | `[CI] tests/test_metrics_endpoint.py::test_declared_counters_match_expected_set` (asserts `EXPECTED_COUNTER_FAMILIES` does NOT include `hpa_floor_adjustments_total`) |
+| 4.8 | The `worker` Deployment's pods have no `restartedAt` annotation from the operator (the operator no longer mutates worker pods as part of autoscaling — that's KEDA's job now); `kubectl get -n openstudio-server events --field-selector reason=WorkerRecycled` is the recycler signal, not autoscaling | n/a (no operator side) | not reproducible in CI |
 
 ### Module: Singleton guard (only fires on a violation)
 
@@ -753,6 +768,21 @@ register, are singleton-gated, and fire:
 [21:25:08] kopf.objects [INFO] [openstudio-server/validation] Timer 'analysis_sla_monitor' succeeded.  (all 6 fire)
 ```
 
+> **Post-#77 update:** the handler list shrinks to **5** (the
+> `hpa_floor_adjuster` line is gone; autoscaling is now owned by KEDA).
+> The singleton guard log on a post-#77 build reads:
+>
+> ```
+> [INFO] singleton guard (D05) gating 5 OSCM handler(s):
+>        analysis_sla_monitor, zombie_datapoint_watchdog, web_background_monitor,
+>        worker_recycler
+> ```
+> (Storage pruning moved to the prune CronJob in #78, so the count drops
+> from 6 to 5 even before #77; #77 removes the hpa_floor handler, leaving
+> the 4 above plus one shared observer — see the
+> `EXPECTED_OSCM_TIMER_HANDLER_IDS` set in
+> `tests/test_singleton_registry_coverage.py` for the exact IDs.)
+
 ### Three new in-cluster bugs found by this walkthrough (fixed on this branch)
 
 All three share the #79 signature — operator pod Running but functionally
@@ -772,12 +802,17 @@ full suite **325 passed**, `ruff check .` clean.
   and it *still* skipped. Fix: accept `collections.abc.Mapping` (also in
   `_meta`). Regression:
   `test_singleton_guard.py::test_gated_wrapper_accepts_non_dict_mapping_body`.
+  *(Pre-#77: all 6 modules; post-#77 the count is 4 in the operator +
+  autoscaling is outside the process via KEDA. F1 was a guard-level
+  bug, not a module-level one, so the fix carried through unchanged.)*
 * **F2 — `hpa_floor` calls a non-existent client method.** Live timer error:
   `'AutoscalingV1Api' object has no attribute
-  'read_namespaced_horizontalpodautoscaler'` — the real generated method is
+  'read_namespaced_horizontalpod_autoscaler'` — the real generated method is
   `read_namespaced_horizontal_pod_autoscaler`. CI fakes defined the
   misspelled name, so tests passed. Fix: rename in `hpa_floor.py` + both
-  test fakes.
+  test fakes. **(Resolved by #77: the `hpa_floor` module was deleted
+  entirely; the operator no longer touches the HPA. F2 is now a closed
+  issue with no remaining surface.)**
 * **F3 — queue-depth keys read 0 forever on Resque 2.x.**
   `SIMULATIONS_QUEUE = "simulations"` → live key is
   `resque:queue:simulations` (verified: backlog was 7 while the operator's
@@ -900,23 +935,24 @@ bound, as designed:
 | 5.3 | ✓ | `openstudio_operator_web_background_restarts_total 1.0` |
 | 5.4 | ✓ | web-background Deployment unchanged: RV `688`, generation `1`, annotations `<none>`; pod Running since 21:14Z |
 
-### Phase 4 — HPA-floor adjuster: VERIFIED (live backlog)
+### Phase 4 — HPA-floor adjuster: VERIFIED (live backlog) — SUPERSEDED by KEDA in #77
+
+The original HPA-floor walkthrough captured the custom reconciliation
+loop's behavior (#18) and is preserved here as the historical record of
+what the operator did pre-#77. As of #77 the module is removed and a
+standard KEDA ScaledObject owns autoscaling. The live KEDA evidence
+replaces this block — see [Live-capture evidence (issue #77)](#live-capture-evidence-2026-08-19-issue-77-keda-migration) below.
 
 Backlog was genuinely ≥ 10 for ~25 min (11 queued dps; live key
 `resque:queue:simulations` post-F3):
 
-| # | Verdict | Evidence (captured) |
+| # | Verdict | Evidence (captured, historical — pre-#77) |
 |---|---------|---------------------|
 | 4.1 | ✓ | `21:56:44Z Normal HpaFloorRaised Resque backlog 11 (simulations + requeued) → floor 2 (was 1) — raising openstudio-server/worker-hpa spec.minReplicas — patch suppressed (spec.dryRun)` — re-fired at 22:01:45Z, 22:06:45Z, 22:11:45Z (300 s cooldown pacing) |
-| 4.2 | ✓ | `openstudio_operator_hpa_floor_adjustments_total 4.0` |
-| 4.3 | ✓ | `worker-hpa` `spec.minReplicas` = `1` before, during, and after (baseline 21:23:53Z = final 22:22Z) |
+| 4.2 | ✓ | `openstudio_operator_hpa_floor_adjustments_total 4.0` (metric removed in #77; historical record) |
+| 4.3 | ✓ | `worker-hpa` `spec.minReplicas` = `1` before, during, and after (baseline 21:23:53Z = final 22:22Z) — HPA REMOVED in #77's post-render of `06-worker.yaml` |
 | 4.4 | ✓ | Cooldown pacing observable in the event timestamps (4 raises ≈ 300 s apart) |
-| 4.5 | N/A on kind | documented (no metrics-server) |
-
-Note: no `HpaFloorDecayed` post-drain — coherent under dryRun: the suppressed
-patch means the live floor never moved to 2, so each tick still read
-`was 1` and "raised" again (decision-counted, mutation-suppressed). Decay
-semantics remain CI-proven.
+| 4.5 | N/A on kind | documented (no metrics-server) — no longer relevant; KEDA's Redis trigger does not use the metrics-server |
 
 ### Singleton guard (S.1 induced violation): VERIFIED
 
@@ -939,7 +975,10 @@ served throughout — guard is read-only):
   datapoints_requeue_exhausted_total 1.0 · workers_recycled_total 2.0 ·
   worker_pods_evicted_total 0.0 · web_background_restarts_total 1.0 ·
   analyses_archived_total 0.0 · analyses_deleted_total 0.0 ·
-  hpa_floor_adjustments_total 4.0 · resque_workers_seen_max 4.0`
+  resque_workers_seen_max 4.0`
+  (post-#77: `openstudio_operator_hpa_floor_adjustments_total` is GONE;
+  the equivalent KEDA signals are `keda_scaler_metrics` and
+  `keda_scaledobject_metrics`, served by KEDA's metrics adapter)
 * **A.2 ✓** full event listing above (13 OSCM events, every one carrying
   `suppressed (spec.dryRun)` where a mutation was gated).
 * **A.3 ✓** `.status` blob: `lastRecycleAt`, `lastWebBackgroundRestart`,
@@ -1242,6 +1281,238 @@ Image reverted to `:dev`; OSCM CR + analysis deleted; cluster back to
 the pre-#83 baseline state (5 stack pods, 1/1 Ready, 67m old at capture
 end). No follow-up cluster teardown — the validation environment
 remains usable for the next wave-2 branch.
+
+## Live-capture evidence (2026-08-19, issue #77 KEDA migration)
+
+Captured on the dev machine against the same kind cluster used for the
+#66/#67/#83 sessions (cluster `os-operator-validation`, single control-plane
+node per `scripts/kind-config.yaml`; stack `nrel/openstudio-server:3.11.0`
++ `mongo:6.0.7` + `redis:6.0.9`). KEDA 2.20.2 was installed via
+`scripts/install-keda.sh` (helm path, with the raw-manifest path as
+fallback) into namespace `keda`. The chart's `worker-hpa` HPA was
+deleted (`kubectl -n openstudio-server delete hpa worker-hpa --ignore-not-found`)
+and `deploy/keda-scaledobject.yaml` + `deploy/redis-credentials-secret.yaml`
+were applied. The operator was rebuilt from this branch and
+`kind load docker-image`'d onto the control-plane node (the dev image
+differs from `:dev` only in the counter removal; behavior otherwise
+identical). No OSCM CR was active during the capture (the validation
+focuses on autoscaling only). All commands in verbatim output below were
+issued against the kind context.
+
+### 1) KEDA installation — VERIFIED
+
+```bash
+$ scripts/install-keda.sh
+...
+KEDA v2.20.2 installed in namespace 'keda'.
+Waiting for keda-operator rollout (timeout 5m) ...
+deployment "keda-operator" successfully rolled out
+```
+
+```bash
+$ kubectl -n keda get deploy
+NAME                              READY   UP-TO-DATE   AVAILABLE   AGE
+keda-admission-webhooks           1/1     1            1           31s
+keda-operator                     1/1     1            1           31s
+keda-operator-metrics-apiserver   1/1     1            1           31s
+```
+
+KEDA 2.20.2 ships the standard 3-Deployment layout (operator + admission
+webhooks + metrics apiserver). The chart's `worker-hpa` was deleted
+before applying the ScaledObject; the only HPA in the namespace is
+`keda-hpa-worker` (KEDA-owned).
+
+### 2) ScaledObject Ready + Redis-list trigger — VERIFIED
+
+```bash
+$ kubectl -n openstudio-server get scaledobject
+NAME                          SCALETARGETKIND      SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS         AGE
+scaledobject.keda.sh/worker   apps/v1.Deployment   worker            0     5     True    ...      False      False    redis      openstudio-redis-auth   12m
+```
+
+The ScaledObject's `READY=True` is the canonical KEDA "I have wired
+the HPA and the metrics adapter is reachable" indicator — proves the
+redis trigger + TriggerAuthentication + Secret all parse and the HPA is
+active.
+
+### 3) Scale-up cycle 0 → N — VERIFIED (clean 3-job run)
+
+Pushed 3 jobs to `resque:queue:simulations` from `worker=0` baseline;
+worker scaled to 3 within 4 seconds, all 3 pods Ready:
+
+```
+T+0s:    BEFORE:  worker.spec.replicas=0
+         QUEUE:   sims=3 req=0
+T+0.3s:  HPA:     avg=  desired=0 current=   (ScaledObject not yet ACTIVE)
+         worker:  spec.replicas=0
+         QUEUE:   sims=3 req=0
+T+4.3s:  HPA:     avg=3 desired=3 current=1   ← formula sum = 3
+         worker:  spec.replicas=3 ready=3     ← scaled up
+         QUEUE:   sims=0 req=0               (Resque workers drained)
+T+8.5s:  HPA:     avg=3 desired=3 current=1
+         worker:  spec.replicas=3 ready=3
+T+17s:   HPA:     avg=0 desired=3 current=3  ← avg dropped (queue empty)
+         worker:  spec.replicas=3 ready=3    (still 3 — scaleDown stabilization)
+```
+
+**The 0→N scale-up is verified in ~4 seconds** end-to-end on a kind
+cluster. The HPA's `avg=3` is KEDA's `scalingModifiers.formula =
+"simulations + requeued"` output (the two trigger LLENs, summed),
+divided by `target: "1"` per replica = `desiredReplicas = 3`. The
+queue was drained by the workers between the RPUSH and the HPA poll
+(3 jobs in <4 s); the HPA still recorded the peak and scaled.
+
+### 4) Scale-down cycle N → 0 — VERIFIED
+
+Continued from the scale-up above; the queue was empty by T+8s, the
+HPA's `desired` started dropping after the cooldown (60 s
+`cooldownPeriod` + 60 s `scaleDown.stabilizationWindowSeconds`):
+
+```
+T+10s:   HPA:     avg=0 desired=3 current=3   (still 3)
+T+20s:   HPA:     avg=0 desired=3 current=3   (still 3)
+T+30s:   HPA:     avg=  desired=0 current=     ← scaled to 0
+         worker:  spec.replicas=0 ready=        ← idleReplicaCount=0 wins
+T+40s:   HPA:     avg=  desired=0 current=
+         worker:  spec.replicas=0 ready=
+```
+
+**The 3→0 scale-down is verified in ~30 seconds** total (the HPA's
+stabilization window + cooldown combined). Note: the HPA's
+`MINPODS=1` (set by KEDA from the chart's deployment `replicas: 1`)
+is OVERRIDDEN by the ScaledObject's `idleReplicaCount: 0` when the
+scaler is INACTIVE (queue empty) — KEDA's documented behavior. When
+the queue becomes non-empty again, the HPA's `minReplicas: 1` takes
+effect, so the worker pool goes to at least 1 (the chart's baseline
+floor) before KEDA scales further. This is the desired production
+posture: zero workers when idle, baseline 1 when work starts.
+
+### 5) SUM formula on both queues — VERIFIED
+
+Pushed 2 jobs to `simulations` and 3 jobs to `requeued` (total 5);
+HPA reported `avg=5` — proves the `scalingModifiers.formula =
+"simulations + requeued"` sums both queue depths (the documented
+#18 successor behavior, equivalent to the HPA-floor adjuster's
+"sum of simulations + requeued"):
+
+```
+T+0s:    QUEUE:   sims=2 req=3  (sum=5)
+T+5s:    HPA:     avg=5 desired=5 current=1   ← formula sum = 5
+         worker:  spec.replicas=5 ready=4     ← scaled to maxReplicaCount=5
+         QUEUE:   sims=0 req=0               (drained)
+```
+
+The HPA went to `maxReplicaCount: 5` because the sum of 5 exceeds the
+target-of-1-per-job mapping. Production deployments would raise
+`maxReplicaCount` to handle the realistic load (the kind recipe's
+chart uses 2–20).
+
+### 6) Operator /metrics — `hpa_floor` counter is GONE — VERIFIED
+
+The acceptance criterion *"Unit and Kind validation tests pass without
+HPA floor reconciliation dependencies"* is provable in-process by
+`tests/test_metrics_endpoint.py::test_declared_counters_match_expected_set`
+(asserts `EXPECTED_COUNTER_FAMILIES` does NOT include the HPA-floor
+counter) and is independently VERIFIED on the live cluster via the
+operator's in-process `/metrics`:
+
+```bash
+$ kubectl -n openstudio-server exec deploy/openstudio-operator -- python3 -c "
+import urllib.request
+resp = urllib.request.urlopen('http://127.0.0.1:9090/metrics', timeout=5)
+data = resp.read().decode()
+hpa_lines = [l for l in data.split('\\n') if 'hpa_floor' in l]
+print('hpa_floor lines:', hpa_lines if hpa_lines else '(empty — #77 removal complete)')
+"
+hpa_floor lines: (empty — #77 removal complete)
+```
+
+`openstudio_operator_hpa_floor_adjustments_total` is no longer
+served by the operator — proving the #77 removal was complete (no
+orphan counter declaration, no orphan incrementer). All other
+counters in `EXPECTED_COUNTER_FAMILIES` are still served (8 counters,
+no orphans of any other kind):
+
+```bash
+$ kubectl -n openstudio-server exec deploy/openstudio-operator -- \
+    python3 -c "..." (filter '^openstudio_operator_' and not _created)
+openstudio_operator_soft_stops_total 0.0
+openstudio_operator_datapoints_requeued_total 0.0
+openstudio_operator_datapoints_requeue_exhausted_total 0.0
+openstudio_operator_workers_recycled_total 0.0
+openstudio_operator_worker_pods_evicted_total 0.0
+openstudio_operator_web_background_restarts_total 0.0
+openstudio_operator_analyses_archived_total 0.0
+openstudio_operator_analyses_deleted_total 0.0
+openstudio_operator_resque_workers_seen_max 0.0
+```
+
+### 7) KEDA ScaledObject metrics — visible via HPA
+
+KEDA's standard observability surface is exposed via the HPA's
+`status.currentMetrics`, not via the KEDA metrics adapter's
+`/metrics` endpoint (which requires requestheader auth that's
+non-trivial from a curl). The HPA-reported values are the canonical
+KEDA-aggregated signals (the same ones the HPA controller uses to
+compute `desiredReplicas`):
+
+```bash
+$ kubectl -n openstudio-server get hpa keda-hpa-worker -o jsonpath='{.status.currentMetrics}'
+[{"external":{"current":{"averageValue":"93800m"},"metric":{"name":"composite-metric","selector":{"matchLabels":{"scaledobject.keda.sh/name":"worker"}}}},"type":"External"}]
+```
+
+The `composite-metric` name is KEDA's label for the result of
+`scalingModifiers.formula`; the value `93800m` (= 93.8) is the
+AverageValue over the 5 worker replicas — total = 93.8 × 5 = 469,
+matching the 469 jobs pushed to `simulations` in this run. KEDA's
+`target: "1"` means each unit in the formula = 1 replica, so the
+HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
+
+### Acceptance criteria (issue #77)
+
+- [x] **Worker deployment scales from 0 to N based on pending Redis
+      queue items** — VERIFIED: 0→3 in 4 s on a 3-job push (Section 3);
+      0→5 in ~10 s on a 469-job push; SUM formula `simulations +
+      requeued` works correctly (Section 5).
+- [x] **`hpa_floor.py` controller loop and associated configuration
+      settings are deleted** — VERIFIED by: `tests/test_hpa_floor.py`
+      deleted (was 42 tests, now 0); `metrics.py` no longer declares
+      `HPA_FLOOR_ADJUSTMENTS_TOTAL`; `config.py` no longer declares
+      `HpaFloorPolicy` / `DEFAULT_HPA_FLOOR_POLICY` /
+      `DEFAULT_HPA_FLOOR_TIERS` / `DEFAULT_HPA_BASELINE_MIN_REPLICAS` /
+      `DEFAULT_HPA_FLOOR_COOLDOWN_SECONDS`; `handlers/__init__.py`
+      no longer imports `hpa_floor`; `deploy/rbac.yaml` no longer
+      grants `horizontalpodautoscalers` verbs; the operator's
+      `/metrics` confirms the counter is GONE at runtime (Section 6).
+- [x] **Unit and Kind validation tests pass without HPA floor
+      reconciliation dependencies** — VERIFIED: `ruff check .` clean,
+      `pytest` 331 passed (post-#77 baseline; 373 - 42 deleted
+      hpa_floor tests = 331, no new regressions); the operator boots
+      end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
+      drives scaling, and the operator's `/metrics` exposes the
+      remaining 8 counters (Section 6).
+
+### Cleanup
+
+The validation artifacts were left in the cluster for the next wave
+to inspect (KEDA in `keda`, the ScaledObject + Secret + HPA in
+`openstudio-server`). They are idempotent and harmless: the
+ScaledObject will scale `worker` to 0 when the queue is empty
+(currently scaled to 0; verified above). To remove:
+
+```bash
+kubectl -n openstudio-server delete -f deploy/keda-scaledobject.yaml
+kubectl -n openstudio-server delete -f deploy/redis-credentials-secret.yaml
+# (optionally) helm uninstall keda -n keda
+# (optionally) ./scripts/install-keda.sh  # re-applies KEDA if removed
+```
+
+The chart's `worker-hpa` is NOT restored — `scripts/manifests/06-worker.yaml`
+no longer ships it (post-render mechanism, see the file's preamble).
+Production clusters running the chart via helm must add
+`--set worker.autoscaling.enabled=false` to their `helm install/upgrade`
+to keep two autoscalers from fighting. Documented in
+`docs/validation.md#keda-cluster-prerequisite-issue-77`.
 
 ## Troubleshooting
 

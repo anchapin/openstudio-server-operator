@@ -28,10 +28,11 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch", "create", "patch"]
-  # HPA-floor adjuster: patch chart's worker-hpa minReplicas from Redis backlog (#18)
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "patch"]
+  # NOTE (#77): the autoscaling/horizontalpodautoscalers rule is GONE.
+  # The custom HPA-floor adjuster (#18) was removed; autoscaling is now
+  # owned by KEDA (deploy/keda-scaledobject.yaml) which runs under its own
+  # ServiceAccount and manages the ScaledObject + HPA from outside the
+  # operator process. The operator no longer touches HorizontalPodAutoscalers.
   # NOTE (#78): no batch/jobs rule anymore — the storage retention pipeline
   # (archival Job spawn/watch/cleanup) moved out of the operator into the
   # storage-prune CronJob, whose ServiceAccount holds its own least-privilege

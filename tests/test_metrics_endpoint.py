@@ -21,7 +21,6 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_web_background_restarts_total",
     "openstudio_operator_analyses_archived_total",
     "openstudio_operator_analyses_deleted_total",
-    "openstudio_operator_hpa_floor_adjustments_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87

@@ -2,7 +2,7 @@
 
 A Kubernetes operator that automates day-2 operations for [OpenStudio Server](https://github.com/NREL/OpenStudio-server) deployments (Ruby/Rails `web` + `web_background` + MongoDB + `worker` pods + NFS-shared volumes). It runs **alongside** the existing [`openstudio-server-helm`](https://github.com/NREL/openstudio-server-helm) chart — it manages that stack; it does not replace it.
 
-**Status: implementation complete (Phases 1–4, issues #2–#21); live kind-cluster validation done for modules 2/3/5/HPA-floor/singleton and the full-module `dryRun: true` walkthrough (#66/#67/#84); D1/D2 contract drift follow-up tracked in #83.** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
+**Status: implementation complete (Phases 1–4, issues #2–#21); live kind-cluster validation done for modules 2/3/5/singleton and the full-module `dryRun: true` walkthrough (#66/#67/#84); Phase-4 autoscaling is now driven by a standard KEDA ScaledObject (#77, replacing the custom HPA-floor adjuster #18); D1/D2 contract drift follow-up tracked in #83.** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
 
 ## What it will automate
 
@@ -13,11 +13,38 @@ A Kubernetes operator that automates day-2 operations for [OpenStudio Server](ht
 | Worker recycler | 2 | Rolling-restart the worker Deployment after analyses / on interval |
 | web_background watchdog | 2 | Detect Resque queue stalls; restart the `web_background` Deployment |
 | Storage archiver & NFS pruner | 3 | Ephemeral Jobs on the NFS PV archive results to S3/GCS, then prune |
-| HPA-floor adjuster + `/metrics` | 4 | Raise the chart `worker-hpa` `minReplicas` floor from Redis backlog; expose operator Prometheus metrics |
+| KEDA ScaledObject + `/metrics` | 4 | Standard KEDA ScaledObject scales the `worker` Deployment from 0..N on the Resque `simulations` + `requeued` queue depths; operator exposes Prometheus metrics on `:9090` |
 
-### Autoscaling approach (D10)
+### Autoscaling approach (KEDA, post-#77)
 
-The operator deliberately does **not** deploy KEDA (or any second autoscaler): the helm chart ships an unconditional CPU-based HPA (`worker-hpa`), and two autoscalers fighting over one Deployment oscillate. Instead, the Phase-4 HPA-floor adjuster reads the Resque backlog (`simulations` + `requeued` depths, summed, read-only via Redis), maps it through a tiered policy table in `config.py`, and patches **only** `worker-hpa` `spec.minReplicas` — raising the floor when the backlog is deep, decaying to the baseline floor when it clears — behind a cooldown that prevents flapping and under `spec.dryRun` gating. KEDA remains the documented **future migration path**: a `ScaledObject` driving the `worker` Deployment from the same Redis list-length trigger would replace this adjuster entirely and is the preferred design if the chart ever makes its HPA conditional.
+Worker autoscaling is a **standard KEDA ScaledObject**
+(`deploy/keda-scaledobject.yaml`) — NOT an in-operator reconciliation loop.
+The custom HPA-floor adjuster (#18) was removed in #77 because (a) it
+patched only the chart's CPU HPA `minReplicas`, which meant the chart
+HPA still controlled scaling above the floor and the operator was
+fighting itself, and (b) KEDA + a Redis-list trigger on the same two
+queues is the standard answer for "Resque-backed worker pool, scale by
+queue depth". The acceptance criterion — *Worker deployment scales from
+0 to N based on pending Redis queue items* — is verified end-to-end on
+the kind cluster in [docs/kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration](./docs/kind-validation.md).
+
+**Cluster prerequisites (cluster-admin, outside the operator process):**
+
+1. KEDA installed (helm `kedacore/keda` ≥ 2.20, or
+   `scripts/install-keda.sh` which uses KEDA's raw manifests as fallback)
+   in namespace `keda`.
+2. The helm chart's `worker-hpa` HPA **disabled** (values override or
+   `kubectl delete hpa worker-hpa --ignore-not-found`); two
+   autoscalers on the same Deployment oscillate. The kind recipe's
+   `scripts/manifests/06-worker.yaml` no longer includes the chart HPA,
+   so a fresh `scripts/deploy-openstudio-stack.sh` does not apply it.
+3. `kubectl apply -f deploy/redis-credentials-secret.yaml` (Redis
+   password for KEDA's TriggerAuthentication — operator never sees it).
+4. `kubectl apply -f deploy/keda-scaledobject.yaml`.
+
+The operator's Role has no `horizontalpodautoscalers` verbs; autoscaling
+is owned by KEDA's own ServiceAccount. Same RBAC-shrink pattern as #78
+(storage moved to a prune CronJob SA).
 
 ## Repository layout
 
@@ -39,9 +66,16 @@ The operator deliberately does **not** deploy KEDA (or any second autoscaler): t
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py
 │       ├── worker_recycler.py
-│       ├── storage_pruner.py
 │       ├── web_background_monitor.py
-│       └── hpa_floor.py
+│       # (storage_pruner moved to the prune CronJob in #78;
+│       #  hpa_floor removed in #77 — autoscaling is a KEDA ScaledObject.)
+├── deploy/
+│   ├── keda-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication (#77)
+│   ├── redis-credentials-secret.yaml  # Redis password for KEDA (#77)
+│   ├── crd.yaml                # OpenStudioClusterManager CRD
+│   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
+│   ├── operator-deployment.yaml
+│   └── storage-cronjob.yaml    # prune CronJob (#78)
 ├── tests/                      # unit tests for every handler + client + status store + fixtures
 │   ├── fixtures/               # contract-shapes.json + samples/ (synthetic) + live/ (captured)
 │   └── golden/                 # snapshot tests for generated rclone Job manifests
