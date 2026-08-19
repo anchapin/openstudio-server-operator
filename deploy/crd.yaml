@@ -31,7 +31,20 @@ spec:
               properties:
                 serverUrl:
                   type: string
-                  description: "Internal K8s DNS URL for OpenStudio web service."
+                  # Issue #160: the field was an unconstrained `type: string`, so a
+                  # user with `create` on the OSCM CR could point the operator at any
+                  # reachable endpoint (SSRF / credential-exfiltration surface). The
+                  # pattern restricts the URL to http(s) against an in-cluster
+                  # Service name: a bare label (`web`), a namespaced form
+                  # (`web.openstudio-server`), or the `.svc[.cluster.local]` FQDN,
+                  # with an optional port and path. Multi-label public hostnames
+                  # (`evil.example.com`) and non-HTTP schemes (`ftp://`) are rejected
+                  # by the API server at apply time.
+                  pattern: '^https?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/.*)?$'
+                  x-kubernetes-validations:
+                    - rule: "self.startsWith('http://') || self.startsWith('https://')"
+                      message: "spec.serverUrl must be an in-cluster http:// or https:// URL (issue #160)."
+                  description: "Internal K8s DNS URL for OpenStudio web service. Must be an in-cluster http(s) Service URL (issue #160)."
                 redisUrl:
                   type: string
                   default: ""
@@ -51,10 +64,28 @@ spec:
                   description: "Gates every mutating action (D11). Default false; when true, mutations are suppressed and emitted as dry-run-marked Events."
                 targetWorkerDeployment:
                   type: string
-                  description: "Name of worker Deployment to manage/recycle."
+                  # Issue #160: unconstrained, this field let a CR-write user
+                  # redirect `patch_namespaced_deployment` (worker_recycler) at any
+                  # Deployment in the namespace and trigger a rolling restart of it.
+                  # DNS-1035 pattern rejects slashes/uppercase/namespaced paths; the
+                  # CEL rule pins the value to the two Deployments the operator is
+                  # actually allowed to manage.
+                  maxLength: 63
+                  pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+                  x-kubernetes-validations:
+                    - rule: "self in ['worker', 'web-background']"
+                      message: "spec.targetWorkerDeployment must be 'worker' or 'web-background' (issue #160)."
+                  description: "Name of worker Deployment to manage/recycle. Restricted to 'worker' or 'web-background' (issue #160)."
                 targetWebBackgroundDeployment:
                   type: string
-                  description: "Name of web_background Deployment."
+                  # Issue #160: same escalation path via web_background_monitor's
+                  # restart patch — constrained identically.
+                  maxLength: 63
+                  pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+                  x-kubernetes-validations:
+                    - rule: "self in ['worker', 'web-background']"
+                      message: "spec.targetWebBackgroundDeployment must be 'worker' or 'web-background' (issue #160)."
+                  description: "Name of web_background Deployment. Restricted to 'worker' or 'web-background' (issue #160)."
                 analysisPolicy:
                   type: object
                   # Issue #170: grace period must be strictly less than the SLA
