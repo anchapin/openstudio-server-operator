@@ -323,8 +323,9 @@ only from:
 
 - a namespace labeled `kubernetes.io/metadata.name: prometheus` (the
   default scraper namespace for stock `kube-prometheus-stack`), AND
-- any same-namespace peer in `openstudio-server` (sidecar or
-  colocated scraper, identified by an empty `podSelector`).
+- a same-namespace peer in `openstudio-server` that opted in via the
+  `app.kubernetes.io/component: metrics-scraper` label — the #295
+  convention, next rule.
 
 A cluster whose Prometheus runs in a differently-named namespace
 (`monitoring`, `kube-prometheus-stack`, `observability`, etc.) MUST
@@ -336,11 +337,96 @@ become unreadable** — there is no other failure signal.
 
 The enforcement test
 [`tests/test_deploy_manifests.py::test_network_policy_metrics_ingress_has_prometheus_and_peer_allow`](../../tests/test_deploy_manifests.py)
-asserts both peers are present and fails CI on either removal. The
+asserts both peers are present, that the same-namespace peer is
+label-scoped (a return to `podSelector: {}` fails CI), and fails on
+either removal. The
 unrelated no-custom-autoscaling rule above (#77) keeps the operator
 process from owning any autoscaling surface; #166 governs which
 **external** scrapers can reach the `/metrics` endpoint it does
 emit.
+
+### `metrics-scraper` label convention (#295)
+
+The AGENTS.md Working-rules bullet of the same name defines the label
+behind the #166 policy above: `app.kubernetes.io/component:
+metrics-scraper` is the project's opt-in marker for pods that
+legitimately need to scrape the operator's `/metrics` endpoint from
+inside `openstudio-server` (a Prometheus sidecar, an in-cluster debug
+scraper). No helm-chart pod in this stack carries that value — `web` /
+`web-background` / `worker` / `db` (Mongo) / `redis` / `queue` / NFS
+all set their own `app.kubernetes.io/component` — so the label-scoped
+peer allow admits exactly the pods that opted in.
+
+When adding a new in-cluster scraper, set
+`app.kubernetes.io/component: metrics-scraper` on its pod template;
+that single label is the contract the NetworkPolicy trusts. Two
+failure modes:
+
+- **Forgetting the label is silent.** The NetworkPolicy drops the
+  TCP/9090 connection and the scraper reads nothing — no Event, no
+  operator log line.
+- **"Fixing" that by widening the selector is loud.** Reintroducing
+  `podSelector: {}` (or any broader selector) re-opens the plaintext
+  endpoint to every helm-chart pod and fails
+  [`tests/test_deploy_manifests.py::test_network_policy_metrics_ingress_has_prometheus_and_peer_allow`](../../tests/test_deploy_manifests.py)
+  in CI.
+
+### Operator pod-delete VAP (#293)
+
+RBAC `PolicyRule` has no `labelSelector` slot: `verbs: [delete]` on
+`pods` cannot be constrained to a subset of pods by label. The AGENTS.md
+ValidatingAdmissionPolicies bullet (issues #293, #294) fills the gap at
+the admission layer. `deploy/pod-delete-admission-policy.yaml` is a
+cluster-scoped `ValidatingAdmissionPolicy` +
+`ValidatingAdmissionPolicyBinding` that rejects any `DELETE pod`
+request from the operator ServiceAccount
+(`system:serviceaccount:openstudio-server:openstudio-operator-sa`)
+unless the target pod carries `app=worker` — exactly the eviction path
+`worker_recycler.py` uses. The CEL short-circuit leaves every other
+actor (humans via `kubectl`, the prune SA) unrestricted; only the
+operator SA is narrowed. `failurePolicy: Fail` keeps a broken CEL
+expression from failing open.
+
+Failure modes:
+
+- A new operator code path that deletes a NON-worker pod passes RBAC
+  and is then rejected at admission — that is the fence working. Point
+  the delete at `app=worker` pods, or extend the policy deliberately.
+- Editing the manifest (dropping the worker-label check, flipping
+  `failurePolicy: Fail`) fails the `test_pod_delete_admission_*`
+  family in `tests/test_deploy_manifests.py` — notably
+  [`test_pod_delete_admission_policy_validations_check_operator_sa_and_worker_label`](../../tests/test_deploy_manifests.py)
+  and `test_pod_delete_admission_policy_failure_policy_is_fail`.
+- **Requires K8s 1.30+** (`admissionregistration.k8s.io/v1` GA); on a
+  pre-1.30 cluster the manifest fails to apply — skip both VAPs there.
+
+### Prune CronJob batch/jobs VAP (#294)
+
+The second half of the AGENTS.md ValidatingAdmissionPolicies bullet:
+`deploy/storage-cronjob.yaml` embeds a second cluster-scoped
+`ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding`
+(`openstudio-prune-job-scope`) that narrows the prune SA's
+`batch/jobs create|update|delete` verbs to Jobs carrying BOTH
+`app.kubernetes.io/managed-by=openstudio-operator` AND
+`app.kubernetes.io/component=archival` — the labels `archival.py`
+stamps on every archival Job (the CEL checks `object` for
+CREATE/UPDATE and `oldObject` for DELETE). RBAC still grants the
+verbs; the VAP does the label narrowing RBAC cannot express. Same
+K8s 1.30+ requirement and `failurePolicy: Fail` stance as #293.
+
+Failure modes:
+
+- **Label drift between `archival.py` and the policy is the nasty
+  one.** The policy stays syntactically valid but rejects the
+  operator's own archival Jobs at CREATE — the retention pipeline
+  stalls. The regression fence
+  [`tests/test_deploy_manifests.py::test_prune_job_scope_vap_label_keys_match_archival_manifest`](../../tests/test_deploy_manifests.py)
+  builds a real Job via `build_archival_job` and asserts the VAP's
+  label pairs match what `archival.py` emits.
+- Relaxing the CEL validations (dropping a label requirement or the
+  `oldObject` DELETE-side clause) fails
+  `test_prune_job_scope_vap_validations_require_archival_labels` and
+  the rest of the `test_prune_job_scope_vap_*` family.
 
 ### Other rules worth knowing
 
