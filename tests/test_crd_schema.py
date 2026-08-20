@@ -386,6 +386,136 @@ def test_server_url_has_cel_scheme_rule():
 
 
 # ---------------------------------------------------------------------------
+# Issue #390: ``spec.redisUrl`` must constrain the URL to an in-cluster Redis
+# Service, mirroring the ``serverUrl`` hardening from #160. An unconstrained
+# ``redisUrl`` let a CR-write user redirect the operator's
+# ``ReadOnlyRedisClient`` (``src/openstudio_operator/redis_client.py``) at any
+# reachable host and coerce the Resque keyspace probe to talk to it
+# (SSRF / hostile-Redis exfiltration). The empty-default escape hatch (#116)
+# must be preserved — the pattern's ``|^$`` branch is what does it.
+#
+# jsonschema/CEL are not executed here — the API server owns that. These tests
+# apply the declared ``pattern`` with ``re`` (same ECMA-262-compatible subset
+# the API server uses) and assert the CEL rules are structurally present.
+# ---------------------------------------------------------------------------
+
+
+_REDIS_URL_BAD = (
+    # Issue #390 headline case: a multi-label public hostname that the
+    # pre-#390 unconstrained field could reach.
+    "redis://:password@attacker.example.com:6379",
+    # Public hostname without auth — same exfiltration surface, just less
+    # obvious to a human reviewer.
+    "redis://attacker.example.com",
+    # Wrong scheme: ftp:// is not a Redis listener.
+    "ftp://queue:6379",
+    # Wrong scheme: http:// would let a CR-write user route the probe to a
+    # REST responder that returns crafted JSON to influence queue-depth
+    # reasoning.
+    "http://queue:6379",
+    # Uppercase service name: K8s Service names are lowercase; the API
+    # server can never resolve an uppercase name and accepting it would mask
+    # the misconfiguration as a runtime 404 instead of an apply-time
+    # rejection.
+    "redis://QUEUE:6379",
+    # Bare scheme, no host: no Service to talk to, no admission.
+    "redis://",
+)
+_REDIS_URL_GOOD = (
+    # Helm-recipe Service URL — the value ``scripts/manifests/*.yaml``
+    # substitutes into the web / web-background / worker ``REDIS_URL``
+    # env vars. This is the headline acceptance case from the issue.
+    "redis://:openstudio-rotated@queue:6379",
+    # Bare Service label, no auth, with port — used by ``test_prune_entrypoint``
+    # and other test fixtures.
+    "redis://queue:6379",
+    # Two-label namespaced Service form (no .svc suffix): legal in-cluster
+    # DNS even though the operator never resolves it that way.
+    "redis://queue.openstudio-server:6379",
+    # Three-label namespaced Service form ending in .svc.
+    "redis://queue.openstudio-server.svc:6379",
+    # Four-label full FQDN ending in .svc.cluster.local — the form
+    # ``singleton.py:773`` documents and ``test_smoke.py:115`` exercises.
+    "redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379",
+    # Full FQDN with a Redis db-number selector — the value the #160-style
+    # ``test_config_from_spec_camelcase`` test applies.
+    "redis://:secret@queue.openstudio-server.svc.cluster.local:6379/1",
+    # Standard ``user:password@`` auth (the helm-recipe form is empty-user
+    # ``:password@``, but a future user-managed Secret could include a
+    # non-empty user).
+    "redis://user:password@queue:6379",
+)
+_REDIS_URL_EMPTY = ""  # documented empty-default escape hatch (#116)
+
+
+def test_redis_url_rejects_off_cluster_host():
+    """Issue #390 acceptance (a): ``redis://:password@attacker.example.com:6379``
+    must be rejected. An unconstrained ``redisUrl`` is an SSRF /
+    hostile-Redis exfiltration surface — the operator's
+    ``ReadOnlyRedisClient`` would happily poll an attacker-controlled Redis
+    and reveal operator timing / scrape the Workload identity / be
+    blocked-by-design to mask a real outage."""
+    schema = _spec_field("redisUrl")
+    assert schema.get("pattern"), "spec.redisUrl is missing a `pattern` constraint (issue #390)"
+    for bad in _REDIS_URL_BAD:
+        assert not _matches_pattern(bad, schema), (
+            f"spec.redisUrl: {bad!r} must be rejected by the in-cluster DNS pattern"
+        )
+
+
+def test_redis_url_accepts_in_cluster_forms():
+    """Issue #390 acceptance (b): ``redis://:openstudio-rotated@queue:6379``
+    and every other in-cluster DNS shape the helm-recipe + tests use must
+    pass. The pattern must not be so strict that it rejects the
+    legitimately-managed URLs."""
+    schema = _spec_field("redisUrl")
+    for good in _REDIS_URL_GOOD:
+        assert _matches_pattern(good, schema), (
+            f"spec.redisUrl: in-cluster URL {good!r} must be accepted by the pattern"
+        )
+
+
+def test_redis_url_accepts_empty_default_per_116():
+    """Issue #390 acceptance (c): ``redisUrl: ""`` (the documented #116
+    empty-default escape hatch) must still pass. The pattern's ``|^$``
+    alternation branch is what preserves this — without it the API server
+    would reject every CR that omitted the field or used the documented
+    empty default."""
+    schema = _spec_field("redisUrl")
+    assert _matches_pattern(_REDIS_URL_EMPTY, schema), (
+        "spec.redisUrl: empty string is the #116 documented escape hatch "
+        "and must be accepted by the pattern"
+    )
+
+
+def test_redis_url_empty_default_is_preserved():
+    """The CRD must still declare ``default: ""`` on ``spec.redisUrl`` —
+    the empty default is the entire point of the #116 escape hatch
+    (re-introducing a non-empty default would re-introduce the public-facing
+    password that #116 deleted). Issue #390 inherits this invariant; a
+    future edit that "fills in" the default would be a regression."""
+    schema = _spec_field("redisUrl")
+    assert schema.get("default") == "", (
+        f"spec.redisUrl.default must remain the empty string (issue #116); "
+        f"got {schema.get('default')!r}"
+    )
+
+
+def test_redis_url_has_cel_redis_scheme_rule():
+    """Issue #390 acceptance: a CEL rule reinforces the ``redis://`` scheme
+    with a readable apply-time message (the raw pattern mismatch is opaque
+    to operators). The rule also short-circuits to true for the #116
+    empty-default escape hatch."""
+    rules = _cel_rules(_spec_field("redisUrl"))
+    assert any("redis://" in r["rule"] for r in rules), (
+        f"spec.redisUrl: no CEL rule asserting the redis:// scheme; got {rules!r}"
+    )
+    assert any("issue #390" in r["message"].lower() for r in rules), (
+        f"spec.redisUrl: CEL rule message must reference 'issue #390'; got {rules!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Issue #240: ``storagePolicy.secretRef`` must constrain archival Job envFrom
 # to the documented ``os-archive-<suffix>`` naming convention. An
 # unconstrained secretRef let a CR-write user mount any Secret in the
