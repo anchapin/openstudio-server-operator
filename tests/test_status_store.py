@@ -691,3 +691,105 @@ def test_status_map_cap_does_not_evict_on_clear(api, store, status_event_sink):
     assert status_event_sink == []
     assert len(store.get_soft_stops()) == status_store.STATUS_MAP_MAX_ENTRIES - 1
     assert "a00042" not in store.get_soft_stops()
+
+
+# --- deferredEvents (#402) -----------------------------------------------------
+
+
+def test_deferred_events_append_get_clear_round_trip(store, api):
+    """``status.deferredEvents`` round-trips through the typed RMW (#402).
+
+    The array is the crash-surviving mirror of the in-process
+    ``QueuedKopfEventSink`` queue: append writes the full replacement
+    list (JSON merge patch replaces arrays wholesale), get returns the
+    plain dicts, clear removes the key entirely (explicit ``None``).
+    """
+    entry = {
+        "namespace": NAMESPACE,
+        "name": NAME,
+        "reason": "StatusMapCapped",
+        "message": "status.softStops size capped at 10000 (issue #171)",
+    }
+    store.append_deferred_event(entry)
+    assert api.obj["status"]["deferredEvents"] == [entry]
+    assert store.get_deferred_events() == [entry]
+
+    second = dict(entry, reason="RedisUrlEmpty", message="spec.redisUrl is empty (issue #116).")
+    store.append_deferred_event(second)
+    assert store.get_deferred_events() == [entry, second]
+    assert api.obj["status"]["deferredEvents"] == [entry, second]
+
+    store.clear_deferred_events()
+    assert store.get_deferred_events() == []
+    assert "deferredEvents" not in api.obj["status"]
+
+
+def test_append_deferred_event_is_409_safe_rmw(api, sleeps):
+    """The append re-reads and recomputes its patch on 409 (#402, D04).
+
+    Two synthetic conflicts force the RMW to restart twice; the final
+    patch must carry the replacement list derived from the FRESH read
+    (one entry — not three stacked retries), and the jittered backoff
+    must have slept between attempts.
+    """
+    api.remaining_conflicts = 2
+    store = StatusStore(NAMESPACE, NAME, api)
+
+    store.append_deferred_event(
+        {"namespace": NAMESPACE, "name": NAME, "reason": "R", "message": "m"}
+    )
+
+    assert api.obj["status"]["deferredEvents"] == [
+        {"namespace": NAMESPACE, "name": NAME, "reason": "R", "message": "m"}
+    ]
+    assert len(api.patches) == 3  # 2 conflicts + 1 success, each with a full patch
+    for body, content_type in api.patches:
+        assert content_type == MERGE_PATCH_CONTENT_TYPE
+        assert body == {
+            "status": {
+                "deferredEvents": [
+                    {"namespace": NAMESPACE, "name": NAME, "reason": "R", "message": "m"}
+                ]
+            }
+        }
+    assert len(sleeps) == 2
+
+
+def test_append_deferred_event_respects_max_entries_backstop(store, api):
+    """The ``max_entries`` backstop skips the append at the cap (#402).
+
+    The persisted array is the twin of the sink's in-memory queue and
+    must never outgrow that queue's own bound: at the cap the append is
+    a no-op (no patch written). The sink owns drop accounting — this
+    path writes nothing, counts nothing, emits nothing.
+    """
+    filler = {"namespace": NAMESPACE, "name": NAME, "reason": "R", "message": "m"}
+    api.obj["status"]["deferredEvents"] = [dict(filler) for _ in range(3)]
+
+    store.append_deferred_event(dict(filler), max_entries=3)
+
+    assert api.patch_calls == 0
+    assert len(store.get_deferred_events()) == 3
+
+
+def test_clear_deferred_events_absent_writes_nothing(store, api):
+    """Clearing an absent array is a no-op — no patch, no error (#402)."""
+    store.clear_deferred_events()
+    assert api.patch_calls == 0
+
+
+def test_get_deferred_events_rejects_corrupt_shapes(store, api):
+    """Corrupt stored values raise ``StatusStoreError`` (#402).
+
+    A non-array field or a non-object item is corruption (only the
+    operator writes this field, through the typed accessors) — surface
+    it loudly rather than coercing; the sink catches, logs, and retries
+    the drain on the next tick.
+    """
+    api.obj["status"]["deferredEvents"] = "nope"
+    with pytest.raises(StatusStoreError, match="expected array"):
+        store.get_deferred_events()
+
+    api.obj["status"]["deferredEvents"] = ["nope"]
+    with pytest.raises(StatusStoreError, match=r"expected object"):
+        store.get_deferred_events()

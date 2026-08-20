@@ -55,6 +55,7 @@ STARTED_SINCE = "startedSince"
 ARCHIVED_ANALYSES = "archivedAnalyses"
 LAST_RECYCLE_AT = "lastRecycleAt"
 LAST_WEB_BACKGROUND_RESTART_AT = "lastWebBackgroundRestart"
+DEFERRED_EVENTS = "deferredEvents"
 
 MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
 
@@ -610,6 +611,76 @@ class StatusStore:
         Idempotent: clearing an absent key writes nothing.
         """
         self._set_map_entry(ARCHIVED_ANALYSES, analysis_id, None)
+
+    # --- deferredEvents (#402) -------------------------------------------------
+
+    def get_deferred_events(self) -> list[dict[str, str]]:
+        """Read ``status.deferredEvents`` — the persisted deferred-Warning queue.
+
+        Issue #402: every accepted ``QueuedKopfEventSink`` deferral is
+        mirrored here so an operator crash does not silently drop queued
+        Warning Events; the sink's ``flush_for`` drains this list first
+        and then clears it. Values are stringified at the boundary — the
+        wire format is JSON, and the sink's tuples are all-strings by
+        construction, so the coercion is a defensive no-op for well-formed
+        entries.
+        """
+        raw = self._read_status().get(DEFERRED_EVENTS) or []
+        if not isinstance(raw, list):
+            raise StatusStoreError(
+                f"status.{DEFERRED_EVENTS}: expected array, got {type(raw).__name__}"
+            )
+        entries: list[dict[str, str]] = []
+        for i, entry in enumerate(raw):
+            if not isinstance(entry, Mapping):
+                raise StatusStoreError(
+                    f"status.{DEFERRED_EVENTS}[{i}]: expected object, "
+                    f"got {type(entry).__name__}"
+                )
+            entries.append({str(k): str(v) for k, v in entry.items()})
+        return entries
+
+    def append_deferred_event(
+        self, entry: Mapping[str, str], *, max_entries: int | None = None
+    ) -> None:
+        """Append one deferred Warning Event to ``status.deferredEvents`` (#402).
+
+        Conflict-safe RMW like every other ``.status`` write (D04): the
+        current array is re-read inside the cycle and the patch carries
+        the full replacement list (JSON merge patch replaces arrays
+        wholesale). ``max_entries`` is the persisted twin of the sink's
+        ``MAX_DEFERRED_WARNING_EVENTS`` cap — a defensive backstop so a
+        clear-failure streak cannot grow the array past the in-memory
+        queue's own bound; the append is skipped (no write) when the
+        list is already at the cap. The caller (the sink) owns drop
+        accounting; this method never counts or emits.
+        """
+        encoded = {str(k): str(v) for k, v in entry.items()}
+
+        def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            current = status.get(DEFERRED_EVENTS)
+            if not isinstance(current, list):
+                current = []
+            if max_entries is not None and len(current) >= max_entries:
+                return None
+            return {"status": {DEFERRED_EVENTS: [*current, encoded]}}
+
+        self._mutate(build_patch)
+
+    def clear_deferred_events(self) -> None:
+        """Delete ``status.deferredEvents`` after a successful drain (#402).
+
+        Idempotent: clearing an absent array writes nothing (the
+        merge-patch removal is an explicit ``None``, same shape the map
+        clears use).
+        """
+
+        def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            if not status.get(DEFERRED_EVENTS):
+                return None
+            return {"status": {DEFERRED_EVENTS: None}}
+
+        self._mutate(build_patch)
 
     # --- scalars ---------------------------------------------------------------
 

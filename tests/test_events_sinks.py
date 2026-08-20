@@ -715,3 +715,358 @@ def test_queue_cap_drops_subsequent_deferrals_until_drained() -> None:
         _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
         == baseline + 5 + 2
     )
+
+
+# --- 5. Issue #402 — deferred-queue persistence across restarts ----------------
+
+
+class _FakeDeferredEventStore:
+    """In-memory :class:`DeferredEventStore` (the Protocol #402 persistence uses).
+
+    Mirrors the ``StatusStore`` surface the sink calls — one shared list
+    per CR stands in for ``status.deferredEvents``. Failure injection:
+    ``fail_appends`` / ``fail_clears`` / ``fail_gets`` raise from the
+    corresponding method so the degradation paths (best-effort
+    persistence, at-least-once re-drain) are testable without a fake
+    apiserver.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, str]] = []
+        self.append_calls: list[dict[str, str]] = []
+        self.clear_calls = 0
+        self.fail_appends = False
+        self.fail_clears = False
+        self.fail_gets = False
+
+    def get_deferred_events(self) -> list[dict[str, str]]:
+        if self.fail_gets:
+            raise RuntimeError("synthetic get failure (issue #402 test)")
+        return [dict(e) for e in self.entries]
+
+    def append_deferred_event(
+        self, entry: dict[str, str], *, max_entries: int | None = None
+    ) -> None:
+        self.append_calls.append(dict(entry))
+        if self.fail_appends:
+            raise RuntimeError("synthetic append failure (issue #402 test)")
+        if max_entries is not None and len(self.entries) >= max_entries:
+            return
+        self.entries.append(dict(entry))
+
+    def clear_deferred_events(self) -> None:
+        self.clear_calls += 1
+        if self.fail_clears:
+            raise RuntimeError("synthetic clear failure (issue #402 test)")
+        self.entries.clear()
+
+
+_ENTRY = {
+    "namespace": "ns",
+    "name": "osc",
+    "reason": "StatusMapCapped",
+    "message": "status.softStops size capped at 10000 (issue #171)",
+}
+
+
+def test_defer_persists_accepted_entry_to_status() -> None:
+    """Every ACCEPTED deferral is mirrored into the persistence store (#402).
+
+    The persisted copy is what survives a crash: without the mirror, a
+    process death between defer and the next tick silently dropped the
+    Warning with no ``queue_full`` drop to observe. The append carries
+    ``max_entries=MAX_DEFERRED_WARNING_EVENTS`` — the persisted twin of
+    the in-memory cap — so the ``.status`` array can never outgrow the
+    queue's own bound.
+    """
+    store = _FakeDeferredEventStore()
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="StatusMapCapped",
+        message="status.softStops size capped at 10000 (issue #171)",
+    )
+    assert store.entries == [_ENTRY]
+    assert len(store.append_calls) == 1
+    # The in-memory queue is untouched by the persistence layer — the
+    # Gauge semantics (in-memory depth) are unchanged by #402.
+    assert sink.queued == [("ns", "osc", "StatusMapCapped", _ENTRY["message"])]
+
+
+def test_flush_drains_persisted_first_and_dedupes_in_memory_twin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dual-write common path emits each Warning EXACTLY once (#402).
+
+    A defer that succeeded in BOTH stores (memory + ``.status``) must not
+    double-emit on flush: the persisted phase runs first and its emitted
+    tuples suppress their in-memory twins. The persisted list is cleared
+    after the successful drain.
+    """
+    store = _FakeDeferredEventStore()
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="StatusMapCapped",
+        message=_ENTRY["message"],
+    )
+    assert store.entries and sink.queued  # dual-write precondition
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+
+    flushed = sink.flush_for(namespace="ns", name="osc")
+    assert flushed == 1, (
+        f"Dual-written entry emitted {flushed} times; expected exactly 1 "
+        f"(persisted-first drain + in-memory dedup). See issue #402."
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["kwargs"]["reason"] == "StatusMapCapped"
+    assert emitted[0]["kwargs"]["type"] == "Warning"
+    assert emitted[0]["args"][0] == {"metadata": {"namespace": "ns", "name": "osc"}}
+    assert store.entries == [], "persisted list must be cleared after the drain"
+    assert store.clear_calls == 1
+    assert sink.queued == []
+
+
+def test_restart_re_emits_persisted_entries_on_fresh_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #402 acceptance criterion: entries queued before a crash re-emit.
+
+    "Restart" is simulated the unit-test-friendly way: sink A defers
+    (dual-write to the shared persisted store), then the process dies —
+    modeled by discarding sink A entirely (its in-memory queue is gone;
+    only ``status.deferredEvents`` survives). Sink B is a FRESH sink
+    (empty in-memory queue) wired to the same persisted store, exactly
+    what a relaunched operator process constructs. ``flush_for`` on sink
+    B — fired by the first OSCM watch tick after restart — must re-emit
+    the persisted Warning and clear it.
+    """
+    store = _FakeDeferredEventStore()
+    sink_a = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink_a.defer_to_next_tick(
+        namespace="ns", name="osc", reason="RedisUrlEmpty",
+        message="spec.redisUrl is empty (issue #116).",
+    )
+    # ... operator process crashes here; in-memory queue is lost ...
+    sink_b = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    assert sink_b.queued == [], "fresh process starts with an empty in-memory queue"
+    assert store.entries, "the persisted mirror survived the crash"
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+
+    flushed = sink_b.flush_for(namespace="ns", name="osc")
+    assert flushed == 1, (
+        f"Restart recovery flushed {flushed} entries; expected 1. The "
+        f"at-least-once contract (#234/#310/#402) is broken — a crashed "
+        f"operator silently dropped the queued Warning."
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["kwargs"]["reason"] == "RedisUrlEmpty"
+    assert emitted[0]["kwargs"]["message"] == "spec.redisUrl is empty (issue #116)."
+    assert emitted[0]["kwargs"]["type"] == "Warning"
+    assert emitted[0]["args"][0] == {"metadata": {"namespace": "ns", "name": "osc"}}
+    assert store.entries == [], "recovery drain must clear the persisted list"
+    assert sink_b.queued == []
+
+    # Second flush is a no-op — the recovery is not a re-emit loop.
+    assert sink_b.flush_for(namespace="ns", name="osc") == 0
+    assert len(emitted) == 1
+
+
+def test_persist_append_failure_degrades_to_in_memory_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing persistence write must not break the deferral itself (#402).
+
+    Persistence is best-effort by contract: on an append failure (apiserver
+    unreachable, 409 budget exhausted) the entry still lives in the
+    in-memory queue and flushes normally — the pre-#402 behavior. The
+    only lost guarantee is crash-survivability for that one entry.
+    """
+    store = _FakeDeferredEventStore()
+    store.fail_appends = True
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m",
+    )
+    assert sink.queued == [("ns", "osc", "R", "m")]
+    assert store.entries == []
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+    assert sink.flush_for(namespace="ns", name="osc") == 1
+    assert len(emitted) == 1
+    assert sink.queued == []
+
+
+def test_persisted_clear_failure_re_emits_next_tick_at_least_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed persisted-clear leaves the entries for the NEXT tick (#402).
+
+    If the emit succeeded but the ``.status`` clear failed (409 budget,
+    transient apiserver error), the persisted entries stay put and
+    re-emit on the next flush — at-least-once semantics: a possible
+    duplicate Kubernetes Event, never a silent loss. The in-memory twins
+    were deduped and drained, so the next tick's emission comes from the
+    persisted list alone.
+    """
+    store = _FakeDeferredEventStore()
+    store.fail_clears = True
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m",
+    )
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+
+    assert sink.flush_for(namespace="ns", name="osc") == 1
+    assert sink.queued == []
+    assert store.entries, "clear failed — the persisted entries must survive"
+    # Next tick: the persisted entry re-emits (at-least-once duplicate).
+    assert sink.flush_for(namespace="ns", name="osc") == 1
+    assert len(emitted) == 2
+
+
+def test_persisted_read_failure_drains_in_memory_anyway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing persistence READ skips phase 1 and still drains phase 2 (#402).
+
+    The drain must never die because the persisted surface is
+    unreadable — the in-memory queue drains as if persistence were not
+    installed (pre-#402 behavior), and the persisted entries retry on
+    the next tick.
+    """
+    store = _FakeDeferredEventStore()
+    store.fail_gets = True
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m",
+    )
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+    assert sink.flush_for(namespace="ns", name="osc") == 1
+    assert len(emitted) == 1
+    assert sink.queued == []
+
+
+def test_store_factory_failure_is_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A factory that RAISES maps to in-memory-only, never a crash (#402).
+
+    The factory runs inside hardening call sites (boot checks, the
+    status_store RMW path); a raising factory must degrade to the
+    pre-#402 behavior, not break the Warning deferral itself.
+    """
+    def _broken_factory(ns: str, nm: str) -> object:
+        raise RuntimeError("synthetic factory failure (issue #402 test)")
+
+    sink = QueuedKopfEventSink(store_factory=_broken_factory)
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m",
+    )
+    assert sink.queued == [("ns", "osc", "R", "m")]
+
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sinks_module.kopf, "event",
+        lambda *a, **k: emitted.append({"args": a, "kwargs": k}),
+    )
+    assert sink.flush_for(namespace="ns", name="osc") == 1
+    assert len(emitted) == 1
+
+
+def test_backpressure_drop_never_reaches_the_persisted_surface() -> None:
+    """A ``queue_full`` drop is NOT mirrored into ``.status`` (#402 scope guard).
+
+    Issue #310's semantics are frozen: ``WARNINGS_DEFERRED_DROPPED_TOTAL``
+    is the account of record for backpressure losses. If the drop branch
+    also appended to the persisted list, the ``.status`` array would
+    disagree with the in-memory queue (and the counter) after every
+    drop — the persisted surface tracks ACCEPTED deferrals only.
+    """
+    store = _FakeDeferredEventStore()
+    sink = QueuedKopfEventSink(store_factory=lambda ns, nm: store)
+    cap = sinks_module.MAX_DEFERRED_WARNING_EVENTS
+    for i in range(cap):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"m{i}",
+        )
+    assert len(store.entries) == cap, "every ACCEPTED deferral is mirrored"
+    # The 1001st deferral is dropped — the persisted list must not grow.
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m-overflow",
+    )
+    assert len(sink.queued) == cap
+    assert len(store.entries) == cap, (
+        "A queue_full drop was mirrored into the persisted surface — "
+        "violates the #402 scope guard (drop semantics frozen by #310)."
+    )
+    assert len(store.append_calls) == cap
+
+
+def test_handlers_install_deferred_event_persistence_at_startup(
+    ensure_handlers_loaded: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The startup handler arms persistence on the shared sink (#402).
+
+    The factory is installed from ``@kopf.on.startup`` — NOT at module
+    import — so test/library imports of the handlers package never
+    build a ``CustomObjectsApi`` against the host's kubeconfig. The test
+    invokes the startup handler directly, asserts the shared sink now
+    carries the factory (and that the factory builds a ``StatusStore``
+    over the operator's single api-construction point), then DISARMS it
+    again — leaving the default sink in-memory-only for the rest of the
+    suite, exactly as a plain import leaves it.
+    """
+    import openstudio_operator.singleton as singleton_mod
+
+    built_over: list[object] = []
+
+    def _fake_operator_api() -> object:
+        sentinel = object()
+        built_over.append(sentinel)
+        return sentinel
+
+    monkeypatch.setattr(singleton_mod, "operator_custom_objects_api", _fake_operator_api)
+
+    # Precondition: a plain import leaves the default sink in-memory-only.
+    assert get_default_sink().store_factory is None
+
+    try:
+        import logging as _logging
+
+        handlers_pkg._install_deferred_event_persistence(_logging.getLogger("test"))
+        assert get_default_sink().store_factory is handlers_pkg._deferred_event_store, (
+            "The startup handler must install the StatusStore-backed "
+            "factory on the SHARED default sink (issue #402)."
+        )
+        store = handlers_pkg._deferred_event_store("ns", "osc")
+        assert isinstance(store, status_store.StatusStore)
+        assert built_over, (
+            "The factory must source its client from the single "
+            "CustomObjectsApi construction point (issue #158)."
+        )
+    finally:
+        get_default_sink().set_store_factory(None)

@@ -272,8 +272,47 @@ def _drain_queued_warning_events(
     Fires once per OSCM watch event; an empty queue is a no-op. The
     Warning Event reasons preserved verbatim: ``RedisUrlEmpty`` (#116),
     ``RedisKeyLayoutDrift`` (#163), ``StatusMapCapped`` (#171).
+
+    Issue #402 — the drain is two-phase: ``status.deferredEvents``
+    first (the crash-surviving mirror), then the in-memory queue. On a
+    fresh operator start the in-memory queue is empty but the watch's
+    initial listing fires this handler, so persisted entries re-emit on
+    the very first tick after a restart.
     """
     _sink.flush_for(namespace=namespace, name=name)
+
+
+# Issue #402 — deferred-Warning-queue persistence across operator restarts.
+# ``QueuedKopfEventSink``'s queue is process-local; a crash while it held
+# entries silently dropped every queued Warning (no ``queue_full`` drop —
+# the loss was invisible to /metrics). The fix mirrors every ACCEPTED
+# deferral into ``status.deferredEvents`` via the :class:`StatusStore` RMW
+# (D04 — the single durable-state surface) and makes ``flush_for`` drain
+# the persisted list before the in-memory queue. The store factory is
+# armed from a ``@kopf.on.startup`` handler — NOT at import time — so
+# importing this package in tests / library contexts never builds a
+# ``CustomObjectsApi`` against whatever kubeconfig the host carries;
+# persistence only exists once a real operator run begins.
+def _deferred_event_store(namespace: str, name: str) -> status_store.StatusStore:
+    """Build the per-CR ``.status`` persistence adapter for the shared sink (#402)."""
+    return status_store.StatusStore(
+        namespace, name, singleton.operator_custom_objects_api()
+    )
+
+
+@kopf.on.startup()
+def _install_deferred_event_persistence(logger: kopf.Logger, **_kwargs: object) -> None:
+    """Arm ``status.deferredEvents`` persistence on the shared sink (#402).
+
+    Runs once per operator start, before the watch streams (and therefore
+    before any ``_drain_queued_warning_events`` invocation) — the restart
+    recovery path is armed by the time the first OSCM watch tick fires.
+    """
+    _sink.set_store_factory(_deferred_event_store)
+    logger.info(
+        "deferred-event persistence armed (issue #402): accepted deferrals "
+        "mirror to status.deferredEvents and drains run persisted-first"
+    )
 
 
 # Operator startup wiring: ``kopf run --module openstudio_operator.handlers``
