@@ -13,7 +13,16 @@ dependencies = [
     # ``tests/test_singleton_registry_coverage.py`` CI gate fails loudly if
     # the internals change shape, but we still require a deliberate bump here.
     "kopf>=1.37,<1.45",
-    "kubernetes>=29.3.0",
+    # Upper bound guards against silent API drift on RBAC-sensitive calls
+    # (issue #292): ``list_namespaced_custom_object`` (singleton.py),
+    # ``patch_namespaced_custom_object_status`` (status_store.py),
+    # ``patch_namespaced_deployment`` (worker_recycler.py,
+    # web_background_monitor.py), and ``list_namespaced_pod`` /
+    # ``delete_namespaced_pod`` (analysis_sla.py) all broker RBAC actions
+    # through the kubernetes client — a major-version bump could silently
+    # remove or weaken the impersonation / SSRF guard rails without
+    # crashing. Require a deliberate bump, mirroring the kopf gate above.
+    "kubernetes>=29.3.0,<37",
     "redis>=5.0", # read-only queue-fabric client (#12)
     "requests>=2.32.0",
     "prometheus-client>=0.20.0", # Phase 4: /metrics endpoint
