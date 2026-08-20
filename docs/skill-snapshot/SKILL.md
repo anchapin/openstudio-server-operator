@@ -205,11 +205,25 @@ than relying on automatic triggers or `gh run rerun`.
 
 ### 4c. Issue Close Verification
 
-After each PR merge, the CI sub-agent verifies that all issues mentioned
-in the PR body are actually closed (issue #961). This catches the case where
-GitHub's auto-close only matches some issues due to incorrect or incomplete
-`Closes #N` syntax in the PR body. If any linked issue remains open, the
-sub-agent reports BLOCKER and stops instead of proceeding.
+After each PR merge, the CI sub-agent runs two steps in this order
+(issues #961, #366):
+
+1. **Auto-close** — `python3 scripts/auto_close_issues.py <PR_NUMBER>`
+   closes every `Closes #N` / `Fixes #N` / `Resolves #N` reference in the
+   PR body that GitHub left OPEN (GitHub only auto-closes the FIRST
+   reference on a comma-separated line).
+2. **Verify** — `bash scripts/verify_issues_closed.sh <PR_NUMBER>`
+   confirms every referenced issue is now CLOSED.
+
+Order matters: auto-close first so verification only fails on issues the
+automation genuinely could not close. If any linked issue is still open
+after both steps, the sub-agent reports BLOCKER and stops instead of
+proceeding.
+
+`scripts/auto_close_issues.py` lives in the project repo and is the
+primary path. The skill-home copy of `scripts/verify_issues_closed.sh` is
+kept as a self-contained fallback for repos that do not ship the Python
+helper.
 
 ### 4d. Wait
 
