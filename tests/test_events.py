@@ -16,9 +16,29 @@ import importlib
 from unittest.mock import patch
 
 import pytest
+from kubernetes.client import ApiException
 
 import openstudio_operator.events as events_module
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.metrics import (
+    EVENTS_EMIT_FAILURES_TOTAL,
+    EVENTS_EMITTED_TOTAL,
+)
+
+#: Issue #255 / #299 — the OSCM warning-event reason vocabulary that the
+#: failure counter (and the dry-run / emitted companion counters) share.
+#: Same seven values as ``tests/test_metrics_endpoint.py::test_events_*_per_reason``
+#: — pinning the cardinality here too so a drift between this module and
+#: the metric-family tests fails CI loudly.
+_REASON_VOCABULARY = (
+    "AnalysisSoftStopped",
+    "AnalysisEscalated",
+    "DatapointRequeued",
+    "DatapointRequeueExhausted",
+    "WorkerRecycled",
+    "WebBackgroundRestarted",
+    "ResqueKeyLayoutUnknown",
+)
 
 
 @pytest.fixture
@@ -103,3 +123,100 @@ def test_event_emitter_imports_clean():
     # message)`` syntax in handler call sites keeps working.
     assert callable(EventEmitter.__call__)
     assert callable(EventEmitter.emit)
+
+
+@pytest.mark.parametrize("reason", _REASON_VOCABULARY)
+def test_emit_kopf_event_failure_increments_failure_counter_and_reraises(reason, body):
+    """Issue #299 (tracks #255) — ``kopf.event`` failure path is observable.
+
+    The dedicated ``EVENTS_EMIT_FAILURES_TOTAL{reason}`` counter must
+    increment by exactly 1 when ``kopf.event`` raises an ``ApiException``,
+    AND the same ``ApiException`` must propagate unchanged to the caller
+    (so the handler wrapper's ``error_type`` label can still classify it
+    via ``handler_tick_failures_total`` — see the comment block in
+    ``src/openstudio_operator/events.py:139-155``).
+
+    Why this matters vs. project goals: AGENTS.md cites the canonical
+    16-counter invariant; without an integration test pinning this
+    contract, a future refactor that catches the exception but forgets
+    to ``.inc()`` the failure counter would ship silently (the bare
+    ``.inc()`` call at ``tests/test_metrics_endpoint.py:524-547`` only
+    exercises the metric-family machinery, not ``EventEmitter.emit``).
+
+    Pinning ``EVENTS_EMITTED_TOTAL is unchanged`` enforces the metric's
+    documented semantic ("successful kopf.event calls") — a failed post
+    never produced an Event, so the emitted counter must stay flat. A
+    regression that re-introduces a pre-try ``.inc()`` would double-count
+    (emitted AND failure incremented for the same failed post), breaking
+    the ``emitted`` vs ``failures`` rate pair #237 documents as the
+    headline observability surface.
+
+    Parametrising over the seven-reason vocabulary pins the per-reason
+    label cardinality of ``EVENTS_EMIT_FAILURES_TOTAL`` from the
+    ``EventEmitter`` integration end — complementing the metric-family
+    tests' exposition shape probes at the metric module surface.
+    """
+    failures_before = EVENTS_EMIT_FAILURES_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason=reason
+    )._value.get()
+    # Sanity baseline: a reason that this test will NOT touch. The
+    # failure path must only bump the specific ``reason`` series, not
+    # every label series of the counter.
+    failures_other_before = EVENTS_EMIT_FAILURES_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason="__sanity_other__"
+    )._value.get()
+    # EVENTS_EMITTED_TOTAL must be untouched by the failure code path
+    # (the metric documents "successful kopf.event calls" — a failure
+    # never produced a posted Event). Pinning this prevents a future
+    # refactor from double-counting by bumping both counters.
+    emitted_same_before = EVENTS_EMITTED_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason=reason
+    )._value.get()
+    emitted_other_before = EVENTS_EMITTED_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason="__sanity_other__"
+    )._value.get()
+
+    emitter = EventEmitter(body=body, dry_run=False)
+    with patch.object(events_module, "kopf") as mock_kopf:
+        mock_kopf.event.side_effect = ApiException(
+            status=503, reason="apiserver down"
+        )
+        with pytest.raises(ApiException) as exc_info:
+            emitter.emit("Warning", reason, "message")
+
+    failures_after = EVENTS_EMIT_FAILURES_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason=reason
+    )._value.get()
+    assert failures_after - failures_before == 1.0
+
+    # Same ApiException propagates unchanged — status and reason
+    # attributes survive the re-raise so the caller can still introspect
+    # (the handler wrapper's ``error_type=ApiException`` branch uses the
+    # same exception object via ``exc_info``).
+    assert exc_info.value.status == 503
+    assert exc_info.value.reason == "apiserver down"
+
+    # Cardinality pin: only the targeted ``reason`` series moves.
+    failures_other_after = EVENTS_EMIT_FAILURES_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason="__sanity_other__"
+    )._value.get()
+    assert failures_other_after == failures_other_before
+
+    # EVENTS_EMITTED_TOTAL is unchanged: a failed ``kopf.event`` post
+    # never produced an Event, so the emitted counter must not move.
+    # Probed for both the exercised reason (must stay flat) and a
+    # sentinel reason (must also stay flat — guards against any
+    # spurious series bumps from the failure-handling code path).
+    emitted_same_after = EVENTS_EMITTED_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason=reason
+    )._value.get()
+    emitted_other_after = EVENTS_EMITTED_TOTAL.labels(
+        namespace="openstudio-server", name="test-oscm", reason="__sanity_other__"
+    )._value.get()
+    assert emitted_same_after == emitted_same_before
+    assert emitted_other_after == emitted_other_before
+
+    # And the suppressed counter stays at zero on the failure path
+    # (the dry-run gate never fired — ``dry_run=False``).
+    assert emitter.suppressed_count == 0
+    assert emitter.dry_run is False
