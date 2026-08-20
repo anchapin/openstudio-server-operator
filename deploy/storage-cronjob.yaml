@@ -102,6 +102,15 @@ spec:
         spec:
           serviceAccountName: openstudio-storage-pruner-sa
           restartPolicy: Never
+          # Issue #414 — node-pressure protection: a mid-tick eviction
+          # strands a retention tick (D12 makes the next schedule retry
+          # safe, but the archival Job watch loses its spawner). Same
+          # openstudio-operator-critical PriorityClass as the operator
+          # Deployment (deploy/priority-class.yaml) — one class covers
+          # both, per the issue's scope guard. The archival Jobs this
+          # entrypoint spawns (archival.py) do NOT set priorityClassName
+          # so rclone pods remain evictable first under pressure.
+          priorityClassName: openstudio-operator-critical
           # Issue #162 — pod-level defense-in-depth baseline (matches the
           # operator Deployment at deploy/operator-deployment.yaml:48-56 and
           # the rclone Job emitted by archival.py:225-232). runAsNonRoot +

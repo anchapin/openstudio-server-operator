@@ -36,6 +36,14 @@ spec:
         app.kubernetes.io/managed-by: openstudio-operator
     spec:
       serviceAccountName: openstudio-operator-sa
+      # Issue #414 — node-pressure protection: single-replica + Recreate
+      # means a mid-tick eviction leaves the StatusStore RMW half-applied.
+      # The openstudio-operator-critical PriorityClass
+      # (deploy/priority-class.yaml, value 1000000000,
+      # preemptionPolicy: Never) makes this pod the LAST evicted under
+      # node pressure. Archival Jobs do NOT carry this class — they stay
+      # evictable first.
+      priorityClassName: openstudio-operator-critical
       # Issue #161 — pod-level defense-in-depth baseline. PSS `restricted`
       # validates pod-level runAsNonRoot + seccompProfile (NOT the
       # container-level fields), so an injected sidecar (Istio ambient
