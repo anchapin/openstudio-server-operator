@@ -732,6 +732,25 @@ _redis_url_warned: set[tuple[str, str]] = set()
 
 
 def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
+    """Emit a one-time ``RedisUrlEmpty`` Warning Event per CR with empty ``spec.redisUrl`` (issue #116).
+
+    The operator cannot service Modules 3/5 (worker recycling, web_background
+    stall) without a Redis URL, and the historical default
+    ``redis://:openstudio@queue...`` was a secret-leak that the empty default
+    now explicitly rejects. The single-callback cache is keyed on
+    ``(namespace, name)`` so the message is at most once per CR per operator
+    restart.
+
+    The Warning Event is emitted directly via :func:`kopf.event` (the same
+    kopf chokepoint :func:`_emit_kopf_event` uses for the SINGLETON_* events
+    above). :func:`_check` is only called from :func:`singleton_guard_startup`
+    (``@kopf.on.startup``) and :func:`singleton_guard_event`
+    (``@kopf.on.event``), both active kopf callbacks where ``settings_var``
+    is populated and the posting engine is enabled — so the queue/defer/drain
+    detour through :mod:`openstudio_operator.handlers` is unnecessary, and
+    routing it through here would invert the natural module dependency
+    direction (handlers → singleton, not singleton → handlers). Issue #304.
+    """
     for item in items:
         # Items may be raw OSCM dicts (``apiVersion``/``kind`` + ``metadata``
         # envelope) or the inner ``metadata`` already-extracted dict, depending
@@ -759,22 +778,19 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
                 "into every published CRD and has been removed.",
                 ns, nm,
             )
-            try:
-                from openstudio_operator.handlers import _emit_redis_warning_event
-
-                _emit_redis_warning_event(
-                    namespace=ns, name=nm,
-                    message=(
-                        "spec.redisUrl is empty (issue #116). Operator Modules "
-                        "3/5 (worker recycler + web_background stall) will be "
-                        "no-ops until you set this field explicitly. The "
-                        "previous default exposed the kind-recipe password "
-                        "`openstudio` and has been removed; helm-chart users "
-                        "should derive the URL from the Redis-secret KeyRef."
-                    ),
-                )
-            except ImportError as exc:  # pragma: no cover — defensive
-                logger.debug("redis URL guard Event emit import failed: %s", exc)
+            _emit_kopf_event(
+                {"metadata": {"namespace": ns, "name": nm}},
+                "Warning",
+                "RedisUrlEmpty",
+                (
+                    "spec.redisUrl is empty (issue #116). Operator Modules "
+                    "3/5 (worker recycler + web_background stall) will be "
+                    "no-ops until you set this field explicitly. The "
+                    "previous default exposed the kind-recipe password "
+                    "`openstudio` and has been removed; helm-chart users "
+                    "should derive the URL from the Redis-secret KeyRef."
+                ),
+            )
 
 
 @kopf.on.startup()

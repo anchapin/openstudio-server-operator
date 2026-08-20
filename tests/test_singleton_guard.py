@@ -479,12 +479,36 @@ def test_gated_wrapper_bumps_handler_tick_failures_total_on_api_exception(
 
 
 def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_crs):
-    monkeypatch.setattr(singleton, "_process_guard", guard_two_crs)
+    # Issue #304 — the URL-guard Warning Event now fires via
+    # ``_emit_kopf_event`` directly (no more queue/drain detour through
+    # ``openstudio_operator.handlers``). Build a guard whose CRs carry an
+    # explicit ``redisUrl`` so the URL-guard branch in ``_check`` is a
+    # no-op for this case; the conflict Events are the only thing under
+    # test. The companion ``test_event_wrapper_url_guard_fires_directly``
+    # below exercises the direct URL-guard path explicitly.
+    populated_guard = SingletonGuard(
+        FakeCustomObjectsApi(
+            [
+                make_cr(
+                    "alpha", OLD_TS, uid="uid-alpha",
+                    spec={"serverUrl": "http://a.test", "redisUrl": "redis://queue.test:6379"},
+                ),
+                make_cr(
+                    "beta", NEW_TS, uid="uid-beta",
+                    spec={"serverUrl": "http://b.test", "redisUrl": "redis://queue.test:6379"},
+                ),
+            ]
+        )
+    )
+    monkeypatch.setattr(singleton, "_process_guard", populated_guard)
     events, emit = make_sink()
     monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
 
     singleton.singleton_guard_event(
-        body=make_cr("beta", NEW_TS),
+        body=make_cr(
+            "beta", NEW_TS,
+            spec={"serverUrl": "http://b.test", "redisUrl": "redis://queue.test:6379"},
+        ),
         namespace=NAMESPACE,
         name="beta",
         logger=log,
@@ -497,7 +521,128 @@ def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_
     ]
 
 
-def test_event_wrapper_survives_api_failure(caplog, log, monkeypatch):
+def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
+    """Issue #304: empty ``spec.redisUrl`` emits ``RedisUrlEmpty`` via ``_emit_kopf_event`` directly.
+
+    Pre-#304 the URL-guard Warning Event was queued and drained on the next
+    OSCM watch tick by the consolidated ``_drain_queued_warning_events``
+    handler in :mod:`openstudio_operator.handlers`. The deferral
+    sidestepped an inverted module dependency (singleton → handlers) but
+    was architecturally unnecessary: ``_check`` is only called from
+    ``@kopf.on.startup`` and ``@kopf.on.event`` callbacks, where
+    ``kopf.event(...)`` is callable directly. The fix in
+    :func:`openstudio_operator.singleton._emit_redis_url_guard_events`
+    routes the Event through the same :func:`_emit_kopf_event` shim the
+    SINGLETON_* conflict/active events use — so a test that monkeypatches
+    that shim MUST see the ``RedisUrlEmpty`` Event on the same path as
+    the conflict Events.
+
+    The CR carries NO ``redisUrl`` (the URL-guard's trigger), so the
+    singleton's loud-half (``enforce``) sees a single CR (no conflict)
+    and stays quiet — only the URL-guard Event fires. The companion
+    conflict test (``test_event_wrapper_enforces_on_conflict``) covers
+    the conflict branch.
+    """
+    guard = SingletonGuard(
+        FakeCustomObjectsApi(
+            [
+                make_cr(
+                    "alpha", OLD_TS, uid="uid-alpha",
+                    spec={"serverUrl": "http://a.test"},
+                ),
+            ]
+        )
+    )
+    monkeypatch.setattr(singleton, "_process_guard", guard)
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    # Each test run caches its warned set in a module-level variable;
+    # clear it so the Event is re-emitted deterministically.
+    monkeypatch.setattr(singleton, "_redis_url_warned", set())
+
+    singleton.singleton_guard_event(
+        body=make_cr("alpha", OLD_TS, spec={"serverUrl": "http://a.test"}),
+        namespace=NAMESPACE,
+        name="alpha",
+        logger=log,
+        patch={},
+        type="ADDED",
+    )
+    # Exactly one Event: Warning / RedisUrlEmpty attached to the CR
+    # (the singleton-conflict branch is silent — single CR, no losers).
+    assert event_triples(events) == [
+        ("alpha", "Warning", "RedisUrlEmpty"),
+    ], (
+        f"URL-guard Warning Event must fire through _emit_kopf_event "
+        f"directly (issue #304). Got: {event_triples(events)!r}. The "
+        f"regression that re-adds a singleton→handlers import would "
+        f"break this assertion: the deferred import + queue detour "
+        f"captured the Event in handlers._sink, not in the patched "
+        f"emit sink."
+    )
+
+
+def test_event_wrapper_url_guard_is_idempotent_per_cr(caplog, log, monkeypatch):
+    """Issue #116/304: the URL-guard fires at most ONCE per ``(ns, name)`` per operator restart.
+
+    The single-callback cache in :data:`openstudio_operator.singleton._redis_url_warned`
+    is the noise-gate that keeps a re-evaluated singleton guard from
+    re-firing the same Warning Event on every kopf watch tick. The
+    guard's ``enforce`` method also deduplicates on state-change (so a
+    second call to ``singleton_guard_event`` for the same CR snapshot
+    is silent on the conflict side too); the URL-guard cache is
+    separate and has its own invariant. This test pins the
+    once-per-(ns,name) contract by calling the URL-guard helper
+    twice and asserting the second call's ``events`` list is empty
+    for the ``RedisUrlEmpty`` reason.
+    """
+    guard = SingletonGuard(
+        FakeCustomObjectsApi(
+            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec={"serverUrl": "http://a.test"})]
+        )
+    )
+    monkeypatch.setattr(singleton, "_process_guard", guard)
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "_redis_url_warned", set())
+
+    # First call: the URL-guard fires for alpha (empty redisUrl).
+    singleton.singleton_guard_event(
+        body=make_cr("alpha", OLD_TS, spec={"serverUrl": "http://a.test"}),
+        namespace=NAMESPACE,
+        name="alpha",
+        logger=log,
+        patch={},
+        type="ADDED",
+    )
+    first = [t for t in event_triples(events) if t[2] == "RedisUrlEmpty"]
+    assert first == [("alpha", "Warning", "RedisUrlEmpty")], (
+        f"First call must fire one RedisUrlEmpty Event; got {first!r}. "
+        f"See issue #116."
+    )
+
+    # Second call with a different (NEW) body delivery, same CR — the
+    # cache must suppress the duplicate. The conflict branch also stays
+    # silent because the snapshot is unchanged.
+    events.clear()
+    singleton.singleton_guard_event(
+        body=make_cr("alpha", OLD_TS, spec={"serverUrl": "http://a.test"}),
+        namespace=NAMESPACE,
+        name="alpha",
+        logger=log,
+        patch={},
+        type="ADDED",
+    )
+    second_url = [t for t in event_triples(events) if t[2] == "RedisUrlEmpty"]
+    assert second_url == [], (
+        f"Second call on the same CR must NOT re-fire RedisUrlEmpty "
+        f"(issue #116 once-per-(ns,name) cache). Got: {second_url!r}. "
+        f"The cache lives in "
+        f"openstudio_operator.singleton._redis_url_warned."
+    )
+
+
+
     monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi([])))
     events, emit = make_sink()
     monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
