@@ -86,6 +86,23 @@ else
     SCOPE_GUARD_PRESENT=0
 fi
 
+# --- Check 2b: heading-vs-line pitfall (#385). A markdown heading
+# `## Scope guard:` / `# Scope guard:` is a common mis-form for the
+# scope-guard block — the body then reads naturally but the regex
+# above (anchored on the line start, with optional whitespace + a
+# bullet, but NOT a `#`) silently rejects it. Detect this misuse FIRST
+# so the user sees a specific error pointing at the heading, not the
+# generic "missing block" error below. Repro in PR #384 (first run
+# failed lint because the body had `## Scope guard:` + bullet list).
+HEADING_LINE=$(printf '%s\n' "$BODY" \
+    | grep -E '^[[:space:]]*#+[[:space:]]+Scope[[:space:]]+[Gg]uard[[:space:]]*:' \
+    | head -n1 || true)
+if [ -n "$HEADING_LINE" ]; then
+    HEADING_DETECTED=1
+else
+    HEADING_DETECTED=0
+fi
+
 # --- Check 3: the scope-guard body must reference at least one issue
 # (#N). A `Scope guard: ...` line that names no issue is not a scope
 # guard, it's a wish.
@@ -132,6 +149,10 @@ if [ "$SCOPE_GUARD_PRESENT" -eq 1 ] && [ "$SCOPE_GUARD_HAS_RATIONALE" -eq 0 ]; t
     FAIL=1
 fi
 
+if [ "$HEADING_DETECTED" -eq 1 ]; then
+    echo "::error::PR body uses a markdown heading for the scope guard ('${HEADING_LINE}'). The script requires a single 'Scope guard:' LINE — optionally bulleted ('- Scope guard: ...' / '* Scope guard: ...') — NOT a section header ('## Scope guard:'). See docs/onboarding.md#scope-guard-issue-301." >&2
+    FAIL=1
+fi
 if [ "$FAIL" -eq 1 ]; then
     echo "" >&2
     echo "Required PR body shape (issue #301):" >&2
