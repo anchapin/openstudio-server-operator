@@ -224,6 +224,26 @@ edge cases (`#246` `#247` `#248` `#249`).
   rejects any inline `load_incluster_config(` / `load_kube_config(`
   call outside `_k8s.py` (catches both bare-name and
   attribute-shape calls). Tests: 529 → 531.
+- **`#293`** — `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding`
+  (`openstudio-operator-pod-delete-scope`) added to
+  `deploy/pod-delete-admission-policy.yaml` constrains the operator
+  SA's `pods/delete` verb to pods that carry `app=worker` (matches the
+  worker-pool label the eviction path targets). The CEL `||` keeps
+  humans-via-kubectl and the prune CronJob SA unrestricted — only the
+  operator SA is narrowed. RBAC's lack of label-selector support is
+  the same reason this is VAP rather than `resourceNames`. Requires
+  K8s 1.30+.
+- **`#294`** — `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding`
+  (`openstudio-prune-job-scope`) added to `deploy/storage-cronjob.yaml`
+  constrains the prune SA's `batch/jobs` `create|update|delete` verbs to
+  Jobs that carry the archival labels (`app.kubernetes.io/managed-by=
+  openstudio-operator` AND `app.kubernetes.io/component=archival`). RBAC
+  `PolicyRule` has no `labelSelector` and `resourceNames` only accepts
+  exact strings (no globs), so the constraint is enforced at admission
+  rather than RBAC. `failurePolicy: Fail` + `namespaceSelector` scoped
+  to `openstudio-server` make this the third defence-in-depth layer
+  after the namespaced `#78` Role split and the `#78` deterministic
+  Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Removed
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])
