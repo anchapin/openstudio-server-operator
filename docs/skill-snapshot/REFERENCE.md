@@ -24,6 +24,9 @@ Steps:
 4. Implement the fix/feature with tests
 5. Run local checks if available (make test-fast, make lint)
  6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
+     (Use `refs #{NUMBER}` instead of `resolve #{NUMBER}` for keep-open PRs —
+      detect from issue body: "Acceptance criterion" + "Closes #N" = closing;
+      "Refs #N" only = keep-open.)
  7. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
     NOTE: If push fails (e.g., remote branch exists with newer commits), use
     `git pull --rebase origin develop` first, then push again with --force-with-lease.
@@ -59,9 +62,9 @@ Issue: #{NUMBER}
 IMPORTANT: Record your worktree path in wave-state.json IMMEDIATELY after
 checking out (before any other steps). This ensures cleanup can happen
 even if the sub-agent is interrupted. Run:
-  jq ".issues[\"{NUMBER}\"].worktree = \"../worktrees/issue-{NUMBER}-{SLUG}\"" \
-    ../worktrees/wave-state.json > /tmp/wave-state.tmp.json \
-    && mv /tmp/wave-state.tmp.json ../worktrees/wave-state.json
+  source scripts/wave-state-helpers.sh
+  STATE_FILE=$(get_state_file)
+  atomic_write_json ".issues[\"{NUMBER}\"].worktree = \"../worktrees/issue-{NUMBER}-{SLUG}\"" "$STATE_FILE"
 
 Steps:
 1. Record worktree path in wave-state.json (see IMPORTANT above)
@@ -69,8 +72,10 @@ Steps:
 3. IF CI is green:
    a. Check mergeable: gh pr view {NUMBER} --json mergeable
    b. If CONFLICTING → follow the merge conflict protocol below
-    c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash
-       NOTE: Do NOT use --delete-branch here. The branch deletion must happen
+c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash \
+           --subject "fix: resolve #{NUMBER} — {brief description}" \
+           --body "Closes #{NUMBER}"
+        NOTE: Do NOT use --delete-branch here. The branch deletion must happen
        AFTER worktree removal (see step 3d below) to avoid:
        "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
 
@@ -84,8 +89,10 @@ Steps:
           ```
           - If all issues closed → proceed to step 3d
           - If any issue remains open → report BLOCKER and STOP
-        - If mergedAt IS null → merge did NOT persist. Retry once:
-          `gh pr merge {NUMBER} --squash`
+- If mergedAt IS null → merge did NOT persist. Retry once:
+           `gh pr merge {NUMBER} --squash \
+           --subject "fix: resolve #{NUMBER} — {brief description}" \
+           --body "Closes #{NUMBER}"`
           If second attempt also yields null mergedAt → report BLOCKED and STOP
     d. Clean up (ORDER MATTERS — worktree remove BEFORE branch delete):
        ```bash
@@ -104,9 +111,9 @@ Steps:
 
     e. Update wave-state.json to mark worktree as cleaned:
        ```bash
-       jq ".issues[\"{NUMBER}\"].worktree_cleaned = true" \
-         ../worktrees/wave-state.json > /tmp/wave-state.tmp.json \
-         && mv /tmp/wave-state.tmp.json ../worktrees/wave-state.json
+       source scripts/wave-state-helpers.sh
+       STATE_FILE=$(get_state_file)
+       atomic_write_json ".issues[\"{NUMBER}\"].worktree_cleaned = true" "$STATE_FILE"
        ```
 3. IF CI is failing:
    a. Get failing run: gh run list --branch fix/issue-{NUMBER}-{SLUG} --limit 1
@@ -178,8 +185,10 @@ git fetch origin develop
 
 # Cleanup (ORDER MATTERS: worktree remove BEFORE branch delete)
 # Use the worktree path from wave-state.json if available
+source scripts/wave-state-helpers.sh
+STATE_FILE=$(get_state_file)
 WORKTREE_PATH=$(jq -r ".issues[\"{N}\"].worktree // \"../worktrees/issue-{N}-{slug}\"" \
-  ../worktrees/wave-state.json 2>/dev/null || echo "../worktrees/issue-{N}-{slug}")
+  "$STATE_FILE" 2>/dev/null || echo "../worktrees/issue-{N}-{slug}")
 
 git worktree remove "$WORKTREE_PATH"
 git branch -d fix/issue-{N}-{slug}
@@ -199,7 +208,17 @@ gh pr view {M} --json mergeable --jq '.mergeable'
 
 The orchestrator writes a state file after each phase transition:
 
-**Location:** `../worktrees/wave-state.json`
+**Location:** `../worktrees/wave-state.<repo-slug>.json` (where `<repo-slug>` is
+derived from `git remote get-url origin`, e.g. `openstudio-server-operator`)
+
+**Backward compatibility (one release):** If the namespaced file does not exist,
+the legacy `../worktrees/wave-state.json` is read with a deprecation warning.
+The legacy path will be removed in a future release.
+
+**Atomic writes:** All state file updates use write-then-rename via a temporary
+file in the same directory (`mv /tmp/wave-state.XXXXXX.json <state-file>`) to
+guarantee that interrupted writes never leave a partially-written file. The
+helper `scripts/wave-state-helpers.sh` provides `atomic_write_json` for this.
 
 ```json
 {
@@ -267,7 +286,8 @@ The orchestrator writes a state file after each phase transition:
 ### Resume Procedure
 
 ```
-1. Read ../worktrees/wave-state.json
+1. source scripts/wave-state-helpers.sh
+   STATE_FILE=$(get_state_file)
 2. IF file does not exist → start fresh (Phase 0)
 3. IF file exists:
    a. First, clean up any stale worktrees from previously merged issues
@@ -275,9 +295,9 @@ The orchestrator writes a state file after each phase transition:
       ```
       for issue_num in $(jq -r '.issues | to_entries[] |
         select(.value.status == "merged" and .value.worktree_cleaned != true) |
-        .key' ../worktrees/wave-state.json 2>/dev/null); do
-        worktree=$(jq -r ".issues[\"$issue_num\"].worktree" ../worktrees/wave-state.json 2>/dev/null)
-        branch=$(jq -r ".issues[\"$issue_num\"].branch" ../worktrees/wave-state.json 2>/dev/null)
+        .key' "$STATE_FILE" 2>/dev/null); do
+        worktree=$(jq -r ".issues[\"$issue_num\"].worktree" "$STATE_FILE" 2>/dev/null)
+        branch=$(jq -r ".issues[\"$issue_num\"].branch" "$STATE_FILE" 2>/dev/null)
         if [[ -n "$worktree" && -d "$worktree" ]]; then
           git worktree remove "$worktree" 2>/dev/null || true
         fi
@@ -285,9 +305,7 @@ The orchestrator writes a state file after each phase transition:
           git branch -d "$branch" 2>/dev/null || true
           git push origin --delete "$branch" 2>/dev/null || true
         fi
-        jq ".issues[\"$issue_num\"].worktree_cleaned = true" \
-          ../worktrees/wave-state.json > /tmp/wave-state.tmp.json \
-          && mv /tmp/wave-state.tmp.json ../worktrees/wave-state.json
+        atomic_write_json ".issues[\"$issue_num\"].worktree_cleaned = true" "$STATE_FILE"
       done
       git worktree prune
       ```
@@ -310,19 +328,25 @@ The orchestrator writes a state file after each phase transition:
 
 ### State Updates
 
-Write to `wave-state.json`:
+Write to the namespaced state file (`../worktrees/wave-state.<repo-slug>.json`):
 - After each wave plan is confirmed (initial state)
 - After each sub-agent reports PR creation
 - After each PR merge or escalation
 - After each wave completion
 
+All writes use `atomic_write_json` from `scripts/wave-state-helpers.sh` to
+guarantee atomic updates.
+
 ### Cleanup on Successful Completion
 
 ```bash
+source scripts/wave-state-helpers.sh
+STATE_FILE=$(get_state_file)
+
 # Before removing state, clean up any remaining worktrees for merged issues
-for issue_num in $(jq -r '.issues | to_entries[] | select(.value.status == "merged" and .value.worktree_cleaned != true) | .key' ../worktrees/wave-state.json 2>/dev/null); do
-  worktree=$(jq -r ".issues[\"$issue_num\"].worktree" ../worktrees/wave-state.json 2>/dev/null)
-  branch=$(jq -r ".issues[\"$issue_num\"].branch" ../worktrees/wave-state.json 2>/dev/null)
+for issue_num in $(jq -r '.issues | to_entries[] | select(.value.status == "merged" and .value.worktree_cleaned != true) | .key' "$STATE_FILE" 2>/dev/null); do
+  worktree=$(jq -r ".issues[\"$issue_num\"].worktree" "$STATE_FILE" 2>/dev/null)
+  branch=$(jq -r ".issues[\"$issue_num\"].branch" "$STATE_FILE" 2>/dev/null)
   if [[ -n "$worktree" && -d "$worktree" ]]; then
     git worktree remove "$worktree" 2>/dev/null || true
   fi
@@ -332,7 +356,7 @@ for issue_num in $(jq -r '.issues | to_entries[] | select(.value.status == "merg
   fi
 done
 git worktree prune
-rm ../worktrees/wave-state.json
+rm "$STATE_FILE"
 ```
 
 ## File-Level Dependency Analysis
@@ -499,8 +523,10 @@ Before creating a worktree:
 After PR merge (ORDER MATTERS: worktree remove BEFORE branch delete):
 ```bash
 # Use wave-state.json if available, otherwise construct from convention
+source scripts/wave-state-helpers.sh
+STATE_FILE=$(get_state_file)
 WORKTREE_PATH=$(jq -r ".issues[\"{N}\"].worktree // \"../worktrees/issue-{N}-{slug}\"" \
-  ../worktrees/wave-state.json 2>/dev/null || echo "../worktrees/issue-{N}-{slug}")
+  "$STATE_FILE" 2>/dev/null || echo "../worktrees/issue-{N}-{slug}")
 
 # Step 1: Remove worktree FIRST (branch must not be deleted yet)
 git worktree remove "$WORKTREE_PATH"
@@ -528,7 +554,9 @@ git worktree list --porcelain | grep "^worktree " | grep "worktrees/issue-" | \
 git branch --list 'fix/issue-*' | xargs -I{} git branch -D {}
 
 git worktree prune
-rm -f ../worktrees/wave-state.json
+source scripts/wave-state-helpers.sh
+STATE_FILE=$(get_state_file)
+rm -f "$STATE_FILE"
 ```
 
 ## Composition Points
