@@ -111,6 +111,80 @@ def test_list_input_raises_typeerror():
         parse_iso_utc([2024, 1, 2])  # type: ignore[arg-type]
 
 
+# --- DST boundary strings (issue #300) ---------------------------------------
+#
+# The hypothesis strategy at ``_offset`` enumerates fixed UTC offsets via
+# ``_FixedOffset``, which carries no DST. A v3.11.0 server return captured at
+# a real wall-clock DST transition is not directly fuzzed. These three
+# hand-written cases pin the parser's contract on the real-world transition
+# strings the operator may see in production:
+#
+#   * US Eastern spring-forward (2025-03-09): clocks jump from 02:00 EST to
+#     03:00 EDT — 02:30 EST never happens as a wall-clock EDT instant, but
+#     the offset-tagged string is unambiguous: 02:30 at -05:00 is 07:30 UTC.
+#   * US Eastern fall-back, duplicated hour (2025-11-02): the wall-clock
+#     hour 01:00-02:00 occurs twice (once as EDT, once as EST). The explicit
+#     -04:00 disambiguates: 01:30 EDT is 05:30 UTC, not 06:30 UTC.
+#   * EU CET pre-transition offset (2024-10-06): the explicit +01:00 offset
+#     is offset-agnostic — the parser performs the same arithmetic that
+#     handles the CEST->CET transition hour on any explicit +01:00 string.
+#
+# The assertion is the exact UTC ``datetime`` (D12: the operator's SLA-clock
+# anchor is tz-aware UTC, never a local-zone datetime), ``utcoffset() ==
+# timedelta(0)`` (the input offset is normalised away), and a
+# ``parse(parse(x)) == parse(x)`` round-trip (the fixed point must be stable
+# in one extra hop — the same gate the hypothesis idempotency tests enforce
+# for arbitrary offsets).
+
+
+def test_parse_us_eastern_spring_forward():
+    """2025-03-09 02:30 EST (UTC-5) normalizes to 07:30 UTC.
+
+    This is the spring-forward boundary: clocks jump from 02:00 EST to
+    03:00 EDT on 2025-03-09, so 02:30 EST never exists as a wall-clock
+    EDT instant. The offset-tagged string is still unambiguous and the
+    parser must treat it as -05:00 wall-clock → 07:30 UTC.
+    """
+    parsed = parse_iso_utc("2025-03-09T02:30:00-05:00")
+    assert parsed == datetime(2025, 3, 9, 7, 30, 0, tzinfo=UTC)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parse_iso_utc(parsed.isoformat()) == parsed
+
+
+def test_parse_us_eastern_fall_back_duplicated_hour():
+    """2025-11-02 01:30 EDT (UTC-4) normalizes to 05:30 UTC.
+
+    This is the fall-back duplicated hour: clocks fall back at 02:00 EDT
+    to 01:00 EST on 2025-11-02, so the wall-clock hour 01:00-02:00
+    occurs twice (once as EDT, once as EST). The explicit -04:00 in the
+    input string disambiguates the duplicated hour in favour of the
+    pre-transition (EDT) interpretation: 01:30 EDT is 05:30 UTC, not
+    06:30 UTC which would be 01:30 EST.
+    """
+    parsed = parse_iso_utc("2025-11-02T01:30:00-04:00")
+    assert parsed == datetime(2025, 11, 2, 5, 30, 0, tzinfo=UTC)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parse_iso_utc(parsed.isoformat()) == parsed
+
+
+def test_parse_eu_summer_to_winter():
+    """2024-10-06 02:30 CET (UTC+1) normalizes to 01:30 UTC.
+
+    EU summer-to-winter transition (CEST +02:00 → CET +01:00) occurs on
+    2024-10-27; this case pins the +01:00 CET offset explicitly. The
+    parser is offset-agnostic — the same arithmetic that handles the
+    transition hour handles any explicit +01:00 string — and must
+    normalise the wall-clock to 01:30 UTC regardless of the date.
+    """
+    parsed = parse_iso_utc("2024-10-06T02:30:00+01:00")
+    assert parsed == datetime(2024, 10, 6, 1, 30, 0, tzinfo=UTC)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parse_iso_utc(parsed.isoformat()) == parsed
+
+
 # --- Hypothesis-driven property tests (issue #246) --------------------------
 #
 # The D12 timestamp boundary is the operator's hottest parse path — every CR
