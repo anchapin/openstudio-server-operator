@@ -380,67 +380,24 @@ release-PR.
 
 ## Branching & PR conventions
 
-### Branch naming
+The canonical, quick-reference summary of branch naming, PR-body
+keywords, merge-subject hygiene (#88), and required CI checks now
+lives in [`CONTRIBUTING.md`](../CONTRIBUTING.md) — start there.
+`AGENTS.md` also carries a one-paragraph branching-model pointer at
+the top of the file.
 
-```
-fix/issue-N-slug
-feat/issue-N-slug
-docs/issue-N-slug
-chore/issue-N-slug
-```
+Two project-specific notes that are NOT in `CONTRIBUTING.md` because
+they are maintainer escape hatches, not contributor paths:
 
-Use a lowercase, hyphenated slug that names the change. The
-issue-number prefix lets `gh pr merge` produce a clean closing keyword
-on squash-merge without further edits.
-
-### PR body
-
-The PR body MUST include `Closes #N` (or `Fixes #N` / `Resolves #N`)
-when the issue SHOULD close on merge, and `Refs #N` (or `for #N` /
-`touches #N`) when it should stay open. See the merge-subject hygiene
-section below — `develop` closes issues from PR **bodies** too, so the
-keywords matter in BOTH places.
-
-### Merge-subject hygiene (#88)
-
-`develop` is the default branch, so GitHub closes an issue when **any**
-commit with a closing keyword lands there — including auto-generated
-squash-merge subjects. Two consequences:
-
-- For **keep-open PRs**, keep closing keywords OUT of the PR title AND
-  out of every commit subject on the branch. Use `Refs #N` /
-  `for #N` / `touches #N` everywhere.
-- For **closing PRs**, the closing keyword IS desired in both the
-  squash subject (`fix: resolve #N — …`) and the PR body
-  (`Closes #N`).
-- Always merge with an explicit subject override rather than relying on
-  the auto-generated one:
-
-  ```bash
-  gh pr merge N --squash --subject "fix: resolve #N — short summary" --body "Closes #N"
-  ```
-
-This is the same rule the maintainer applies by hand; documenting it
-here so contributors do not accidentally close issues via
-auto-generated subjects.
-
-### Required CI checks
-
-The `require-ci-on-develop-prs` ruleset requires two jobs to pass on
-PR merges into `develop`:
-
-- `lint` — `ruff check .`
-- `test`  — `.venv/bin/pytest`
-
-The `guard-branch-pairing` job is a required status check on **`main`**
-(not `develop`); its name is part of the public CI contract — do not
-rename it.
-
-When GitHub Actions is unavailable, the maintainer may push via admin
-bypass after locally verifying `ruff + pytest` green on the branch (and
-`docker build` when Release/Docker files are touched). A retroactive CI
-run on `develop` HEAD follows once runners recover. This is a maintainer
-escape hatch, not a contributor path.
+- The `guard-branch-pairing` job is a required status check on
+  **`main`** (not `develop`); its name is part of the public CI
+  contract — do not rename it.
+- When GitHub Actions is unavailable, the maintainer may push via
+  admin bypass after locally verifying `ruff + pytest` green on the
+  branch (and `docker build` when Release/Docker files are touched).
+  A retroactive CI run on `develop` HEAD follows once runners
+  recover. This is a maintainer escape hatch, not a contributor
+  path.
 
 ---
 
