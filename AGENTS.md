@@ -20,10 +20,13 @@ OpenCode-specific: the `codebase-memory-mcp` server is wired up for this repo (s
 
 ## Branching model
 
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the canonical branch,
+PR-body, and merge-subject conventions (the source of truth for issue
+#88). Summary:
+
 - `develop` — default branch; all work lands here (direct pushes allowed for the owner).
-- `main` — release branch; protected by ruleset `protect-main`. Direct/force pushes rejected for everyone. Updates require a PR **from `develop`**; the required `guard-branch-pairing` CI check fails any PR into `main` whose source branch is not `develop`. **Never push `main` directly** — rejected by design.
-- Ruleset `require-ci-on-develop-prs` requires `lint` + `test` on PR merges into `develop`. The owner is a bypass actor — direct pushes to `develop` remain allowed.
-- **Merge-subject hygiene (issue #88):** see [`docs/onboarding.md#merge-subject-hygiene-88`](docs/onboarding.md#merge-subject-hygiene-88) for the full rule and the canonical command examples (`docs/onboarding.md` is the source of truth; this line is a quick-reference pointer). The shape: `develop` closes an issue whenever any commit with `Closes #N` / `resolve #N` / `fixes #N` lands there — including auto-generated squash subjects. Keep-open PRs use `Refs #N` / `for #N` / `touches #N` everywhere (PR title, squash subject, body); closing PRs use `Closes #N` in both the squash subject AND the body. Always merge with an explicit `--subject` override; never trust the auto-generated subject.
+- `main` — release branch; protected by ruleset `protect-main`. Updates require a PR **from `develop`**; the required `guard-branch-pairing` CI check fails any PR into `main` whose source branch is not `develop`. **Never push `main` directly.**
+- Ruleset `require-ci-on-develop-prs` requires `lint` + `test` on PR merges into `develop`. The owner is a bypass actor.
 - **Outage bypass:** when GitHub Actions is unavailable, the owner may merge/push via admin bypass. Mitigations: every change locally verified on the branch (ruff + pytest green; `docker build` when Release/Docker files are touched) and a retroactive CI run on `develop` HEAD once runners recover.
 
 ## Commands
