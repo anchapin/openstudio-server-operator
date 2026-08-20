@@ -459,6 +459,50 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
     labelnames=["namespace", "name", "module", "error_type"],
 )
 
+# Issue #306 — observability surface for the storage-prune CronJob's
+# skip-tick branches. The CronJob runs as a separate process from the
+# operator (deploy/storage-cronjob.yaml invoking
+# ``openstudio_operator.prune_entrypoint.main()``); the two skip-tick
+# branches — ``prune_entrypoint.py:213-222`` (CR list failure) and
+# ``:280-288`` (D12 exception tuple caught around ``run_retention_tick``)
+# — log at WARNING level and return exit code 0. Without a counter, a
+# sustained degraded window in the retention pipeline (Redis unreachable,
+# REST API 5xx storm, ``StatusStoreConflictError`` thundering herd) is
+# invisible at ``/metrics`` — the only signal is a Loki/CloudWatch log
+# alert. Each OSCM timer wrapper has the analogue
+# ``HANDLER_TICK_FAILURES_TOTAL{module, error_type}`` (#117); the prune
+# actor now mirrors that pattern with a process-local counter. The
+# CronJob pod exposes ``/metrics`` on port 9090 (the same port as the
+# operator Deployment, gated by the parallel
+# ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy), so a
+# Prometheus job can scrape both processes out of the same target list.
+# Labels mirror the two branch sites: ``cr_list_failure`` for the kube
+# API list path, ``runtime_failure`` for the D12 exception tuple. The
+# exception class name is already in the WARNING log line via
+# ``type(exc).__name__`` — keeping the label vocabulary bounded to the
+# two branch names keeps cardinality trivial (2 series max) and matches
+# the regex of "one increment per tick the wrapper suppressed" that
+# #117 established for the handler wrappers.
+PRUNE_TICK_FAILURES_TOTAL = Counter(
+    "openstudio_operator_prune_tick_failures_total",
+    "Storage-prune CronJob tick failures caught by the skip-tick branches "
+    "in ``prune_entrypoint.main()`` (issue #306). The CronJob runs as a "
+    "separate process from the operator; the two skip-tick branches "
+    "(CR list failure + D12 exception tuple caught around "
+    "``run_retention_tick``) log at WARNING and return exit code 0, so "
+    "without this counter a sustained degraded window (Redis unreachable, "
+    "REST 5xx storm, StatusStoreConflictError) is invisible at "
+    "``/metrics``. Labelled by ``reason`` (cr_list_failure | "
+    "runtime_failure) — mirror of the two branch sites, bounded "
+    "cardinality (2 series total). Increment-by-1 per tick the entrypoint "
+    "suppresses; the WARNING log line records the same event for log "
+    "forwarding with the exception class name. Scraped from the "
+    "CronJob pod's plaintext ``/metrics`` on port 9090 (gated by the "
+    "parallel ``openstudio-storage-pruner-metrics-ingress`` "
+    "NetworkPolicy).",
+    labelnames=["reason"],
+)
+
 # Issue #237 — observability surface for the dry-run gate on
 # :class:`openstudio_operator.events.EventEmitter` (#164). When
 # ``spec.dryRun=true`` the EventEmitter suppresses every Event that would
