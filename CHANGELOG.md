@@ -282,6 +282,41 @@ edge cases (`#246` `#247` `#248` `#249`).
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#391`** — operator Deployment gained `livenessProbe` + `readinessProbe`
+  against the named `metrics` port (containerPort 9090). Liveness
+  (initialDelay 60s, period 30s, timeout 5s, failureThreshold 3) restarts a
+  wedged operator within ~90s — previously a silent stall (pod Running,
+  kubelet never restarts, the four `@kopf.timer` handlers stop firing) had
+  no recovery path under the single-replica + `Recreate` posture. Readiness
+  (initialDelay 5s, period 10s) gates Service endpoints during boot. Two
+  regression tests pin the probe shape and the 3×30≥90s restart budget.
+- **`#423`** — the test-count CI guard now covers all four claim locations.
+  The `#151`/`#220` steps consolidated into one
+  `Verify test-count claims in all four docs` step looping over AGENTS.md,
+  onboarding.md, audit-dryrun-idempotency.md, and kind-validation.md with a
+  report-all FAIL accumulator (mirroring the #387 metrics gate). The two
+  secondary docs had drifted three times in one day because only the first
+  two were guarded. Also revives a dead missing-claim branch previously
+  swallowed under `set -o pipefail`.
+- **`#378`** (skill, `docs/skill-snapshot/`) — wave-state cross-repo
+  isolation: new `scripts/wave-state-helpers.sh` derives a repo slug from
+  the git remote, namespaces the state file
+  (`wave-state.<repo-slug>.json`), writes atomically via
+  temp-file-then-rename, and falls back to the legacy unprefixed path with
+  a deprecation warning. Two concurrent orchestrators on different repos
+  in the same `../worktrees/` directory no longer collide or corrupt each
+  other's state.
+- **`#380`** (skill, `docs/skill-snapshot/`) — closing-PR title convention:
+  sub-agent templates now emit `fix: resolve #N — …` subjects + `Closes #N`
+  bodies for closing PRs and `refs #N` + `Refs #N` for keep-open PRs, with
+  the merge command always passing an explicit `--subject` override per
+  CONTRIBUTING.md #88 (auto-generated squash subjects previously preserved
+  the keep-open keyword on closing PRs, defeating git-log archaeology).
+- **`#385`** — closed via documentation comment (stale-sweep): both
+  acceptance items (scope-guard heading detection in
+  `scripts/check_pr_body_scope.sh` Check 2b + `.github/PULL_REQUEST_TEMPLATE.md`)
+  shipped in PR #386 / commit `f9e480f`, but the keep-open `refs` keyword
+  left the issue open. No code change.
 - **`#387`** — metrics-family prose claim drift. The four prose
   locations (`README.md` lines 67 and 205, the audit `Appendix D`
   introduction, `docs/kind-validation.md` lines 1474 and 1542) all
