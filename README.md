@@ -51,7 +51,7 @@ is owned by KEDA's own ServiceAccount. Same RBAC-shrink pattern as #78
 ## Metrics
 
 The operator exposes a Prometheus scrape endpoint at `:9090/metrics` (plain
-HTTP, no auth — see `src/openstudio_operator/metrics.py`). `/metrics` is the
+HTTP, no auth by default — see `src/openstudio_operator/metrics.py`). `/metrics` is the
 **only** direct observability window into operator health: every Kopf timer
 wrapper catches its failure tuples and silently skips the tick (D04 idempotency
 survives), so a sustained degraded window — REST API down, Redis unreachable,
@@ -75,6 +75,21 @@ REST round-trip duration histograms; post-#310 QueuedKopfEventSink
 backpressure drop counter + Queue depth gauge; post-#312 paired freshness
 timestamp gauges for `resque_queue_depth` and `stall_window_elapsed_seconds`;
 post-#403 singleton-guard loser per-tick skip counter).**
+
+**Optional bearer-token authN (issue #401):** by default the endpoint is open
+plaintext behind the `openstudio-operator-metrics-ingress` NetworkPolicy
+(#166). To add protocol-layer authN, set the `OPENSTUDIO_METRICS_TOKEN_FILE`
+env var in `deploy/operator-deployment.yaml` to a mounted token-file path and
+uncomment the commented-out `metrics-token` Secret volume + volumeMount
+blocks there (Secret `openstudio-operator-metrics-token`, key `token`). The
+server then requires `Authorization: Bearer <token>` on `/metrics` and
+returns 401 on a missing or invalid token; a separate unauthenticated
+`/healthz` path serves a bare 200 for the kubelet probes — when the token is
+enabled, point both probe paths at `/healthz` (the kubelet cannot present a
+Bearer header). The token file is re-read on every request, so Secret
+rotation takes effect without an operator restart, and a missing or empty
+file fails closed (every request 401s). No TLS is added — that is a separate
+concern requiring cert management.
 
 The seven metric families added since the 16+4+1 claim are signed off below
 for the on-call's reference; the drift-integrity invariant that fails CI is

@@ -13,13 +13,25 @@ Port choice (issue #165): the conventional Prometheus port lives in
 :mod:`openstudio_operator._constants` as :data:`METRICS_PORT` — the single
 source of truth shared with ``deploy/operator-deployment.yaml`` ``containerPort``
 and the ``openstudio-operator-metrics-ingress`` NetworkPolicy (issue #166).
+
+Optional bearer-token authN (issue #401): when ``OPENSTUDIO_METRICS_TOKEN_FILE``
+(or the ``token_file=`` argument) names a readable file, the server demands
+``Authorization: Bearer <token>`` on ``/metrics`` and returns 401 otherwise.
+Unset/empty = the pre-#401 open-plaintext behavior (NetworkPolicy is then the
+only gate). The token file is re-read on EVERY request, so a kubelet-mounted
+Secret rotation (atomic symlink swap) takes effect without an operator restart;
+a missing/empty file at request time fails CLOSED (401 for everything).
 """
 
+import hmac
 import logging
+import os
 import threading
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import prometheus_client
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter, Gauge, Histogram, make_wsgi_app
 
 from openstudio_operator._constants import METRICS_PORT
 
@@ -714,12 +726,135 @@ REST_REQUEST_DURATION_SECONDS = Histogram(
 #: consolidated the port into :data:`openstudio_operator._constants.METRICS_PORT`).
 DEFAULT_METRICS_PORT = METRICS_PORT
 
+#: Issue #401 — env var naming the optional bearer-token file for /metrics.
+#: Unset/empty = open plaintext (the documented default; the NetworkPolicy from
+#: issue #166 is then the only gate). ``deploy/operator-deployment.yaml`` ships
+#: this env var with an empty default plus a commented-out Secret volume mount
+#: a cluster admin can enable per-cluster — the same opt-in shape as the
+#: ``OPENSTUDIO_TLS_CA_BUNDLE`` hook (#242).
+METRICS_TOKEN_FILE_ENV = "OPENSTUDIO_METRICS_TOKEN_FILE"
+
 _start_lock = threading.Lock()
 _started = False
 _active_port: int | None = None
 
 
-def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> int | None:
+def _read_bearer_token(token_file: str) -> str | None:
+    """Read and strip the bearer token; ``None`` when the file is unreadable.
+
+    ``strip()`` absorbs the trailing newline ``kubectl create secret`` /
+    ``--from-file`` bakes in — a Secret written from a shell heredoc would
+    otherwise never match any header. A missing/unreadable file returns
+    ``None`` (the caller fails CLOSED — 401 for every request) rather than
+    falling back to open plaintext: a transiently-unmounted volume must not
+    silently disable authN on the endpoint that #401 exists to protect.
+    """
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def _bearer_authorized(header: str, token: str) -> bool:
+    """Constant-time check of ``Authorization: Bearer <token>``.
+
+    ``hmac.compare_digest`` avoids the timing side channel of ``==`` on the
+    secret. The auth-scheme match is case-insensitive per RFC 7235; the token
+    itself is compared byte-exact (Bearer tokens are opaque, case-sensitive).
+    """
+    scheme, _, presented = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(
+        presented.strip().encode("utf-8"), token.encode("utf-8")
+    )
+
+
+def _make_bearer_auth_wsgi_app(token_file: str):
+    """Build the #401-gated WSGI app around prometheus_client's exposition.
+
+    Path routing when auth is enabled:
+
+    - ``/metrics`` — the full exposition, ONLY with a valid Bearer token
+      (401 + ``WWW-Authenticate`` otherwise). The prometheus_client app
+      itself serves metrics for ANY path, so every other path is explicitly
+      non-leaking here — an attacker must not be able to scrape ``/`` or
+      ``/healthz`` and get the exposition around the gate.
+    - ``/healthz`` — bare ``200 OK`` (no data, no auth). The kubelet's
+      ``httpGet`` liveness/readiness probes cannot present a Bearer token;
+      with auth enabled they MUST point here (401s on ``/metrics`` would
+      restart-loop the pod — see the probe note in
+      ``deploy/operator-deployment.yaml``).
+    - anything else — 404.
+
+    The token file is re-read on EVERY /metrics request (cheap: one small
+    file open per scrape) so Secret rotation takes effect without an
+    operator restart.
+    """
+    inner = make_wsgi_app()
+
+    def app(environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path == "/metrics":
+            token = _read_bearer_token(token_file)
+            header = environ.get("HTTP_AUTHORIZATION", "")
+            if not token or not _bearer_authorized(header, token):
+                body = b"Unauthorized\n"
+                start_response(
+                    "401 Unauthorized",
+                    [
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("Content-Length", str(len(body))),
+                        ("WWW-Authenticate", 'Bearer realm="openstudio-operator-metrics"'),
+                    ],
+                )
+                return [body]
+            return inner(environ, start_response)
+        if path == "/healthz":
+            body = b"ok\n"
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                ],
+            )
+            return [body]
+        body = b"Not Found\n"
+        start_response(
+            "404 Not Found",
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ],
+        )
+        return [body]
+
+    return app
+
+
+class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    """Threaded WSGI server (one daemon thread per scrape), mirroring the
+    ``ThreadingWSGIServer`` prometheus_client itself builds inside
+    ``start_wsgi_server`` — a concurrent liveness probe + Prometheus scrape
+    must not serialize behind a single-threaded ``serve_forever`` loop."""
+
+    daemon_threads = True
+
+
+class _QuietWSGIRequestHandler(WSGIRequestHandler):
+    """WSGI request handler that logs nothing — mirrors prometheus_client's
+    ``_SilentHandler`` so per-scrape request logs never hit the operator's
+    JSON log stream."""
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Log nothing."""
+
+
+def start_metrics_server(
+    port: int | None = None, addr: str = "0.0.0.0", token_file: str | None = None
+) -> int | None:
     """Serve /metrics from a daemon thread (idempotent).
 
     Returns the port /metrics is actively served on. If the server is
@@ -728,21 +863,55 @@ def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> int 
     at operator startup, so later calls are reads, not restarts). Returns
     ``None`` only when the port could not be bound (logged as a warning —
     losing metrics must never take the operator down).
+
+    Issue #401 — optional bearer-token authN: when ``token_file`` names a
+    token file (or :data:`METRICS_TOKEN_FILE_ENV` is set in the environ),
+    the server wraps prometheus_client's exposition app with a Bearer gate
+    (401 on missing/invalid tokens — see
+    :func:`_make_bearer_auth_wsgi_app`). Unset/empty = the pre-#401 open
+    plaintext server, unchanged. The wiring is checked once at start (a
+    missing/empty token file logs a warning — every request then fails
+    closed with 401 until the file appears).
     """
     global _started, _active_port
     with _start_lock:
         if _started:
             return _active_port
+        if token_file is None:
+            token_file = os.environ.get(METRICS_TOKEN_FILE_ENV, "").strip() or None
         bound_port = DEFAULT_METRICS_PORT if port is None else port
         try:
-            server, thread = prometheus_client.start_http_server(bound_port, addr=addr)
+            if token_file:
+                # Wiring check only — the authoritative read stays per-request
+                # so Secret rotation is picked up without a restart.
+                if not _read_bearer_token(token_file):
+                    logger.warning(
+                        "metrics bearer token file %r missing or empty — serving "
+                        "401 for every /metrics request until it appears (issue #401)",
+                        token_file,
+                    )
+                server = make_server(
+                    addr,
+                    bound_port,
+                    _make_bearer_auth_wsgi_app(token_file),
+                    server_class=_ThreadingWSGIServer,
+                    handler_class=_QuietWSGIRequestHandler,
+                )
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+            else:
+                server, thread = prometheus_client.start_http_server(bound_port, addr=addr)
         except OSError as exc:
             logger.warning("Cannot serve /metrics on %s:%s: %s", addr, bound_port, exc)
             return None
         _started = True
         _active_port = server.server_address[1]
         logger.info(
-            "Serving /metrics on %s:%s (daemon thread: %s)", addr, bound_port, thread.daemon
+            "Serving /metrics on %s:%s (daemon thread: %s, auth: %s)",
+            addr,
+            bound_port,
+            thread.daemon,
+            "bearer-token" if token_file else "none (open plaintext)",
         )
         return _active_port
 
