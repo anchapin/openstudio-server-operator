@@ -23,6 +23,23 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from openstudio_operator._constants import METRICS_PORT
 
+# Default bucket set for handler tick-duration Histograms (issue #308).
+# Spread matches the operator's poll cadence: 50 ms–30 s covers both fast
+# idle ticks (~0.1 s) and degraded stalls (REST 5xx storms, GC pauses, kopf
+# bus contention — D12 says handlers "skip the tick and retry naturally on
+# the next poll"; without this histogram a slow tick that masks the retry
+# window is invisible). A new SRE-facing latency-budget SLO lives or dies
+# on this set: too tight and the right tail gets clipped, too loose and
+# the dashboard loses resolution on the healthy-band the operator cares
+# about. See the issue body for the canonical choice.
+_HANDLER_TICK_BUCKETS = (0.05, 0.1, 0.5, 1, 2, 5, 10, 30)
+
+# Default bucket set for the REST request-duration Histogram (issue #308).
+# Tighter than the handler set because the v3.11.0 REST endpoints are
+# fast (< 1 s on a healthy cluster; #242 timing data); a 5 s cap keeps
+# resolution at the healthy band where a degrade is detectable.
+_REST_REQUEST_BUCKETS = (0.05, 0.1, 0.5, 1, 2, 5)
+
 logger = logging.getLogger(__name__)
 
 SOFT_STOPS_TOTAL = Counter(
@@ -582,6 +599,77 @@ ANALYSIS_DATAPOINT_COUNT = Histogram(
     "openstudio_operator_analysis_datapoint_count",
     "Datapoints per analysis observed by SLA / watchdog modules",
     buckets=[5, 10, 50, 100, 500, 1000, 5000],
+)
+
+# Issue #308 — handler tick-duration Histogram. The four ``@kopf.timer``
+# wrappers (analysis_sla, datapoint_watchdog, worker_recycler,
+# web_background_monitor) catch their respective exception tuples and
+# silently skip the tick on transient failure — D12 says "handlers skip
+# the tick and retry naturally on the next poll". A slow tick that masks
+# the retry window (REST 5xx storm, GC pause, kopf bus contention, Mongo
+# write amplification, NFS stall) was previously invisible: the only
+# /metrics signal was ``handler_tick_failures_total`` AFTER the tick
+# crossed the failure threshold, and an SRE alerting on tick failure
+# rate had no early warning that a tick was trending slow. This Histogram
+# observes the wall-clock duration of every wrapper invocation —
+# regardless of success or caught-exception outcome — so a sustained
+# degradation between the healthy-band baseline and the eventual
+# ``handler_tick_failures_total`` increment is visible. ``module``
+# label vocabulary matches the failure counter (analysis_sla |
+# datapoint_watchdog | worker_recycler | web_background_monitor) so a
+# dashboard can correlate latency with failure rate on the same module
+# dimension. Buckets cover 50 ms (a fast idle tick) through 30 s
+# (a degraded poll that masks the retry window); the issue body is the
+# canonical source of the bucket choice.
+HANDLER_TICK_DURATION_SECONDS = Histogram(
+    "openstudio_operator_handler_tick_duration_seconds",
+    "Wall-clock duration of the four @kopf.timer wrappers (issue #308). "
+    "Observed at the END of each wrapper invocation, regardless of "
+    "success or caught-exception outcome, so a sustained degradation "
+    "(REST 5xx storm, GC pause, kopf bus contention, NFS stall) is "
+    "visible to Prometheus before it crosses the failure threshold "
+    "captured by ``handler_tick_failures_total``. Labelled by "
+    "``module`` (analysis_sla | datapoint_watchdog | worker_recycler | "
+    "web_background_monitor) — same vocabulary as the failure counter, "
+    "so a dashboard can correlate latency with failure rate on the same "
+    "module dimension.",
+    labelnames=["module"],
+    buckets=_HANDLER_TICK_BUCKETS,
+)
+
+# Issue #308 — REST round-trip duration Histogram. ``OpenStudioClient._request``
+# runs the 3-attempt retry loop (GET-only) with jittered exponential
+# backoff; each attempt is a real HTTP round-trip, but only the final
+# outcome (a 200 response, or an exhausted-budget ``OpenStudioApiError``)
+# is surfaced to the caller — a single slow attempt that succeeds on
+# retry is invisible at /metrics, and so is a 5xx storm that succeeds
+# on the third try. This Histogram observes the wall-clock duration of
+# every ``_request`` call, labelled by HTTP ``method`` (the same vocab
+# the operator uses — GET | POST | DELETE) and ``outcome``. The
+# ``outcome`` label is the terminal result the caller would see:
+# ``"200"`` for any 2xx/3xx that returned, ``"exception"`` for any
+# raised ``OpenStudioApiError`` (4xx immediately, 5xx retries exhausted,
+# non-GET 5xx per issue #226). The bucket set is tighter than the
+# handler set because v3.11.0 endpoints are fast on a healthy cluster;
+# a 5 s cap keeps resolution at the healthy band where a degrade is
+# detectable. A sustained non-zero rate on ``outcome="exception"`` is
+# the canonical "REST API degraded" alert, and the per-method split
+# tells the on-call which verb is responsible.
+REST_REQUEST_DURATION_SECONDS = Histogram(
+    "openstudio_operator_rest_request_duration_seconds",
+    "Wall-clock duration of every ``OpenStudioClient._request`` call "
+    "(issue #308), including the GET-only 3x retry loop. Observed at "
+    "the END of ``_request`` so the time spent inside the retry envelope "
+    "is part of the observation. Labelled by ``method`` (GET | POST | "
+    "DELETE — the verbs the operator actually uses) and ``outcome`` "
+    "(``\"200\"`` for any successful 2xx/3xx response, ``\"exception\"`` "
+    "for any raised ``OpenStudioApiError``: 4xx immediately, 5xx retries "
+    "exhausted, or non-GET 5xx per issue #226). A sustained non-zero "
+    "rate on ``outcome=\"exception\"`` is the canonical REST-degraded "
+    "alert; the per-method split tells the on-call which verb is "
+    "responsible.",
+    labelnames=["method", "outcome"],
+    buckets=_REST_REQUEST_BUCKETS,
 )
 
 #: Re-exported alias for back-compat with the historical ``DEFAULT_METRICS_PORT``

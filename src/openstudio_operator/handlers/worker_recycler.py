@@ -49,6 +49,7 @@ on); flipping ``spec.dryRun`` back to false changes only the mutation.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -59,6 +60,7 @@ from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
+    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     WORKERS_RECYCLED_TOTAL,
 )
@@ -203,6 +205,35 @@ def worker_recycler(
     **_: object,
 ) -> None:
     """Timer thin wrapper: wire config/client/store/apps/events, run one tick."""
+    # Issue #308 — wall-clock observation of the wrapper invocation. The
+    # ``finally`` guarantees observation regardless of success or caught
+    # exception, so the slow-tick signal is independent of the failure
+    # counter and a sustained degradation between the healthy band and
+    # the eventual ``handler_tick_failures_total`` increment is visible.
+    _started = time.perf_counter()
+    try:
+        _worker_recycler_impl(
+            body=body,
+            spec=spec,
+            namespace=namespace,
+            name=name,
+            logger=logger,
+        )
+    finally:
+        HANDLER_TICK_DURATION_SECONDS.labels(module="worker_recycler").observe(
+            time.perf_counter() - _started
+        )
+
+
+def _worker_recycler_impl(
+    *,
+    body: dict,
+    spec: dict,
+    namespace: str,
+    name: str,
+    logger: kopf.Logger,
+) -> None:
+    """Inner body of :func:`worker_recycler` (issue #308)."""
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — worker recycler idle this tick")

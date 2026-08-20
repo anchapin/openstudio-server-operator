@@ -106,13 +106,32 @@ EXPECTED_GAUGE_FAMILIES = (
 )
 
 #: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
-#: datapoint watchdog each observe the count off the OpenStudio REST
-#: analysis payload (or the equivalent summary endpoint) once per tick:
-#: the SLA records ``len(analyses)`` from ``/analyses.json``; the watchdog
-#: records ``len(started_ids)`` from ``/data_points/status?status=1&jobs=
+#: datapoint watchdog each observe the count off the OpenStudio REST analysis
+#: payload (or the equivalent summary endpoint) once per tick: the SLA records
+#: ``len(analyses)`` from ``/analyses.json``; the watchdog records
+#: ``len(started_ids)`` from ``/data_points/status?status=1&jobs=
 #: started``. No labels — one observation per tick, bounded-cardinality
 #: at the histogram level rather than per analysis.
-EXPECTED_HISTOGRAM_FAMILIES = ("openstudio_operator_analysis_datapoint_count",)
+#:
+#: Issue #308 — handler tick-duration Histogram. The four ``@kopf.timer``
+#: wrappers (analysis_sla, datapoint_watchdog, worker_recycler,
+#: web_background_monitor) observe their wall-clock duration regardless of
+#: success or caught-exception outcome, so a sustained degradation
+#: (REST 5xx storm, GC pause, kopf bus contention, NFS stall) is visible
+#: to Prometheus before it crosses the failure threshold captured by
+#: ``handler_tick_failures_total``. ``module`` label vocabulary matches the
+#: failure counter.
+#:
+#: Issue #308 — REST round-trip duration Histogram. ``OpenStudioClient
+#: ._request`` observes its wall-clock duration including the GET-only 3x
+#: retry envelope, labelled by ``method`` and ``outcome`` (``"200"`` |
+#: ``"exception"``). A sustained non-zero rate on ``outcome="exception"``
+#: is the canonical REST-degraded alert.
+EXPECTED_HISTOGRAM_FAMILIES = (
+    "openstudio_operator_analysis_datapoint_count",
+    "openstudio_operator_handler_tick_duration_seconds",
+    "openstudio_operator_rest_request_duration_seconds",
+)
 
 
 def _declared_counter_families():
@@ -162,6 +181,17 @@ def test_every_declared_histogram_family_in_registry_exposition():
     # below keeps the family-existence assertion self-contained
     # (mirrors the labelled-counter pattern from #117).
     metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    # Issue #308 — labelled Histograms need at least one labelled
+    # observation before the family line is exposed. Pre-touch each
+    # labelled histogram so the family-existence assertion is
+    # self-contained for every declared family — same pattern as
+    # issue #117's labelled-counter pre-touch.
+    metrics.HANDLER_TICK_DURATION_SECONDS.labels(
+        module="__metrics_test_sentinel__"
+    ).observe(0.1)
+    metrics.REST_REQUEST_DURATION_SECONDS.labels(
+        method="GET", outcome="200"
+    ).observe(0.1)
     exposition = generate_latest().decode()
     for name in _declared_histogram_families():
         assert f"# TYPE {name} histogram" in exposition
@@ -395,9 +425,34 @@ def test_metrics_http_server_serves_all_declared_counters():
     # after the first observation. Pre-touch it here so the family-existence
     # assertion is self-contained (mirrors the labelled-counter pattern).
     metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    # Issue #308 — labelled Histograms (handler_tick_duration_seconds,
+    # rest_request_duration_seconds) need at least one labelled observation
+    # before the family line is exposed. Pre-touch each labelled histogram
+    # so the family-existence assertion is self-contained — same pattern
+    # as issue #117's labelled-counter pre-touch. The labelled form is
+    # asserted below alongside the bare-form unlabelled histogram.
+    metrics.HANDLER_TICK_DURATION_SECONDS.labels(
+        module="__metrics_test_sentinel__"
+    ).observe(0.1)
+    metrics.REST_REQUEST_DURATION_SECONDS.labels(
+        method="GET", outcome="200"
+    ).observe(0.1)
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     for name in _declared_histogram_families():
         assert f"# TYPE {name} histogram" in response.text
+        if name == "openstudio_operator_handler_tick_duration_seconds":
+            # prometheus_client emits labels in alphabetical order
+            # (``le`` < ``module``); pin that shape so a future
+            # client-side change to label ordering is caught here.
+            assert (
+                'openstudio_operator_handler_tick_duration_seconds_bucket{le="0.1",module="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_rest_request_duration_seconds":
+            assert (
+                'openstudio_operator_rest_request_duration_seconds_bucket{le="0.1",method="GET",outcome="200"}'
+                in response.text
+            )
 
     # idempotent: a second call must not start another server — it returns
     # the already-active port instead
@@ -951,5 +1006,136 @@ def test_analyses_deleted_counter_exposition_uses_outcome_label():
     exposition = generate_latest().decode()
     assert (
         'openstudio_operator_analyses_deleted_total{outcome="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+# --- Issue #308 — handler tick + REST round-trip Histograms ---------------------
+
+
+def test_handler_tick_duration_histogram_exposes_per_module_series():
+    """Issue #308 acceptance: ``openstudio_operator_handler_tick_duration_seconds``
+    Histogram exposes one labelled series per module — same vocabulary as
+    ``handler_tick_failures_total`` so a dashboard can correlate latency
+    with failure rate on the same dimension. Driving ``.observe(...)``
+    directly via ``labels(...).observe(...)`` mirrors the labelled-counter
+    pattern from #117 and the labelled-histogram pattern this issue
+    introduces; the call-site integration is covered end-to-end by
+    ``tests/test_handler_boundaries.py::test_handler_wrapper_observe_tick_duration``.
+    """
+    histogram = metrics.HANDLER_TICK_DURATION_SECONDS
+    for module in (
+        "analysis_sla",
+        "datapoint_watchdog",
+        "worker_recycler",
+        "web_background_monitor",
+    ):
+        histogram.labels(module=module).observe(0.1)
+    exposition = generate_latest().decode()
+    for module in (
+        "analysis_sla",
+        "datapoint_watchdog",
+        "worker_recycler",
+        "web_background_monitor",
+    ):
+        # Each labelled series must register its own _count + _bucket line.
+        # The le="0.1" bucket line is the canonical proof the observation
+        # landed on the right module's series — pinning the label key here
+        # catches a future refactor that drops or renames the ``module``
+        # label. prometheus_client emits labels in alphabetical order
+        # (``le`` < ``module``) — pin that shape too.
+        assert (
+            f'openstudio_operator_handler_tick_duration_seconds_count{{module="{module}"}}'
+            in exposition
+        )
+        assert (
+            f'openstudio_operator_handler_tick_duration_seconds_bucket{{le="0.1",module="{module}"}}'
+            in exposition
+        )
+
+
+def test_rest_request_duration_histogram_exposes_per_method_outcome_series():
+    """Issue #308 acceptance: ``openstudio_operator_rest_request_duration_seconds``
+    Histogram exposes one labelled series per ``(method, outcome)`` pair.
+    The ``outcome`` label vocabulary is ``"200"`` (any successful 2xx/3xx)
+    or ``"exception"`` (any raised ``OpenStudioApiError``); the ``method``
+    label is the verb the operator actually uses (GET | POST | DELETE).
+    A sustained non-zero rate on ``outcome="exception"`` is the canonical
+    REST-degraded alert. Driving ``.observe(...)`` directly mirrors the
+    labelled-counter pattern from #117 and pins the label cardinality so
+    a future refactor that drops the ``outcome`` label is caught at CI.
+    """
+    histogram = metrics.REST_REQUEST_DURATION_SECONDS
+    for method, outcome in (
+        ("GET", "200"),
+        ("GET", "exception"),
+        ("POST", "200"),
+        ("POST", "exception"),
+        ("DELETE", "200"),
+        ("DELETE", "exception"),
+    ):
+        histogram.labels(method=method, outcome=outcome).observe(0.1)
+    exposition = generate_latest().decode()
+    for method, outcome in (
+        ("GET", "200"),
+        ("GET", "exception"),
+        ("POST", "200"),
+        ("POST", "exception"),
+        ("DELETE", "200"),
+        ("DELETE", "exception"),
+    ):
+        # Labels are alphabetical: ``le`` < ``method`` < ``outcome``.
+        assert (
+            f'openstudio_operator_rest_request_duration_seconds_count{{method="{method}",outcome="{outcome}"}}'
+            in exposition
+        )
+        assert (
+            f'openstudio_operator_rest_request_duration_seconds_bucket{{le="0.1",method="{method}",outcome="{outcome}"}}'
+            in exposition
+        )
+
+
+def test_rest_request_duration_histogram_uses_issue_308_bucket_set():
+    """Issue #308 — verified exposition shape: the histogram bucket list
+    must be the canonical ``(0.05, 0.1, 0.5, 1, 2, 5)`` set. Pinning the
+    bucket boundaries catches a future refactor that silently broadens or
+    narrows the resolution at the healthy band — a coarser bucket set
+    hides a 100 ms → 500 ms degradation; a finer set is just cardinality
+    growth on the right tail."""
+    histogram = metrics.REST_REQUEST_DURATION_SECONDS
+    # Drive a single observation so the bucket lines are emitted, then
+    # assert the ``le`` boundaries match the issue body's canonical set.
+    histogram.labels(method="GET", outcome="200").observe(0.1)
+    exposition = generate_latest().decode()
+    for le in ("0.05", "0.1", "0.5", "1.0", "2.0", "5.0"):
+        assert (
+            f'openstudio_operator_rest_request_duration_seconds_bucket{{le="{le}",method="GET",outcome="200"}}'
+            in exposition
+        )
+    # The ``+Inf`` bucket is implicit in prometheus_client — it is always
+    # present, even with no observations. Confirm it too so a future
+    # refactor that strips the default bucket is caught at CI.
+    assert (
+        'openstudio_operator_rest_request_duration_seconds_bucket{le="+Inf",method="GET",outcome="200"}'
+        in exposition
+    )
+
+
+def test_handler_tick_duration_histogram_uses_issue_308_bucket_set():
+    """Issue #308 — verified exposition shape: the histogram bucket list
+    must be the canonical ``(0.05, 0.1, 0.5, 1, 2, 5, 10, 30)`` set.
+    Pinning the bucket boundaries catches a future refactor that clips
+    the right tail (a degraded poll that masks the retry window is the
+    exact data point the 30 s cap preserves)."""
+    histogram = metrics.HANDLER_TICK_DURATION_SECONDS
+    histogram.labels(module="analysis_sla").observe(0.1)
+    exposition = generate_latest().decode()
+    for le in ("0.05", "0.1", "0.5", "1.0", "2.0", "5.0", "10.0", "30.0"):
+        assert (
+            f'openstudio_operator_handler_tick_duration_seconds_bucket{{le="{le}",module="analysis_sla"}}'
+            in exposition
+        )
+    assert (
+        'openstudio_operator_handler_tick_duration_seconds_bucket{le="+Inf",module="analysis_sla"}'
         in exposition
     )

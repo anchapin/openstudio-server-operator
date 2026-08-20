@@ -60,6 +60,7 @@ recorded ones never re-fire.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 import kopf
@@ -71,6 +72,7 @@ from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
     DATAPOINTS_REQUEUED_TOTAL,
+    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
@@ -213,6 +215,35 @@ def zombie_datapoint_watchdog(
     **_: object,
 ) -> None:
     """Timer thin wrapper: wire config/client/store/events, run one tick."""
+    # Issue #308 — wall-clock observation of the wrapper invocation. The
+    # ``finally`` guarantees observation regardless of success or caught
+    # exception, so the slow-tick signal is independent of the failure
+    # counter and a sustained degradation between the healthy band and
+    # the eventual ``handler_tick_failures_total`` increment is visible.
+    _started = time.perf_counter()
+    try:
+        _zombie_datapoint_watchdog_impl(
+            body=body,
+            spec=spec,
+            namespace=namespace,
+            name=name,
+            logger=logger,
+        )
+    finally:
+        HANDLER_TICK_DURATION_SECONDS.labels(module="datapoint_watchdog").observe(
+            time.perf_counter() - _started
+        )
+
+
+def _zombie_datapoint_watchdog_impl(
+    *,
+    body: dict,
+    spec: dict,
+    namespace: str,
+    name: str,
+    logger: kopf.Logger,
+) -> None:
+    """Inner body of :func:`zombie_datapoint_watchdog` (issue #308)."""
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — datapoint watchdog idle this tick")

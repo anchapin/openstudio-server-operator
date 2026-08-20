@@ -59,6 +59,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from prometheus_client import generate_latest
+
+from openstudio_operator import metrics
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HANDLERS_DIR = PROJECT_ROOT / "src" / "openstudio_operator" / "handlers"
 PACKAGE_INIT = HANDLERS_DIR / "__init__.py"
@@ -69,6 +73,17 @@ PACKAGE_INIT = HANDLERS_DIR / "__init__.py"
 # module importing from a sibling module — through any import form —
 # is a regression of issue #236.
 ALLOWED_IMPORTERS_FROM_HANDLERS_PACKAGE: frozenset[Path] = frozenset({PACKAGE_INIT})
+
+# Sentinel Logger shim for issue #308. The four timer wrappers accept a
+# ``logger: kopf.Logger`` kwarg; the empty-serverUrl early-return path
+# only invokes ``logger.warning(...)`` on its way out — a plain object
+# whose ``warning`` is a no-op is sufficient. Using a real logging
+# Logger is overkill for this gate and would couple the test to the
+# JSON-logging install (issue #256).
+import logging
+
+_SENTINEL_LOGGER = logging.getLogger("openstudio_operator.tests.handler_boundaries_sentinel")
+_SENTINEL_LOGGER.addHandler(logging.NullHandler())
 
 
 def _iter_handler_modules() -> list[Path]:
@@ -220,3 +235,92 @@ def test_no_handler_to_handler_imports_outside_init() -> None:
         "prevent regressions of #236, not to dictate where new shared "
         "helpers live."
     )
+
+
+# --- Issue #308 — handler tick-duration observation ----------------------------
+
+
+def _histogram_count_for(histogram, **labels: str) -> float:
+    """Read the ``_count`` of a labelled Histogram series.
+
+    The cumulative observation count is exposed by the per-label
+    histogram child's ``_child_samples()`` walk as a sample named
+    ``<base>_count``. Reading directly off ``_buckets[-1]`` does NOT
+    work: in-memory ``_buckets`` holds per-bucket counts, NOT cumulative
+    counts — the cumulative semantic is only computed at sample-
+    collection time. Returns 0.0 when the label combo has never been
+    observed.
+    """
+    child = histogram._metrics.get(tuple(labels.values()))
+    if child is None:
+        return 0.0
+    for sample in child._child_samples():
+        if sample.name.endswith("_count"):
+            return float(sample.value)
+    return 0.0
+
+
+def test_handler_wrapper_observe_tick_duration() -> None:
+    """Issue #308 acceptance: every timer wrapper invocation observes the
+    wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels(module=...)``,
+    regardless of success or caught-exception outcome. The four handlers
+    are imported via the aggregate ``from openstudio_operator.handlers
+    import (...)`` block; each handler function is the ``@kopf.timer``-
+    decorated object. The test drives a wrapper invocation that
+    short-circuits on the empty-serverUrl early-return path (the same
+    path the production failure path uses) and asserts the
+    observation is recorded on the canonical ``module`` label.
+
+    The test does NOT exercise the real kopf machinery; it imports the
+    wrapper fn directly and calls it with the same kwargs shape kopf
+    uses. The outer wrapper's ``finally`` block is the production
+    tick-duration observation site — we verify it by calling the
+    wrapper fn directly and asserting the histogram child for the
+    module label advanced.
+    """
+    from openstudio_operator.handlers import (
+        analysis_sla,
+        datapoint_watchdog,
+        web_background_monitor,
+        worker_recycler,
+    )
+
+    histogram = metrics.HANDLER_TICK_DURATION_SECONDS
+    # The four canonical module labels — same vocabulary as
+    # ``handler_tick_failures_total`` (issue #117). Read the count
+    # BEFORE the call, drive the call, read AFTER, assert the count
+    # advanced. A future refactor that drops the observation site
+    # entirely fails here — the count never advances.
+    modules = (
+        ("analysis_sla", analysis_sla.analysis_sla_monitor),
+        ("datapoint_watchdog", datapoint_watchdog.zombie_datapoint_watchdog),
+        ("worker_recycler", worker_recycler.worker_recycler),
+        ("web_background_monitor", web_background_monitor.web_background_monitor),
+    )
+    for module, fn in modules:
+        before = _histogram_count_for(histogram, module=module)
+        fn(
+            body={"metadata": {"name": "x", "namespace": "ns"}},
+            spec={"serverUrl": "", "redisUrl": ""},
+            namespace="ns",
+            name="x",
+            logger=_SENTINEL_LOGGER,
+        )
+        after = _histogram_count_for(histogram, module=module)
+        assert after == before + 1, (
+            f"module={module}: HANDLER_TICK_DURATION_SECONDS did not "
+            "observe the wrapper invocation — the try/finally block on "
+            "the outer wrapper is missing or the early-return path "
+            "bypassed it (issue #308)."
+        )
+
+    exposition = generate_latest().decode()
+    for module, _fn in modules:
+        # Pin the labelled exposition shape — same vocabulary as the
+        # failure-counter guard. A future refactor that drops the
+        # ``module`` label fails at this assertion, not at the on-call's
+        # Grafana board.
+        assert (
+            f'openstudio_operator_handler_tick_duration_seconds_count{{module="{module}"}}'
+            in exposition
+        )
