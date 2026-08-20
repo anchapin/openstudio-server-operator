@@ -306,6 +306,31 @@ edge cases (`#246` `#247` `#248` `#249`).
   `AGENTS.md` test-count guard from #151 / #220. Companion repo-text
   fix landed in same PR as the gate; this fix is the only entry that
   documents the prose→tuple convergence.
+- **`#389`** — supply-chain hardening: every `uses:` ref in
+  `.github/workflows/release.yml` and `ci.yml` (17 lines across 7
+  third-party actions: `actions/checkout`, `docker/setup-buildx-action`,
+  `docker/login-action`, `docker/build-push-action`,
+  `sigstore/cosign-installer`, `softprops/action-gh-release`,
+  `actions/setup-python`) now resolves to a 40-char commit SHA with the
+  resolved tag as a trailing `# vX.Y.Z` comment. A new CI lint step
+  `Enforce commit-SHA action pinning (#389)` in the `lint` job rejects
+  any `uses: <name>@v<N>` shape that regresses. The release workflow
+  holds `packages: write` + `id-token: write` + `attestations: write`
+  permissions — a compromised mutable tag would have gained push access
+  to `ghcr.io/anchapin/openstudio-server-operator` with a valid
+  Sigstore signature.
+- **`#390`** — `spec.redisUrl` hardened with a DNS-1035-style `pattern:`
+  constraint + CEL `x-kubernetes-validations` rule (mirrors the existing
+  `spec.serverUrl` rule from #160). A CR-write user can no longer pivot
+  the operator's Redis probe to an external host (SSRF / hostile-Redis
+  exfil). The empty-default escape hatch (#116) is preserved via a
+  `|^$` branch in the regex. The corrected pattern accepts the
+  helm-recipe `:password@queue:6379` form; the original issue body
+  pattern was internally inconsistent (it required `.svc` literally,
+  which would have rejected the issue's own acceptance-criterion good
+  URL). 5 new tests in `tests/test_crd_schema.py` pin the three cases
+  (rejects off-cluster host, accepts in-cluster forms incl. bare
+  Service + FQDN + auth, accepts empty default).
 
 ### Removed
 - (none — the legacy sites retired by `#234` / `#235` / `#251` /
