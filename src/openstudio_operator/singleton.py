@@ -70,6 +70,7 @@ from kubernetes.client import (
 )
 from kubernetes.config import ConfigException
 
+from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator._time import parse_iso_utc
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
@@ -274,25 +275,26 @@ _operator_custom_objects_api: CustomObjectsApi | None = None
 
 
 def _load_k8s_config() -> None:
-    """Load the operator pod's kubeconfig in-cluster first, ``kube_config`` fallback.
+    """Thin delegation to the single public loader (issue #305).
 
-    Issue #158 + #251 — the shared loader for every K8s client factory
-    below. In-cluster first (``KUBERNETES_SERVICE_HOST`` /
-    ``KUBERNETES_SERVICE_PORT`` envs + the pod's service-account token
-    mount); on ``ConfigException`` (bare ``kopf run`` dev sessions, no
-    service-account env vars) falls back to ``~/.kube/config``. Idempotent
-    in production — the loader is idempotent on the same source and the
-    factories below all check their cache before calling. Kept private
-    so the only entry point is one of the ``operator_*_api()`` factories
-    (the AST test in ``tests/test_singleton_registry_coverage.py`` gates
-    against inline ``*V1Api()`` construction outside those factories).
+    The in-cluster / ``kube_config`` fallback loader this function used
+    to host inline is now :func:`openstudio_operator._k8s.load_operator_kube_config`
+    — the SINGLE public loader for every K8s client the operator
+    builds. The companion ``_load_kube_config`` in
+    :mod:`openstudio_operator.prune_entrypoint` was a verbatim copy of
+    the same try/except; a future loader change (kubeconfig Secret
+    reference, network-proxy client, custom CA bundle) would have had to
+    land in two places. The wrapper is preserved only to keep the local
+    factory call sites
+    (:func:`operator_custom_objects_api`, :func:`operator_apps_api`,
+    :func:`operator_batch_api`, :func:`operator_core_api`) and their
+    try/except ``ConfigException`` shape unchanged. The AST gate in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
+    rejects any inline ``load_incluster_config(`` /
+    ``load_kube_config(`` call outside ``_k8s.py`` so a partial update
+    fails CI loudly.
     """
-    from kubernetes import config as kube_config
-
-    try:
-        kube_config.load_incluster_config()
-    except ConfigException:
-        kube_config.load_kube_config()
+    load_operator_kube_config()
 
 
 def operator_custom_objects_api() -> CustomObjectsApi:
@@ -315,9 +317,11 @@ def operator_custom_objects_api() -> CustomObjectsApi:
     Behaviour:
 
     * Loads the operator pod's in-cluster service-account config via
-      ``kubernetes.config.load_incluster_config``; on ``ConfigException``
-      (bare ``kopf run`` dev sessions, no service-account env vars) falls
-      back to ``kubernetes.config.load_kube_config``. Same posture as the
+      :func:`openstudio_operator._k8s.load_operator_kube_config` (the
+      SINGLE public loader, issue #305); the loader tries
+      ``kubernetes.config.load_incluster_config`` first, on
+      ``ConfigException`` falls back to
+      ``kubernetes.config.load_kube_config``. Same posture as the
       original ``_build_custom_objects_api`` (issue #79) — kopf >=1.44
       never initializes client-python's default ``Configuration``, so a
       bare ``CustomObjectsApi()`` with no loaded config raises
@@ -369,10 +373,12 @@ def operator_apps_api() -> AppsV1Api:
     :mod:`openstudio_operator.handlers.web_background_monitor`) imports
     this factory instead of instantiating ``AppsV1Api`` inline. The
     factory loads the in-cluster / kubeconfig fallback via
-    :func:`_load_k8s_config` and caches the client for the operator's
-    lifetime, sharing the underlying :class:`kubernetes.client.ApiClient`
-    HTTP connection pool across every operator tick. Inline
-    ``AppsV1Api()`` calls outside this function are a regression; the
+    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
+    SINGLE public loader, issue #305) and caches the client for the
+    operator's lifetime, sharing the underlying
+    :class:`kubernetes.client.ApiClient` HTTP connection pool across
+    every operator tick. Inline ``AppsV1Api()`` calls outside this
+    function are a regression; the
     AST test in
     ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
     fails the CI gate loudly.
@@ -404,9 +410,11 @@ def operator_batch_api() -> BatchV1Api:
     (:mod:`openstudio_operator.retention`) and the prune CronJob
     (:mod:`openstudio_operator.prune_entrypoint`) import this factory
     instead of instantiating ``BatchV1Api`` inline. The factory loads
-    the in-cluster / kubeconfig fallback via :func:`_load_k8s_config` and
-    caches the client for the operator's lifetime. Inline
-    ``BatchV1Api()`` calls outside this function are a regression; the
+    the in-cluster / kubeconfig fallback via
+    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
+    SINGLE public loader, issue #305) and caches the client for the
+    operator's lifetime. Inline ``BatchV1Api()`` calls outside this
+    function are a regression; the
     AST test in
     ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
     fails the CI gate loudly.
@@ -442,9 +450,11 @@ def operator_core_api() -> CoreV1Api:
     prune CronJob's Event emitter
     (:mod:`openstudio_operator.prune_entrypoint`) import this factory
     instead of instantiating ``CoreV1Api`` inline. The factory loads the
-    in-cluster / kubeconfig fallback via :func:`_load_k8s_config` and
-    caches the client for the operator's lifetime. Inline
-    ``CoreV1Api()`` calls outside this function are a regression; the
+    in-cluster / kubeconfig fallback via
+    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
+    SINGLE public loader, issue #305) and caches the client for the
+    operator's lifetime. Inline ``CoreV1Api()`` calls outside this
+    function are a regression; the
     AST test in
     ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
     fails the CI gate loudly.

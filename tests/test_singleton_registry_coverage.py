@@ -870,6 +870,131 @@ def test_only_one_v1_api_construction_point_per_factory() -> None:
     )
 
 
+# --- Issue #305 — single kubeconfig loader call site ----------------------------
+#
+# Issue #305: the kubeconfig loader — ``load_incluster_config`` /
+# ``load_kube_config`` — was duplicated verbatim between
+# ``singleton._load_k8s_config`` and ``prune_entrypoint._load_kube_config``.
+# Both copies have been replaced with thin delegations to the SINGLE
+# public loader :func:`openstudio_operator._k8s.load_operator_kube_config`.
+# The companion v1-API construction gate (issue #251) enforces the
+# construction pattern but did not cover the loader itself, so a future
+# maintainer who re-introduces an inline loader call would have left the
+# two files in disagreement silently. The AST test below pins the
+# single-site invariant at the source level: every production-source
+# ``load_incluster_config(`` or ``load_kube_config(`` call must live in
+# ``_k8s.py``.
+
+#: The two client-python loader symbols the operator touches. Bare-name
+#: (``load_incluster_config(...)``) AND attribute
+#: (``kube_config.load_incluster_config(...)``) call shapes are caught —
+#: the existing singleton.py used the attribute shape, the existing
+#: prune_entrypoint.py used the bare-name shape, and a future regression
+#: that flips either spelling is rejected by the same gate.
+_KUBECONFIG_LOADER_NAMES = frozenset({"load_incluster_config", "load_kube_config"})
+
+
+def _find_kube_config_loader_calls() -> list[tuple[str, int, str]]:
+    """Return ``(relative_path, lineno, name)`` for every loader call site.
+
+    Walks ``src/openstudio_operator/`` and locates ``ast.Call`` nodes
+    whose function is either a bare ``load_incluster_config`` /
+    ``load_kube_config`` name OR an attribute ending in either name
+    (e.g. ``kube_config.load_incluster_config()``). The
+    attribute-shape match is necessary because the original
+    ``singleton._load_k8s_config`` used the qualified form
+    (``kube_config.load_incluster_config()`` via a local module-alias
+    import); without it, a regression that re-introduces the
+    attribute-shape call would slip past the gate.
+    """
+    src_root = Path(singleton.__file__).parent
+    found: list[tuple[str, int, str]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _KUBECONFIG_LOADER_NAMES:
+                found.append((str(py.relative_to(src_root.parent)), node.lineno, func.id))
+            elif isinstance(func, ast.Attribute) and func.attr in _KUBECONFIG_LOADER_NAMES:
+                found.append((str(py.relative_to(src_root.parent)), node.lineno, func.attr))
+    return found
+
+
+def test_only_one_kubeconfig_loader_call_site() -> None:
+    """Issue #305: ``load_incluster_config`` / ``load_kube_config`` live in exactly one place.
+
+    The kubeconfig loader is the upstream gate every K8s API call
+    shares — the operators's :func:`operator_custom_objects_api`,
+    :func:`operator_apps_api`, :func:`operator_batch_api`, and
+    :func:`operator_core_api` factories all depend on it, and so does
+    :mod:`openstudio_operator.prune_entrypoint`'s pre-factory preload.
+    Before #305, the inline ``try: load_incluster_config(); except
+    ConfigException: load_kube_config()`` lived in two places
+    (``singleton._load_k8s_config`` and
+    ``prune_entrypoint._load_kube_config``); a future loader change
+    (kubeconfig Secret reference, network-proxy client, custom CA
+    bundle) would have to land in two files in lockstep, and the
+    existing v1-API construction gate (issue #251) covers the
+    construction step but not the loader step.
+
+    The fix: the loader is now hosted at
+    :func:`openstudio_operator._k8s.load_operator_kube_config` and
+    both wrappers delegate to it. This test pins the single-site
+    invariant at the source level: any production-source
+    ``load_incluster_config(`` or ``load_kube_config(`` call outside
+    ``_k8s.py`` is a regression — and the test fails the CI gate
+    loudly so the regression cannot reach ``develop``.
+
+    Note: the test mocks in ``tests/test_singleton_guard.py`` and
+    ``tests/test_k8s_clients.py`` monkeypatch
+    ``kubernetes.config.load_incluster_config`` /
+    ``kubernetes.config.load_kube_config`` — those are TEST files
+    (the AST scan is scoped to ``src/openstudio_operator/``) and the
+    monkeypatched symbols are still resolved through the local
+    import inside ``load_operator_kube_config``, so the existing
+    load-order contract tests
+    (``test_get_guard_loads_config_before_building_client``,
+    ``test_factory_loads_incluster_config``) continue to pass without
+    modification.
+    """
+    src_root = Path(singleton.__file__).parent
+    found = _find_kube_config_loader_calls()
+    assert found, (
+        "No ``load_incluster_config(`` or ``load_kube_config(`` call "
+        "site found in src/openstudio_operator/. The SINGLE public "
+        "loader in openstudio_operator._k8s.load_operator_kube_config() "
+        "must call into kubernetes.config. See issue #305."
+    )
+    offenders = [
+        (path, lineno, name)
+        for path, lineno, name in found
+        if not path.endswith("openstudio_operator/_k8s.py")
+    ]
+    assert not offenders, (
+        f"Production code calls ``{_KUBECONFIG_LOADER_NAMES}`` outside "
+        f"openstudio_operator/_k8s.py: {offenders}. Every K8s client "
+        f"the operator builds must go through the SINGLE public loader "
+        f"openstudio_operator._k8s.load_operator_kube_config(); "
+        f"inline ``load_incluster_config(`` / ``load_kube_config(`` "
+        f"calls in any other module are a regression (issue #305). "
+        f"The companion wrappers "
+        f"openstudio_operator.singleton._load_k8s_config and "
+        f"openstudio_operator.prune_entrypoint._load_kube_config "
+        f"both delegate to the canonical loader."
+    )
+    # Sanity: the scan root must match the heuristic used by the #158
+    # and #251 tests — defensive in case the source-root heuristic
+    # ever drifts (the test would otherwise silently scan a wrong
+    # subtree and pass).
+    assert src_root.name == "openstudio_operator", (
+        f"AST scan root drifted: expected 'openstudio_operator', got "
+        f"{src_root.name!r}. Update the #158, #251, and #305 AST "
+        f"tests in lockstep."
+    )
+
+
 # --- Issue #250 — Python-level registry cross-check ----------------------------
 #
 # Issue #250: ``EXPECTED_OSCM_TIMER_HANDLER_IDS`` (the frozenset above) was

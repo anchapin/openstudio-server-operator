@@ -54,9 +54,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from kubernetes.client import ApiException, BatchV1Api
-from kubernetes.config import ConfigException, load_incluster_config, load_kube_config
+from kubernetes.config import ConfigException
 
 from openstudio_operator import singleton
+from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.logging_setup import install_json_logging
@@ -141,20 +142,26 @@ def build_event_emitter(
 
 
 def _load_kube_config() -> None:
-    """In-cluster first, kubeconfig fallback (dev/kind parity with singleton).
+    """Thin delegation to the single public loader (issue #305).
 
-    Issue #251 — kept for the prune entrypoint's load-once posture; the
-    K8s client factories below (``operator_batch_api``,
-    ``operator_core_api``, ``operator_custom_objects_api``) all call the
-    same loader internally on first use, so this explicit call is
-    redundant for the operator's process lifetime. Retained as a
-    pre-#251 audit seam: a maintainer reading the entrypoint should see
-    the loader path explicitly, not implicitly behind a factory call.
+    The in-cluster / ``kube_config`` fallback loader this function used
+    to host inline is now :func:`openstudio_operator._k8s.load_operator_kube_config`
+    — the SINGLE public loader for every K8s client the operator
+    builds. The companion ``_load_k8s_config`` in
+    :mod:`openstudio_operator.singleton` was a verbatim copy of the
+    same try/except; a future loader change (kubeconfig Secret
+    reference, network-proxy client, custom CA bundle) would have had
+    to land in two places. The wrapper is preserved only because the
+    entrypoint's :func:`main` calls it explicitly (the redundant
+    pre-factory load that avoids the ``ConfigException`` fallback path
+    in environments where ``load_kube_config`` succeeds), and the
+    visible call site documents that intent. The AST gate in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
+    rejects any inline ``load_incluster_config(`` /
+    ``load_kube_config(`` call outside ``_k8s.py`` so a partial update
+    fails CI loudly.
     """
-    try:
-        load_incluster_config()
-    except ConfigException:
-        load_kube_config()
+    load_operator_kube_config()
 
 
 def _list_crs(custom_api: CustomApi, namespace: str) -> list[dict]:
@@ -194,17 +201,16 @@ def main(
     namespace = str(namespace)
 
     if custom_api is None or batch_api is None or core_api is None:
-        # Issue #251 — every K8s client is built via the operator's
+        # Issue #251 + #305 — every K8s client is built via the operator's
         # central factory (singleton.operator_*_api()), which loads the
         # in-cluster / kubeconfig fallback and caches the result for the
-        # process lifetime. The factory itself calls the kubeconfig
-        # loader on first use; the explicit ``_load_kube_config()`` here
-        # is retained for the ``ConfigException`` fallback path that
-        # the entrypoint still owns (the factories catch the same
-        # exception internally, but doing the load once at the top
-        # ensures the factories find the kubeconfig already loaded —
-        # belt + braces, plus it preserves the historical pre-#251
-        # ordering for the CustomObjectsApi construction).
+        # process lifetime. The factory itself calls the SINGLE public
+        # loader (:func:`openstudio_operator._k8s.load_operator_kube_config`)
+        # on first use; the explicit ``_load_kube_config()`` here is a thin
+        # delegation to that same loader, so the factories find the
+        # kubeconfig already loaded and the ``ConfigException`` warning
+        # path inside the factory (the placeholder-client branch) is
+        # avoided in environments where ``load_kube_config`` succeeds.
         _load_kube_config()
         custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
         batch_api = batch_api if batch_api is not None else operator_batch_api()
