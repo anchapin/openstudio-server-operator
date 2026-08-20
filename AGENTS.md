@@ -39,7 +39,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 650 tests across 32 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 655 tests across 33 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -110,5 +110,5 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 - **Issue #220** — same guard for `docs/onboarding.md` (plain prose form, no `# ` prefix).
 - **Issue #152** — no surviving `TODO(phase N)` markers in `deploy/` or `scripts/` (initial-scaffold placeholders that should be deleted once the acceptance criterion ships).
 - **Issues #150 / #219** — see the password literal rule above.
-- **Metrics family drift** — `tests/test_metrics_endpoint.py::EXPECTED_*_FAMILIES` is the source of truth; adding a counter/gauge/histogram anywhere without updating the tuple fails CI.
+- **Metrics family drift** — `tests/test_metrics_endpoint.py::EXPECTED_*_FAMILIES` is the source of truth; adding a counter/gauge/histogram anywhere without updating the tuple fails CI. **Issue #387** — the prose claim `N counters + M gauges + K histograms` in `README.md` and `docs/audit-dryrun-idempotency.md` is held to the same tuple counts; the Python test in `tests/test_metrics_family_prose_claim.py` and the shell script `scripts/check_metrics_family_claim.sh` (run as a CI step in `lint` job) both fail the build when the prose desyncs.
 - **Issue #301** — every PR body must carry a `Scope guard:` block that names the issues this PR touches and declares what is intentionally NOT being changed (with the follow-up issue that owns that area); `scripts/check_pr_body_scope.sh` is the CI gate that fails the `lint` job when the block is missing, lacks an issue reference, or has no rationale phrase.

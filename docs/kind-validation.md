@@ -1471,8 +1471,8 @@ hpa_floor lines: (empty — #77 removal complete)
 `openstudio_operator_hpa_floor_adjustments_total` is no longer
 served by the operator — proving the #77 removal was complete (no
 orphan counter declaration, no orphan incrementer). All other
-counters in `EXPECTED_COUNTER_FAMILIES` are still served (16 counters +
-4 gauges + 1 histogram — the +1 counter over the pre-#171 baseline is
+counters in `EXPECTED_COUNTER_FAMILIES` are still served (18 counters +
+7 gauges + 3 histograms — the +1 counter over the pre-#171 baseline is
 the post-#171 `status_map_caps_total` defensive cap, the +1 histogram
 is the post-#179 `analysis_datapoint_count` per-CR datapoint-budget
 distribution; the additional counters and gauges were landed in the
@@ -1480,6 +1480,10 @@ auto-improvement-loop iteration 2 sweep (#237 dry-run suppressed +
 emitted Events; #238 Resque queue depth Gauge; #239 singleton-guard
 election outcomes; #253 Redis key-layout validation status; #254
 sustained-window elapsed seconds; #255 kopf.event emission failures);
+the post-#255 → 18+7+3 expansion was landed in iteration 3 (#306
+storage-prune CronJob skip-tick failure counter; #308 handler tick +
+REST round-trip duration histograms; #310 QueuedKopfEventSink drop
+counter + queue depth gauge; #312 paired freshness timestamp gauges);
 no orphans of any other kind):
 
 ```bash
@@ -1539,13 +1543,14 @@ HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
       `pytest --collect-only`); the operator boots
       end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
       drives scaling, and the operator's `/metrics` exposes the
-      16 counters + 4 gauges + 1 histogram (Section 6) — the +1 counter
+      18 counters + 7 gauges + 3 histograms (Section 6) — the +1 counter
       over the pre-#171 baseline is the `status_map_caps_total` defensive
       cap, and the +1 histogram is the post-#179
       `analysis_datapoint_count` per-CR datapoint-budget distribution
       (the post-#171 → post-iter-2 expansion to 16+4+1 is the auto-
       improvement-loop iteration 2 sweep: #237 #238 #239 #253 #254 #255
-      plus the +1 histogram).
+      plus the +1 histogram; the post-#255 → 18+7+3 expansion is the
+      iteration 3 sweep: #306 #308 #310 #312).
 
 ### Cleanup
 

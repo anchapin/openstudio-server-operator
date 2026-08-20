@@ -281,6 +281,32 @@ edge cases (`#246` `#247` `#248` `#249`).
   after the namespaced `#78` Role split and the `#78` deterministic
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
+### Fixed
+- **`#387`** — metrics-family prose claim drift. The four prose
+  locations (`README.md` lines 67 and 205, the audit `Appendix D`
+  introduction, `docs/kind-validation.md` lines 1474 and 1542) all
+  claimed **16 counters + 4 gauges + 1 histograms** while the actual
+  registry — asserted by `tests/test_metrics_endpoint.py`'s
+  `EXPECTED_COUNTER_FAMILIES` / `EXPECTED_GAUGE_FAMILIES` /
+  `EXPECTED_HISTOGRAM_FAMILIES` — is **18 counters + 7 gauges + 3
+  histograms**. The seven families added since the 16+4+1 claim:
+  - `openstudio_operator_prune_tick_failures_total` (counter, #306)
+  - `openstudio_operator_warnings_deferred_dropped_total` (counter, #310)
+  - `openstudio_operator_resque_queue_depth_fresh` (gauge, #312)
+  - `openstudio_operator_stall_window_fresh` (gauge, #312)
+  - `openstudio_operator_warnings_deferred_queue_depth` (gauge, #310)
+  - `openstudio_operator_handler_tick_duration_seconds` (histogram, #308)
+  - `openstudio_operator_rest_request_duration_seconds` (histogram, #308)
+  Prose claims updated to **18 counters + 7 gauges + 3 histograms**; the
+  README metrics table now lists every family the registry serves. New
+  CI gate `tests/test_metrics_endpoint.py` mirrored to parse the
+  `N counters + M gauges + K histograms` claim out of `README.md` and
+  `docs/audit-dryrun-idempotency.md` and fail the build when it
+  disagrees with `len(EXPECTED_*_FAMILIES)` — parallels the
+  `AGENTS.md` test-count guard from #151 / #220. Companion repo-text
+  fix landed in same PR as the gate; this fix is the only entry that
+  documents the prose→tuple convergence.
+
 ### Removed
 - (none — the legacy sites retired by `#234` / `#235` / `#251` /
   `#252` are described inline within their Changed bullets above)
