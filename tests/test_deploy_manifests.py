@@ -180,14 +180,29 @@ def test_cronjob_runs_entrypoint_from_pinned_operator_image():
     assert CRONJOB["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 0
     assert pod["serviceAccountName"] == PRUNE_SA["metadata"]["name"]
     container = pod["containers"][0]
-    # Issue #291: pin to the same SHA256 digest as deploy/operator-deployment.yaml;
-    # the operator image is re-pinned by .github/workflows/release.yml on every
-    # develop push. The mutable `:dev` tag combined with `IfNotPresent` allowed the
-    # kubelet to retain a previously-cached image across restarts.
-    assert container["image"] == (
-        "ghcr.io/anchapin/openstudio-server-operator@sha256:"
-        "6681d2545970ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e"
+    # Issue #291: the CronJob must pin the operator image by SHA256 digest
+    # (not a mutable tag) and use imagePullPolicy: Always. The exact digest
+    # is intentionally NOT hard-coded here — release.yml re-pins both manifests
+    # on every develop push (issue #316), so a literal would go stale on the
+    # next re-pin. The load-bearing invariant "operator-deployment and
+    # storage-cronjob agree on the same digest" is enforced by
+    # `test_cronjob_image_digest_matches_operator_deployment` below.
+    image = container["image"]
+    assert "@sha256:" in image, (
+        f"CronJob image must be digest-pinned (got {image!r}); a mutable "
+        "tag like `:latest` or `:dev` lets the kubelet retain a stale "
+        "image across restarts (issue #291)"
     )
+    # No mutable tag suffix — `@sha256:...` must be the only ref component.
+    # Split on `@` and check the tag slot (between `:` and `@`) is absent.
+    assert ":" not in image.split("@", 1)[0], (
+        f"CronJob image must not carry a mutable tag (got {image!r}); "
+        "the part before `@` must have no `:` (issue #291)"
+    )
+    # Belt-and-braces: the historical weak tags `:dev` and `:latest` must
+    # never reappear as the only image reference.
+    assert not image.endswith(":dev"), image
+    assert not image.endswith(":latest"), image
     # Issue #291: Always re-pulls the digest on every CronJob tick (10 min).
     # The previous IfNotPresent policy left the kubelet free to keep a stale
     # image if the digest-pinning invariant was ever bypassed.
