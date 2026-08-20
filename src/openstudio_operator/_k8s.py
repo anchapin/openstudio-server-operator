@@ -170,7 +170,7 @@ def deployment_label_selector(
 
 
 def rolling_restart_deployment(
-    apps_api: "AppsV1Api",
+    apps_api: AppsV1Api,
     *,
     deployment: str,
     namespace: str,
