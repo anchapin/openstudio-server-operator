@@ -40,6 +40,8 @@ referenced the deleted `handlers/storage_pruner.py`; those lines predate the
 | 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | **live** | Reads Resque queue depth via `redis_client.stale_workers(...)`; pod eviction on stall |
 | Phase 4 — KEDA autoscaling | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication) | **live** | Replaces custom Redis HPA-floor handler in #77; operator owns zero autoscaling surface and emits no `hpa_floor_adjustments_total` counter |
 | Singleton guard (D05) | `src/openstudio_operator/singleton.py`, installed from `handlers/__init__.py` | **live** | Passive oldest-CR-per-namespace guard; Warning Event + loud log on second CR |
+| VAP pod-delete scope (#293) | `deploy/pod-delete-admission-policy.yaml` (cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the operator SA's `pods/delete` to pods labeled `app=worker` — a constraint RBAC cannot express (`PolicyRule` has no `labelSelector`). Requires K8s 1.30+ (`admissionregistration.k8s.io/v1` GA); pre-1.30 clusters must skip it |
+| VAP prune batch/jobs scope (#294) | `deploy/storage-cronjob.yaml` (embedded cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the prune SA's `batch/jobs` create/update/delete to Jobs carrying both `app.kubernetes.io/managed-by=openstudio-operator` and `app.kubernetes.io/component=archival`. Requires K8s 1.30+; pre-1.30 clusters must skip it |
 
 ## Ground rules (from AGENTS.md)
 
@@ -85,6 +87,22 @@ the four that change how you interpret curl output here:
   `deploy/operator-deployment.yaml`. If the published image is unavailable,
   run the operator locally (Phase A step 4), or build/push the dev image
   yourself before using the Deployment.
+- The two cluster-scoped ValidatingAdmissionPolicies that narrow the
+  operator / prune ServiceAccounts beyond what RBAC can express (RBAC
+  `PolicyRule` has no `labelSelector`; `resourceNames` takes exact strings
+  only). Apply them in this order alongside the Phase A operator manifests:
+  1. `deploy/pod-delete-admission-policy.yaml` (#293) — operator SA's
+     `pods/delete` restricted to pods labeled `app=worker`.
+  2. `deploy/storage-cronjob.yaml` (#294) — prune SA's `batch/jobs`
+     create/update/delete restricted to Jobs carrying both
+     `app.kubernetes.io/managed-by=openstudio-operator` and
+     `app.kubernetes.io/component=archival`; the same manifest ships the
+     prune CronJob with its SA/Role.
+
+  Both policies are cluster-scoped and independent of each other; both
+  require Kubernetes 1.30+ (`admissionregistration.k8s.io/v1` GA) —
+  pre-1.30 clusters must skip both and run with RBAC-only guardrails
+  (see the Module status table above).
 - Note (#69): the `:dev` publish pipeline was broken from #57 until the #69
   fix (README.md was excluded from the Docker build context, failing pip
   metadata generation). It is live again — future waves can pull the image
