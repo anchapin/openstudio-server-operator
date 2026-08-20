@@ -1,0 +1,98 @@
+# Issue #293 — defense-in-depth for the operator's pods/delete verb.
+#
+# Native RBAC cannot constrain a verb by label selector: the
+# `apiGroups / resources / verbs / resourceNames` rule shape has no
+# label-selector slot (see kubernetes/kubernetes#112130 and the
+# `rbac.authorization.k8s.io/v1` Role spec). Pre-fix, deploy/rbac.yaml
+# granted the operator ServiceAccount `verbs: [get, list, watch, delete]`
+# against core pods with NO resourceNames, NO namespace restriction
+# beyond the namespaced Role scope, and NO label gating — so a
+# compromised operator pod could DELETE any pod in
+# `openstudio-server`: `web`, `web-background`, `mongo`, `redis`,
+# `queue`, NFS, even the operator's own. The retention pipeline
+# (`delete_namespaced_pod` → server-side `DELETE /analyses/{id}` → NFS
+# cascade) made the wildcard delete especially dangerous (D03):
+# there is no REST kill endpoint and no soft-stop recovery once the
+# cascade is underway.
+#
+# The fix: a ValidatingAdmissionPolicy (GA in k8s 1.30; the kind
+# validation cluster runs 1.31 per docs/kind-validation.md:519) that
+# intercepts every DELETE pod admission request in
+# `openstudio-server`, and rejects any request that:
+#
+#   * originates from the operator ServiceAccount
+#     `system:serviceaccount:openstudio-server:openstudio-operator-sa`, AND
+#   * targets a pod whose labels do NOT include `app=worker`
+#     (the helm chart's worker Deployment pod-template label — see
+#     scripts/manifests/06-worker.yaml:39-40 and the corresponding
+#     chart label).
+#
+# The CEL short-circuit `request.userInfo.username != '<operator SA>'
+# || ...` means actors OTHER than the operator SA are NOT restricted
+# by this policy — humans via kubectl, the prune CronJob SA, etc.,
+# keep their normal pod-delete access; only the operator SA's
+# destructive surface is narrowed. The `failurePolicy: Fail` setting
+# means a broken admission webhook (e.g. a CEL runtime error) rejects
+# the request rather than failing open; the alternative `Warn` would
+# silently re-open the gap.
+#
+# Apply order alongside the rest of the operator manifests (see
+# docs/kind-validation.md:218-219). The policy lives in the
+# `admissionregistration.k8s.io/v1` API group — it is cluster-scoped
+# by default, so the namespaceSelector in both the policy and the
+# binding restricts evaluation to `openstudio-server`. There is no
+# RBAC surface for a binding; the binding's only job is to scope the
+# cluster-scoped policy to the namespace the operator actually runs in.
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openstudio-operator-pod-delete-scope
+spec:
+  admissionReviewVersions: ["v1"]
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        # DELETE only. CREATE/UPDATE/PATCH operations on pods are NOT
+        # operator SA surfaces (the operator never writes to pod specs
+        # directly — see worker_recycler.py: it patches the Deployment,
+        # which transitively restarts pods). Constraining DELETE matches
+        # the documented blast radius (analysis_sla.py:542).
+        operations: ["DELETE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
+  validations:
+    - expression: >
+        request.userInfo.username !=
+        'system:serviceaccount:openstudio-server:openstudio-operator-sa'
+        ||
+        (has(object.metadata.labels) &&
+         object.metadata.labels['app'] == 'worker')
+      message: >
+        openstudio-operator-sa may only DELETE pods carrying the
+        `app=worker` label (the helm chart's worker Deployment pod
+        selector). All other pod deletes from this ServiceAccount
+        are rejected at admission time. Issue #293: closes the
+        pre-fix blast radius where a compromised operator pod could
+        DELETE web, web-background, mongo, redis, queue, NFS, or its
+        own pod. Humans via kubectl and other ServiceAccounts are
+        unaffected — only this SA is constrained.
+---
+# ValidatingAdmissionPolicyBinding scopes the cluster-scoped policy
+# to the `openstudio-server` namespace via namespaceSelector (which
+# is additive with the policy's own matchConstraints.namespaceSelector
+# — both must match for the policy to evaluate a request).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openstudio-operator-pod-delete-scope
+spec:
+  policyName: openstudio-operator-pod-delete-scope
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
