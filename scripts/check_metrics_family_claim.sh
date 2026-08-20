@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI / local guard — verify the metrics-family prose claim in README.md and
 # docs/audit-dryrun-idempotency.md agrees with the canonical tuple counts
-# in tests/test_metrics_endpoint.py (issue #387).
+# in tests/_metrics_inventory.py (issue #387; home moved there by #406).
 #
 # The Python test in tests/test_metrics_family_prose_claim.py is the
 # load-bearing assertion; this shell script is the grep-based mirror of
@@ -21,25 +21,25 @@
 # The script is intentionally dependency-free (bash + grep + python). CI
 # runs it from the `lint` job on every pull_request event after the
 # Python test has run. The tuple lengths are extracted via `python3 -c`
-# that parses the AST of `tests/test_metrics_endpoint.py` directly — no
+# that parses the AST of `tests/_metrics_inventory.py` directly — no
 # package import is required, so the script works without the operator
 # editable-install being on the Python path.
 set -euo pipefail
 
 # --- Derive tuple counts from the canonical source of truth.
-# `tests/test_metrics_endpoint.py` is the SOLE source of truth for the
-# counter / gauge / histogram family names. The Python AST walk here
-# is the lightweight alternative to `from test_metrics_endpoint import
-# ...` (which would pull in `openstudio_operator.metrics` and force the
-# operator editable-install to be available). The AST approach reads
-# the three tuples directly from the source, so the script works in
-# CI even when only the lint path (no `pip install -e '.[dev]'`) has
-# run.
+# `tests/_metrics_inventory.py` is the SOLE source of truth for the
+# counter / gauge / histogram family names (issue #406 moved the
+# tuples out of `tests/test_metrics_endpoint.py`, which now imports
+# them). The Python AST walk here is the lightweight alternative to
+# `from _metrics_inventory import ...` (which would require the tests
+# dir on sys.path). The AST approach reads the three tuples directly
+# from the source, so the script works in CI even when only the lint
+# path (no `pip install -e '.[dev]'`) has run.
 PYTHON_AST_HELPER=$(cat <<'PY'
 import ast
 import sys
 
-path = "tests/test_metrics_endpoint.py"
+path = "tests/_metrics_inventory.py"
 with open(path, "r", encoding="utf-8") as f:
     tree = ast.parse(f.read(), filename=path)
 
@@ -104,7 +104,7 @@ if [ "$FAIL" -ne 0 ]; then
     echo "Required prose shape (issue #387):" >&2
     echo "  README.md + docs/audit-dryrun-idempotency.md both carry:" >&2
     echo "  ${COUNTERS} counters + ${GAUGES} gauges + ${HISTOGRAMS} histograms" >&2
-    echo "Mirror the existing 'tests/test_metrics_endpoint.py' tuples —" >&2
+    echo "Mirror the existing 'tests/_metrics_inventory.py' tuples —" >&2
     echo "the prose is held to the tuple, not the other way around." >&2
     exit 1
 fi
