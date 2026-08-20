@@ -404,6 +404,77 @@ def test_gated_wrapper_fails_closed_on_api_error(caplog, log, monkeypatch):
     assert any("singleton guard" in r.getMessage() for r in caplog.records)
 
 
+# --- Issue #307 — singleton guard wrapper must bump HANDLER_TICK_FAILURES_TOTAL on API errors ---
+
+
+class _ServiceUnavailableApi(FakeCustomObjectsApi):
+    """list_namespaced_custom_object raises ApiException(503).
+
+    The acceptance criterion for issue #307 — a sustained apiserver outage
+    must surface on the per-module counter, not just the WARNING log line.
+    The 503 / "Service Unavailable" shape matches the live apiserver
+    overload signature (vs. the generic ``ExplodingCustomObjectsApi``'s
+    500/boom) so the test exercises the documented failure path.
+    """
+
+    def list_namespaced_custom_object(self, group, version, namespace, plural):
+        raise ApiException(status=503, reason="Service Unavailable")
+
+
+def _handler_tick_failure_total(module: str, error_type: str) -> float:
+    """Sum of ``handler_tick_failures_total{module=...,error_type=...}`` across all label series."""
+    total = 0.0
+    for metric in singleton.HANDLER_TICK_FAILURES_TOTAL.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") and sample.labels.get("module") == module \
+                    and sample.labels.get("error_type") == error_type:
+                total += float(sample.value)
+    return total
+
+
+def test_gated_wrapper_bumps_handler_tick_failures_total_on_api_exception(
+    caplog, log, monkeypatch
+):
+    """Issue #307 acceptance: when ``_get_guard().is_active`` raises
+    ``ApiException(503)``, the gate's outer wrapper must increment
+    ``HANDLER_TICK_FAILURES_TOTAL{module=<handler_id>,error_type=ApiException}``
+    in addition to logging the WARNING. The pre-#307 wrapper suppressed the
+    exception silently — a sustained apiserver outage produced zero per-module
+    increments and SREs (alerting on the #117 counter) had no signal.
+
+    The module label is the wrapped handler's ``__name__`` (preserved by
+    ``functools.wraps`` at install time — see ``oscm_timer`` in
+    ``make_registry_with_handlers``); error_type is the exception class name.
+    """
+    registry = make_registry_with_handlers()
+    install_singleton_guard(registry=registry)
+    gated = oscm_handlers(registry)[0].fn
+    monkeypatch.setattr(
+        singleton, "_process_guard", SingletonGuard(_ServiceUnavailableApi([]))
+    )
+
+    # Sanity: ``oscm_timer`` is the wrapped handler's preserved __name__ —
+    # the counter module label must match exactly so the #117 alert can
+    # group observations by handler module.
+    assert gated.__name__ == "oscm_timer"
+
+    before = _handler_tick_failure_total("oscm_timer", "ApiException")
+
+    result = gated(
+        body=make_cr("alpha", OLD_TS), spec={}, namespace=NAMESPACE, name="alpha", logger=log
+    )
+    assert result is None  # fail-closed posture preserved (D05 / D12)
+
+    after = _handler_tick_failure_total("oscm_timer", "ApiException")
+    assert after - before == 1.0  # exactly one increment per suppressed tick
+
+    # The WARNING log line is the companion signal — both must fire so an
+    # SRE can correlate log forwarding with the Prometheus increment.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("singleton guard" in r.getMessage() and "ApiException" in r.getMessage()
+               for r in warnings)
+
+
 # --- kopf wrappers --------------------------------------------------------------
 
 

@@ -71,7 +71,10 @@ from kubernetes.client import (
 from kubernetes.config import ConfigException
 
 from openstudio_operator._time import parse_iso_utc
-from openstudio_operator.metrics import SINGLETON_ELECTION_TOTAL
+from openstudio_operator.metrics import (
+    HANDLER_TICK_FAILURES_TOTAL,
+    SINGLETON_ELECTION_TOTAL,
+)
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
@@ -530,6 +533,24 @@ def _gated(fn: Callable) -> Callable:
         try:
             active = _get_guard().is_active(body, str(namespace))
         except (ApiException, ConfigException, SingletonGuardError) as exc:
+            # Issue #307 — the gate's outer wrapper used to swallow this
+            # exception silently (single WARNING log, no counter bump). The
+            # inner per-handler ``try/except`` blocks only fire when the
+            # apiserver reaches the handler body; here the exception is
+            # raised BEFORE the inner wrapper ever sees the tick, so a
+            # sustained apiserver outage produced zero
+            # ``handler_tick_failures_total{module=...,error_type=ApiException}``
+            # increments and SREs (alerting on the per-module counter, #117)
+            # had no signal. Increment at the same site that logs the
+            # WARNING so the per-tick observation is the SAME as the
+            # log line — one bump per suppressed tick, labelled by the
+            # wrapped handler's ``__name__`` (preserved by
+            # ``functools.wraps`` at install time, falls back to
+            # ``"handler"`` for un-named callables).
+            HANDLER_TICK_FAILURES_TOTAL.labels(
+                module=getattr(fn, "__name__", "handler"),
+                error_type=type(exc).__name__,
+            ).inc()
             log.warning(
                 "%s skipped this tick, retrying next poll — singleton guard could not "
                 "resolve the active CR (%s: %s)",
