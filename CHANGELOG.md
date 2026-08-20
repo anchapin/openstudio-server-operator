@@ -174,6 +174,15 @@ edge cases (`#246` `#247` `#248` `#249`).
   are now hash-pinned alongside the production deps.
 
 ### Changed
+- **`#234`** — `handlers/__init__.py` no longer carries three
+  divergent queue/drain sites: removed the `_NOTIFY_QUEUE`,
+  `_REDIS_KEY_LAYOUT_QUEUE`, `_STATUS_MAP_CAP_QUEUE` module-level
+  lists and the three corresponding `@kopf.on.event` drain
+  handlers. The `#116` redis-URL guard, the `#163` Resque key-layout
+  guard, and the `#171` status-map-cap guard now share one
+  `QueuedKopfEventSink` (`src/openstudio_operator/events_sinks.py`)
+  queue and one drain handler installed by `handlers/__init__.py`.
+  See Added `#234` above for the new class.
 - **`#235`** — `ReadOnlyRedisClient` construction is now centralized in
   `client_factory.get_read_only_redis_client(redis_url)`
   (`lru_cache(maxsize=8)`, keyed by URL), mirroring what `#168` did for
@@ -188,6 +197,22 @@ edge cases (`#246` `#247` `#248` `#249`).
   liveness). New AST CI gate
   `tests/test_client_factory.py::test_only_one_read_only_redis_client_construction_point`
   fails on any inline `ReadOnlyRedisClient(` outside the factory.
+- **`#251`** — `prune_entrypoint.py`, `analysis_sla.py`,
+  `web_background_monitor.py`, `worker_recycler.py` no longer
+  construct `AppsV1Api()` / `BatchV1Api()` / `CoreV1Api()` inline; the
+  four sites now call `singleton.operator_*_api()` factories (the
+  `CustomObjectsApi` precedent was `#158`, in `[0.2.0]` Added). The
+  previously cross-imported `deployment_label_selector` from
+  `analysis_sla` moves to its canonical home in
+  `src/openstudio_operator/_k8s.py` alongside the new
+  `DeploymentReader` Protocol (see Added `#251` above).
+- **`#252`** — `retention.py` no longer reaches into the private
+  `OpenStudioClient._request_json` to fetch the data-point list; the
+  fetch goes through the new public
+  `:func:`openstudio_operator.openstudio_client.list_datapoints``
+  (see Added `#252` above). No behaviour change to the client
+  itself; the reach-in removal closes the only public-side caller
+  of the private method.
 - **`#226`** — `OpenStudioClient` mutating POSTs no longer retry on 5xx
   by default (retries on 5xx without idempotency keys risk duplicate
   state mutations); the retry policy is now keyed on the method
@@ -246,7 +271,8 @@ edge cases (`#246` `#247` `#248` `#249`).
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Removed
-- (no entries yet — all changes since 0.1.0 are in [0.2.0])
+- (none — the legacy sites retired by `#234` / `#235` / `#251` /
+  `#252` are described inline within their Changed bullets above)
 
 ## [0.2.0] - 2026-08-19
 
