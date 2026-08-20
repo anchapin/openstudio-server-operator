@@ -89,6 +89,32 @@ spec:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with
             # metrics.DEFAULT_METRICS_PORT (issue #17)
+          # Issue #391 — kubelet restart path for a wedged operator. The
+          # four @kopf.timer handlers can silently stop firing (deadlock,
+          # indefinitely-blocking REST call, GC pause, stuck list_crs) while
+          # the pod stays `Running`; single-replica + Recreate means the
+          # kubelet is the ONLY restart path. Both probes hit the metrics
+          # endpoint (already exposed on the named port `metrics` above):
+          # liveness restarts a pod whose metrics endpoint has gone
+          # unresponsive for failureThreshold * periodSeconds (~90s);
+          # readiness removes the pod from Service endpoints during boot.
+          # The new pod resumes from the persisted CR .status (D04).
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics # named port → containerPort 9090 (issue #17)
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           # Issue #115 — operator hardening matching deploy/storage-cronjob.yaml:114-118.
           # readOnlyRootFilesystem requires writable /tmp for kopf / log buffering —
           # the emptyDir volume below provides it.

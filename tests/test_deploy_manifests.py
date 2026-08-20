@@ -1000,6 +1000,66 @@ def test_operator_deployment_pod_securitycontext_hardened():
     assert sc["fsGroup"] == 1000, sc
 
 
+# ---- Issue #391: operator Deployment liveness/readiness probes -------
+#
+# Single-replica + Recreate (no leader election, no second replica) means
+# the kubelet is the ONLY restart path for a wedged operator: a deadlock,
+# an indefinitely-blocking REST call inside the GET-only retry envelope,
+# a GC pause, or a stuck list_crs in the singleton guard's _gated wrapper
+# can stop the four @kopf.timer handlers while the pod stays `Running`.
+# Both probes hit the /metrics endpoint on the named port `metrics`
+# (containerPort 9090, issue #17) — the prometheus_client HTTP server is
+# the only in-process surface that answers while the operator is healthy.
+
+
+def test_operator_deployment_has_liveness_and_readiness_probes():
+    """Issue #391 acceptance: BOTH probes exist on the operator container
+    and hit the metrics endpoint. Pre-fix the container had neither — a
+    wedged tick was invisible to Kubernetes (pod `Running`, kubelet never
+    restarts, handlers silently stop firing)."""
+    container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    for probe_kind in ("livenessProbe", "readinessProbe"):
+        assert probe_kind in container, (
+            f"operator container must declare {probe_kind} against /metrics "
+            f"(issue #391); got keys {sorted(container)}"
+        )
+        probe = container[probe_kind]
+        http_get = probe.get("httpGet")
+        assert http_get is not None, (
+            f"{probe_kind} must be an httpGet probe against the metrics endpoint"
+        )
+        assert http_get.get("path") == "/metrics", http_get
+        # The named port (containerPort 9090, issue #17) is preferred over
+        # a bare integer so a future port renumbering cannot desync the
+        # probes from the declared `ports:` block.
+        assert http_get.get("port") == "metrics", http_get
+        assert probe.get("timeoutSeconds") == 5, probe
+        assert probe.get("failureThreshold") == 3, probe
+
+
+def test_operator_deployment_liveness_restarts_wedged_operator_within_90s():
+    """Issue #391 acceptance: the kubelet restarts a wedged operator that
+    has stopped answering /metrics for ~90s — failureThreshold (3) ×
+    periodSeconds (30) ≥ 90. Also pins initialDelaySeconds (60) high
+    enough that a slow first reconciliation (CRD list, mongo/redis
+    reachability checks) cannot trip liveness on a healthy boot, and the
+    readiness cadence (initialDelay 5, period 10) so boot-time readiness
+    is detected promptly without flapping."""
+    container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    liveness = container["livenessProbe"]
+    assert liveness["periodSeconds"] == 30, liveness
+    assert liveness["initialDelaySeconds"] == 60, liveness
+    budget = liveness["failureThreshold"] * liveness["periodSeconds"]
+    assert budget >= 90, (
+        f"liveness failureThreshold * periodSeconds must be >= 90s so a "
+        f"wedged operator is restarted within ~90s; got {budget}s "
+        f"({liveness})"
+    )
+    readiness = container["readinessProbe"]
+    assert readiness["initialDelaySeconds"] == 5, readiness
+    assert readiness["periodSeconds"] == 10, readiness
+
+
 # ---- Issue #112: namespace NetworkPolicy ----------------------------
 #
 # The operator surface (operator Deployment + storage-prune CronJob +
