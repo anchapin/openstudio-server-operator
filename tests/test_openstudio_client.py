@@ -16,6 +16,7 @@ from openstudio_operator.openstudio_client import (
     OpenStudioClient,
     _parse_timestamp,
 )
+from openstudio_operator.redis_client import OperatorConfigError
 
 BASE = "http://web.test"
 
@@ -424,7 +425,7 @@ def test_session_default_verify_is_pinned_true(monkeypatch):
     assert client._session.verify is True
 
 
-def test_session_verify_honors_ca_bundle_env_var(monkeypatch):
+def test_session_verify_honors_ca_bundle_env_var(monkeypatch, tmp_path):
     """Issue #242: when ``OPENSTUDIO_TLS_CA_BUNDLE`` is set, the session
     uses the bundle path instead of the system trust store.
 
@@ -432,10 +433,106 @@ def test_session_verify_honors_ca_bundle_env_var(monkeypatch):
     roots) mount the bundle as a Secret volume and set this env var so
     the operator can verify the API server's certificate against the
     cluster-controlled trust anchor instead of the host's ca-certificates.
+
+    Issue #296: the path is now validated against a real PEM file — this
+    test writes a synthetic bundle with the ``BEGIN CERTIFICATE`` marker
+    so the validator's path/PEM checks pass.
     """
-    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "/etc/ssl/certs/custom-ca.pem")
+    bundle = tmp_path / "custom-ca.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBdummy\n"
+        "-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", str(bundle))
     client = OpenStudioClient(BASE)
-    assert client._session.verify == "/etc/ssl/certs/custom-ca.pem"
+    assert client._session.verify == str(bundle)
+
+
+# --- OPENSTUDIO_TLS_CA_BUNDLE validation (issue #296) ------------------
+
+
+def test_openstudio_tls_ca_bundle_valid_file(monkeypatch, tmp_path):
+    """Issue #296: a syntactically valid PEM bundle path is accepted and
+    passed straight through to ``requests.Session.verify``.
+
+    The validator must accept the in-cluster case where the operator pod
+    has a Secret-mounted ``ca-certificates`` bundle at a known path. The
+    path is preserved verbatim — ``requests`` is the layer that actually
+    consumes the file.
+    """
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", str(bundle))
+    client = OpenStudioClient(BASE)
+    assert client._session.verify == str(bundle)
+
+
+def test_openstudio_tls_ca_bundle_invalid_path(monkeypatch):
+    """Issue #296: a path that does not name an existing file is rejected.
+
+    A misconfigured helm chart that points the env var at a Secret volume
+    that has not been mounted yet (or a typo in the path) used to silently
+    hand a non-existent path to ``requests``, surfacing an obscure
+    ``SSLError`` at the first tick. The validator now raises
+    ``OperatorConfigError`` so the operator refuses to start.
+    """
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "/nonexistent/ca-bundle.pem")
+    with pytest.raises(OperatorConfigError, match="does not name an existing file"):
+        OpenStudioClient(BASE)
+
+
+def test_openstudio_tls_ca_bundle_truthy_invalid(monkeypatch):
+    """Issue #296: a non-empty string that is not a valid path is rejected.
+
+    This is the central acceptance criterion: a truthy env value such as
+    ``"True"``, ``"1"``, ``"yes"``, or ``"on"`` used to be passed straight
+    to ``requests.Session.verify``, which interprets it as a CA-bundle
+    path. An attacker who controls the env var could substitute a CA
+    bundle of their choosing and MITM the in-cluster REST traffic. The
+    validator now refuses to start the tick instead.
+    """
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "True")
+    with pytest.raises(OperatorConfigError, match="does not name an existing file"):
+        OpenStudioClient(BASE)
+
+
+def test_openstudio_tls_ca_bundle_unset_or_empty(monkeypatch):
+    """Issue #296: the regression-fence empty/unset branch is preserved.
+
+    When ``OPENSTUDIO_TLS_CA_BUNDLE`` is unset or empty the session must
+    fall through to ``verify=True`` (the system trust store) — never to
+    ``False`` and never to a random truthy-string path. This test pins
+    both the unset and empty-string cases against the new validator so
+    the fix cannot regress the safe path.
+    """
+    monkeypatch.delenv("OPENSTUDIO_TLS_CA_BUNDLE", raising=False)
+    client = OpenStudioClient(BASE)
+    assert client._session.verify is True
+
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "")
+    client = OpenStudioClient(BASE)
+    assert client._session.verify is True
+
+
+def test_openstudio_tls_ca_bundle_existing_file_without_pem_marker(monkeypatch, tmp_path):
+    """Issue #296: an existing file without ``BEGIN CERTIFICATE`` is rejected.
+
+    Closes the false-positive gap where any readable file would have
+    passed the path-existence test alone. A bundle that lacks the PEM
+    marker is not a CA bundle — pass it through to ``requests`` and the
+    library raises an obscure ``SSLError``; refuse to start the tick
+    instead so the misconfiguration surfaces in operator logs.
+    """
+    not_a_bundle = tmp_path / "not-a-bundle.pem"
+    not_a_bundle.write_text("# this is a config file, not a CA bundle\n", encoding="utf-8")
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", str(not_a_bundle))
+    with pytest.raises(OperatorConfigError, match="BEGIN CERTIFICATE"):
+        OpenStudioClient(BASE)
 
 
 @responses.activate
