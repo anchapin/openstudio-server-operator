@@ -48,6 +48,30 @@ spec:
                 redisUrl:
                   type: string
                   default: ""
+                  # Issue #390: the field was an unconstrained `type: string`, so
+                  # a CR-write user could redirect the operator's `ReadOnlyRedisClient`
+                  # (`src/openstudio_operator/redis_client.py`) at any reachable
+                  # host and coerce the Resque keyspace probe to talk to it
+                  # (SSRF / hostile-Redis exfiltration). The pattern restricts the
+                  # URL to ``redis://`` against an in-cluster Service name: a bare
+                  # Service label (`queue`), a namespaced form
+                  # (`queue.openstudio-server`), or the ``.svc[.cluster.local]``
+                  # FQDN, with optional `:password@` auth, port, and ``/<db>``
+                  # selector. Multi-label public hostnames
+                  # (``attacker.example.com``) and non-Redis schemes
+                  # (``http://``, ``ftp://``) are rejected by the API server at
+                  # apply time. The trailing ``|^$`` branch preserves the
+                  # #116 empty-default escape hatch. The `[^@]+@` auth group
+                  # covers the helm-recipe ``redis://:openstudio-rotated@queue``
+                  # shape (empty user + password) and the standard
+                  # ``redis://user:password@host`` form. The issue's stated
+                  # pattern omitted the auth group and required ``.svc``
+                  # literally; both would reject the acceptance-criterion
+                  # good URL ``redis://:openstudio-rotated@queue:6379``.
+                  pattern: '^redis://([^@]+@)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
+                  x-kubernetes-validations:
+                    - rule: "self == '' || self.startsWith('redis://')"
+                      message: "spec.redisUrl must be empty or an in-cluster redis:// Service URL (issue #390)."
                   description: |
                     Redis (Resque) URL for read-only queue-depth checks.
                     Issue #116: the default is intentionally EMPTY — the historical
@@ -57,7 +81,11 @@ spec:
                     password. The operator now refuses to start when this is
                     empty (see handlers/__init__.py startup guard). Helm-chart
                     users should derive the URL from the Redis-secret KeyRef
-                    and set `spec.redisUrl` explicitly.
+                    and set `spec.redisUrl` explicitly. Issue #390 locks the
+                    value to an in-cluster ``redis://`` Service URL (or empty
+                    per #116); the API server rejects off-cluster hosts
+                    (``attacker.example.com``) and non-Redis schemes at apply
+                    time.
                 dryRun:
                   type: boolean
                   default: false
