@@ -3,8 +3,9 @@
 The kopf registry is the operational register for the operator's
 ``@kopf.timer`` / ``@kopf.daemon`` handlers. The Python-level registry
 here provides a declarative seam that EVERY OSCM spawning handler
-module calls at module import time via :func:`register`, and the
-singleton guard (D05, :mod:`openstudio_operator.singleton`)
+module calls at module import time via :func:`register` (or, since
+#407, its ``__name__``-introspecting convenience :func:`register_fn`),
+and the singleton guard (D05, :mod:`openstudio_operator.singleton`)
 cross-checks the two registries at gate time. The AST test in
 ``tests/test_singleton_registry_coverage.py::test_python_registry_includes_all_oscm_spawning_handlers``
 pins the agreement invariant so the failure mode that was the entire
@@ -70,16 +71,19 @@ def register(handler_id: str, fn: Callable) -> Callable:
         @register("my_new_handler", lambda: None)  # bracket-shaped awkward
         def my_new_handler(...): ...
 
-    The canonical pattern is a bare call at module bottom:
+    The canonical pattern (since #407) is the :func:`register_fn`
+    convenience at module bottom, which introspects the id from the
+    function's ``__name__`` so it cannot drift out of agreement with
+    the kopf ``id``:
 
     .. code-block:: python
 
-        from openstudio_operator._oscm_handlers import register
+        from openstudio_operator._oscm_handlers import register_fn
 
         @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
         def my_new_handler(...): ...
 
-        register("my_new_handler", my_new_handler)
+        register_fn(my_new_handler)
 
     Handler id MUST match the kopf ``id`` attribute (which is the
     function ``__name__`` by default). Mismatched ids are stored
@@ -88,6 +92,33 @@ def register(handler_id: str, fn: Callable) -> Callable:
     """
     REGISTRY[handler_id] = fn
     return fn
+
+
+def register_fn(fn: Callable) -> Callable:
+    """Register an OSCM handler under its own ``__name__`` (issue #407).
+
+    Thin call-site convenience over :func:`register`: the handler id is
+    introspected from ``fn.__name__`` instead of being typed a second
+    time at the call site. Because the kopf ``id`` attribute defaults to
+    the decorated function's ``__name__``, this shape cannot disagree
+    with the kopf registry entry — the string-typed id duplication the
+    four handler modules carried pre-#407 is gone:
+
+    .. code-block:: python
+
+        from openstudio_operator._oscm_handlers import (
+            register_fn as _register_oscm_handler,
+        )
+
+        @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+        def my_new_handler(...): ...
+
+        _register_oscm_handler(my_new_handler)
+
+    Use :func:`register` directly only when the handler id must differ
+    from ``fn.__name__`` (none of the production timers do).
+    """
+    return register(fn.__name__, fn)
 
 
 def is_registered(handler_id: str) -> bool:
