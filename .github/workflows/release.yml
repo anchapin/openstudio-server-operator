@@ -57,14 +57,19 @@ jobs:
           provenance: mode=max
           sbom: true
       # Issue #149: after the build step resolves the digest, pin
-      # deploy/operator-deployment.yaml to `@sha256:<digest>` and commit
-      # back to develop. The standard pattern, made idempotent: if the
-      # manifest already pins this digest, exit 0 without committing (this
-      # avoids the auto-commit→auto-rebuild infinite loop the obvious
-      # implementation falls into, because the Dockerfile is unchanged
-      # and the build deterministically emits the same digest for a
-      # given source tree). `storage-cronjob.yaml` is intentionally out
-      # of scope for this step — it ships its own separate pin.
+      # deploy/operator-deployment.yaml AND deploy/storage-cronjob.yaml
+      # to `@sha256:<digest>` and commit back to develop. The standard
+      # pattern, made idempotent: if both manifests already pin this
+      # digest, exit 0 without committing (this avoids the auto-commit→
+      # auto-rebuild infinite loop the obvious implementation falls into,
+      # because the Dockerfile is unchanged and the build deterministically
+      # emits the same digest for a given source tree).
+      # Issue #291: storage-cronjob.yaml was historically exempt from
+      # this step (the previous comment claimed it "ships its own
+      # separate pin") but the manifest was never actually pinned —
+      # it used the mutable `:dev` tag with `imagePullPolicy: IfNotPresent`,
+      # which let the kubelet retain whatever image was already on the
+      # node. Both manifests now pin the same digest in lockstep.
       - name: Pin operator image by SHA256 digest
         id: pin
         env:
@@ -82,16 +87,26 @@ jobs:
             echo "deploy/operator-deployment.yaml already pins ${DIGEST}; no commit needed."
             exit 0
           fi
-          sed -i.bak "s|image: ${IMAGE}:.*|image: ${IMAGE}@${DIGEST}|" deploy/operator-deployment.yaml
-          rm -f deploy/operator-deployment.yaml.bak
-          if git diff --quiet deploy/operator-deployment.yaml; then
-            echo "No changes after sed (manifest already had no mutable tag); nothing to commit."
+          # Issue #291: pin storage-cronjob.yaml alongside the operator
+          # deployment. Both manifests must agree on the digest; the
+          # test_cronjob_image_digest_matches_operator_deployment test
+          # enforces equality.
+          CHANGED=0
+          for MANIFEST in deploy/operator-deployment.yaml deploy/storage-cronjob.yaml; do
+            sed -i.bak "s|image: ${IMAGE}:.*|image: ${IMAGE}@${DIGEST}|" "${MANIFEST}"
+            rm -f "${MANIFEST}.bak"
+            if ! git diff --quiet "${MANIFEST}"; then
+              CHANGED=1
+            fi
+          done
+          if [ "${CHANGED}" = "0" ]; then
+            echo "No changes after sed (both manifests already pin the same digest); nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deploy/operator-deployment.yaml
-          git commit -m "build: refs #149 — pin operator image by SHA256 digest (${DIGEST})"
+          git add deploy/operator-deployment.yaml deploy/storage-cronjob.yaml
+          git commit -m "build: refs #149 #291 — pin operator + cronjob image by SHA256 digest (${DIGEST})"
           git push origin develop
       # Issue #113: cosign keyless sign against the digest just published,
       # using GitHub Actions OIDC (no long-lived key). Pushes the signature
