@@ -910,3 +910,189 @@ def test_no_port_443_egress_block_uses_kube_dns_placeholder_selector():
         f"port-443 egress blocks use k8s-app: kube-dns placeholder "
         f"selector (#225 regression): {offenders}"
     )
+
+
+# ---- Issue #294: prune SA's batch/jobs verbs are scoped via a
+# ValidatingAdmissionPolicy ---------------------------------------------
+#
+# RBAC `PolicyRule` does NOT support `labelSelector` and `resourceNames`
+# only accepts exact strings (no globs). The prune SA's Role at
+# deploy/storage-cronjob.yaml:45-47 therefore cannot express "only
+# archival Jobs" in RBAC alone — its `batch/jobs` create|delete allow
+# list accepts any Job, which a compromised prune pod could exploit to
+# spawn an arbitrary Job with any name, any image, any service account
+# (an exfiltration path the destructive-fence tests above cannot catch).
+#
+# The acceptance criterion (issue #294) lists three options:
+#   1. RBAC `labelSelector` — NOT supported by the RBAC v1 API.
+#   2. RBAC `resourceNames: [oscm-archive-*]` — globs NOT supported by
+#      `resourceNames`; only exact strings.
+#   3. ValidatingAdmissionPolicy — the only API that can express the
+#      "must be archival-labelled" constraint declaratively.
+#
+# The fix ships a ValidatingAdmissionPolicy + Binding, colocated with
+# the storage-cronjob.yaml manifests they constrain. The tests below
+# pin the shape: the policy exists, scopes to `openstudio-server` only,
+# hooks CREATE/UPDATE/DELETE on `batch/jobs`, requires the archival
+# labels, and fails closed by default.
+
+PRUNE_JOB_SCOPE_VAP = next(
+    (d for d in STORAGE_DOCS if d["kind"] == "ValidatingAdmissionPolicy"),
+    None,
+)
+PRUNE_JOB_SCOPE_BINDING = next(
+    (d for d in STORAGE_DOCS if d["kind"] == "ValidatingAdmissionPolicyBinding"),
+    None,
+)
+ARCHIVAL_LABELS = {
+    "app.kubernetes.io/managed-by": "openstudio-operator",
+    "app.kubernetes.io/component": "archival",
+}
+
+
+def _strip_cel_whitespace(expr: str) -> str:
+    """Normalise a CEL expression for substring tests."""
+    return " ".join(expr.split())
+
+
+def test_prune_job_scope_vap_exists_and_targets_batch_jobs():
+    """Issue #294 acceptance: a ValidatingAdmissionPolicy lives next to the
+    storage CronJob manifests and hooks CREATE/UPDATE/DELETE on `batch/jobs`.
+    Without it, the prune SA's `batch/jobs create|delete` verbs accept any
+    Job name and any label set — the regression #294 closes."""
+    assert PRUNE_JOB_SCOPE_VAP is not None, (
+        "no ValidatingAdmissionPolicy in deploy/storage-cronjob.yaml — "
+        "the prune SA's batch/jobs verbs are unscoped (issue #294)"
+    )
+    assert PRUNE_JOB_SCOPE_VAP["apiVersion"] == "admissionregistration.k8s.io/v1"
+    spec = PRUNE_JOB_SCOPE_VAP["spec"]
+    res = spec["matchConstraints"]["resourceRules"][0]
+    assert res["apiGroups"] == ["batch"]
+    assert res["apiVersions"] == ["v1"]
+    assert res["resources"] == ["jobs"]
+    # GET is intentionally NOT in the operation list — read access is not
+    # an exfiltration path and constraining it would block the prune pod's
+    # own watch-by-deterministic-name lookup. The CREATE/UPDATE/DELETE
+    # triple is the exact set that lets the prune pod do its job AND
+    # that an attacker would need to spawn arbitrary Jobs.
+    assert sorted(res["operations"]) == ["CREATE", "DELETE", "UPDATE"]
+
+
+def test_prune_job_scope_vap_scopes_to_openstudio_server_namespace():
+    """The policy must NOT apply cluster-wide. The `namespaceSelector`
+    inside `matchConstraints` is the canonical gate, and it must
+    match only the `openstudio-server` namespace via the standard
+    `kubernetes.io/metadata.name` label (the same pattern the
+    metrics-ingress NetworkPolicy uses at network-policy.yaml:264)."""
+    match = PRUNE_JOB_SCOPE_VAP["spec"]["matchConstraints"]
+    selector = match["namespaceSelector"]
+    assert selector == {
+        "matchLabels": {"kubernetes.io/metadata.name": "openstudio-server"}
+    }, (
+        "policy namespaceSelector must restrict to openstudio-server only; "
+        f"got {selector!r}; a cluster-wide match would reject Jobs in "
+        "every namespace (issue #294)"
+    )
+
+
+def test_prune_job_scope_vap_validations_require_archival_labels():
+    """The CEL validation must require both archival labels. The test
+    pins the exact label keys and values the policy enforces — a
+    regression that drops one label, relaxes the value, or types the
+    wrong key must fail loudly. Both the CREATE-side (`object`) and
+    DELETE-side (`oldObject`) clauses must reference the labels so
+    the policy actually fires on its own operation."""
+    validations = PRUNE_JOB_SCOPE_VAP["spec"]["validations"]
+    assert validations, "policy must declare at least one validation"
+    # Concatenate and normalise the validation expressions — K8s
+    # evaluates each entry independently, so the test asserts the
+    # aggregate expression references the right labels.
+    full_expr = _strip_cel_whitespace(
+        " ".join(v["expression"] for v in validations)
+    )
+    # Both object-side and oldObject-side clauses must appear — the
+    # `has()` guards on either side are what makes the policy
+    # operation-correct (CREATE has object, DELETE has oldObject).
+    assert "has(object.metadata.labels)" in full_expr, (
+        f"validation expression missing object-side has() guard: {full_expr!r}"
+    )
+    assert "has(oldObject.metadata.labels)" in full_expr, (
+        f"validation expression missing oldObject-side has() guard: {full_expr!r}"
+    )
+    for key, value in ARCHIVAL_LABELS.items():
+        assert key in full_expr, (
+            f"validation expression missing label key {key!r}: {full_expr!r}"
+        )
+        assert f'"{value}"' in full_expr, (
+            f"validation expression missing expected value {value!r} for "
+            f"key {key!r}: {full_expr!r}"
+        )
+
+
+def test_prune_job_scope_vap_failure_policy_is_fail():
+    """Any CEL evaluation error must reject the request — the same
+    default-deny stance the network policies use. `Ignore` would let
+    a malformed CEL expression silently let an attacker through."""
+    assert PRUNE_JOB_SCOPE_VAP["spec"]["failurePolicy"] == "Fail", (
+        "ValidatingAdmissionPolicy.failurePolicy must be 'Fail' so a "
+        "CEL evaluation error blocks the request (issue #294); "
+        "see network-policy.yaml for the same default-deny stance"
+    )
+
+
+def test_prune_job_scope_vap_binding_binds_to_policy():
+    """A ValidatingAdmissionPolicy with no binding is dormant. The
+    binding must name the policy above, and the binding itself must
+    have no resource-level selectors that would narrow scope below
+    what the policy's matchConstraints already enforce."""
+    assert PRUNE_JOB_SCOPE_BINDING is not None, (
+        "no ValidatingAdmissionPolicyBinding in deploy/storage-cronjob.yaml — "
+        "the policy is dormant without a binding (issue #294)"
+    )
+    assert PRUNE_JOB_SCOPE_BINDING["apiVersion"] == "admissionregistration.k8s.io/v1"
+    assert PRUNE_JOB_SCOPE_BINDING["spec"]["policyName"] == (
+        PRUNE_JOB_SCOPE_VAP["metadata"]["name"]
+    )
+    # The binding's `selector` is `{}` (matches everything, as the policy
+    # itself scopes by namespaceSelector). This is the canonical K8s
+    # pattern; a non-empty selector would silently exclude the
+    # openstudio-server namespace.
+    assert PRUNE_JOB_SCOPE_BINDING["spec"]["selector"] == {}
+
+
+def test_prune_job_scope_vap_label_keys_match_archival_manifest():
+    """Regression fence: the label KEY/VALUE pairs the VAP enforces
+    must equal the labels `archival.py` actually emits at lines
+    185-189. If they drift, the policy is sound but doesn't accept
+    any real Job — the acceptance criterion is unmet. The values
+    are referenced by their string identity in the policy, so a
+    typo on either side causes simultaneous test failures here and
+    a runtime reject by the policy."""
+    from openstudio_operator.archival import build_archival_job
+    from openstudio_operator.config import StoragePolicy
+
+    job = build_archival_job(
+        "64f0c8e2a1b3c4d5e6f7a8b9",
+        StoragePolicy(
+            archive_to_s3=True,
+            backend="s3",
+            bucket="os-archives",
+            secret_ref="os-archive-creds",
+        ),
+        "openstudio-server",
+    )
+    job_labels = job["metadata"]["labels"]
+    for key, value in ARCHIVAL_LABELS.items():
+        assert job_labels[key] == value, (
+            f"archival Job label {key}={job_labels.get(key)!r} drifts from "
+            f"VAP-expected value {value!r}; VAP and archival manifest must "
+            "agree on the exact key/value pair (issue #294)"
+        )
+
+    # Same check on the policy CEL expression
+    full_expr = _strip_cel_whitespace(
+        " ".join(v["expression"] for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"])
+    )
+    for key, value in ARCHIVAL_LABELS.items():
+        assert key in full_expr
+        assert f'"{value}"' in full_expr

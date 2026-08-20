@@ -41,7 +41,15 @@ rules:
     resources: ["openstudioclustermanagers/status"]
     verbs: ["get", "patch"]
   # Archival Job spawn (create), watch-by-deterministic-name (get) and
-  # failed-Job cleanup (delete) — the same verbs the operator Role used to hold
+  # failed-Job cleanup (delete) — the same verbs the operator Role used to hold.
+  # Issue #294: these verbs alone scope the prune SA to `batch/jobs` with NO
+  # constraint on Job name or label — a compromised prune pod could spawn
+  # arbitrary Jobs (any image, any service account, including one that
+  # overrides the `oscm-archive-*` name pattern and exfiltrates cluster
+  # credentials). The constraint that labels the Jobs "must be archival" is
+  # enforced by the ValidatingAdmissionPolicy below; the RBAC list above
+  # stays the same shape because RBAC `PolicyRule` has no `labelSelector`
+  # and `resourceNames` only accepts exact strings (no globs).
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "create", "delete"]
@@ -148,3 +156,92 @@ spec:
           volumes:
             - name: tmp
               emptyDir: {}
+---
+# Issue #294 — ValidatingAdmissionPolicy that constrains the prune SA's
+# `batch/jobs create|delete` verbs to Jobs that carry the archival labels.
+#
+# Why this exists: RBAC `PolicyRule` does NOT support `labelSelector`
+# and `resourceNames` only accepts exact strings (no globs), so the prune
+# SA's Role rule at lines 45-47 cannot express the constraint "only Jobs
+# whose name is `oscm-archive-*`" in RBAC alone. A compromised prune pod
+# (running on the `*/10` schedule with the cluster's API token) could
+# therefore spawn a Job with any name, any image, any service account —
+# exfiltrating the cluster's Redis/Mongo/TLS credentials via a different
+# `envFrom` secretRef.
+#
+# The acceptance criterion (#294) lists three options:
+#   1. RBAC `labelSelector` — NOT supported by the RBAC v1 API.
+#   2. RBAC `resourceNames: [oscm-archive-*]` — glob wildcards NOT
+#      supported by `resourceNames`; only exact strings.
+#   3. ValidatingAdmissionPolicy — the only API that can express the
+#      "must be archival-labelled" constraint declaratively.
+#
+# This policy is cluster-scoped (ValidatingAdmissionPolicy lives at
+# cluster scope) but its `namespaceSelector` narrows it to the
+# `openstudio-server` namespace only. `failurePolicy: Fail` makes any
+# CEL evaluation error block the request — the same default-deny
+# stance the network policies use. The CEL expression uses `has()` to
+# guard the `object` vs `oldObject` fields that VAP exposes per
+# operation (CREATE has `object`, DELETE has `oldObject`, UPDATE has
+# both); without the guard, a CREATE would error on `oldObject`
+# evaluation and the policy would reject every legitimate archival Job.
+# GET is intentionally left unbound — Reads are not part of the
+# exfiltration path and constraining them would also block the prune
+# pod's own watch-by-deterministic-name lookup.
+#
+# Requires: Kubernetes 1.30+ (ValidatingAdmissionPolicy v1 GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openstudio-prune-job-scope
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: archival-admission
+  annotations:
+    energy.nrel.gov/description: |
+      Issue #294 — constrain the prune SA's batch/jobs verbs to archival
+      Jobs only. Combined with the Role at lines 45-47, the prune SA can
+      only create/delete Jobs that carry the archival labels, so a
+      compromised prune pod cannot spawn arbitrary Jobs.
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["jobs"]
+  validations:
+    - expression: |
+        (has(object.metadata.labels) &&
+         object.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
+         object.metadata.labels["app.kubernetes.io/component"] == "archival") ||
+        (has(oldObject.metadata.labels) &&
+         oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
+         oldObject.metadata.labels["app.kubernetes.io/component"] == "archival")
+      message: |
+        Jobs in openstudio-server must be labelled with BOTH
+        app.kubernetes.io/managed-by=openstudio-operator AND
+        app.kubernetes.io/component=archival (issue #294). The prune
+        SA's batch/jobs verbs are scoped to archival Jobs only; any
+        other Job create/update/delete attempt is rejected.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openstudio-prune-job-scope
+  labels:
+    app.kubernetes.io/managed-by: openstudio-operator
+    app.kubernetes.io/component: archival-admission
+spec:
+  policyName: openstudio-prune-job-scope
+  # Empty selector matches every namespace that the policy's own
+  # namespaceSelector already filtered to `openstudio-server`. The
+  # binding is required because a ValidatingAdmissionPolicy with no
+  # binding is dormant — see K8s docs on ValidatingAdmissionPolicy.
+  # Re-stating the namespace label here would be redundant; the
+  # matchConstraints.namespaceSelector above is the canonical gate.
+  selector: {}

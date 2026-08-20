@@ -193,6 +193,17 @@ edge cases (`#246` `#247` `#248` `#249`).
 - **`#244`** — `README.md` + `AGENTS.md` Repository layout sections
   list the four new shared-utility modules (`events_sinks.py`, `_k8s.py`,
   `_oscm_handlers.py`, `logging_setup.py`).
+- **`#294`** — `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding`
+  (`openstudio-prune-job-scope`) added to `deploy/storage-cronjob.yaml`
+  constrains the prune SA's `batch/jobs` `create|update|delete` verbs to
+  Jobs that carry the archival labels (`app.kubernetes.io/managed-by=
+  openstudio-operator` AND `app.kubernetes.io/component=archival`). RBAC
+  `PolicyRule` has no `labelSelector` and `resourceNames` only accepts
+  exact strings (no globs), so the constraint is enforced at admission
+  rather than RBAC. `failurePolicy: Fail` + `namespaceSelector` scoped
+  to `openstudio-server` make this the third defence-in-depth layer
+  after the namespaced `#78` Role split and the `#78` deterministic
+  Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Removed
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])
