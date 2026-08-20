@@ -620,7 +620,10 @@ def analysis_sla_monitor(
         )
     except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError) as exc:
         HANDLER_TICK_FAILURES_TOTAL.labels(
-            module="analysis_sla", error_type=type(exc).__name__
+            namespace=namespace,
+            name=name,
+            module="analysis_sla",
+            error_type=type(exc).__name__,
         ).inc()
         logger.warning(
             "analysis SLA tick skipped, retrying next poll (%s: %s)",

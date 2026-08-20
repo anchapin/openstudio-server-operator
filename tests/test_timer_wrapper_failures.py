@@ -121,7 +121,12 @@ def _counter(module: str, error_type: str) -> float:
     return (
         REGISTRY.get_sample_value(
             "openstudio_operator_handler_tick_failures_total",
-            {"module": module, "error_type": error_type},
+            {
+                "namespace": NAMESPACE,
+                "name": NAME,
+                "module": module,
+                "error_type": error_type,
+            },
         )
         or 0.0
     )

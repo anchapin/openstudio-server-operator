@@ -548,6 +548,8 @@ def _gated(fn: Callable) -> Callable:
             # ``functools.wraps`` at install time, falls back to
             # ``"handler"`` for un-named callables).
             HANDLER_TICK_FAILURES_TOTAL.labels(
+                namespace=str(namespace),
+                name=str(kwargs.get("name") or ""),
                 module=getattr(fn, "__name__", "handler"),
                 error_type=type(exc).__name__,
             ).inc()

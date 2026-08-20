@@ -228,7 +228,10 @@ def worker_recycler(
         )
     except (OpenStudioApiError, StatusStoreError, ApiException) as exc:
         HANDLER_TICK_FAILURES_TOTAL.labels(
-            module="worker_recycler", error_type=type(exc).__name__
+            namespace=namespace,
+            name=name,
+            module="worker_recycler",
+            error_type=type(exc).__name__,
         ).inc()
         logger.warning(
             "worker recycler tick skipped, retrying next poll (%s: %s)",

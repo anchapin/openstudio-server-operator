@@ -169,6 +169,15 @@ def test_metrics_http_server_serves_all_declared_counters():
     port = start_metrics_server(port=_free_port(), addr="127.0.0.1")
     assert port is not None
     assert metrics.is_metrics_server_started()
+    # Issue #311 — namespace/name CR-identity labels are added to the
+    # four status-store/conflict counters and the four action counters;
+    # the pre-touch labels below must carry the full label set so the
+    # sentinel series exists in the exposition. The ``namespace`` /
+    # ``name`` values use the ``__metrics_test_sentinel__`` placeholder
+    # convention so the assert lines below can pin the exact exposition
+    # shape (no production-value leakage, easy to grep / fixture).
+    SENTINEL_NAMESPACE = "__metrics_test_sentinel_ns__"
+    SENTINEL_NAME = "__metrics_test_sentinel__"
     # Issue #117 — pre-touch the labelled counter so the exposition
     # registers at least one series. A labelled Counter with no
     # observations does not expose the family until `.labels(...).inc()`
@@ -177,30 +186,57 @@ def test_metrics_http_server_serves_all_declared_counters():
     # a no-op in prometheus_client 0.26.x — `inc()` alone is what
     # actually creates the series.)
     metrics.HANDLER_TICK_FAILURES_TOTAL.labels(
-        module="__metrics_test_sentinel__", error_type="OpenStudioApiError"
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        module="__metrics_test_sentinel__",
+        error_type="OpenStudioApiError",
+    ).inc()
+    # Issue #119 / #171 — same pattern for the status-store counters.
+    # Issue #311 adds (namespace, name) labels so the family existence
+    # check must include the full label set.
+    metrics.STATUS_CONFLICTS_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).inc()
+    metrics.STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
     ).inc()
     # Issue #171 — same pattern for the defensive-cap eviction counter.
+    # Issue #311 adds (namespace, name) to the existing (map_name) set.
     metrics.STATUS_MAP_CAPS_TOTAL.labels(
-        map_name="__metrics_test_sentinel__"
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        map_name="__metrics_test_sentinel__",
     ).inc()
     # Issue #237 — same pattern for the two EventEmitter (#164)
     # counters. ``events_dry_run_suppressed_total`` and
-    # ``events_emitted_total`` are both labelled by ``reason``; pre-touch
-    # both so the family-existence assertion is self-contained for the
-    # labelled-counter branch.
+    # ``events_emitted_total`` are labelled by (namespace, name, reason);
+    # pre-touch both so the family-existence assertion is self-contained
+    # for the labelled-counter branch.
     metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
-        reason="__metrics_test_sentinel__"
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        reason="__metrics_test_sentinel__",
     ).inc()
-    metrics.EVENTS_EMITTED_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    metrics.EVENTS_EMITTED_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        reason="__metrics_test_sentinel__",
+    ).inc()
     # Issue #239 — pre-touch the singleton-guard election outcome
     # counter so its labelled family is exposed at the exposition
     # surface. ``outcome`` label vocabulary mirrors the enforce()'s three
-    # branches (idle | active | conflict).
+    # branches (idle | active | conflict). Issue #311 leaves this
+    # counter CR-unlabelled (the singleton guard is namespace-scoped,
+    # not CR-scoped — the guard itself is the multi-CR protection).
     metrics.SINGLETON_ELECTION_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
     # Issue #255 — pre-touch the kopf.event emission-failure counter.
-    # ``reason`` label vocabulary matches ``events_emitted_total`` so the
-    # two can be rate-correlated on a dashboard.
-    metrics.EVENTS_EMIT_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # ``reason`` label vocabulary matches ``events_emitted_total`` and,
+    # post-#311, the (namespace, name) labels carry the same CR identity.
+    metrics.EVENTS_EMIT_FAILURES_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        reason="__metrics_test_sentinel__",
+    ).inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -219,32 +255,60 @@ def test_metrics_http_server_serves_all_declared_counters():
     for name in _declared_counter_families():
         assert f"# TYPE {name} counter" in response.text
         # Labelled counters (issue #117's ``handler_tick_failures_total``,
-        # issue #171's ``status_map_caps_total``,
-        # issue #237's ``events_dry_run_suppressed_total`` /
-        # ``events_emitted_total``, issue #239's
-        # ``singleton_election_total``, issue #255's
-        # ``events_emit_failures_total``) emit
-        # ``<name>{<labels>} value``; non-labelled emit ``<name> value``.
-        # The sentinel increments above pre-touch the labelled series;
-        # check the labelled form for them, the bare form for the rest.
+        # issue #119's ``status_conflicts_total`` /
+        # ``status_conflict_retries_exhausted_total``, issue #171's
+        # ``status_map_caps_total``, issue #237's
+        # ``events_dry_run_suppressed_total`` / ``events_emitted_total``,
+        # issue #239's ``singleton_election_total``, issue #255's
+        # ``events_emit_failures_total``) emit ``<name>{<labels>} value``;
+        # non-labelled emit ``<name> value``. The sentinel increments above
+        # pre-touch the labelled series; check the labelled form for them,
+        # the bare form for the rest. Issue #311 — the exposition label
+        # order is the order prometheus_client writes the labels (sorted
+        # alphabetically by key); the assert strings below use that order.
         if name == "openstudio_operator_handler_tick_failures_total":
             assert (
-                'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",module="__metrics_test_sentinel__"}'
+                'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",'
+                'module="__metrics_test_sentinel__",'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
+                in response.text
+            )
+        elif name == "openstudio_operator_status_conflicts_total":
+            assert (
+                f'openstudio_operator_status_conflicts_total{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"}}'
+                in response.text
+            )
+        elif name == "openstudio_operator_status_conflict_retries_exhausted_total":
+            assert (
+                f'openstudio_operator_status_conflict_retries_exhausted_total{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"}}'
                 in response.text
             )
         elif name == "openstudio_operator_status_map_caps_total":
             assert (
-                'openstudio_operator_status_map_caps_total{map_name="__metrics_test_sentinel__"}'
+                'openstudio_operator_status_map_caps_total{map_name="__metrics_test_sentinel__",'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_events_dry_run_suppressed_total":
             assert (
-                'openstudio_operator_events_dry_run_suppressed_total{reason="__metrics_test_sentinel__"}'
+                f'openstudio_operator_events_dry_run_suppressed_total{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}",'
+                'reason="__metrics_test_sentinel__"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_events_emitted_total":
             assert (
-                'openstudio_operator_events_emitted_total{reason="__metrics_test_sentinel__"}'
+                f'openstudio_operator_events_emitted_total{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}",'
+                'reason="__metrics_test_sentinel__"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_singleton_election_total":
@@ -254,7 +318,10 @@ def test_metrics_http_server_serves_all_declared_counters():
             )
         elif name == "openstudio_operator_events_emit_failures_total":
             assert (
-                'openstudio_operator_events_emit_failures_total{reason="__metrics_test_sentinel__"}'
+                f'openstudio_operator_events_emit_failures_total{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}",'
+                'reason="__metrics_test_sentinel__"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_warnings_deferred_dropped_total":
@@ -339,9 +406,11 @@ def _counter_total(counter) -> float:
 
 def test_handler_tick_failures_counter_increments_per_module():
     """The 4 handler modules must each report a distinct tick-failure counter
-    with `(module, error_type)` labels. Driving the increment directly via
-    ``labels(...).inc()`` is sufficient to verify the label machinery works
-    across every module name the wrappers use (#117)."""
+    with ``(namespace, name, module, error_type)`` labels. Driving the
+    increment directly via ``labels(...).inc()`` is sufficient to verify
+    the label machinery works across every module name the wrappers use
+    (#117); issue #311 adds the (namespace, name) CR-identity labels so
+    a multi-CR process can attribute failures to the specific CR."""
     counter = metrics.HANDLER_TICK_FAILURES_TOTAL
     baseline = _counter_total(counter)
     for module in (
@@ -350,7 +419,12 @@ def test_handler_tick_failures_counter_increments_per_module():
         "worker_recycler",
         "web_background_monitor",
     ):
-        counter.labels(module=module, error_type="OpenStudioApiError").inc()
+        counter.labels(
+            namespace="openstudio-server",
+            name="oscm",
+            module=module,
+            error_type="OpenStudioApiError",
+        ).inc()
     after = _counter_total(counter)
     # 4 modules × 1 increment each.
     assert after - baseline == 4.0
@@ -359,19 +433,37 @@ def test_handler_tick_failures_counter_increments_per_module():
 def test_handler_tick_failures_counter_distinguishes_error_types():
     """Same module, two distinct exception classes — must record separately so
     a dashboard alerting on ``error_type`` can tell an API-down from a
-    store-conflict from a Redis-down storm."""
+    store-conflict from a Redis-down storm. Issue #311 adds (namespace,
+    name) CR identity so the (module, error_type) tuple is now a
+    4-tuple (namespace, name, module, error_type)."""
     counter = metrics.HANDLER_TICK_FAILURES_TOTAL
     baseline = _counter_total(counter)
-    counter.labels(module="analysis_sla", error_type="OpenStudioApiError").inc()
-    counter.labels(module="analysis_sla", error_type="ApiException").inc()
-    counter.labels(module="analysis_sla", error_type="RedisClientError").inc()
+    counter.labels(
+        namespace="openstudio-server",
+        name="oscm",
+        module="analysis_sla",
+        error_type="OpenStudioApiError",
+    ).inc()
+    counter.labels(
+        namespace="openstudio-server",
+        name="oscm",
+        module="analysis_sla",
+        error_type="ApiException",
+    ).inc()
+    counter.labels(
+        namespace="openstudio-server",
+        name="oscm",
+        module="analysis_sla",
+        error_type="RedisClientError",
+    ).inc()
     after = _counter_total(counter)
     assert after - baseline == 3.0
-    # The exposition form is the verified shape — each (module, error_type)
-    # is its own labelled series.
+    # The exposition form is the verified shape — each
+    # (namespace, name, module, error_type) is its own labelled series.
     exposition = generate_latest().decode()
     assert (
-        'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",module="analysis_sla"}'
+        'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",'
+        'module="analysis_sla",name="oscm",namespace="openstudio-server"}'
         in exposition
     )
 
@@ -387,7 +479,9 @@ def test_events_dry_run_suppressed_counter_increments_per_reason():
     labelled-counter pattern from #117 and #171 — the actual emission site
     (inside :meth:`EventEmitter.emit`) is covered end-to-end by
     ``tests/test_events.py``. This test pins the label cardinality so a
-    future refactor that drops the label is caught at CI."""
+    future refactor that drops the label is caught at CI. Issue #311
+    adds (namespace, name) CR-identity labels so the per-reason drill
+    is now a 3-tuple (namespace, name, reason)."""
     counter = metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL
     baseline = _counter_total(counter)
     for reason in (
@@ -399,7 +493,9 @@ def test_events_dry_run_suppressed_counter_increments_per_reason():
         "WebBackgroundRestarted",
         "ResqueKeyLayoutUnknown",
     ):
-        counter.labels(reason=reason).inc()
+        counter.labels(
+            namespace="openstudio-server", name="oscm", reason=reason
+        ).inc()
     after = _counter_total(counter)
     # 7 reasons × 1 increment each.
     assert after - baseline == 7.0
@@ -412,7 +508,9 @@ def test_events_emitted_counter_increments_per_reason():
     ``rate(emitted) / rate(suppressed)`` is the headline SLO for an
     audit-only install — a non-trivial suppressed rate with a zero
     emitted rate is the intended state; the test pin is for the inverse
-    drift (suppressed > emitted during a non-dry-run deploy)."""
+    drift (suppressed > emitted during a non-dry-run deploy). Issue
+    #311 adds (namespace, name) CR identity so the per-reason drill
+    is now a 3-tuple (namespace, name, reason)."""
     counter = metrics.EVENTS_EMITTED_TOTAL
     baseline = _counter_total(counter)
     for reason in (
@@ -424,7 +522,9 @@ def test_events_emitted_counter_increments_per_reason():
         "WebBackgroundRestarted",
         "ResqueKeyLayoutUnknown",
     ):
-        counter.labels(reason=reason).inc()
+        counter.labels(
+            namespace="openstudio-server", name="oscm", reason=reason
+        ).inc()
     after = _counter_total(counter)
     assert after - baseline == 7.0
 
@@ -436,18 +536,25 @@ def test_events_counters_exposition_uses_reason_label():
     ``<name>{<labels>} <value>`` and the family line. Pinning the label key
     here (``reason``) means a future refactor that silently renames the label
     (e.g. to ``event_reason``) is caught at CI rather than at the on-call's
-    Grafana board."""
+    Grafana board. Issue #311 — the labels now include (namespace, name)
+    so the exposition shape is the verified 3-tuple."""
     counter_suppressed = metrics.EVENTS_DRY_RUN_SUPPRESSED_TOTAL
     counter_emitted = metrics.EVENTS_EMITTED_TOTAL
-    counter_suppressed.labels(reason="ExpositionShapeProbe").inc()
-    counter_emitted.labels(reason="ExpositionShapeProbe").inc()
+    counter_suppressed.labels(
+        namespace="openstudio-server", name="oscm", reason="ExpositionShapeProbe"
+    ).inc()
+    counter_emitted.labels(
+        namespace="openstudio-server", name="oscm", reason="ExpositionShapeProbe"
+    ).inc()
     exposition = generate_latest().decode()
     assert (
-        'openstudio_operator_events_dry_run_suppressed_total{reason="ExpositionShapeProbe"}'
+        'openstudio_operator_events_dry_run_suppressed_total{name="oscm",'
+        'namespace="openstudio-server",reason="ExpositionShapeProbe"}'
         in exposition
     )
     assert (
-        'openstudio_operator_events_emitted_total{reason="ExpositionShapeProbe"}'
+        'openstudio_operator_events_emitted_total{name="oscm",'
+        'namespace="openstudio-server",reason="ExpositionShapeProbe"}'
         in exposition
     )
 
@@ -634,7 +741,7 @@ def test_events_emit_failures_counter_increments_per_reason():
         "WebBackgroundRestarted",
         "ResqueKeyLayoutUnknown",
     ):
-        counter.labels(reason=reason).inc()
+        counter.labels(namespace="test-ns", name="test-cr", reason=reason).inc()
     after = _counter_total(counter)
     assert after - baseline == 7.0
 
@@ -644,9 +751,11 @@ def test_events_emit_failures_counter_exposition_uses_reason_label():
     its own labelled series. Pinning the label key (``reason``) means a
     future refactor that silently renames the label is caught at CI."""
     counter = metrics.EVENTS_EMIT_FAILURES_TOTAL
-    counter.labels(reason="ExpositionShapeProbe").inc()
+    counter.labels(
+        namespace="test-ns", name="test-cr", reason="ExpositionShapeProbe"
+    ).inc()
     exposition = generate_latest().decode()
     assert (
-        'openstudio_operator_events_emit_failures_total{reason="ExpositionShapeProbe"}'
+        'openstudio_operator_events_emit_failures_total{name="test-cr",namespace="test-ns",reason="ExpositionShapeProbe"}'
         in exposition
     )

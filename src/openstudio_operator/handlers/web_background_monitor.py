@@ -640,7 +640,10 @@ def web_background_monitor(
         )
     except (RedisClientError, StatusStoreError, ApiException) as exc:
         HANDLER_TICK_FAILURES_TOTAL.labels(
-            module="web_background_monitor", error_type=type(exc).__name__
+            namespace=namespace,
+            name=name,
+            module="web_background_monitor",
+            error_type=type(exc).__name__,
         ).inc()
         logger.warning(
             "web_background monitor tick skipped, retrying next poll (%s: %s)",
