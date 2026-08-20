@@ -75,11 +75,12 @@ ASSET_ROOT = "server/assets"
 # Issue #124 — pin the rclone image by digest to close the supply-chain
 # drift window independently of #113 (operator provenance). Refresh with:
 #   docker buildx imagetools inspect rclone/rclone:1.67.0
-# and update both this line AND test_archival.py's RCLONE_IMAGE_DIGEST.
-# The tag is kept for human readability; the digest is what the Job pull
-# resolves against, so a malicious tag-mutation cannot steer the image.
+# and update RCLONE_IMAGE below — that is the only line to touch: the
+# digest constant is derived from it (issue #417, single-source digest
+# pin). The tag is kept for human readability; the digest is what the Job
+# pull resolves against, so a malicious tag-mutation cannot steer the image.
 RCLONE_IMAGE = "rclone/rclone:1.67.0@sha256:25a2a208a8e3f4ad27ac5e7441cbfebdcea7953c8d7c9effa31f234a3c251024"
-RCLONE_IMAGE_DIGEST = "sha256:25a2a208a8e3f4ad27ac5e7441cbfebdcea7953c8d7c9effa31f234a3c251024"
+RCLONE_IMAGE_DIGEST = RCLONE_IMAGE.rsplit("@", 1)[-1]
 RCLONE_REMOTE_NAME = "archive"
 RESTART_POLICY = "Never"
 ARCHIVAL_BACKOFF_LIMIT = 3
