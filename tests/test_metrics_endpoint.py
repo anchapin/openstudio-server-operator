@@ -70,7 +70,6 @@ EXPECTED_COUNTER_FAMILIES = (
 #: and the eventual ``web_background_restarts_total`` increment — a heads-
 #: up display that gives SREs time to react before the gate trips.
 #:
-<<<<<<< HEAD
 #: Issue #312 — paired freshness timestamp gauges for ``resque_queue_
 #: depth`` and ``stall_window_elapsed_seconds``. Set to ``time.time()``
 #: on every successful read/update so dashboards can compute staleness
