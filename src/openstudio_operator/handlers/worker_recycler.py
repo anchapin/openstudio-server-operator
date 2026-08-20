@@ -56,7 +56,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException
 
-from openstudio_operator._oscm_handlers import register as _register_oscm_handler
+from openstudio_operator._oscm_handlers import register_fn as _register_oscm_handler
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -275,8 +275,6 @@ def _worker_recycler_impl(
         logger.info("worker recycled (trigger=%s)", trigger)
 
 
-# Issue #285 — register this timer in the Python-level OSCM handler
-# registry so the singleton guard's cross-check passes without the
-# legacy-id whitelist (retired after #285 closed the grandfathering
-# window for the four pre-#250 timers).
-_register_oscm_handler("worker_recycler", worker_recycler)
+# Issue #285 / #407 — register this timer in the Python-level OSCM handler
+# registry under fn.__name__ for the singleton guard's cross-check.
+_register_oscm_handler(worker_recycler)

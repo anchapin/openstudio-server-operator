@@ -236,7 +236,7 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 │   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
 │   ├── _time.py                # tz-aware UTC parser (`parse_utc`); None-safe; replaces three byte-equivalent duplicates (#174)
 │   ├── _k8s.py                 # Shared Kubernetes API helpers (`DeploymentReader`, `deployment_label_selector`); neutral home for cross-handler K8s surface (#236, #250)
-│   ├── _oscm_handlers.py       # Python-level OSCM handler registry; new handlers call `register()` at import; singleton guard cross-checks against the kopf registry at gate time (#250)
+│   ├── _oscm_handlers.py       # Python-level OSCM handler registry; new handlers call `register_fn(fn)` at import (id = fn.__name__, #407); singleton guard cross-checks against the kopf registry at gate time (#250)
 │   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
 │   ├── openstudio_client.py    # OpenStudio REST client (verified against v3.11.0)
 │   ├── client_factory.py       # `lru_cache`-keyed factories for `OpenStudioClient` + `ReadOnlyRedisClient`; a mutated `spec.serverUrl` / `spec.redisUrl` invalidates by a different key (#168, #235)
