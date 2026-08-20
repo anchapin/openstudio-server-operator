@@ -151,6 +151,15 @@ edge cases (`#246` `#247` `#248` `#249`).
   the boot-time check fires on `#163`).
 - **`#257`** — `pytest` `slow` marker + duration budget to catch
   test-suite regressions before they land.
+- **`#298`** — CI drift gate for `pyproject.toml` dev deps vs
+  `requirements.lock`. `tests/test_dependency_drift.py` parses
+  `[project.optional-dependencies].dev` and asserts every entry has a
+  matching `--hash=sha256:...` line in `requirements.lock`; the failure
+  message names the missing dep and prints the canonical `pip-compile`
+  remediation command. The lockfile was regenerated with `--extra=dev` so
+  `ruff`, `responses`, `fakeredis`, `hypothesis` (and their transitive
+  deps `packaging`, `pluggy`, `pygments`, `iniconfig`, `sortedcontainers`)
+  are now hash-pinned alongside the production deps.
 
 ### Changed
 - **`#235`** — `ReadOnlyRedisClient` construction is now centralized in
