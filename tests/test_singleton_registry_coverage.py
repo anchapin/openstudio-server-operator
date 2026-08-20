@@ -1157,3 +1157,166 @@ def test_install_singleton_guard_skips_unregistered_oscm_handler(
             "and the test in lockstep."
         )
 
+
+# --- Issue #304 — singleton.py must not import from openstudio_operator.handlers ----
+#
+# Issue #304: ``singleton.py`` historically did a deferred
+# ``from openstudio_operator.handlers import _emit_redis_warning_event`` from
+# inside :func:`openstudio_operator.singleton._emit_redis_url_guard_events`,
+# inverting the natural module dependency direction
+# (handlers → singleton, NOT singleton → handlers). The deferred import was
+# guarded by ``try/except ImportError`` so the import-time circular risk was
+# hidden but real, and was reachable in any future import-ordering change. The
+# fix is for ``_emit_redis_url_guard_events`` to call :func:`kopf.event`
+# directly (the helper is invoked from kopf ``@kopf.on.startup`` and
+# ``@kopf.on.event`` callbacks, where the ``settings_var`` ContextVar is
+# populated and ``kopf.event(...)`` is callable directly). The redirect
+# removes the inverted import, but the regression risk is "someone re-adds
+# the import" or "a future sibling module pulls in handlers via a new
+# transitive dep" — both must fail this test loudly.
+#
+# The test walks the singleton module's TRANSITIVE imports via AST (no
+# import-time side effects, safe for the rest of the test suite's import
+# order) and asserts that none of the visited modules are the
+# ``openstudio_operator.handlers`` package OR any of its submodules. The
+# scan is bounded by the project source tree (we only recurse into modules
+# under ``src/openstudio_operator/``); third-party imports and stdlib are
+# terminal leaves, not probed for their own internal graph (the test would
+# never terminate otherwise).
+
+
+_SCAN_ROOT = Path(singleton.__file__).resolve().parent
+_HANDLERS_PKG = "openstudio_operator.handlers"
+
+
+def _imported_modules_in_file(path: Path) -> set[str]:
+    """Return the set of fully-qualified module names imported by ``path``.
+
+    Walks every :class:`ast.Import` and :class:`ast.ImportFrom` node in the
+    parsed file and returns the long form of each imported name. The result
+    is bounded to module names that start with ``openstudio_operator.`` —
+    third-party and stdlib imports are filtered out because (a) the
+    regression we're guarding against is specifically a singleton↔handlers
+    cycle, and (b) following them would explode the search into kopf,
+    kubernetes, requests, etc., none of which the operator controls.
+
+    For ``from openstudio_operator.x import y``, the returned name is
+    ``openstudio_operator.x`` (the module, not the symbol). For
+    ``import openstudio_operator.x``, the returned name is
+    ``openstudio_operator.x``. For ``import openstudio_operator`` (the
+    package itself), the returned name is ``openstudio_operator`` — which
+    never matches the ``_HANDLERS_PKG`` prefix but is harmless to include.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except SyntaxError:
+        # Treat syntax errors as no imports — the linter / CI gate will
+        # catch them elsewhere; the AST scan is for import-graph drift,
+        # not syntax.
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod.startswith("openstudio_operator."):
+                # All openstudio_operator.* imports are surfaced — the
+                # handlers-prefix check happens in the test assertion
+                # itself (a singleton→handlers import lands in this
+                # set and the test fails the build). Surfacing it here
+                # is what the AST walk exists for; the visit set is
+                # bounded to the production source tree by the
+                # caller's path resolution.
+                found.add(mod)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.name
+                if name.startswith("openstudio_operator."):
+                    found.add(name)
+    return found
+
+
+def _transitive_openstudio_operator_imports(entry: Path) -> set[str]:
+    """Walk the openstudio_operator import graph rooted at ``entry``.
+
+    BFS over the production source tree (``src/openstudio_operator/``);
+    modules outside that tree (third-party, stdlib) are terminal leaves.
+    Returns the set of every module visited whose dotted name starts with
+    ``openstudio_operator.`` — including the entry point itself. The
+    ``singleton → handlers`` test gates against any module whose name is
+    the ``openstudio_operator.handlers`` package OR a submodule thereof.
+    """
+    visited: set[str] = set()
+    queue: list[Path] = [entry]
+    while queue:
+        path = queue.pop(0)
+        # Map the on-disk path back to the dotted module name. ``singleton.py``
+        # is ``openstudio_operator.singleton``; ``handlers/__init__.py`` is
+        # ``openstudio_operator.handlers``; ``handlers/analysis_sla.py`` is
+        # ``openstudio_operator.handlers.analysis_sla``. Anything else under
+        # ``src/openstudio_operator/`` follows the same shape.
+        try:
+            rel = path.relative_to(_SCAN_ROOT.parent)
+        except ValueError:
+            continue
+        parts = rel.with_suffix("").as_posix().split("/")
+        dotted = ".".join(parts)
+        if dotted in visited:
+            continue
+        visited.add(dotted)
+        for imported in _imported_modules_in_file(path):
+            if not imported.startswith("openstudio_operator."):
+                continue
+            # Translate the dotted name back to a file path. We only recurse
+            # into modules that live under our source tree — third-party and
+            # stdlib are pruned above.
+            mod_parts = imported.split(".")
+            candidate = _SCAN_ROOT.parent.joinpath(*mod_parts)
+            py_file = candidate.with_suffix(".py")
+            pkg_init = candidate / "__init__.py"
+            next_path: Path | None = None
+            if py_file.is_file():
+                next_path = py_file
+            elif pkg_init.is_file():
+                next_path = pkg_init
+            if next_path is not None and next_path not in queue:
+                queue.append(next_path)
+    return visited
+
+
+def test_singleton_module_does_not_import_handlers() -> None:
+    """Issue #304: singleton.py's transitive imports never touch handlers.
+
+    The singleton guard is a SHARED utility — it is imported by every
+    handler module (and by ``handlers/__init__.py`` itself). A singleton
+    module that imports back from ``openstudio_operator.handlers``
+    creates a circular import whose failure mode is hidden by the
+    ``try/except ImportError`` defensive guard (or, in production, by
+    import-order luck). The natural dep direction is handlers → singleton
+    (and singleton → its OWN utility submodules like ``_time``,
+    ``status_store``, ``metrics``); the handlers package must NOT appear
+    anywhere in the singleton module's transitive import graph.
+
+    The test walks the import graph from ``singleton.py`` via AST (no
+    import-time side effects) and fails the build if any visited module
+    is the ``openstudio_operator.handlers`` package or any of its
+    submodules. The scan is bounded to the production source tree
+    (``src/openstudio_operator/``); third-party and stdlib imports are
+    terminal leaves. The message names the offending module(s) so a
+    regression is one read to fix.
+    """
+    visited = _transitive_openstudio_operator_imports(Path(singleton.__file__))
+    handlers_modules = {
+        mod for mod in visited
+        if mod == _HANDLERS_PKG or mod.startswith(_HANDLERS_PKG + ".")
+    }
+    assert not handlers_modules, (
+        f"singleton.py transitively imports openstudio_operator.handlers — "
+        f"inverted module dependency (issue #304). Found: "
+        f"{sorted(handlers_modules)}. The natural dep direction is "
+        f"handlers → singleton, never the other way around. If singleton "
+        f"needs a handler-side helper, call kopf.event(...) directly "
+        f"(the kopf @kopf.on.startup and @kopf.on.event callbacks that "
+        f"invoke singleton._check are active kopf callbacks where "
+        f"settings_var is populated). See issue #304 and "
+        f"openstudio_operator/singleton.py:_emit_redis_url_guard_events."
+    )
