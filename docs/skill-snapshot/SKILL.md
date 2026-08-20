@@ -111,7 +111,37 @@ instead of passively waiting for a done signal:
    gh pr list --search "fix/issue-{N}" --json number,title,state --jq '.[] | select(.state=="OPEN") | .number'
    ```
    - **PR found** → record PR number in wave-state.json, move to next issue
-   - **PR NOT found after 60s** → enter recovery sequence below
+   - **PR NOT found after 60s** → if `wave-state.json` records a prior
+     PR number for this issue (status `pr_created`), run the `pr_recreate`
+     sub-step below; otherwise enter the recovery sequence.
+   - **`pr_recreate` sub-step** (when the previous PR is stuck CLOSED
+     because `gh pr reopen` failed after a force-push; issue #364):
+     ```bash
+     # 1. Look up the prior PR number from wave-state.json
+     PRIOR_PR=$(jq -r '.issues["{N}"].pr_number // empty' ../wave-state.json)
+     if [ -n "$PRIOR_PR" ]; then
+       STATE=$(gh pr view "$PRIOR_PR" --json state --jq '.state')
+       if [ "$STATE" = "CLOSED" ]; then
+         # 2. Attempt reopen; on failure, recreate the PR (issue #364)
+         if ! gh pr reopen "$PRIOR_PR" 2>/dev/null; then
+           OLD_TITLE=$(gh pr view "$PRIOR_PR" --json title --jq '.title' 2>/dev/null)
+           OLD_BODY=$(gh pr view "$PRIOR_PR" --json body --jq '.body' 2>/dev/null)
+           gh pr close "$PRIOR_PR"  # confirm closed
+           NEW_PR=$(gh pr create --base develop \
+             --title "$OLD_TITLE" \
+             --body "$OLD_BODY" \
+             --head fix/issue-{N}-{slug} | tail -1 | awk -F'/' '{print $NF}')
+           # 3. Update wave-state.json with the new PR number
+           jq --arg n "{N}" --arg p "$NEW_PR" \
+             '.issues[$n].pr_number = ($p | tonumber)' \
+             ../wave-state.json > ../wave-state.json.tmp \
+             && mv ../wave-state.json.tmp ../wave-state.json
+         fi
+       fi
+     fi
+     ```
+     The verification loop re-runs Phase 3c § 4 (PR base) and § 5
+     (PR body) on the new PR before recording it.
 
 3. **Recovery sequence** (when PR missing or timeout):
    ```bash
@@ -223,6 +253,32 @@ CI when a branch is force-pushed or when a PR is closed/reopened. The CI
 sub-agent template uses `gh pr close && gh pr reopen` to force a fresh
 workflow dispatch on the new HEAD after force-pushes. This is more reliable
 than relying on automatic triggers or `gh run rerun`.
+
+**Stuck CLOSED + reopen fails → recreate (issue #364):** When a branch is
+force-pushed after a rebase, GitHub's PR head reference becomes stale and
+`gh pr reopen <N>` fails with `Could not open the pull request. (reopenPullRequest)`.
+In that case, recreate the PR instead of escalating:
+
+```bash
+if ! gh pr reopen <N> 2>/dev/null; then
+  OLD_TITLE=$(gh pr view <N> --json title --jq '.title' 2>/dev/null)
+  OLD_BODY=$(gh pr view <N> --json body --jq '.body' 2>/dev/null)
+  gh pr close <N>  # confirm closed
+  NEW_PR=$(gh pr create --base develop \
+    --title "$OLD_TITLE" \
+    --body "$OLD_BODY" \
+    --head fix/issue-{N}-{slug} | tail -1 | awk -F'/' '{print $NF}')
+  # Phase 3c verification loop picks up the new PR on its next poll;
+  # update wave-state.json with the new number.
+fi
+```
+
+The recreate path carries over the old title/body verbatim, so re-run
+Phase 3c § 4 (PR base) and § 5 (PR body) checks on the new PR before
+recording it. The CI sub-agent template keeps `gh pr close && gh pr
+reopen` as the primary retrigger; the recreate flow above is the
+fallback for the stale-head case (replaces the prior "escalate on
+reopen failure" behavior with an automatic recovery).
 
 ### 4c. Issue Close Verification
 
