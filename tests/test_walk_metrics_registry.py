@@ -50,49 +50,15 @@ from __future__ import annotations
 import pytest
 from prometheus_client import REGISTRY, Counter
 
-# Local mirror of the EXPECTED_*_FAMILIES tuples defined in
-# ``tests/test_metrics_endpoint.py``. We deliberately do NOT import them:
-# (a) the equality test that owns them must keep them as the canonical
-# source of truth, and (b) coupling this drift detector to that file
-# would import ``requests`` and start the metrics-server thread as a
-# side effect, polluting the global test state. The two tuples below are
-# kept in lockstep by the round-trip walk tests; if either drifts, the
-# equality test in test_metrics_endpoint.py ALSO fails, surfacing the
-# same change request twice.
-EXPECTED_COUNTER_FAMILIES = (
-    "openstudio_operator_soft_stops_total",
-    "openstudio_operator_datapoints_requeued_total",
-    "openstudio_operator_datapoints_requeue_exhausted_total",
-    "openstudio_operator_workers_recycled_total",
-    "openstudio_operator_worker_pods_evicted_total",
-    "openstudio_operator_web_background_restarts_total",
-    "openstudio_operator_analyses_archived_total",
-    "openstudio_operator_analyses_deleted_total",
-    "openstudio_operator_status_conflicts_total",
-    "openstudio_operator_status_conflict_retries_exhausted_total",
-    "openstudio_operator_handler_tick_failures_total",
-    "openstudio_operator_status_map_caps_total",
-    "openstudio_operator_events_dry_run_suppressed_total",
-    "openstudio_operator_events_emitted_total",
-    "openstudio_operator_singleton_election_total",
-    "openstudio_operator_singleton_loser_skips_total",
-    "openstudio_operator_events_emit_failures_total",
-    "openstudio_operator_prune_tick_failures_total",
-    "openstudio_operator_warnings_deferred_dropped_total",
-)
-EXPECTED_GAUGE_FAMILIES = (
-    "openstudio_operator_resque_workers_seen_max",
-    "openstudio_operator_resque_queue_depth",
-    "openstudio_operator_redis_key_layout_status",
-    "openstudio_operator_stall_window_elapsed_seconds",
-    "openstudio_operator_resque_queue_depth_fresh",
-    "openstudio_operator_stall_window_fresh",
-    "openstudio_operator_warnings_deferred_queue_depth",
-)
-EXPECTED_HISTOGRAM_FAMILIES = (
-    "openstudio_operator_analysis_datapoint_count",
-    "openstudio_operator_handler_tick_duration_seconds",
-    "openstudio_operator_rest_request_duration_seconds",
+# The EXPECTED_*_FAMILIES tuples are imported from the shared canonical
+# source ``tests/_metrics_inventory.py`` (issue #406). The old #287
+# "deliberately do NOT import" local mirror is gone: the shared module
+# has no import side effects, so the drift gate now lives in exactly
+# one tuple per family.
+from _metrics_inventory import (
+    EXPECTED_COUNTER_FAMILIES,
+    EXPECTED_GAUGE_FAMILIES,
+    EXPECTED_HISTOGRAM_FAMILIES,
 )
 
 _OPERATOR_PREFIX = "openstudio_operator_"
@@ -186,8 +152,7 @@ def test_every_registered_counter_in_expected():
     assert not extra, (
         f"REGISTRY has operator Counter families not in "
         f"EXPECTED_COUNTER_FAMILIES: {extra}. Either remove the metric, or "
-        f"add the name to the tuple in tests/test_metrics_endpoint.py "
-        f"(and mirror it here)."
+        f"add the name to the tuple in tests/_metrics_inventory.py."
     )
 
 
@@ -213,7 +178,7 @@ def test_every_expected_counter_registered():
         f"EXPECTED_COUNTER_FAMILIES contains names not registered in the "
         f"default prometheus_client REGISTRY: {missing}. Either declare the "
         f"Counter in metrics.py, or remove the name from the tuple in "
-        f"tests/test_metrics_endpoint.py (and mirror the removal here)."
+        f"tests/_metrics_inventory.py."
     )
 
 
