@@ -23,7 +23,17 @@ none of the four handler modules owns. Today it hosts:
   query string from a Deployment's own ``spec.selector`` (honors BOTH
   ``matchLabels`` AND ``matchExpressions``; the narrow-fallback-on-unsupported
   operator behavior established by issue #44 was preserved verbatim — see the
-  function's docstring for the rationale).
+  function's docstring for the rationale),
+* :func:`load_operator_kube_config` — the SINGLE public loader for the
+  operator's kubeconfig (in-cluster first, ``kube_config`` fallback). The
+  companion ``_load_k8s_config`` / ``_load_kube_config`` thin wrappers in
+  :mod:`openstudio_operator.singleton` and
+  :mod:`openstudio_operator.prune_entrypoint` both delegate here. A future
+  loader change (kubeconfig Secret reference, network-proxy client, custom
+  CA bundle) applies at this single site; the AST gate in
+  ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
+  rejects any inline ``load_incluster_config(`` / ``load_kube_config(`` call
+  outside this module so a partial update fails CI loudly (issue #305).
 
 Why ``_k8s`` and not ``k8s_helpers`` / ``k8s_api_helpers``? Mirrors the
 ``_constants`` / ``_time`` convention in this package (operator-internal
@@ -132,3 +142,70 @@ def deployment_label_selector(
     if not terms:
         return None
     return ",".join(terms)
+
+
+def load_operator_kube_config() -> None:
+    """Load the operator pod's kubeconfig: in-cluster first, ``kube_config`` fallback.
+
+    SINGLE public loader for the operator's Kubernetes configuration
+    (issues #158, #251, #305). The upstream gate every K8s API call
+    shares: the in-cluster ``KUBERNETES_SERVICE_HOST`` /
+    ``KUBERNETES_SERVICE_PORT`` envs plus the pod's service-account
+    token mount; on ``ConfigException`` (bare ``kopf run`` dev sessions,
+    no service-account env vars) falls back to ``~/.kube/config``.
+
+    Why here rather than in :mod:`openstudio_operator.singleton` where
+    the loader previously lived: ``singleton`` originally owned the
+    factory (``operator_custom_objects_api``) and the loader was a
+    private helper beside it. The companion ``_load_kube_config`` in
+    :mod:`openstudio_operator.prune_entrypoint` was a verbatim copy of
+    the same try/except, and any future loader change (kubeconfig
+    Secret reference, network-proxy client, custom CA bundle) had to
+    land in two places. The factories' same-file loader was the source
+    of the duplication problem; the cross-handler ``_k8s`` module is the
+    neutral home (its module docstring already enumerates the helpers
+    it hosts, so the loader fits there), and the AST gate in
+    ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
+    rejects any inline ``load_incluster_config(`` /
+    ``load_kube_config(`` call outside this module so a partial update
+    fails CI loudly (issue #305).
+
+    Behaviour:
+
+    * In-cluster first via ``kubernetes.config.load_incluster_config``;
+      on ``ConfigException`` falls back to
+      ``kubernetes.config.load_kube_config``. Same posture as the
+      original ``_load_k8s_config`` (issue #79) — kopf >=1.44 never
+      initializes client-python's default ``Configuration``, so a bare
+      ``*V1Api()`` with no loaded config raises ``LocationValueError``
+      on every call (proven live in #66's kind validation).
+    * Idempotent in production — the loader is idempotent on the same
+      source and the factories check their cache before calling. Both
+      wrappers (:func:`openstudio_operator.singleton._load_k8s_config`
+      and
+      :func:`openstudio_operator.prune_entrypoint._load_kube_config`)
+      delegate here.
+    * On config-loading failure (both ``load_incluster_config`` and
+      ``load_kube_config`` raise ``ConfigException``), propagates the
+      second exception — callers fail closed (skip the tick, retry next
+      poll per D12).
+
+    Tests that mock ``kubernetes.config.load_incluster_config`` use
+    :func:`openstudio_operator.singleton.reset_operator_k8s_client` to
+    drop the cache between cases so the next call to any
+    ``operator_*_api()`` factory re-runs the load path with the freshly
+    patched loader. The local import inside the function binds the
+    module-level patched function object, so monkeypatch-style test
+    replacements of ``kubernetes.config.load_incluster_config`` are
+    honored on every call.
+    """
+    from kubernetes.config import (
+        ConfigException,
+        load_incluster_config,
+        load_kube_config,
+    )
+
+    try:
+        load_incluster_config()
+    except ConfigException:
+        load_kube_config()

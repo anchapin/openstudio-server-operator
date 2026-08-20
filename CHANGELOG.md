@@ -193,6 +193,16 @@ edge cases (`#246` `#247` `#248` `#249`).
 - **`#244`** — `README.md` + `AGENTS.md` Repository layout sections
   list the four new shared-utility modules (`events_sinks.py`, `_k8s.py`,
   `_oscm_handlers.py`, `logging_setup.py`).
+- **`#305`** — kubeconfig loader collapsed to the SINGLE public loader
+  `openstudio_operator._k8s.load_operator_kube_config()`; the
+  `singleton._load_k8s_config` and `prune_entrypoint._load_kube_config`
+  wrappers are now thin delegations to it. Future loader changes
+  (kubeconfig Secret reference, network-proxy client, custom CA bundle)
+  apply at the single site. New AST CI gate
+  `tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site`
+  rejects any inline `load_incluster_config(` / `load_kube_config(`
+  call outside `_k8s.py` (catches both bare-name and
+  attribute-shape calls). Tests: 529 → 531.
 
 ### Removed
 - (no entries yet — all changes since 0.1.0 are in [0.2.0])
