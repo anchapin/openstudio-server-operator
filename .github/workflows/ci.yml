@@ -178,4 +178,20 @@ jobs:
             echo "::error::docs/onboarding.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, onboarding.md says '$CLAIM'"
             exit 1
           fi
+      # Issue #387 — guard against the metrics-family prose claim drift that
+      # #151 / #220 were designed to catch for the test-count claim. The Python
+      # test in `tests/test_metrics_family_prose_claim.py` runs as part of the
+      # `pytest` step above; this shell step is the parallel grep-based guard
+      # that mirrors the test-count guard pattern (`grep -oE` + `awk` over
+      # `EXPECTED_*_FAMILIES` tuple lengths). Two gates share the same invariant
+      # — the Python test inspects the tuple values directly; the shell step
+      # cross-checks the prose everywhere the claim appears. The Python test
+      # is the load-bearing one for `Literal[18, 7, 3]` parity; this shell
+      # step is the high-signal CI wall that prevents the prose-only claim in
+      # `README.md` / `docs/audit-dryrun-idempotency.md` from drifting when a
+      # maintainer reads the failure message and bumps the prose.
+      - name: Verify metrics-family prose claim (#387)
+        run: |
+          set -euo pipefail
+          bash scripts/check_metrics_family_claim.sh
 
