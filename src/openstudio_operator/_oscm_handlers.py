@@ -37,6 +37,8 @@ two always agree without a hand-maintained test set.
 
 from __future__ import annotations
 
+import functools
+import time
 from collections.abc import Callable
 
 #: Process-wide registry of OSCM spawning handlers, keyed by handler id
@@ -112,3 +114,48 @@ def reset_registry() -> None:
     shape (e.g. "no new handler registered") need a clean slate.
     """
     REGISTRY.clear()
+
+
+# Shared @kopf.timer wrapper decorator (issue #395).
+# The four OSCM timer handlers each had a near-identical wrapper that:
+#   (1) captures ``_started = time.perf_counter()``,
+#   (2) calls the inner ``_xxx_impl(...)`` body,
+#   (3) in a ``finally``, observes the elapsed wall-clock on
+#       ``HANDLER_TICK_DURATION_SECONDS.labels(module="<name>")``.
+# This decorator centralizes that pattern so handler modules no longer
+# need to copy-paste the wrapper.
+#
+# Usage:
+#     from openstudio_operator._oscm_handlers import observe_tick_duration
+#
+#     @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+#     @observe_tick_duration(module="my_handler")
+#     def my_handler_impl(...): ...
+
+
+def observe_tick_duration(*, module: str):
+    """Decorator factory for the standard OSCM timer tick duration observation.
+
+    Wraps the inner impl function, captures ``time.perf_counter()`` at entry,
+    calls the impl, and in a ``finally`` block observes the elapsed wall-clock
+    on ``HANDLER_TICK_DURATION_SECONDS.labels(module=module)``.
+
+    The import of ``HANDLER_TICK_DURATION_SECONDS`` is deferred to call time
+    to avoid import-order issues during module load.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            _started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                from openstudio_operator.metrics import HANDLER_TICK_DURATION_SECONDS
+                HANDLER_TICK_DURATION_SECONDS.labels(module=module).observe(
+                    time.perf_counter() - _started
+                )
+
+        return wrapper
+
+    return decorator
