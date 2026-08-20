@@ -28,6 +28,15 @@ spec:
       labels:
         app: web-background
     spec:
+      # Issue #388 — PSS `restricted` hardening. Mirrors
+      # scripts/manifests/04-web.yaml (same Rails image, same Secret
+      # mounts, same fsGroup-owned NFS PVC).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
       containers:
         - name: web-background
           image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
@@ -55,9 +64,25 @@ spec:
                 secretKeyRef:
                   name: openstudio-mongo
                   key: password
+          # Issue #388 — container-level PSS `restricted` baseline matching
+          # deploy/operator-deployment.yaml:95-103 and
+          # deploy/storage-cronjob.yaml:162-170. readOnlyRootFilesystem
+          # requires writable /tmp for Rails / Resque buffering — the
+          # emptyDir volume below provides it.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: nfs
               mountPath: /mnt/openstudio
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 250m
@@ -68,3 +93,5 @@ spec:
         - name: nfs
           persistentVolumeClaim:
             claimName: nfs-pvc
+        - name: tmp
+          emptyDir: {}

@@ -45,6 +45,21 @@ spec:
       labels:
         app: web
     spec:
+      # Issue #388 — PSS `restricted` hardening. The web pod mounts
+      # `MONGO_USER` / `MONGO_PASSWORD` / `REDIS_URL` from Secrets, so a
+      # CVE in the pinned `nrel/openstudio-server:3.11.0` digest running
+      # as root pivots straight into the database. The pod-level block
+      # mirrors deploy/operator-deployment.yaml:47-52 and
+      # deploy/storage-cronjob.yaml:112-117 (runAsNonRoot + runAsUser
+      # 1000 + seccompProfile RuntimeDefault + fsGroup 1000). fsGroup 1000
+      # makes the nfs-pvc mount writable by the non-root UID the
+      # container runs as.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
       containers:
         - name: web
           image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
@@ -75,9 +90,27 @@ spec:
               value: "50"
             - name: MAX_POOL
               value: "4"
+          # Issue #388 — container-level PSS `restricted` baseline matching
+          # deploy/operator-deployment.yaml:95-103 and
+          # deploy/storage-cronjob.yaml:162-170. readOnlyRootFilesystem
+          # requires writable /tmp for Rails / Resque buffering — the
+          # emptyDir volume below provides it. Mounting the nfs-pvc at
+          # /mnt/openstudio is unaffected (the PVC carries its own
+          # fsGroup-owned writability via the pod-level fsGroup above).
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: nfs
               mountPath: /mnt/openstudio
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /
@@ -96,6 +129,8 @@ spec:
         - name: nfs
           persistentVolumeClaim:
             claimName: nfs-pvc
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

@@ -1,7 +1,25 @@
 # Namespace for the whole validation stack AND the operator (issue #19).
 # Matches the production namespace from the helm chart and AGENTS.md exactly:
 # `openstudio-server` (chart manifests that still say `openstudio` are stale).
+#
+# Issue #388 — Pod Security Standards labels. The operator + prune CronJob +
+# archival Jobs all declare PSS `restricted` (deploy/operator-deployment.yaml,
+# deploy/storage-cronjob.yaml, src/openstudio_operator/archival.py), but
+# until now the namespace carried no PSS labels, so the per-pod
+# `securityContext` was defense-in-depth, not enforced. The three labels
+# below make the posture real:
+#   * `enforce: restricted` rejects non-compliant pods at admission time
+#     (kubelet-level, not just operator-managed surface).
+#   * `enforce-version: latest` pins to the PSS profile bundled with the
+#     running cluster (a K8s-version-aligned policy is the supported mode).
+#   * `audit: restricted` annotates admitted-but-non-compliant workloads
+#     in the audit log so a regression can be caught after the fact (the
+#     "warn first" staging shape before flipping `enforce`).
 apiVersion: v1
 kind: Namespace
 metadata:
   name: openstudio-server
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
