@@ -401,6 +401,86 @@ when the issue SHOULD close on merge, and `Refs #N` (or `for #N` /
 section below — `develop` closes issues from PR **bodies** too, so the
 keywords matter in BOTH places.
 
+### Scope guard (issue #301)
+
+Every PR body MUST also carry a `Scope guard:` block. This is the
+counterpart to the keyword rule above: keywords tell GitHub which
+issues to auto-close, but they say nothing about **what this PR
+intentionally does NOT touch**. The scope guard makes that explicit so
+reviewers can verify the change stays within its lane and so follow-up
+work is unambiguously assigned.
+
+The rule was first stated in the PR/branch-conventions prose and
+finally documented here (issue #301). Before #301 the convention was
+referenced but never defined; new contributors (and the
+auto-improvement-loop / wave-orchestrator) produced PRs that satisfied
+the keyword rule but violated the unspoken scope rule. The
+[`scripts/check_pr_body_scope.sh`](../scripts/check_pr_body_scope.sh)
+CI gate (wired into the `lint` job) fails the build when the block is
+missing, empty, lacks an issue reference, or contains no rationale.
+
+**Required content of the `Scope guard:` line:**
+
+1. The issues this PR actually touches (`#N`, comma-separated, with a
+   one-line rationale per issue — usually just the issue title is
+   enough).
+2. A statement of what is intentionally **not** being changed in this
+   PR. Use one of these forms:
+   - `Do NOT touch <area>; #M owns that.` (preferred when the area is
+     already tracked by a follow-up issue),
+   - `<area> is out of scope; tracked by #M.` (when the rationale needs
+     more context),
+   - `<area> is unchanged in this PR.` (when the area is intentionally
+     left alone but no follow-up issue exists yet).
+3. At least one of the rationale phrases `Do NOT`, `do not`, `owns`,
+   `out of scope`, `not in scope`, `do not modify`, `unchanged`, or
+   `untouched` — the lint script greps for one of these so a bare
+   `Scope guard: #301` line is rejected.
+
+**Canonical example** (closing PR that touches one issue + defers
+another):
+
+```markdown
+Closes #301
+
+## What this changes
+
+- Adds `scripts/check_pr_body_scope.sh` and wires it into the `lint`
+  CI job.
+- Documents the scope-guard rule in `AGENTS.md` and
+  `docs/onboarding.md`.
+
+## What this does NOT change
+
+- Scope guard: Do NOT touch any of the four OSCM timer handler modules
+  (`analysis_sla`, `datapoint_watchdog`, `worker_recycler`,
+  `web_background_monitor`); #297 owns that refactor.
+- Scope guard: Do NOT touch `CONTRIBUTING.md` (it does not exist yet);
+  #302 owns adding it.
+```
+
+The two `Scope guard:` lines name the areas intentionally excluded and
+the follow-up issues that own them — a reviewer can verify at a glance
+that nothing leaked past the stated scope.
+
+**Why a separate rule from #88?** The merge-subject hygiene rule
+(#88) governs closing/keep-open keywords; it runs against commit
+subjects. The scope-guard rule (#301) governs PR bodies and the
+*intent* of the change — it is a content review guard, not a keyword
+parser. Both rules run independently: a PR with perfect keywords and
+no scope guard still fails CI on this gate.
+
+**Running the check locally:**
+
+```bash
+# Pipe a PR body from gh:
+gh pr view 301 --json body -q .body \
+  | bash scripts/check_pr_body_scope.sh -
+
+# Or check a saved file:
+bash scripts/check_pr_body_scope.sh --file /tmp/pr_body.md
+```
+
 ### Merge-subject hygiene (#88)
 
 `develop` is the default branch, so GitHub closes an issue when **any**
