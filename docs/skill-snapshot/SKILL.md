@@ -157,18 +157,39 @@ instead of passively waiting for a done signal:
      ```bash
      BODY=$(gh pr view {PR_NUMBER} --json body --jq '.body')
      if echo "$BODY" | grep -qE "(Closes|Fixes)\s+#{N}"; then
-       # Keyword found — record PR number in wave-state.json, move to next issue
-       :
-     else
-       # Auto-fix: append the required keyword to the PR body
-       gh pr edit {PR_NUMBER} --body "${BODY}
+        # Keyword found — record PR number in wave-state.json, move to next issue
+        :
+      else
+        # Auto-fix: append the required keyword to the PR body
+        gh pr edit {PR_NUMBER} --body "${BODY}
 
 Closes #{N}"
+      fi
+     if echo "$BODY" | grep -qE "^Scope guard:"; then
+       # Scope guard already present — record PR number in wave-state.json
+       :
+     else
+       # Auto-fix: append the default scope-guard line (issue #365;
+       # fence from issue #301). Set NEXT_ISSUE to the next-priority
+       # open issue in the same wave, or leave "#M" as a placeholder
+       # the orchestrator substitutes before editing. The shape uses
+       # "#M" so the appended block always satisfies all four
+       # check_pr_body_scope.sh assertions (keyword, scope guard line,
+       # issue reference, rationale phrase).
+       NEXT_ISSUE="#M"
+       gh pr edit {PR_NUMBER} --body "${BODY}
+
+Scope guard: Do NOT touch any other area of the codebase; ${NEXT_ISSUE} owns the follow-up area."
      fi
      ```
-     This catches sub-agents that omit the `Closes #N` / `Fixes #N` keyword from
-     the PR body (issue #2340). The regex accepts both exact and whitespace-
-     variant forms (e.g., `Closes  #123`, `Closes#123`).
+     This catches sub-agents that omit either the `Closes #N` /
+     `Fixes #N` keyword or the `Scope guard:` line from the PR body
+     (issues #2340 and #365 respectively; the Scope guard contract is
+     the gate added by #301). The keyword regex accepts both exact
+     and whitespace-variant forms (e.g., `Closes  #123`, `Closes#123`);
+     the Scope guard regex is anchored at start-of-line (`^Scope
+     guard:`) so mentions inside fenced code blocks or prose do not
+     false-positive.
 
   6. **Idempotency**: All orchestrator push commands use `--force-with-lease`.
      All `gh pr create` calls are safe to re-run — GitHub returns error if PR
