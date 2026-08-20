@@ -100,13 +100,34 @@ the four that change how you interpret curl output here:
      prune CronJob with its SA/Role.
 
   Both policies are cluster-scoped and independent of each other; both
-  require Kubernetes 1.30+ (`admissionregistration.k8s.io/v1` GA) —
-  pre-1.30 clusters must skip both and run with RBAC-only guardrails
-  (see the Module status table above).
+  are gated on Kubernetes 1.30+ — run the
+  [K8s minor version gate](#k8s-minor-version-gate-130) at the end of
+  this section before applying either. Pre-1.30 clusters must skip both
+  and run with RBAC-only guardrails (see the Module status table above).
 - Note (#69): the `:dev` publish pipeline was broken from #57 until the #69
   fix (README.md was excluded from the Docker build context, failing pip
   metadata generation). It is live again — future waves can pull the image
   directly.
+
+### K8s minor version gate (1.30+)
+
+Both admission policies above are `admissionregistration.k8s.io/v1`
+objects, an API that is GA only on Kubernetes **1.30+**. Gate on the
+server minor version before applying anything from this runbook:
+
+```bash
+kubectl version --short   # the Server Version line must read v1.30 or newer
+```
+
+- **1.30+** — apply both policies as written (the Prerequisites bullet
+  above and Phase A step 1).
+- **pre-1.30** — fail forward, do not abort: skip BOTH policies — omit the
+  `deploy/pod-delete-admission-policy.yaml` apply in Phase A step 1, and
+  strip the embedded VAP documents out of `deploy/storage-cronjob.yaml`
+  before applying it. The operator and the prune CronJob run without the
+  policies; what you lose is the label-scoped narrowing of `pods/delete`
+  and `batch/jobs` verbs (#293/#294), so those ServiceAccounts stay as
+  wide as their RBAC Roles allow.
 
 ## Phase 0 — pre-flight: fixture drift on the work cluster
 
@@ -203,12 +224,29 @@ queue to drain and watching the same. Live evidence in
 ## Phase A — deploy the operator with `dryRun: true`
 
 1. **Install the operator's K8s objects** (post-#3 manifests; same as the
-   [kind walkthrough](kind-validation.md#phase-1-dryrun-true-smoke-walkthrough-feeds-20s-runbook)):
+   [kind walkthrough](kind-validation.md#phase-1-dryrun-true-smoke-walkthrough-feeds-20s-runbook);
+   the VAP apply below requires the
+   [K8s minor version gate (1.30+)](#k8s-minor-version-gate-130) from
+   Prerequisites):
 
    ```bash
    kubectl apply -f deploy/crd.yaml
    kubectl apply -f deploy/rbac.yaml
+   # Issue #293 — ValidatingAdmissionPolicy narrows the operator SA's
+   # pods/delete to pods labeled app=worker (RBAC has no labelSelector).
+   # Apply AFTER rbac.yaml so the operator SA referenced in the CEL rule
+   # already exists at admission-evaluation time. Skip this apply on a
+   # pre-1.30 cluster (RBAC-only guardrails).
+   kubectl apply -f deploy/pod-delete-admission-policy.yaml
    ```
+
+   The prune-side VAP (#294) has **no apply step of its own**: it rides
+   inside `deploy/storage-cronjob.yaml` — the same manifest that ships the
+   prune CronJob with its SA/Role (Prerequisites bullet above). When
+   Module 4's storage pruning goes live,
+   `kubectl apply -f deploy/storage-cronjob.yaml` installs the CronJob and
+   the VAP in one stroke; on a pre-1.30 cluster strip the embedded VAP
+   documents out of that manifest before applying it.
 
 2. **Create the OSCM custom resource, dry-run mode, with tuned policies**
    so a short batch can trip the SLA clock within minutes instead of hours
