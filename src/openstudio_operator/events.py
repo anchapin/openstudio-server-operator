@@ -158,9 +158,13 @@ class EventEmitter:
         # is the headline SLO for an audit-only install. Issue #311
         # adds (namespace, name) CR identity so the suppression-vs-emit
         # ratio can be sliced per CR.
-        EVENTS_EMITTED_TOTAL.labels(
-            namespace=self._namespace, name=self._name, reason=reason
-        ).inc()
+        #
+        # Issue #299 — the ``.inc()`` runs ONLY on a successful
+        # ``kopf.event`` post (i.e. AFTER the ``try/except`` below returns
+        # without raising). A failed post bumps ``EVENTS_EMIT_FAILURES_TOTAL``
+        # instead, never both. Pinned by
+        # ``tests/test_events.py::test_emit_kopf_event_failure_increments_failure_counter_and_reraises``
+        # (tracks #255).
         try:
             kopf.event(self._body, type=event_type, reason=reason, message=message)
         except Exception:  # defensive: increment counter, re-raise unchanged
@@ -181,6 +185,14 @@ class EventEmitter:
                 namespace=self._namespace, name=self._name, reason=reason
             ).inc()
             raise
+        # ``kopf.event`` returned without raising — the Event was posted.
+        # Bump the emitted counter AFTER the post succeeds so a failed
+        # post never bumps the "successful posts" series. This matches
+        # the documented semantic in ``metrics.py`` ("successful
+        # kopf.event calls") and the headline SLO ratio (#237).
+        EVENTS_EMITTED_TOTAL.labels(
+            namespace=self._namespace, name=self._name, reason=reason
+        ).inc()
 
     def __call__(self, event_type: str, reason: str, message: str) -> None:
         """Backwards-compat shim: ``emit("Warning", REASON, msg)`` syntax.
