@@ -1,0 +1,76 @@
+# Issue #400 — ResourceQuota + LimitRange for the openstudio-server
+# namespace (resource-surface blast-radius bound).
+#
+# Pre-fix the namespace carried no ResourceQuota and no LimitRange:
+# the verb surface was gated (RBAC #78/#228, admission #293/#294,
+# network #112/#166) but the RESOURCE surface was not. A misbehaving
+# web pod or an attacker-controlled archival Job (any image passing
+# the `oscm-archive-*` admission rule) could claim arbitrary
+# CPU/memory without bound, evicting the operator pod on a
+# memory-constrained node and triggering D05/D12 retry storms.
+#
+# The two objects bound the surface at different levels:
+#
+#   * ResourceQuota caps the AGGREGATE — requests.cpu=4 /
+#     limits.cpu=8, requests.memory=8Gi / limits.memory=16Gi. This is
+#     the actual blast-radius bound: nothing in the namespace can
+#     reserve more than these totals, so the operator's 100m/128Mi
+#     reservation always has documented headroom (steady-state
+#     arithmetic fenced by tests/test_deploy_manifests.py::
+#     test_resource_quota_totals_leave_room_for_steady_state).
+#   * LimitRange supplies the PER-CONTAINER defaults — containers
+#     that omit resources are defaulted to requests 500m/512Mi and
+#     limits 2 CPU/4Gi. The defaults are load-bearing, not cosmetic:
+#     a ResourceQuota that tracks limits REJECTS pods whose
+#     containers omit limits, and the helm chart's pods (web,
+#     web-background, worker) declare limits.memory but NOT
+#     limits.cpu — without the LimitRange default the quota would
+#     make those pods inadmissible.
+#
+# Deliberately NO LimitRange `max`: the chart's pods legitimately
+# declare limits.memory up to the 4Gi ceiling the issue documents,
+# and the issue's scope guard forbids touching the chart's upstream
+# values — a `max` at that ceiling would reject any future chart
+# bump. The aggregate ResourceQuota stays the only hard per-namespace
+# bound; the per-pod default is fenced at CI level instead
+# (tests/test_deploy_manifests.py::
+# test_no_deploy_container_exceeds_limit_range_defaults fails any
+# deploy/ manifest whose container requests/limits exceed the
+# defaults below).
+#
+# Scope guard (#400): the operator's own requests stay at
+# requests.cpu: 100m, memory: 128Mi (deploy/operator-deployment.yaml)
+# and the helm chart's upstream values are untouched. Both objects
+# are namespaced core/v1 and need no extra RBAC; a cluster admin can
+# apply this file alongside scripts/manifests/00-namespace.yaml.
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: openstudio-server-quota
+  namespace: openstudio-server
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: openstudio-server-limits
+  namespace: openstudio-server
+spec:
+  limits:
+    # `type: Container` is the only LimitRange type that can express
+    # `default`/`defaultRequest` — the issue's "per-pod default" is
+    # the per-container default the API injects at admission for
+    # every container that omits resources.
+    - type: Container
+      defaultRequest:
+        cpu: 500m
+        memory: 512Mi
+      default:
+        cpu: "2"
+        memory: 4Gi

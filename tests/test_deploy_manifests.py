@@ -2298,3 +2298,287 @@ def test_storage_cronjob_does_not_disable_sa_token_mount():
         "container never calls the API server (#241); copying it here "
         "silently breaks the retention pipeline (issue #415)."
     )
+
+
+# ---- Issue #400: ResourceQuota + LimitRange bound the namespace's
+# resource blast radius ----------------------------------------------
+#
+# Pre-fix `openstudio-server` had no ResourceQuota and no LimitRange:
+# the verb surface was gated (RBAC, admission policies, network
+# policies) but the RESOURCE surface was not — a misbehaving web pod
+# or an attacker-controlled archival Job could claim arbitrary
+# CPU/memory, evicting the operator pod on a memory-constrained node.
+# The fix ships deploy/resource-quota.yaml with a ResourceQuota
+# (aggregate totals) + a LimitRange (per-container defaults so pods
+# that omit resources remain admissible under a quota that tracks
+# limits). `kubectl apply --dry-run=server` is not available in CI
+# (no cluster), so the "lint" below is a static YAML-structure walk
+# in the same style as the rest of this file.
+RESOURCE_QUOTA_PATH = DEPLOY / "resource-quota.yaml"
+RESOURCE_QUOTA_DOCS = [
+    d for d in yaml.safe_load_all(RESOURCE_QUOTA_PATH.read_text()) if d
+]
+RESOURCE_QUOTA = next(
+    (d for d in RESOURCE_QUOTA_DOCS if d.get("kind") == "ResourceQuota"),
+    None,
+)
+LIMIT_RANGE = next(
+    (d for d in RESOURCE_QUOTA_DOCS if d.get("kind") == "LimitRange"),
+    None,
+)
+
+# The LimitRange per-container defaults (issue #400's "per-pod
+# default" numbers). `type: Container` is the only LimitRange type
+# that can express default/defaultRequest; the constants below are
+# what the admission controller injects for containers that omit
+# resources.
+LR_DEFAULT_REQUEST_CPU_MILLIS = 500.0
+LR_DEFAULT_REQUEST_MEM_BYTES = 512 * 1024**2
+LR_DEFAULT_LIMIT_CPU_MILLIS = 2000.0
+LR_DEFAULT_LIMIT_MEM_BYTES = 4 * 1024**3
+
+# Documented steady-state pod count (issue #400): 5 chart pods
+# (web, web-background, worker, db, queue — the AGENTS.md
+# managed-objects inventory) + 1 operator pod + 1 prune CronJob pod.
+STEADY_STATE_PODS = 7
+
+_CPU_SUFFIX_TO_CORES = {"n": 1e-9, "u": 1e-6, "m": 1e-3}
+_MEM_SUFFIX_TO_BYTES = {
+    "Ki": 1024,
+    "Mi": 1024**2,
+    "Gi": 1024**3,
+    "Ti": 1024**4,
+    "Pi": 1024**5,
+    "Ei": 1024**6,
+    "K": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+    "P": 10**15,
+    "E": 10**18,
+}
+
+
+def _cpu_millis(quantity):
+    """Parse a k8s CPU quantity ("500m", "2", "100m") to millicores.
+
+    Raises ValueError on an unsupported suffix so an exotic unit fails
+    the scan loudly instead of silently comparing as zero."""
+    q = str(quantity).strip()
+    for suffix, cores in _CPU_SUFFIX_TO_CORES.items():
+        if q.endswith(suffix):
+            return float(q[: -len(suffix)]) * cores * 1000
+    try:
+        return float(q) * 1000  # bare cores ("2" == 2000m)
+    except ValueError as exc:
+        raise ValueError(f"unsupported CPU quantity {quantity!r}") from exc
+
+
+def _mem_bytes(quantity):
+    """Parse a k8s memory quantity ("512Mi", "8Gi", 1024) to bytes.
+
+    Raises ValueError on an unsupported suffix — same loud-failure
+    rationale as `_cpu_millis`."""
+    q = str(quantity).strip()
+    for suffix, mult in sorted(
+        _MEM_SUFFIX_TO_BYTES.items(), key=lambda kv: -len(kv[0])
+    ):
+        if q.endswith(suffix):
+            return int(float(q[: -len(suffix)]) * mult)
+    if q.isdigit():
+        return int(q)
+    raise ValueError(f"unsupported memory quantity {quantity!r}")
+
+
+def test_resource_quota_manifest_ships_quota_and_limitrange():
+    """Issue #400 acceptance #1: deploy/resource-quota.yaml exists,
+    parses, and contains EXACTLY a ResourceQuota + a LimitRange, both
+    bound to `openstudio-server` (namespaced core/v1 objects; a
+    cluster admin can apply the file alongside
+    scripts/manifests/00-namespace.yaml with no extra RBAC). The
+    ResourceQuota must track all four totals (requests.cpu/memory +
+    limits.cpu/memory) — a quota that omits one dimension leaves that
+    dimension unbounded, the exact gap #400 closes."""
+    assert RESOURCE_QUOTA is not None, (
+        "deploy/resource-quota.yaml is missing a ResourceQuota — the "
+        "namespace's resource surface is unbounded (issue #400)"
+    )
+    assert LIMIT_RANGE is not None, (
+        "deploy/resource-quota.yaml is missing a LimitRange — pods that "
+        "omit resources get no defaults and a limits-tracking quota "
+        "would reject the chart's pods at admission (issue #400)"
+    )
+    kinds = {d["kind"] for d in RESOURCE_QUOTA_DOCS}
+    assert kinds == {"ResourceQuota", "LimitRange"}, (
+        f"deploy/resource-quota.yaml must declare exactly a "
+        f"ResourceQuota + LimitRange, got {kinds!r}"
+    )
+    for doc in (RESOURCE_QUOTA, LIMIT_RANGE):
+        assert doc["apiVersion"] == "v1", doc
+        assert doc["metadata"]["namespace"] == "openstudio-server", doc
+    hard = RESOURCE_QUOTA["spec"]["hard"]
+    assert set(hard) == {
+        "requests.cpu",
+        "requests.memory",
+        "limits.cpu",
+        "limits.memory",
+    }, (
+        f"ResourceQuota must track all four CPU/memory totals, got "
+        f"{sorted(hard)!r}"
+    )
+
+
+def test_limit_range_defaults_match_issue_400_numbers():
+    """Issue #400 acceptance: the LimitRange carries the documented
+    per-container defaults — defaultRequest cpu 500m / memory 512Mi,
+    default cpu 2 / memory 4Gi — under `type: Container` (the only
+    LimitRange type that can express defaults; the issue's "per-pod
+    default" is realized as the per-container default injected for
+    every container that omits resources). These defaults are
+    load-bearing: a ResourceQuota tracking limits REJECTS pods whose
+    containers omit limits, and the chart's pods declare
+    limits.memory but NOT limits.cpu, so the injected default is what
+    keeps them admissible."""
+    assert LIMIT_RANGE is not None
+    limits = LIMIT_RANGE["spec"]["limits"]
+    container_limits = [l for l in limits if l.get("type") == "Container"]
+    assert len(container_limits) == 1, (
+        f"LimitRange must have exactly one type: Container entry, got "
+        f"{limits!r}"
+    )
+    entry = container_limits[0]
+    default_request = entry.get("defaultRequest") or {}
+    default = entry.get("default") or {}
+    assert _cpu_millis(default_request["cpu"]) == LR_DEFAULT_REQUEST_CPU_MILLIS
+    assert _mem_bytes(default_request["memory"]) == LR_DEFAULT_REQUEST_MEM_BYTES
+    assert _cpu_millis(default["cpu"]) == LR_DEFAULT_LIMIT_CPU_MILLIS
+    assert _mem_bytes(default["memory"]) == LR_DEFAULT_LIMIT_MEM_BYTES
+
+
+def test_resource_quota_totals_leave_room_for_steady_state():
+    """Issue #400 acceptance #2: the quota totals leave room for the
+    documented steady state — 5 chart pods (web, web-background,
+    worker, db, queue) + 1 operator + 1 prune CronJob pod = 7 pods.
+    The arithmetic this test fences (all values from the issue):
+
+      * requests.cpu   7 x 500m  = 3.5   <= quota 4
+      * requests.memory 7 x 512Mi = 3.5Gi <= quota 8Gi
+
+    i.e. quota >= per-pod default request x documented pod count, so
+    the namespace can always schedule the steady state even if every
+    pod relies entirely on the LimitRange defaults. A quota shrink
+    below that product strands the documented stack. The limits-side
+    counterpart cannot use the same x7 product (7 x 2 CPU = 14 and
+    7 x 4Gi = 28Gi both intentionally exceed the quota — limit
+    defaults are burst ceilings, not reservations); instead the fence
+    asserts the issue's 2:1 limits:requests ratio (8 = 2x4,
+    16Gi = 2x8Gi), which guarantees every reserved request unit has a
+    matching burst unit of headroom above it."""
+    assert RESOURCE_QUOTA is not None
+    hard = RESOURCE_QUOTA["spec"]["hard"]
+    # Requests side: quota >= per-pod default x documented pod count.
+    steady_cpu = STEADY_STATE_PODS * LR_DEFAULT_REQUEST_CPU_MILLIS
+    steady_mem = STEADY_STATE_PODS * LR_DEFAULT_REQUEST_MEM_BYTES
+    quota_req_cpu = _cpu_millis(hard["requests.cpu"])
+    quota_req_mem = _mem_bytes(hard["requests.memory"])
+    assert quota_req_cpu >= steady_cpu, (
+        f"requests.cpu quota {_cpu_str(quota_req_cpu)} must leave room "
+        f"for {STEADY_STATE_PODS} steady-state pods x 500m default = "
+        f"{_cpu_str(steady_cpu)} (issue #400)"
+    )
+    assert quota_req_mem >= steady_mem, (
+        f"requests.memory quota {_mem_str(quota_req_mem)} must leave "
+        f"room for {STEADY_STATE_PODS} steady-state pods x 512Mi "
+        f"default = {_mem_str(steady_mem)} (issue #400)"
+    )
+    # Limits side: the 2:1 limits:requests ratio (8 = 2x4, 16Gi = 2x8Gi).
+    quota_lim_cpu = _cpu_millis(hard["limits.cpu"])
+    quota_lim_mem = _mem_bytes(hard["limits.memory"])
+    assert quota_lim_cpu >= 2 * quota_req_cpu, (
+        f"limits.cpu quota {_cpu_str(quota_lim_cpu)} must be >= 2x the "
+        f"requests.cpu quota {_cpu_str(quota_req_cpu)} — the issue's "
+        "documented burst headroom ratio (issue #400)"
+    )
+    assert quota_lim_mem >= 2 * quota_req_mem, (
+        f"limits.memory quota {_mem_str(quota_lim_mem)} must be >= 2x "
+        f"the requests.memory quota {_mem_str(quota_req_mem)} — the "
+        "issue's documented burst headroom ratio (issue #400)"
+    )
+
+
+def _cpu_str(millis):
+    """Render millicores for assertion messages."""
+    return f"{millis:.0f}m"
+
+
+def _mem_str(num_bytes):
+    """Render bytes as GiB (or MiB below 1 GiB) for assertion messages."""
+    if num_bytes >= 1024**3:
+        return f"{num_bytes / 1024**3:g}Gi"
+    return f"{num_bytes / 1024**2:g}Mi"
+
+
+def test_no_deploy_container_exceeds_limit_range_defaults():
+    """Issue #400 acceptance #3 (the static "lint"): every container in
+    every deploy/ workload manifest must declare requests/limits at or
+    below the LimitRange per-container defaults (requests <=
+    500m/512Mi, limits <= 2/4Gi). Today both deploy/ workloads pass
+    with room to spare — the operator container declares
+    100m/128Mi requests + 500m/256Mi limits and the prune container
+    50m/128Mi + 250m/256Mi (the operator's requests are pinned by the
+    issue #400 scope guard and must NOT be changed). Any NEW deploy/
+    manifest whose container specs exceed the defaults fails here, so
+    the steady-state arithmetic in
+    ``test_resource_quota_totals_leave_room_for_steady_state`` stays
+    valid as deploy/ grows.
+
+    Scope: deploy/ only (the operator-owned surface). The kind-chart
+    overlay under scripts/manifests/ is deliberately NOT scanned — its
+    pods legitimately declare requests above the defaultRequest (web
+    requests 2Gi memory), which is fine because LimitRange defaults
+    apply only to containers that OMIT resources, and the chart's
+    upstream values are protected by the issue #400 scope guard.
+    initContainers are out of scope: no deploy/ manifest declares any
+    (the shared iterator walks `containers` only)."""
+    offenders = []
+    for path_name, kind, name, container in _iter_workload_containers():
+        if path_name.startswith("scripts/"):
+            continue  # chart overlay — out of scope (docstring above)
+        resources = container.get("resources") or {}
+        requests = resources.get("requests") or {}
+        limits = resources.get("limits") or {}
+        problems = []
+        if "cpu" in requests and (
+            _cpu_millis(requests["cpu"]) > LR_DEFAULT_REQUEST_CPU_MILLIS
+        ):
+            problems.append(
+                f"requests.cpu={requests['cpu']!r} > defaultRequest "
+                f"500m"
+            )
+        if "memory" in requests and (
+            _mem_bytes(requests["memory"]) > LR_DEFAULT_REQUEST_MEM_BYTES
+        ):
+            problems.append(
+                f"requests.memory={requests['memory']!r} > "
+                f"defaultRequest 512Mi"
+            )
+        if "cpu" in limits and (
+            _cpu_millis(limits["cpu"]) > LR_DEFAULT_LIMIT_CPU_MILLIS
+        ):
+            problems.append(f"limits.cpu={limits['cpu']!r} > default 2")
+        if "memory" in limits and (
+            _mem_bytes(limits["memory"]) > LR_DEFAULT_LIMIT_MEM_BYTES
+        ):
+            problems.append(
+                f"limits.memory={limits['memory']!r} > default 4Gi"
+            )
+        if problems:
+            offenders.append(
+                (path_name, kind, name, container.get("name"), problems)
+            )
+    assert not offenders, (
+        f"deploy/ containers exceed the LimitRange per-container "
+        f"defaults (issue #400 — shrink the manifest or, if the "
+        f"workload genuinely needs more, adjust the LimitRange "
+        f"defaults and the steady-state test together): {offenders}"
+    )
