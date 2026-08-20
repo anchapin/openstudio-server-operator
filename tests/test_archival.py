@@ -17,6 +17,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from openstudio_operator.archival import (
+    ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS,
     NFS_MOUNT_PATH,
     NFS_PVC_NAME,
     RCLONE_IMAGE,
@@ -244,6 +245,28 @@ def test_job_mechanics() -> None:
     assert container["image"] == RCLONE_IMAGE
     assert container["image"].startswith("rclone/rclone:1.67.0@")
     assert container["command"][0:2] == ["/bin/sh", "-c"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_archival_job_emits_active_deadline_seconds(backend: str) -> None:
+    """Issue #394 — emit ``activeDeadlineSeconds`` on the Job manifest.
+
+    The kubelet hard-kills any rclone pod that runs past this bound so a
+    hung rclone (TLS handshake stall, stuck TCP retransmit, S3 500 storm
+    with no response) cannot keep a Job alive forever. The value is the
+    module-level constant ``ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS`` (6× the
+    chart's worker ``terminationGracePeriodSeconds``), pinned here so a
+    silent constant change surfaces as a test failure.
+    """
+    job = _job(backend)
+    spec = job["spec"]
+    assert spec["activeDeadlineSeconds"] == ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS
+    # belt-and-braces: the constant itself is large enough to absorb a
+    # healthy multi-GB upload (5200s chart worker grace × 6 = 31200s ≈
+    # 8.7h). A regression that drops the multiplier (e.g. 5200 → 30)
+    # would silently break the alert upper-bound contract.
+    assert ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS == 6 * 5200
+    assert ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS > 3600
 
 
 @pytest.mark.parametrize(
