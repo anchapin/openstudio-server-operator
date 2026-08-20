@@ -22,6 +22,20 @@ PRUNE_ROLEBINDING = next(d for d in STORAGE_DOCS if d["kind"] == "RoleBinding")
 PRUNE_SA = next(d for d in STORAGE_DOCS if d["kind"] == "ServiceAccount")
 OPERATOR_ROLE = next(d for d in OPERATOR_RBAC_DOCS if d["kind"] == "Role")
 
+# Issue #293 — defense-in-depth admission policy for the operator's
+# pods/delete verb. Native RBAC has no label-selector slot, so the
+# constraint lives in a ValidatingAdmissionPolicy declared in
+# deploy/pod-delete-admission-policy.yaml. Loading the docs at module
+# import keeps the test functions focused on assertions; a YAML parse
+# error here surfaces in the first test that touches the constant.
+_POD_DELETE_ADMISSION_PATH = DEPLOY / "pod-delete-admission-policy.yaml"
+POD_DELETE_ADMISSION_DOCS = list(yaml.safe_load_all(_POD_DELETE_ADMISSION_PATH.read_text()))
+_OPERATOR_SA_NAME = "openstudio-operator-sa"
+_OPERATOR_SA_FULL = (
+    f"system:serviceaccount:openstudio-server:{_OPERATOR_SA_NAME}"
+)
+_OPERATOR_NS = "openstudio-server"
+
 
 def test_operator_role_no_longer_holds_any_batch_permission():
     """The #78 reduction: the entire batch/jobs rule is gone from the operator.
@@ -113,6 +127,254 @@ def test_operator_role_oscm_verbs_are_enumerated_subset():
     assert not offenders, (
         "OSCM rules grant verbs outside the least-privilege subset "
         f"(issue #228): {offenders}"
+    )
+
+
+# ---- Issue #293: ValidatingAdmissionPolicy narrows the operator's
+# pods/delete blast radius --------------------------------------
+#
+# Native RBAC has no label-selector slot on a Role rule, so the
+# `pods/delete` verb in deploy/rbac.yaml cannot be label-restricted
+# in-Role. The fix is a ValidatingAdmissionPolicy
+# (admissionregistration.k8s.io/v1) — GA in k8s 1.30; the kind
+# validation cluster runs 1.31 — that intercepts every DELETE pod
+# admission request in `openstudio-server` and rejects any request
+# from the operator ServiceAccount unless the target pod carries the
+# `app=worker` label (the helm chart's worker Deployment pod
+# selector — scripts/manifests/06-worker.yaml:39-40). All other
+# actors (humans via kubectl, the prune CronJob SA, etc.) are NOT
+# restricted — the CEL short-circuits on a non-matching userInfo.
+#
+# These tests pin the structural acceptance criteria: the manifest
+# exists, parses, scopes to the operator namespace, targets
+# DELETE on pods, hard-closes on policy failure (`failurePolicy:
+# Fail`), carries the operator SA username + worker-label check in
+# CEL, and is bound into the namespace by a matching Binding. A
+# regression that re-introduces the wildcard delete blast radius
+# trips at least one assertion below.
+
+
+def _pod_delete_admission_policy():
+    """Return the ValidatingAdmissionPolicy doc for #293."""
+    matches = [
+        d for d in POD_DELETE_ADMISSION_DOCS
+        if d.get("kind") == "ValidatingAdmissionPolicy"
+    ]
+    assert matches, (
+        "deploy/pod-delete-admission-policy.yaml is missing a "
+        "ValidatingAdmissionPolicy — the operator's pods/delete verb "
+        "is unconstrained at the admission layer (issue #293)"
+    )
+    return matches[0]
+
+
+def _pod_delete_admission_binding():
+    """Return the ValidatingAdmissionPolicyBinding doc for #293."""
+    matches = [
+        d for d in POD_DELETE_ADMISSION_DOCS
+        if d.get("kind") == "ValidatingAdmissionPolicyBinding"
+    ]
+    assert matches, (
+        "deploy/pod-delete-admission-policy.yaml is missing a "
+        "ValidatingAdmissionPolicyBinding — the policy is "
+        "cluster-scoped and has no RBAC for itself; the binding is "
+        "what scopes evaluation to `openstudio-server` (issue #293)"
+    )
+    return matches[0]
+
+
+def test_pod_delete_admission_manifest_exists_and_parses():
+    """Issue #293 acceptance #1: the manifest file exists, parses as YAML,
+    and contains exactly the two admissionregistration resources — no
+    other resources (ConfigMap, ServiceAccount, etc.) belong here.
+    """
+    assert _POD_DELETE_ADMISSION_PATH.exists(), (
+        f"{_POD_DELETE_ADMISSION_PATH} is missing — the operator's "
+        "pods/delete verb is unconstrained at the admission layer "
+        "(issue #293)"
+    )
+    kinds = {d["kind"] for d in POD_DELETE_ADMISSION_DOCS if d}
+    assert kinds == {
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+    }, (
+        f"deploy/pod-delete-admission-policy.yaml must declare exactly "
+        f"a ValidatingAdmissionPolicy + Binding, got {kinds!r}"
+    )
+
+
+def test_pod_delete_admission_policy_targets_delete_on_pods():
+    """Issue #293 acceptance #2: the policy's matchConstraints
+    resourceRules target DELETE operations on core/v1 pods ONLY. CREATE
+    / UPDATE / PATCH on pods are not operator surfaces (the operator
+    patches Deployments, which transitively restart pods — see
+    worker_recycler.py). Over-broad match would falsely reject pod
+    lifecycle operations that other actors legitimately perform.
+    """
+    policy = _pod_delete_admission_policy()
+    rules = policy["spec"]["matchConstraints"]["resourceRules"]
+    assert len(rules) == 1, (
+        f"pod-delete policy must have exactly one resourceRule "
+        f"(DELETE on pods), got {rules!r}"
+    )
+    rule = rules[0]
+    assert rule["apiGroups"] == [""], rule
+    assert rule["apiVersions"] == ["v1"], rule
+    assert rule["operations"] == ["DELETE"], rule
+    assert rule["resources"] == ["pods"], rule
+
+
+def test_pod_delete_admission_policy_scopes_to_openstudio_server():
+    """The policy must be namespace-scoped via matchConstraints. A
+    cluster-scoped policy (no namespaceSelector) would evaluate
+    pod deletes in EVERY namespace — narrowing the operator blast
+    radius in `openstudio-server` while widening it everywhere else
+    is the wrong trade.
+    """
+    policy = _pod_delete_admission_policy()
+    ns_selector = policy["spec"]["matchConstraints"].get("namespaceSelector")
+    assert ns_selector, (
+        "pod-delete policy must scope via matchConstraints."
+        "namespaceSelector to openstudio-server; a cluster-scoped "
+        "policy would evaluate pod deletes in every namespace "
+        "(issue #293)"
+    )
+    match_labels = ns_selector.get("matchLabels") or {}
+    assert match_labels.get("kubernetes.io/metadata.name") == _OPERATOR_NS, (
+        f"namespaceSelector must target {(_OPERATOR_NS)!r}, got "
+        f"{match_labels!r}"
+    )
+
+
+def test_pod_delete_admission_policy_validations_check_operator_sa_and_worker_label():
+    """Issue #293 acceptance #3: the CEL validations must encode BOTH
+    halves of the constraint:
+
+    * `request.userInfo.username != '<operator SA>' || ...` —
+      narrows the surface to ONLY the operator SA. Humans via
+      kubectl, the prune CronJob SA, and any other principal are
+      NOT restricted by this policy.
+    * `object.metadata.labels['app'] == 'worker'` — narrows the
+      pod-delete target to the helm chart's worker Deployment pod
+      selector. A bare `pods/delete` RBAC rule on a compromised
+      operator pod could otherwise reach `web`, `web-background`,
+      `mongo`, `redis`, `queue`, NFS, or the operator's own pod.
+
+    Both checks MUST be present in a single `||`-chained CEL
+    expression (the short-circuit is what keeps non-operator
+    actors unconstrained). A regression that drops either check
+    silently re-opens the gap.
+    """
+    policy = _pod_delete_admission_policy()
+    validations = policy["spec"].get("validations") or []
+    assert validations, (
+        "pod-delete policy must declare at least one CEL validation; "
+        "an empty validations list means the policy does nothing "
+        "(issue #293)"
+    )
+    matched = [
+        v for v in validations
+        if _OPERATOR_SA_FULL in v.get("expression", "")
+        and "metadata.labels" in v["expression"]
+        and "'app'" in v["expression"]
+        and "'worker'" in v["expression"]
+    ]
+    assert matched, (
+        "pod-delete policy CEL must check BOTH the operator SA "
+        f"username ({_OPERATOR_SA_FULL!r}) AND the worker's "
+        "`app=worker` label; a regression that drops either check "
+        "silently re-opens issue #293. Current validations: "
+        f"{[v.get('expression') for v in validations]!r}"
+    )
+    # The expression must short-circuit on non-matching userInfo so
+    # other actors are not constrained. The CEL `||` operator is
+    # present iff the policy author wrote a disjunction rather than
+    # two separate `validations`. We require the disjunction shape
+    # because it expresses the constraint as a single human-readable
+    # rule; the k8s CEL compiler evaluates `||` left-to-right and
+    # short-circuits on truth.
+    expr = matched[0]["expression"]
+    assert "||" in expr, (
+        f"pod-delete policy CEL must short-circuit on userInfo so "
+        f"non-operator actors keep unrestricted pod-delete access; "
+        f"expected a `||`-chained expression, got {expr!r}"
+    )
+
+
+def test_pod_delete_admission_policy_message_cites_issue_293():
+    """The validation message must reference issue #293 so an operator
+    who hits the policy at apply time can find the rationale + the
+    doc-string narrative without grepping source."""
+    policy = _pod_delete_admission_policy()
+    validations = policy["spec"]["validations"]
+    messages = [v.get("message", "") for v in validations]
+    assert any("#293" in m for m in messages), (
+        f"pod-delete policy validation message must cite issue #293; "
+        f"got {messages!r}"
+    )
+
+
+def test_pod_delete_admission_policy_failure_policy_is_fail():
+    """`failurePolicy: Fail` (the default, but pinned here) means a
+    broken admission webhook REJECTS the request rather than
+    failing open. A regression to `Warn` would silently re-open the
+    blast radius when the admission evaluation itself is broken
+    (CEL compile error, missing object field, etc.)."""
+    policy = _pod_delete_admission_policy()
+    assert policy["spec"].get("failurePolicy") == "Fail", (
+        f"pod-delete policy must have failurePolicy: Fail so a broken "
+        f"admission evaluation REJECTS the request rather than "
+        f"failing open; got failurePolicy="
+        f"{policy['spec'].get('failurePolicy')!r}"
+    )
+
+
+def test_pod_delete_admission_binding_binds_policy_to_openstudio_server():
+    """The Binding must (a) reference the policy by name and (b) scope
+    to `openstudio-server` via namespaceSelector. The policy is
+    cluster-scoped at the API level — the Binding is what restricts
+    evaluation to the operator's namespace. A missing or
+    incorrectly-targeted Binding silently turns the policy into a
+    no-op."""
+    binding = _pod_delete_admission_binding()
+    assert binding["spec"]["policyName"] == "openstudio-operator-pod-delete-scope", (
+        f"Binding.policyName must reference the operator policy, got "
+        f"{binding['spec'].get('policyName')!r}"
+    )
+    ns_selector = binding["spec"].get("matchResources", {}).get("namespaceSelector")
+    assert ns_selector, (
+        "Binding must scope via matchResources.namespaceSelector to "
+        f"{_OPERATOR_NS!r}; a missing selector leaves the "
+        "cluster-scoped policy evaluating every namespace"
+    )
+    assert ns_selector.get("matchLabels", {}).get(
+        "kubernetes.io/metadata.name"
+    ) == _OPERATOR_NS, (
+        f"Binding.namespaceSelector must target {_OPERATOR_NS!r}, got "
+        f"{ns_selector!r}"
+    )
+
+
+def test_operator_role_still_grants_pods_delete_verb():
+    """The RBAC `pods/delete` verb MUST remain in deploy/rbac.yaml —
+    the admission policy is an additional defense-in-depth layer,
+    NOT a replacement. Removing the RBAC verb would break the
+    documented call site (analysis_sla.py:542 /
+    delete_namespaced_pod) before any operator could even reach the
+    admission check. This regression fence pins the RBAC surface
+    even as the audit/audit-dryrun narrative evolves."""
+    pod_rules = [
+        rule for rule in OPERATOR_ROLE["rules"]
+        if rule["apiGroups"] == [""] and rule["resources"] == ["pods"]
+    ]
+    assert len(pod_rules) == 1, (
+        f"expected exactly one pods rule in operator Role, got {pod_rules!r}"
+    )
+    assert "delete" in pod_rules[0]["verbs"], (
+        "operator Role must retain `delete` on pods — analysis_sla."
+        "py:542 calls delete_namespaced_pod and the admission policy "
+        "is the defense-in-depth layer, NOT a replacement for the "
+        f"RBAC verb (issue #293). Current verbs: {pod_rules[0]['verbs']!r}"
     )
 
 

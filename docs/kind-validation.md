@@ -217,6 +217,11 @@ dev machine with kubeconfig pointed at kind:
    ```bash
    kubectl apply -f deploy/crd.yaml
    kubectl apply -f deploy/rbac.yaml
+   # Issue #293 — ValidatingAdmissionPolicy narrows the operator's
+   # pods/delete blast radius (native RBAC has no label-selector slot).
+   # Apply AFTER rbac.yaml so the operator SA referenced in the CEL
+   # rule already exists at admission-evaluation time.
+   kubectl apply -f deploy/pod-delete-admission-policy.yaml
    ```
 
 2. **Create the OSCM custom resource in dry-run mode** — the CRD

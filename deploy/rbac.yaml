@@ -30,7 +30,17 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "update"]
-  # Read pods; delete for surgical escalation of zombie datapoint workers (#9)
+  # Read pods; delete for surgical escalation of zombie datapoint workers (#9).
+  # Issue #293: native RBAC has no label-selector slot, so the
+  # `pods/delete` verb is unconstrained in this manifest — any pod in
+  # the namespace is deletable by the operator SA. The defense-in-depth
+  # narrowing lives in deploy/pod-delete-admission-policy.yaml: a
+  # ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1) rejects
+  # operator-SA pod deletes that don't target a pod labeled
+  # `app=worker` (the helm chart's worker Deployment pod selector).
+  # The policy's CEL rule short-circuits for non-operator actors, so
+  # humans via kubectl and the prune CronJob SA keep their normal
+  # pod-delete access; only this SA's destructive surface is narrowed.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]
