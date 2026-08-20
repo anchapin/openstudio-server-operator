@@ -199,6 +199,43 @@ SINGLETON_ELECTION_TOTAL = Counter(
     labelnames=["outcome"],
 )
 
+# Issue #403 — per-tick singleton-guard loser suppression counter. The
+# ``_gated`` wrapper in :mod:`openstudio_operator.singleton` skips every
+# OSCM timer tick whose CR is not the oldest in the namespace (D05); the
+# skip branch was a bare ``log.debug`` — no counter, no /metrics signal.
+# The change-gated ``SINGLETON_ELECTION_TOTAL{outcome="conflict"}`` only
+# fires when ``enforce()`` observes a snapshot DIFFERENT from
+# ``_last_state``, so a stable multi-CR namespace produces ZERO per-tick
+# signals: the loser is silently ticked and skipped on every interval (4
+# handlers × tick rate) and the sustained per-tick load is diagnosable
+# only by reading logs at debug level. This Counter is incremented
+# inside the ``if not active:`` branch on EVERY suppressed tick — the
+# per-tick twin of the change-gated election counter. Labelled by
+# ``module`` (the wrapped handler's ``__name__``, same vocabulary as
+# ``HANDLER_TICK_FAILURES_TOTAL``) + ``namespace`` + ``name`` (the LOSER
+# CR's identity — the CR whose tick was suppressed). Cardinality is
+# bounded by the singleton-guard's per-namespace one-winner invariant
+# (D05): one series per ``(module, namespace, name)`` tuple, the same
+# shape as ``HANDLER_TICK_FAILURES_TOTAL``. Alert on
+# ``rate(openstudio_operator_singleton_loser_skips_total[5m]) > 0`` — a
+# sustained multi-CR configuration.
+SINGLETON_LOSER_SKIPS_TOTAL = Counter(
+    "openstudio_operator_singleton_loser_skips_total",
+    "Per-tick singleton-guard loser suppressions (issue #403). "
+    "Incremented inside the ``if not active:`` branch of the ``_gated`` "
+    "wrapper on EVERY suppressed tick — unlike the change-gated "
+    "``singleton_election_total{outcome=\"conflict\"}``, which fires "
+    "only on state changes and is silent for a stable multi-CR "
+    "namespace. Labelled by ``module`` (the wrapped handler's "
+    "``__name__`` — analysis_sla | datapoint_watchdog | worker_recycler "
+    "| web_background_monitor) + ``namespace`` + ``name`` (the LOSER "
+    "CR whose tick was suppressed). Cardinality is bounded by the "
+    "singleton guard (D05 — one served CR per namespace). Alert on "
+    "``rate(openstudio_operator_singleton_loser_skips_total[5m]) > 0`` — "
+    "a sustained multi-CR configuration.",
+    labelnames=["module", "namespace", "name"],
+)
+
 # Issue #253 — Redis key-layout validation status as a Gauge. The boot-time
 # validator (#163) returns one of ``ok | degraded | unreachable | error |
 # skipped`` and emits a structured log line per CR; the Warning Event on the

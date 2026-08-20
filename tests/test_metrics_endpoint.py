@@ -37,6 +37,13 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_events_emitted_total",
     # Issue #239 — singleton-guard election outcomes (per outcome).
     "openstudio_operator_singleton_election_total",
+    # Issue #403 — per-tick singleton-guard loser suppressions (per
+    # (module, namespace, name) tuple). The change-gated election
+    # counter above is silent for a stable multi-CR namespace; this one
+    # fires on EVERY suppressed loser tick so a sustained multi-CR
+    # configuration is visible as rate(...) > 0. Cardinality is bounded
+    # by the one-winner-per-namespace invariant (D05).
+    "openstudio_operator_singleton_loser_skips_total",
     # Issue #255 — kopf.event emission failures (per reason).
     "openstudio_operator_events_emit_failures_total",
     # Issue #306 — storage-prune CronJob skip-tick failures (per branch
@@ -267,6 +274,15 @@ def test_metrics_http_server_serves_all_declared_counters():
     # counter CR-unlabelled (the singleton guard is namespace-scoped,
     # not CR-scoped — the guard itself is the multi-CR protection).
     metrics.SINGLETON_ELECTION_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    # Issue #403 — pre-touch the per-tick singleton-guard loser skip
+    # counter. Labelled by (module, namespace, name); the module
+    # vocabulary is the wrapped handler's __name__ (the four OSCM timer
+    # module names, same as handler_tick_failures_total).
+    metrics.SINGLETON_LOSER_SKIPS_TOTAL.labels(
+        module="__metrics_test_sentinel__",
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+    ).inc()
     # Issue #255 — pre-touch the kopf.event emission-failure counter.
     # ``reason`` label vocabulary matches ``events_emitted_total`` and,
     # post-#311, the (namespace, name) labels carry the same CR identity.
@@ -365,6 +381,16 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_singleton_election_total":
             assert (
                 'openstudio_operator_singleton_election_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_singleton_loser_skips_total":
+            # Issue #403 — labelled by (module, namespace, name);
+            # exposition writes labels alphabetically by key.
+            assert (
+                'openstudio_operator_singleton_loser_skips_total{module="__metrics_test_sentinel__",'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_events_emit_failures_total":

@@ -33,6 +33,15 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#403`** — `openstudio_operator_singleton_loser_skips_total{module,namespace,name}`:
+  per-tick singleton-guard loser suppression counter, bumped inside the
+  `_gated` wrapper's `if not active:` branch on every suppressed tick. The
+  change-gated `singleton_election_total{outcome="conflict"}` (#239) is
+  silent for a stable multi-CR namespace; this is the per-tick twin.
+  Alert `rate(singleton_loser_skips_total[5m]) > 0` surfaces a sustained
+  multi-CR configuration. Cardinality bounded by the one-winner-per-
+  namespace invariant (D05) — one series per `(module, namespace, name)`
+  tuple, same shape as `handler_tick_failures_total`.
 - **`#256`** — structured JSON logs from the operator process (and the
   prune `CronJob`). `:func:`openstudio_operator.logging_setup.install_json_logging``
   installs a stdlib `logging.Formatter` subclass that emits one JSON

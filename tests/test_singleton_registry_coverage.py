@@ -1397,3 +1397,200 @@ def test_no_oscm_handler_orphan_or_legacy_whitelist() -> None:
         f"openstudio_operator._oscm_handlers.register(handler_id, fn) "
         f"at module import time. See issue #285."
     )
+
+
+# --- Issue #403 — SINGLETON_LOSER_SKIPS_TOTAL per-tick loser suppression --------
+#
+# The ``_gated`` wrapper skips every OSCM timer tick whose CR is not the
+# oldest in the namespace (D05). Pre-#403 the skip branch was a bare
+# ``log.debug(...)`` — no counter bump — and the change-gated
+# ``SINGLETON_ELECTION_TOTAL{outcome="conflict"}`` only fires when
+# ``enforce()`` sees a snapshot DIFFERENT from ``_last_state``, so a
+# stable multi-CR namespace produced ZERO per-tick /metrics signals.
+# #403 adds ``SINGLETON_LOSER_SKIPS_TOTAL{module,namespace,name}``,
+# bumped inside the ``if not active:`` branch on every suppressed tick.
+# This test pins the acceptance criterion: a multi-CR namespace (winner
+# + loser) advances the counter monotonically, one increment per
+# suppressed tick, and the cardinality stays bounded at one series per
+# ``(module, namespace, name)`` tuple (the same shape as
+# ``HANDLER_TICK_FAILURES_TOTAL`` — the singleton guard's
+# one-winner-per-namespace invariant bounds it).
+
+_NAMESPACE = "openstudio-server"
+_OLD_TS = "2026-08-10T08:00:00Z"
+_NEW_TS = "2026-08-11T08:00:00Z"
+
+
+def _make_cr_403(name: str, created: str, uid: str) -> dict:
+    return {
+        "apiVersion": "energy.nrel.gov/v1alpha1",
+        "kind": "OpenStudioClusterManager",
+        "metadata": {
+            "name": name,
+            "namespace": _NAMESPACE,
+            "creationTimestamp": created,
+            "uid": uid,
+        },
+        "spec": {"serverUrl": f"http://{name}.test"},
+    }
+
+
+class _TwoCrCustomObjectsApi:
+    """List-only CustomObjectsApi stand-in: oldest 'alpha' + loser 'beta'.
+
+    Returns a fresh deepcopy-shaped snapshot per call (the guard never
+    mutates), mirroring ``FakeCustomObjectsApi`` in
+    ``tests/test_singleton_guard.py`` — re-declared locally so this CI
+    gate file stays free of cross-test-module imports.
+    """
+
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    def list_namespaced_custom_object(self, group, version, namespace, plural):
+        assert (group, version, plural) == (GROUP, "v1alpha1", PLURAL)
+        assert namespace == _NAMESPACE
+        self.list_calls += 1
+        return {
+            "items": [
+                _make_cr_403("alpha", _OLD_TS, "uid-alpha"),
+                _make_cr_403("beta", _NEW_TS, "uid-beta"),
+            ]
+        }
+
+
+def _singleton_loser_skips_series(module: str) -> set[tuple[str, str, str]]:
+    """Every ``(module, namespace, name)`` label tuple the family exposes
+    for the given ``module`` label value.
+
+    Scoped to a module value so the process-global REGISTRY's test
+    sentinels (e.g. ``tests/test_metrics_endpoint.py`` pre-touches the
+    family with ``module="__metrics_test_sentinel__"``) do not pollute
+    the cardinality pin — the assertion targets the production
+    vocabulary (the wrapped handler's ``__name__``).
+    """
+    series: set[tuple[str, str, str]] = set()
+    for metric in singleton.SINGLETON_LOSER_SKIPS_TOTAL.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") and sample.labels.get("module") == module:
+                series.add(
+                    (
+                        str(sample.labels.get("module")),
+                        str(sample.labels.get("namespace")),
+                        str(sample.labels.get("name")),
+                    )
+                )
+    return series
+
+
+def _singleton_loser_skips_value(module: str, namespace: str, name: str) -> float:
+    """Current value of the one series identified by the label tuple."""
+    for metric in singleton.SINGLETON_LOSER_SKIPS_TOTAL.collect():
+        for sample in metric.samples:
+            if (
+                sample.name.endswith("_total")
+                and sample.labels.get("module") == module
+                and sample.labels.get("namespace") == namespace
+                and sample.labels.get("name") == name
+            ):
+                return float(sample.value)
+    return 0.0
+
+
+def _make_gated_oscm_timer_403() -> tuple[object, object]:
+    """Registry with one registered + gated OSCM timer; returns (gated_fn, registry)."""
+    from openstudio_operator import _oscm_handlers
+
+    registry = kopf.OperatorRegistry()
+
+    @kopf.timer(GROUP, "v1alpha1", PLURAL, interval=30.0, registry=registry)
+    def oscm_timer(body: dict, spec: dict, **_: object):
+        return ("served", spec.get("serverUrl"))
+
+    # Issue #250 — the gate cross-checks every OSCM timer against the
+    # Python-level registry before wrapping; register explicitly (same
+    # pattern as make_registry_with_handlers in test_singleton_guard.py).
+    kopf_id = next(
+        h.id for h in registry._spawning._handlers if h.fn is oscm_timer
+    )
+    _oscm_handlers.register(kopf_id, oscm_timer)
+
+    assert singleton.install_singleton_guard(registry=registry) == 1
+    gated = next(
+        h.fn for h in registry._spawning._handlers if singleton._selector_matches_oscms(h)
+    )
+    assert gated.__name__ == "oscm_timer"  # functools.wraps: the module label
+    return gated, registry
+
+
+def test_gated_wrapper_bumps_singleton_loser_skips_total_monotonically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #403 acceptance: a multi-CR namespace advances
+    ``SINGLETON_LOSER_SKIPS_TOTAL{module,namespace,name}`` monotonically —
+    exactly one increment per suppressed loser tick, zero for the winner's
+    ticks — and the family's cardinality stays bounded at one series per
+    ``(module, namespace, name)`` tuple (no winner series, no per-tick
+    series growth).
+    """
+    gated, _ = _make_gated_oscm_timer_403()
+    monkeypatch.setattr(singleton, "_process_guard", singleton.SingletonGuard(_TwoCrCustomObjectsApi()))
+    log = logging.getLogger(__name__)
+
+    loser_body = _make_cr_403("beta", _NEW_TS, "uid-beta")
+    winner_body = _make_cr_403("alpha", _OLD_TS, "uid-alpha")
+
+    before = _singleton_loser_skips_value("oscm_timer", _NAMESPACE, "beta")
+
+    # Three suppressed loser ticks: each must advance the counter by
+    # exactly 1.0 (monotonic, no coalescing — the change-gated election
+    # counter is silent for a stable snapshot, this one must not be).
+    observed = [before]
+    for _ in range(3):
+        assert (
+            gated(
+                body=loser_body,
+                spec={"serverUrl": "http://b.test"},
+                namespace=_NAMESPACE,
+                name="beta",
+                logger=log,
+            )
+            is None
+        )
+        observed.append(_singleton_loser_skips_value("oscm_timer", _NAMESPACE, "beta"))
+    assert observed == [before, before + 1.0, before + 2.0, before + 3.0], (
+        f"loser ticks must advance the counter monotonically by exactly "
+        f"1.0 per suppressed tick; observed {observed}. See issue #403."
+    )
+
+    # The winner's tick runs the handler body (fail-open on the gate's
+    # happy path) and must NOT bump the loser series — nor create a
+    # winner-named series.
+    assert (
+        gated(
+            body=winner_body,
+            spec={"serverUrl": "http://a.test"},
+            namespace=_NAMESPACE,
+            name="alpha",
+            logger=log,
+        )
+        == ("served", "http://a.test")
+    )
+    assert _singleton_loser_skips_value("oscm_timer", _NAMESPACE, "beta") == before + 3.0
+
+    # Cardinality pin: for the production module vocabulary, exactly one
+    # series for the family — the loser's (module, namespace, name)
+    # tuple. The default REGISTRY is shared process-wide (the
+    # metrics-endpoint test pre-touches a ``__metrics_test_sentinel__``
+    # module series), so the pin is scoped to the wrapped handler's
+    # ``__name__``; every loser-path invocation labelled with this exact
+    # tuple bumps the same single series regardless of test ordering
+    # (same assertion shape as the #307 helper in
+    # tests/test_singleton_guard.py).
+    assert _singleton_loser_skips_series("oscm_timer") == {
+        ("oscm_timer", _NAMESPACE, "beta")
+    }, (
+        f"SINGLETON_LOSER_SKIPS_TOTAL cardinality must stay bounded at one "
+        f"series per (module, namespace, name) tuple; observed "
+        f"{_singleton_loser_skips_series('oscm_timer')}. See issue #403."
+    )

@@ -75,6 +75,7 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_events_dry_run_suppressed_total",
     "openstudio_operator_events_emitted_total",
     "openstudio_operator_singleton_election_total",
+    "openstudio_operator_singleton_loser_skips_total",
     "openstudio_operator_events_emit_failures_total",
     "openstudio_operator_prune_tick_failures_total",
     "openstudio_operator_warnings_deferred_dropped_total",

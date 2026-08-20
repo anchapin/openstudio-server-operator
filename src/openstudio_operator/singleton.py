@@ -75,6 +75,7 @@ from openstudio_operator._time import parse_iso_utc
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     SINGLETON_ELECTION_TOTAL,
+    SINGLETON_LOSER_SKIPS_TOTAL,
 )
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
@@ -572,6 +573,25 @@ def _gated(fn: Callable) -> Callable:
             )
             return None
         if not active:
+            # Issue #403 — per-tick loser-suppression counter. The
+            # change-gated SINGLETON_ELECTION_TOTAL{outcome="conflict"}
+            # (issue #239) fires only when ``enforce()`` observes a
+            # snapshot DIFFERENT from ``_last_state``, so a stable
+            # multi-CR namespace produces zero per-tick signals and this
+            # branch was a bare log.debug — the sustained per-tick load
+            # was diagnosable only by reading logs at debug level. One
+            # bump per suppressed tick, labelled by the wrapped
+            # handler's ``__name__`` (same module vocabulary as
+            # HANDLER_TICK_FAILURES_TOTAL) + the LOSER CR's identity.
+            # Cardinality is bounded by the one-winner-per-namespace
+            # invariant (D05) — one series per (module, namespace,
+            # name) tuple. The log.debug stays: this counter does not
+            # change the noise channel, it adds the /metrics signal.
+            SINGLETON_LOSER_SKIPS_TOTAL.labels(
+                module=getattr(fn, "__name__", "handler"),
+                namespace=str(namespace),
+                name=_cr_name(body),
+            ).inc()
             log.debug(
                 "%s skipped: %s is not the oldest OpenStudioClusterManager (D05)",
                 getattr(fn, "__name__", "handler"),

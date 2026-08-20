@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (672 tests across 33 files, current count)
+ruff check . && pytest                       # both green (673 tests across 33 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **18 counters + 7 gauges + 3 histograms** — is asserted by `tests/test_metrics_endpoint.py`'s
+local; the scrape is in-cluster). The exhaustive inventory — **19 counters + 7 gauges + 3 histograms** — is asserted by `tests/test_metrics_endpoint.py`'s
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES`:
 drift in either direction fails CI before it ships, so any new metric added to
 this codebase MUST be added to both the table below and the matching
@@ -246,7 +246,9 @@ expansion was landed in the iteration 3 sweep (#306 storage-prune
 CronJob skip-tick failure counter, #308 handler tick + REST round-trip
 duration histograms, #310 QueuedKopfEventSink drop counter + queue depth
 gauge, #312 paired freshness timestamp gauges for `resque_queue_depth`
-and `stall_window_elapsed_seconds`).
+and `stall_window_elapsed_seconds`). The post-#312 → 19+7+3 expansion is
+#403 (singleton-guard loser per-tick skip counter — the per-tick twin of
+the change-gated #239 election counter).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -281,6 +283,7 @@ stays self-contained.
 | `openstudio_operator_events_dry_run_suppressed_total` | `events` (`EventEmitter.emit` dry-run branch) (#237) | Kubernetes Events suppressed by the dry-run gate (D11) — incremented at the same site as `EventEmitter.suppressed_count`, inside `EventEmitter.emit` when `dry_run=True`. **Labelled by `reason`** mirroring the warning-event vocabulary (`AnalysisSoftStopped` \| `AnalysisEscalated` \| `DatapointRequeued` \| `DatapointRequeueExhausted` \| `WorkerRecycled` \| `WebBackgroundRestarted` \| `ResqueKeyLayoutUnknown`). | n/a — observability for the dry-run path (the substitution observable was previously in-process only). Companion to `events_emitted_total`; the emitted-vs-suppressed rate ratio is the headline SLO for an audit-only install. |
 | `openstudio_operator_events_emitted_total` | `events` (`EventEmitter.emit` non-dry-run branch) (#237) | Companion to `events_dry_run_suppressed_total` — every successful `kopf.event` call from `EventEmitter` (`dry_run=False`). Same `reason` label vocabulary. | n/a — observability for the Event path; `rate(events_emitted_total) / rate(events_dry_run_suppressed_total)` is the headline SLO for an audit-only install (a non-trivial suppressed rate with zero emitted rate is the intended steady state; the inverse drift — suppressed > emitted during a non-dry-run deploy — is the alert signal). |
 | `openstudio_operator_singleton_election_total` | `singleton` (`SingletonGuard.enforce` post-decode branches) (#239) | Singleton-guard election outcomes (D05). **Labelled by `outcome`** — `outcome` ∈ {`idle`, `active`, `conflict`}; only fires on STATE CHANGES (mirrors the existing change-gated log/Event noise channel — steady state is silent). | n/a — observability for the silent-bypass failure mode (when the kopf registry internals change shape and `install_singleton_guard` returns 0 without the AST coverage test catching it, the corruption is silent on the dashboard without this counter). Alert on sustained nonzero rate on `outcome=conflict` (a multi-CR namespace is a singleton-guard violation). |
+| `openstudio_operator_singleton_loser_skips_total` | `singleton` (`_gated` wrapper `if not active:` branch) (#403) | Per-tick loser suppressions — incremented on EVERY tick whose CR is not the oldest in the namespace (D05). **Labelled by `(module, namespace, name)`** — the LOSER CR's identity; `module` is the wrapped handler's name (same vocabulary as `handler_tick_failures_total`). The per-tick twin of the change-gated #239 election counter, which is silent for a stable multi-CR namespace. | n/a — observability for sustained per-tick loser load; cardinality is bounded by the one-winner-per-namespace invariant (D05). Alert on `rate(...[5m]) > 0` — a sustained multi-CR configuration. |
 | `openstudio_operator_events_emit_failures_total` | `events` (`EventEmitter.emit` try/except wrapper) (#255) | `kopf.event` posting failures caught by `EventEmitter.emit`'s try/except wrapper BEFORE re-raising. **Labelled by `reason`** — same vocabulary as `events_emitted_total` — so a dashboard can tell WHICH handler path's Event emission failed. Sustained nonzero rate means the operator cannot post Kubernetes Events to the apiserver, **distinct from** the REST/Redis/K8s API signals that surface via `handler_tick_failures_total`. | n/a — observability for the Event posting path; complements `handler_tick_failures_total` (which captures `ApiException` for all three paths under one label and cannot distinguish "REST API down" from "Event posting down"). |
 | `openstudio_operator_prune_tick_failures_total` | `prune_entrypoint` (storage-prune CronJob) (#306) | Skip-tick failures inside the storage-prune CronJob (`prune_entrypoint.main()`). **Labelled by `reason`** — `reason` ∈ {`cr_list_failure`, `runtime_failure`} — the two skip-tick sites that bump this counter (the K8s API CR list failure and the caught-exception branch). The CronJob pod exposes the same `/metrics` endpoint on port 9090 as the operator, gated by the parallel `openstudio-storage-pruner-metrics-ingress` NetworkPolicy. | n/a — observability for the prune pipeline (separate from the operator's scope); a sustained nonzero rate means the prune pipeline is repeatedly skipping ticks (RBAC, apiserver, NFS) and the storage-archival backlog is growing. |
 | `openstudio_operator_warnings_deferred_dropped_total` | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` cap path) (#310) | `defer_to_next_tick` calls rejected by the sink's cap (MAX_DEFERRED_WARNING_EVENTS = 1000). **Labelled by `reason`** — initial vocabulary is `queue_full` (the only drop path today); the label leaves room for a future per-reason-cap branch without a Counter rename. | n/a — observability for QueueKopfEventSink backpressure; sustained nonzero rate means Warning Events are being silently lost. Pair with `warnings_deferred_queue_depth` to see how close the queue is to the cap on subsequent ticks. |
