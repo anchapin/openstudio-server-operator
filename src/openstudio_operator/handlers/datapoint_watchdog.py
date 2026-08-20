@@ -236,7 +236,10 @@ def zombie_datapoint_watchdog(
         )
     except (OpenStudioApiError, StatusStoreError) as exc:
         HANDLER_TICK_FAILURES_TOTAL.labels(
-            module="datapoint_watchdog", error_type=type(exc).__name__
+            namespace=namespace,
+            name=name,
+            module="datapoint_watchdog",
+            error_type=type(exc).__name__,
         ).inc()
         logger.warning(
             "datapoint watchdog tick skipped, retrying next poll (%s: %s)",

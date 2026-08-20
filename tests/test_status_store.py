@@ -596,9 +596,11 @@ def test_status_map_cap_increments_counter(api, store):
     counter = metrics_module.STATUS_MAP_CAPS_TOTAL
     # Pre-touch the series so the before-value is observable (see the
     # get_started_since counter pattern in test_metrics_endpoint.py).
-    counter.labels(map_name="softStops").inc(0)
+    counter.labels(
+        namespace=NAMESPACE, name=NAME, map_name="softStops"
+    ).inc(0)
     per_series = getattr(counter, "_metrics", {})
-    soft_stops_key = ("softStops",)
+    soft_stops_key = (NAMESPACE, NAME, "softStops")
     snapshot = per_series.get(soft_stops_key)
     assert snapshot is not None
     before = _counter_value(snapshot)
@@ -606,21 +608,27 @@ def test_status_map_cap_increments_counter(api, store):
     _fill_map_to_cap(api, "softStops")
     store.set_soft_stop("new-key", make_soft_stop())
 
-    after = _counter_value(per_series[soft_stops_key])
+    after = _counter_value(per_series[(NAMESPACE, NAME, "softStops")])
     assert after - before == 1
 
 
-def _counter_value(snapshot):
-    """Read a prometheus_client Counter snapshot's value (test helper).
+def _counter_value(counter):
+    """Read a prometheus_client.Counter's current sample value.
 
-    Mirrors the existing unlabelled-Counter helper above; duplicated here
-    so the labelled-counter test does not need to reach into the test
-    module's private name. The snapshot is a child ``Counter`` instance
-    whose ``_value`` is a ``MutexValue`` (or a list of samples in older
-    prometheus_client versions) — see the existing helper for the full
-    shape.
+    prometheus_client 0.26.x exposes ``Counter._value`` as a ``MutexValue``
+    whose ``.get()`` returns the current float directly (no iterable wrapper).
+    Earlier versions returned a list of values; this helper picks whatever
+    the installed client gives us. Works for both parent (unlabelled) and
+    child (labelled) Counters — labelled parents expose ``_metrics`` and
+    fall back to summing all child series.
     """
-    raw = snapshot._value.get()
+    if hasattr(counter, "_metrics"):
+        # Labelled parent — sum across all child series.
+        total = 0.0
+        for child in counter._metrics.values():
+            total += _counter_value(child)
+        return total
+    raw = counter._value.get()
     if isinstance(raw, (int, float)):
         return float(raw)
     try:
@@ -644,9 +652,11 @@ def test_status_map_cap_does_not_evict_when_key_already_holds_same_value(api, st
     from openstudio_operator import metrics as metrics_module
 
     counter = metrics_module.STATUS_MAP_CAPS_TOTAL
-    counter.labels(map_name="softStops").inc(0)
+    counter.labels(
+        namespace=NAMESPACE, name=NAME, map_name="softStops"
+    ).inc(0)
     per_series = getattr(counter, "_metrics", {})
-    snapshot = per_series.get(("softStops",))
+    snapshot = per_series.get((NAMESPACE, NAME, "softStops"))
     before = _counter_value(snapshot)
 
     _fill_map_to_cap(api, "softStops")
@@ -660,7 +670,7 @@ def test_status_map_cap_does_not_evict_when_key_already_holds_same_value(api, st
 
     # No eviction, no event, no counter increment.
     assert status_event_sink == []
-    after = _counter_value(per_series[("softStops",)])
+    after = _counter_value(per_series[(NAMESPACE, NAME, "softStops")])
     assert after == before
     # The map is still at the cap (no entries added or removed).
     assert len(store.get_soft_stops()) == status_store.STATUS_MAP_MAX_ENTRIES

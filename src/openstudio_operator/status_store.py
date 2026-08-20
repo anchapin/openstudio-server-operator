@@ -348,8 +348,10 @@ class StatusStore:
                     raise
                 # Issue #119 — count the conflict at the moment we observe it,
                 # BEFORE the backoff sleep. A sustained burst reads as N+1
-                # in a single tick.
-                STATUS_CONFLICTS_TOTAL.inc()
+                # in a single tick. Issue #311 — labelled by (namespace, name)
+                # so a multi-CR operator process can attribute the conflict
+                # burst to the specific CR.
+                STATUS_CONFLICTS_TOTAL.labels(namespace=self._namespace, name=self._name).inc()
                 conflict = exc
                 if attempt < MAX_CONFLICT_RETRIES:
                     _sleep(_conflict_backoff(attempt))
@@ -359,7 +361,11 @@ class StatusStore:
         # Issue #119 — count exhaustion just before raising so an SRE alerting
         # on `rate(... _exhausted_total[5m]) > 0` can fire on "real"
         # (retry-budgeted-out) contention, distinct from per-attempt conflicts.
-        STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL.inc()
+        # Issue #311 — labelled by (namespace, name) so a multi-CR operator
+        # process can distinguish which CR is exhausting its retry budget.
+        STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL.labels(
+            namespace=self._namespace, name=self._name
+        ).inc()
         raise StatusStoreConflictError(
             f"status patch for {self._namespace}/{self._name} conflicted (409) "
             f"{MAX_CONFLICT_RETRIES} times"
@@ -430,8 +436,12 @@ class StatusStore:
         # counter + Event fire exactly once per actual cap hit, not per 409
         # attempt. The eviction logic above is purely data (the new map
         # shape), so the side effects live here — outside the retry loop.
+        # Issue #311 — labelled by (namespace, name, map_name) so a multi-CR
+        # operator process can attribute the cap hit to the specific CR.
         if evicted_keys:
-            STATUS_MAP_CAPS_TOTAL.labels(map_name=field).inc()
+            STATUS_MAP_CAPS_TOTAL.labels(
+                namespace=self._namespace, name=self._name, map_name=field
+            ).inc()
             preview = ", ".join(repr(k) for k in evicted_keys[:5])
             if len(evicted_keys) > 5:
                 preview += f" (+{len(evicted_keys) - 5} more)"

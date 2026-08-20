@@ -263,14 +263,23 @@ STALL_WINDOW_FRESH = Gauge(
 # granularity for the kopf event path. This Counter is incremented inside
 # the try/except that wraps the ``kopf.event`` call in ``EventEmitter.emit``,
 # BEFORE re-raising, so a sustained ``ApiException`` storm from the event
-# posting path is a distinct /metrics signal. Labelled by ``reason`` —
-# the warning-event reasons the call site passes to ``kopf.event``
-# (``AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued``
-# | ``DatapointRequeueExhausted`` | ``WorkerRecycled`` |
-# ``WebBackgroundRestarted`` | ``ResqueKeyLayoutUnknown`` | …) — so a
-# dashboard can tell WHICH event the operator failed to post. Cardinality
-# is bounded to the same vocabulary as ``events_emitted_total``; no
-# labels beyond what the call site already carries.
+# posting path is a distinct /metrics signal.
+#
+# Issue #311 — ``(namespace, name)`` per-CR labels on the four
+# status-store / conflict counters + the four action counters. The
+# motivation is multi-CR observability: an SRE cannot tell which CR
+# is generating conflicts when the operator process serves multiple
+# CRs (legal until the singleton guard picks a winner — but during the
+# pick window, in a multi-namespace setup, or in the test harness where
+# the singleton guard is short-circuited). The existing labelled
+# counters (``status_map_caps_total{map_name}``,
+# ``handler_tick_failures_total{module,error_type}``,
+# ``events_*_total{reason}``) carry dimension-specific labels but NOT
+# CR identity, so the per-CR dimension is added across the board. CR
+# cardinality is bounded by the singleton guard (D05, one CR per
+# namespace), so the multiplied series count stays small. EVENTS_EMIT_*
+# counters inherit ``namespace`` + ``name`` for symmetry with the
+# ``events_emitted_total`` family.
 EVENTS_EMIT_FAILURES_TOTAL = Counter(
     "openstudio_operator_events_emit_failures_total",
     "``kopf.event`` emission failures caught by EventEmitter.emit "
@@ -278,11 +287,13 @@ EVENTS_EMIT_FAILURES_TOTAL = Counter(
     "``kopf.event`` call BEFORE re-raising — a sustained nonzero rate "
     "means the operator cannot post Kubernetes Events to the apiserver "
     "(independent of the REST/Redis/K8s API signals that surface via "
-    "``handler_tick_failures_total``). Labelled by ``reason`` — the "
-    "warning-event reason the call site was attempting to post — so a "
-    "dashboard can tell WHICH handler path's Event emission failed "
-    "(same vocabulary as ``events_emitted_total``).",
-    labelnames=["reason"],
+    "``handler_tick_failures_total``). Labelled by ``namespace`` + "
+    "``name`` (CR identity, issue #311) + ``reason`` (the warning-event "
+    "reason the call site was attempting to post) so a dashboard can "
+    "tell WHICH handler path's Event emission failed AND which CR the "
+    "failure happened on (same ``reason`` vocabulary as "
+    "``events_emitted_total`` so the two can be rate-correlated).",
+    labelnames=["namespace", "name", "reason"],
 )
 
 # Issue #310 — Queue-depth observability + backpressure cap for
@@ -371,12 +382,18 @@ RESQUE_WORKERS_SEEN_MAX = Gauge(
 # only safe because status_store._mutate retries on 409 up to
 # `MAX_CONFLICT_RETRIES` times. Without these counters a sustained conflict
 # storm is invisible: the operator keeps responding healthy on /metrics and
-# the only signal is a SLOW tick.
+# the only signal is a SLOW tick. Labelled by ``namespace`` + ``name``
+# (CR identity, issue #311) so an SRE can attribute a sustained 409 burst
+# to the specific CR generating the conflicts — the singleton guard
+# (D05) bounds CR cardinality per namespace.
 STATUS_CONFLICTS_TOTAL = Counter(
     "openstudio_operator_status_conflicts_total",
     "Per-attempt 409 responses from the Kubernetes API Server during "
     "status-store RMW cycles (incremented inside _mutate's except branch "
-    "for each 409 before the backoff sleep; #119)",
+    "for each 409 before the backoff sleep; #119). Labelled by "
+    "``namespace`` + ``name`` (issue #311) so a multi-CR operator process "
+    "can attribute a conflict burst to the specific CR.",
+    labelnames=["namespace", "name"],
 )
 
 # Issue #171 — defensive cap on the four CR .status maps (``softStops``,
@@ -390,18 +407,19 @@ STATUS_CONFLICTS_TOTAL = Counter(
 # deterministic but not age-aware) before adding a new entry. This counter
 # is incremented once per actual eviction (post-RMW, retry-stable), not per
 # 409 attempt, so an alert on ``rate(...[5m]) > 0`` fires once per cap hit.
-# ``map_name`` label values: softStops | requeues | startedSince |
-# archivedAnalyses. The companion Warning Event (``StatusMapCapped``) is
-# emitted from the same code path so the on-call has both a log/Event and
-# a Prometheus signal to correlate.
+# Labelled by ``namespace`` + ``name`` (CR identity, issue #311) +
+# ``map_name`` (softStops | requeues | startedSince | archivedAnalyses).
+# The companion Warning Event (``StatusMapCapped``) is emitted from the
+# same code path so the on-call has both a log/Event and a Prometheus
+# signal to correlate.
 STATUS_MAP_CAPS_TOTAL = Counter(
     "openstudio_operator_status_map_caps_total",
     "Defensive cap evictions issued by status_store when a CR .status map "
     "hits STATUS_MAP_MAX_ENTRIES (incremented once per actual cap hit, after "
     "the successful RMW — retry-stable, not per 409 attempt; #171). "
-    "Labelled by map_name (softStops | requeues | startedSince | "
-    "archivedAnalyses).",
-    labelnames=["map_name"],
+    "Labelled by ``namespace`` + ``name`` (CR identity, issue #311) + "
+    "``map_name`` (softStops | requeues | startedSince | archivedAnalyses).",
+    labelnames=["namespace", "name", "map_name"],
 )
 
 STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
@@ -409,7 +427,11 @@ STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
     "Status-store RMW cycles that exhausted the 409 retry budget and "
     "raised StatusStoreConflictError; the tick that hit this counter was "
     "skipped (the failure surfaces as a WARNING log + no .status write). "
-    "Issued by status_store._mutate just before raising; #119.",
+    "Issued by status_store._mutate just before raising; #119. "
+    "Labelled by ``namespace`` + ``name`` (CR identity, issue #311) so a "
+    "multi-CR operator process can distinguish which CR is exhausting "
+    "its retry budget.",
+    labelnames=["namespace", "name"],
 )
 
 # Issue #117 — observability surface for handler tick failures.
@@ -419,18 +441,22 @@ STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
 # sustained degraded window (REST API down, Redis unreachable, k8s
 # API unavailable) is invisible at the /metrics endpoint, and an SRE
 # alerting on tick failure rate cannot tell which module is degraded.
-# Per-issue #117: one increment per observation (i.e., per tick that
-# the wrapper caught), labelled by module name and exception class.
+# Labelled by ``namespace`` + ``name`` (CR identity, issue #311) +
+# ``module`` (analysis_sla | datapoint_watchdog | worker_recycler |
+# web_background_monitor) + ``error_type`` (OpenStudioApiError |
+# StatusStoreError | ApiException | RedisClientError). Increment-by-1
+# per tick the wrapper suppresses; the WARNING log line in the wrapper
+# records the same event for log forwarding.
 HANDLER_TICK_FAILURES_TOTAL = Counter(
     "openstudio_operator_handler_tick_failures_total",
     "Handler tick failures caught by the timer wrappers (issue #117). "
-    "Labelled by module (analysis_sla | datapoint_watchdog | "
-    "worker_recycler | web_background_monitor) and error_type "
-    "(OpenStudioApiError | StatusStoreError | ApiException | "
-    "RedisClientError). Increment-by-1 per tick the wrapper suppresses; "
-    "the WARNING log line in the wrapper records the same event for log "
-    "forwarding.",
-    labelnames=["module", "error_type"],
+    "Labelled by ``namespace`` + ``name`` (CR identity, issue #311) + "
+    "``module`` (analysis_sla | datapoint_watchdog | worker_recycler | "
+    "web_background_monitor) + ``error_type`` (OpenStudioApiError | "
+    "StatusStoreError | ApiException | RedisClientError). Increment-by-1 "
+    "per tick the wrapper suppresses; the WARNING log line in the wrapper "
+    "records the same event for log forwarding.",
+    labelnames=["namespace", "name", "module", "error_type"],
 )
 
 # Issue #237 — observability surface for the dry-run gate on
@@ -456,9 +482,10 @@ EVENTS_DRY_RUN_SUPPRESSED_TOTAL = Counter(
     "openstudio_operator_events_dry_run_suppressed_total",
     "Kubernetes Events suppressed by the dry-run gate on EventEmitter (#164). "
     "Incremented at the same site as EventEmitter.suppressed_count, inside "
-    "EventEmitter.emit when dry_run=True (issue #237). Labelled by reason "
+    "EventEmitter.emit when dry_run=True (issue #237). Labelled by "
+    "``namespace`` + ``name`` (CR identity, issue #311) + ``reason`` "
     "(the same warning-event reasons used by the four handler modules).",
-    labelnames=["reason"],
+    labelnames=["namespace", "name", "reason"],
 )
 
 EVENTS_EMITTED_TOTAL = Counter(
@@ -466,9 +493,10 @@ EVENTS_EMITTED_TOTAL = Counter(
     "Kubernetes Events posted to the kube-apiserver via EventEmitter (#164). "
     "Companion to events_dry_run_suppressed_total: emitted-vs-suppressed "
     "rate is the headline SLO for an audit-only install (issue #237). "
-    "Labelled by reason (the same warning-event reasons used by the four "
-    "handler modules).",
-    labelnames=["reason"],
+    "Labelled by ``namespace`` + ``name`` (CR identity, issue #311) + "
+    "``reason`` (the same warning-event reasons used by the four handler "
+    "modules).",
+    labelnames=["namespace", "name", "reason"],
 )
 
 # Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the

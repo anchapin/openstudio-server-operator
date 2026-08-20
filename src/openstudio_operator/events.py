@@ -72,7 +72,7 @@ class EventEmitter:
     immutable for the lifetime of the instance (one tick).
     """
 
-    __slots__ = ("_body", "_dry_run", "_suppressed_count")
+    __slots__ = ("_body", "_dry_run", "_name", "_namespace", "_suppressed_count")
 
     def __init__(self, body: dict, *, dry_run: bool = False) -> None:
         """Bind the OSCM body and the dry-run gate for one tick.
@@ -82,10 +82,26 @@ class EventEmitter:
         ``dry_run`` mirrors :attr:`openstudio_operator.config.OperatorConfig.dry_run`
         and decides whether :meth:`emit` posts the Event or just
         increments the suppressed counter.
+
+        The CR's ``namespace`` and ``name`` are extracted from
+        ``body["metadata"]`` at construction time (issue #311) so the
+        emitted / suppressed / failed-event counters can be labelled by
+        CR identity. A missing ``metadata`` block is treated as the
+        ``"<unknown>"`` placeholder rather than raising — the timer
+        wrapper already validates the body via the singleton guard, so
+        a missing metadata here is a test-side shortcut, not a real
+        failure.
         """
         self._body = body
         self._dry_run = dry_run
         self._suppressed_count = 0
+        metadata = body.get("metadata") if isinstance(body, dict) else None
+        if isinstance(metadata, dict):
+            self._namespace = str(metadata.get("namespace") or "<unknown>")
+            self._name = str(metadata.get("name") or "<unknown>")
+        else:
+            self._namespace = "<unknown>"
+            self._name = "<unknown>"
 
     @property
     def suppressed_count(self) -> int:
@@ -121,9 +137,14 @@ class EventEmitter:
             # Issue #237 — Prometheus surface for the dry-run gate. The
             # counter is incremented at the same site as suppressed_count
             # so a /metrics scrape can prove dry-run mode is firing
-            # without parsing logs. Labelled by reason so dashboards can
-            # distinguish which handler path the gate intercepted.
-            EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(reason=reason).inc()
+            # without parsing logs. Labelled by (namespace, name, reason)
+            # — issue #311 adds CR identity so a multi-CR operator can
+            # attribute the suppression to the specific CR; the reason
+            # dimension lets dashboards distinguish which handler path
+            # the gate intercepted.
+            EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
+                namespace=self._namespace, name=self._name, reason=reason
+            ).inc()
             logger.info(
                 "dry-run suppressed %s Event reason=%s message=%r (#164)",
                 event_type,
@@ -134,24 +155,31 @@ class EventEmitter:
         # Issue #237 — companion emitted counter. Together with the
         # dry-run suppressed counter above, the ratio
         # ``rate(events_emitted_total) / rate(events_dry_run_suppressed_total)``
-        # is the headline SLO for an audit-only install.
-        EVENTS_EMITTED_TOTAL.labels(reason=reason).inc()
+        # is the headline SLO for an audit-only install. Issue #311
+        # adds (namespace, name) CR identity so the suppression-vs-emit
+        # ratio can be sliced per CR.
+        EVENTS_EMITTED_TOTAL.labels(
+            namespace=self._namespace, name=self._name, reason=reason
+        ).inc()
         try:
             kopf.event(self._body, type=event_type, reason=reason, message=message)
         except Exception:  # defensive: increment counter, re-raise unchanged
             # Issue #255 — observability surface for kopf.event posting
             # failures. The handler wrapper would otherwise catch the
             # raised ``ApiException`` via
-            # ``handler_tick_failures_total{module,error_type}`` and
-            # collapse "Event posting down" into the same counter as
+            # ``handler_tick_failures_total{namespace,name,module,error_type}``
+            # and collapse "Event posting down" into the same counter as
             # "REST API down" (both ``ApiException``). Increment the
             # dedicated counter BEFORE re-raising so a sustained
             # ``ApiException`` storm from the event posting path is its
-            # own /metrics signal — labelled by ``reason`` so a dashboard
-            # can tell WHICH handler path's Event emission failed.
-            # Cardinality matches ``events_emitted_total`` so the failure
-            # series can be rate-correlated with the success series.
-            EVENTS_EMIT_FAILURES_TOTAL.labels(reason=reason).inc()
+            # own /metrics signal — labelled by (namespace, name, reason)
+            # so a dashboard can tell WHICH CR's Event emission failed
+            # AND which handler path it came from. Cardinality matches
+            # ``events_emitted_total`` so the failure series can be
+            # rate-correlated with the success series.
+            EVENTS_EMIT_FAILURES_TOTAL.labels(
+                namespace=self._namespace, name=self._name, reason=reason
+            ).inc()
             raise
 
     def __call__(self, event_type: str, reason: str, message: str) -> None:
