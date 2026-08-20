@@ -27,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 SOFT_STOPS_TOTAL = Counter(
     "openstudio_operator_soft_stops_total",
-    "Analyses soft-stopped by the SLA monitor",
+    "Analyses soft-stopped by the SLA monitor. Labelled by ``outcome`` "
+    "(issue #309) so the dashboard can distinguish real soft-stops "
+    "(``issued``) from dry-run-marked suppressions (``dry-run``). "
+    "Incremented at the soft-stop branch in ``run_sla_tick``.",
+    labelnames=["outcome"],
 )
 
 DATAPOINTS_REQUEUED_TOTAL = Counter(
@@ -43,14 +47,27 @@ DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL = Counter(
 
 WORKERS_RECYCLED_TOTAL = Counter(
     "openstudio_operator_workers_recycled_total",
-    "Worker deployment recycles performed",
+    "Worker deployment recycles performed. Labelled by ``trigger`` "
+    "(issue #309) so an SRE investigating a recycle spike can tell "
+    "whether the interval-elapsed sweep fired (``interval-elapsed``) "
+    "or an analysis-completed edge fired (``analysis-completed``). "
+    "Incremented at the recycle site in ``run_recycler_tick``; the "
+    "trigger string is the value returned by ``_armed_trigger``.",
+    labelnames=["trigger"],
 )
 
 WORKER_PODS_EVICTED_TOTAL = Counter(
     "openstudio_operator_worker_pods_evicted_total",
     "Worker pods surgically evicted by the analysis-SLA escalation "
     "(incremented by the SLA monitor, #9; counts decisions — dry-run ticks "
-    "increment too, matching SOFT_STOPS_TOTAL)",
+    "increment too, matching SOFT_STOPS_TOTAL). Labelled by ``outcome`` "
+    "(issue #309) so the dashboard can distinguish escalation outcomes "
+    "(``evicted`` | ``evicted-partial`` | ``no-matching-pods`` | ``dry-run``) "
+    "without log scraping. The outcome is decided once per analysis at the "
+    "end of the per-pod loop in ``_escalate_analysis`` and applied to the "
+    "evicted count via ``inc(evicted_count)`` — a per-pod label would race "
+    "with the post-loop ``failed_count`` aggregation.",
+    labelnames=["outcome"],
 )
 
 WEB_BACKGROUND_RESTARTS_TOTAL = Counter(
@@ -70,7 +87,11 @@ ANALYSES_DELETED_TOTAL = Counter(
     "openstudio_operator_analyses_deleted_total",
     "Analyses deleted by the retention pipeline after verified archival "
     "(incremented by the storage pruner, #16; spec.dryRun suppresses both the "
-    "delete and the increment)",
+    "delete and the increment). Labelled by ``outcome`` (issue #309) — the "
+    "current code path only exercises ``deleted`` (the only branch that "
+    "performs the REST cascade), but the label is pinned so a future "
+    "expansion (e.g. partial-failure splits) is a one-line change.",
+    labelnames=["outcome"],
 )
 
 # Issue #238 — per-queue Resque depth Gauge. The operator reads

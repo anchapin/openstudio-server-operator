@@ -250,6 +250,14 @@ def test_metrics_http_server_serves_all_declared_counters():
     # mirrors the two skip-tick sites in prune_entrypoint.main(); the
     # CronJob pod exposes the same exposition format on port 9090.
     metrics.PRUNE_TICK_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # Issue #309 — pre-touch the four action counters that gained
+    # outcome/trigger labels in this PR. Each call creates a labelled
+    # series so the family-existence assertion below is self-contained
+    # (mirrors the #117 / #171 / #237 / #239 / #255 pattern).
+    metrics.SOFT_STOPS_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    metrics.WORKERS_RECYCLED_TOTAL.labels(trigger="__metrics_test_sentinel__").inc()
+    metrics.WORKER_PODS_EVICTED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    metrics.ANALYSES_DELETED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -346,6 +354,26 @@ def test_metrics_http_server_serves_all_declared_counters():
             # Issue #306 — labelled by `reason` (cr_list_failure | runtime_failure).
             assert (
                 'openstudio_operator_prune_tick_failures_total{reason="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_soft_stops_total":
+            assert (
+                'openstudio_operator_soft_stops_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_workers_recycled_total":
+            assert (
+                'openstudio_operator_workers_recycled_total{trigger="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_worker_pods_evicted_total":
+            assert (
+                'openstudio_operator_worker_pods_evicted_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_analyses_deleted_total":
+            assert (
+                'openstudio_operator_analyses_deleted_total{outcome="__metrics_test_sentinel__"}'
                 in response.text
             )
         else:
@@ -776,5 +804,152 @@ def test_events_emit_failures_counter_exposition_uses_reason_label():
     exposition = generate_latest().decode()
     assert (
         'openstudio_operator_events_emit_failures_total{name="test-cr",namespace="test-ns",reason="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+# --- Issue #309 — action-counter outcome / trigger labels -----------------------
+
+
+def test_workers_recycled_counter_increments_per_trigger():
+    """Issue #309 acceptance: ``openstudio_operator_workers_recycled_total``
+    counter increments per trigger at the recycle site in
+    ``run_recycler_tick``. The vocabulary is the two-string return of
+    ``_armed_trigger`` — pinned here so a future refactor that drops the
+    label (or that adds a third trigger without expanding the pin) is
+    caught at CI rather than at the on-call's Grafana board. Mirrors the
+    labelled-counter pattern from #117 / #171 / #237 / #239 / #255.
+    """
+    from openstudio_operator.handlers.worker_recycler import (
+        TRIGGER_ANALYSIS_COMPLETED,
+        TRIGGER_INTERVAL_ELAPSED,
+    )
+
+    counter = metrics.WORKERS_RECYCLED_TOTAL
+    baseline = _counter_total(counter)
+    for trigger in (TRIGGER_ANALYSIS_COMPLETED, TRIGGER_INTERVAL_ELAPSED):
+        counter.labels(trigger=trigger).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 2.0
+
+
+def test_workers_recycled_counter_exposition_uses_trigger_label():
+    """Issue #309 — verified exposition shape: the ``trigger`` label is
+    present at the /metrics surface. Pinning the label key here means a
+    future refactor that silently renames the label (e.g. to
+    ``recycle_trigger``) is caught at CI rather than when the on-call
+    rewrites a dashboard panel to match."""
+    counter = metrics.WORKERS_RECYCLED_TOTAL
+    counter.labels(trigger="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_workers_recycled_total{trigger="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+def test_worker_pods_evicted_counter_increments_per_outcome():
+    """Issue #309 acceptance: ``openstudio_operator_worker_pods_evicted_total``
+    counter increments per outcome at the escalation site in
+    ``_escalate_analysis``. The vocabulary is the four-slot
+    ``escalationOutcome`` enum (evicted | evicted-partial | no-matching-pods
+    | dry-run) — pinned here so a future refactor that drops the label (or
+    that introduces a new outcome without expanding the pin) is caught at
+    CI. Mirrors the labelled-counter pattern from #117 / #171 / #237 / #239
+    / #255.
+    """
+    from openstudio_operator.handlers.analysis_sla import (
+        ESCALATION_DRY_RUN,
+        ESCALATION_EVICTED,
+        ESCALATION_EVICTED_PARTIAL,
+        ESCALATION_NO_MATCH,
+    )
+
+    counter = metrics.WORKER_PODS_EVICTED_TOTAL
+    baseline = _counter_total(counter)
+    for outcome in (
+        ESCALATION_EVICTED,
+        ESCALATION_EVICTED_PARTIAL,
+        ESCALATION_NO_MATCH,
+        ESCALATION_DRY_RUN,
+    ):
+        counter.labels(outcome=outcome).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 4.0
+
+
+def test_worker_pods_evicted_counter_exposition_uses_outcome_label():
+    """Issue #309 — verified exposition shape: the ``outcome`` label is
+    present at the /metrics surface. Pinning the label key here means a
+    future refactor that silently renames the label is caught at CI."""
+    counter = metrics.WORKER_PODS_EVICTED_TOTAL
+    counter.labels(outcome="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_worker_pods_evicted_total{outcome="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+def test_soft_stops_counter_increments_per_outcome():
+    """Issue #309 acceptance: ``openstudio_operator_soft_stops_total``
+    counter increments per outcome at the soft-stop branch in
+    ``run_sla_tick``. The vocabulary is the two-slot soft-stop outcome
+    (issued | dry-run) — pinned here so a future refactor that drops the
+    label (or that introduces a new outcome without expanding the pin)
+    is caught at CI. Mirrors the labelled-counter pattern from #117 /
+    #171 / #237 / #239 / #255.
+    """
+    from openstudio_operator.handlers.analysis_sla import (
+        _OUTCOME_DRY_RUN,
+        _OUTCOME_ISSUED,
+    )
+
+    counter = metrics.SOFT_STOPS_TOTAL
+    baseline = _counter_total(counter)
+    for outcome in (_OUTCOME_ISSUED, _OUTCOME_DRY_RUN):
+        counter.labels(outcome=outcome).inc()
+    after = _counter_total(counter)
+    assert after - baseline == 2.0
+
+
+def test_soft_stops_counter_exposition_uses_outcome_label():
+    """Issue #309 — verified exposition shape: the ``outcome`` label is
+    present at the /metrics surface. Pinning the label key here means a
+    future refactor that silently renames the label is caught at CI."""
+    counter = metrics.SOFT_STOPS_TOTAL
+    counter.labels(outcome="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_soft_stops_total{outcome="ExpositionShapeProbe"}'
+        in exposition
+    )
+
+
+def test_analyses_deleted_counter_increments_per_outcome():
+    """Issue #309 acceptance: ``openstudio_operator_analyses_deleted_total``
+    counter increments per outcome at the delete-commit site in
+    ``retention.delete_verified_analysis``. Current code only exercises
+    the ``deleted`` outcome (the only branch that performs the REST
+    cascade) — pinned here so the existing label is not silently dropped
+    by a future refactor. Mirrors the labelled-counter pattern from
+    #117 / #171 / #237 / #239 / #255.
+    """
+    counter = metrics.ANALYSES_DELETED_TOTAL
+    baseline = _counter_total(counter)
+    counter.labels(outcome="deleted").inc()
+    after = _counter_total(counter)
+    assert after - baseline == 1.0
+
+
+def test_analyses_deleted_counter_exposition_uses_outcome_label():
+    """Issue #309 — verified exposition shape: the ``outcome`` label is
+    present at the /metrics surface. Pinning the label key here means a
+    future refactor that silently renames the label is caught at CI."""
+    counter = metrics.ANALYSES_DELETED_TOTAL
+    counter.labels(outcome="ExpositionShapeProbe").inc()
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_analyses_deleted_total{outcome="ExpositionShapeProbe"}'
         in exposition
     )
