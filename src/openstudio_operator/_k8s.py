@@ -28,9 +28,10 @@ none of the four handler modules owns. Today it hosts:
   Deployment by patching the pod template's ``restartedAt`` annotation (issue #395).
 * :func:`load_operator_kube_config` — the SINGLE public loader for the
   operator's kubeconfig (in-cluster first, ``kube_config`` fallback). The
-  companion ``_load_k8s_config`` / ``_load_kube_config`` thin wrappers in
-  :mod:`openstudio_operator.singleton` and
-  :mod:`openstudio_operator.prune_entrypoint` both delegate here. A future
+  ``singleton.operator_*_api`` factories and
+  :mod:`openstudio_operator.prune_entrypoint` call it directly (issue
+  #405 removed the former ``_load_k8s_config`` / ``_load_kube_config``
+  thin wrappers). A future
   loader change (kubeconfig Secret reference, network-proxy client, custom
   CA bundle) applies at this single site; the AST gate in
   ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
@@ -249,11 +250,10 @@ def load_operator_kube_config() -> None:
       ``*V1Api()`` with no loaded config raises ``LocationValueError``
       on every call (proven live in #66's kind validation).
     * Idempotent in production — the loader is idempotent on the same
-      source and the factories check their cache before calling. Both
-      wrappers (:func:`openstudio_operator.singleton._load_k8s_config`
-      and
-      :func:`openstudio_operator.prune_entrypoint._load_kube_config`)
-      delegate here.
+      source and the factories check their cache before calling. The
+      ``singleton.operator_*_api`` factories and
+      :func:`openstudio_operator.prune_entrypoint.main` call this
+      loader directly (issue #405 removed the thin wrappers).
     * On config-loading failure (both ``load_incluster_config`` and
       ``load_kube_config`` raise ``ConfigException``), propagates the
       second exception — callers fail closed (skip the tick, retry next

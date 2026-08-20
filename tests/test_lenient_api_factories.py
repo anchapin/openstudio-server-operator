@@ -168,7 +168,8 @@ def _no_config_loaders(monkeypatch: pytest.MonkeyPatch):
     Mirrors :func:`tests.test_singleton_guard.no_config_loaders`. Both
     ``load_incluster_config`` (the in-cluster path used by production
     operators) and ``load_kube_config`` (the dev-session fallback) raise —
-    so :func:`openstudio_operator.singleton._load_k8s_config` always raises
+    so :func:`openstudio_operator._k8s.load_operator_kube_config` (called
+    directly by the factories since issue #405) always raises
     ``ConfigException`` under this fixture. The strict
     ``operator_custom_objects_api`` factory propagates this; the three
     lenient factories swallow it and return a placeholder.
@@ -217,7 +218,8 @@ def test_lenient_core_api_returns_placeholder_when_config_loads_fail(
 
     The factory's contract:
 
-    * catches the :class:`ConfigException` from ``_load_k8s_config``,
+    * catches the :class:`ConfigException` from the
+      ``load_operator_kube_config()`` call,
     * emits a WARNING log naming the K8s API type (so the on-call can see
       which factory degraded),
     * constructs a real :class:`CoreV1Api` against the uninitialised
@@ -331,7 +333,7 @@ def test_singleton_guard_skips_tick_when_no_config_and_lenient_factories(
     alerting).
     """
     # Strict path: ``operator_custom_objects_api`` raises ConfigException
-    # because ``_load_k8s_config`` raises ConfigException (the loaders are
+    # because ``load_operator_kube_config`` raises ConfigException (the loaders are
     # patched to raise by ``_no_config_loaders``).
     # Lenient path: ``operator_core_api`` would NOT raise — but the gate
     # never reaches it because the strict path fails first.

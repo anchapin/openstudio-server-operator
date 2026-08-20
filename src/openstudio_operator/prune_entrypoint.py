@@ -150,29 +150,6 @@ def build_event_emitter(
     return emit
 
 
-def _load_kube_config() -> None:
-    """Thin delegation to the single public loader (issue #305).
-
-    The in-cluster / ``kube_config`` fallback loader this function used
-    to host inline is now :func:`openstudio_operator._k8s.load_operator_kube_config`
-    — the SINGLE public loader for every K8s client the operator
-    builds. The companion ``_load_k8s_config`` in
-    :mod:`openstudio_operator.singleton` was a verbatim copy of the
-    same try/except; a future loader change (kubeconfig Secret
-    reference, network-proxy client, custom CA bundle) would have had
-    to land in two places. The wrapper is preserved only because the
-    entrypoint's :func:`main` calls it explicitly (the redundant
-    pre-factory load that avoids the ``ConfigException`` fallback path
-    in environments where ``load_kube_config`` succeeds), and the
-    visible call site documents that intent. The AST gate in
-    ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
-    rejects any inline ``load_incluster_config(`` /
-    ``load_kube_config(`` call outside ``_k8s.py`` so a partial update
-    fails CI loudly.
-    """
-    load_operator_kube_config()
-
-
 def _list_crs(custom_api: CustomApi, namespace: str) -> list[dict]:
     resp = custom_api.list_namespaced_custom_object(GROUP, VERSION, namespace, PLURAL)
     items = resp.get("items") or []
@@ -225,12 +202,13 @@ def main(
         # in-cluster / kubeconfig fallback and caches the result for the
         # process lifetime. The factory itself calls the SINGLE public
         # loader (:func:`openstudio_operator._k8s.load_operator_kube_config`)
-        # on first use; the explicit ``_load_kube_config()`` here is a thin
-        # delegation to that same loader, so the factories find the
+        # on first use; the explicit ``load_operator_kube_config()`` here
+        # (issue #405 — the former ``_load_kube_config`` wrapper was
+        # removed) loads the config directly, so the factories find the
         # kubeconfig already loaded and the ``ConfigException`` warning
         # path inside the factory (the placeholder-client branch) is
         # avoided in environments where ``load_kube_config`` succeeds.
-        _load_kube_config()
+        load_operator_kube_config()
         custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
         batch_api = batch_api if batch_api is not None else operator_batch_api()
         core_api = core_api if core_api is not None else operator_core_api()

@@ -275,29 +275,6 @@ def set_guard(guard: SingletonGuard | None) -> None:
 _operator_custom_objects_api: CustomObjectsApi | None = None
 
 
-def _load_k8s_config() -> None:
-    """Thin delegation to the single public loader (issue #305).
-
-    The in-cluster / ``kube_config`` fallback loader this function used
-    to host inline is now :func:`openstudio_operator._k8s.load_operator_kube_config`
-    — the SINGLE public loader for every K8s client the operator
-    builds. The companion ``_load_kube_config`` in
-    :mod:`openstudio_operator.prune_entrypoint` was a verbatim copy of
-    the same try/except; a future loader change (kubeconfig Secret
-    reference, network-proxy client, custom CA bundle) would have had to
-    land in two places. The wrapper is preserved only to keep the local
-    factory call sites
-    (:func:`operator_custom_objects_api`, :func:`operator_apps_api`,
-    :func:`operator_batch_api`, :func:`operator_core_api`) and their
-    try/except ``ConfigException`` shape unchanged. The AST gate in
-    ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
-    rejects any inline ``load_incluster_config(`` /
-    ``load_kube_config(`` call outside ``_k8s.py`` so a partial update
-    fails CI loudly.
-    """
-    load_operator_kube_config()
-
-
 def operator_custom_objects_api() -> CustomObjectsApi:
     """Return the process-wide :class:`CustomObjectsApi` (issue #158).
 
@@ -342,7 +319,7 @@ def operator_custom_objects_api() -> CustomObjectsApi:
     """
     global _operator_custom_objects_api
     if _operator_custom_objects_api is None:
-        _load_k8s_config()
+        load_operator_kube_config()
         _operator_custom_objects_api = CustomObjectsApi()
     return _operator_custom_objects_api
 
@@ -387,7 +364,7 @@ def operator_apps_api() -> AppsV1Api:
     global _operator_apps_api
     if _operator_apps_api is None:
         try:
-            _load_k8s_config()
+            load_operator_kube_config()
         except ConfigException:
             # CI / bare-clone environments: leave the default
             # Configuration uninitialised. The AppsV1Api() constructor
@@ -423,7 +400,7 @@ def operator_batch_api() -> BatchV1Api:
     global _operator_batch_api
     if _operator_batch_api is None:
         try:
-            _load_k8s_config()
+            load_operator_kube_config()
         except ConfigException:
             # CI / bare-clone environments: leave the default
             # Configuration uninitialised. The BatchV1Api() constructor
@@ -463,7 +440,7 @@ def operator_core_api() -> CoreV1Api:
     global _operator_core_api
     if _operator_core_api is None:
         try:
-            _load_k8s_config()
+            load_operator_kube_config()
         except ConfigException:
             # CI / bare-clone environments: leave the default
             # Configuration uninitialised. The CoreV1Api() constructor
