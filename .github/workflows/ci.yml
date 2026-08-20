@@ -148,49 +148,47 @@ jobs:
           /tmp/lockfile-verify/bin/python -m pip install --upgrade pip
           /tmp/lockfile-verify/bin/pip install --require-hashes -r requirements.lock
       - run: pytest
-      # Issue #151 — guard against AGENTS.md test-count claim drift. The previous
-      # three (#106, #144, plus this one) were each caught by hand-editing the
-      # line. The guard below fails the CI job loudly when the claim desyncs
-      # from `pytest --collect-only` + a glob of `tests/test_*.py`.
-      - name: Verify AGENTS.md test-count claim (#151)
+      # Issues #151 / #220 / #423 — guard against test-count claim drift.
+      # The `N tests across M files` claim lives in FOUR prose locations:
+      # AGENTS.md (#151), docs/onboarding.md (#220, plain-prose form),
+      # docs/audit-dryrun-idempotency.md and docs/kind-validation.md (#423).
+      # The two secondary docs drifted three separate times before #423
+      # because only the guarded files failed CI — every test-adding PR
+      # bumped just AGENTS.md + onboarding.md. This single step loops over
+      # all four locations and fails the job when any claim desyncs from
+      # `pytest --collect-only` + a glob of `tests/test_*.py`, mirroring
+      # how the #387 metrics-family gate covers README + audit-doc in one
+      # step. AGENTS.md carries the claim behind a `# ` prefix while the
+      # docs carry plain prose; the bare-number regex extracts the same
+      # numbers from both shapes, so one pattern covers all four files.
+      - name: Verify test-count claims in all four docs (#151/#220/#423)
         run: |
           set -euo pipefail
           ACTUAL_TESTS=$(pytest --collect-only 2>/dev/null | tail -1 | awk '{print $1}')
           ACTUAL_FILES=$(ls tests/test_*.py | wc -l | tr -d ' ')
-          CLAIM=$(grep -oE '# ?[0-9]+ tests across [0-9]+ files' AGENTS.md | head -1)
-          if [ -z "$CLAIM" ]; then
-            echo "::error::AGENTS.md is missing the '# N tests across M files' claim"
-            exit 1
-          fi
-          EXPECTED_TESTS=$(echo "$CLAIM" | awk '{print $2}')
-          EXPECTED_FILES=$(echo "$CLAIM" | awk '{print $5}')
-          echo "AGENTS.md claim: $CLAIM"
-          echo "Actual:          $ACTUAL_TESTS tests across $ACTUAL_FILES files"
-          if [ "$ACTUAL_TESTS" != "$EXPECTED_TESTS" ] || [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
-            echo "::error::AGENTS.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, AGENTS.md says '$CLAIM'"
-            exit 1
-          fi
-      # Issue #220 — parallel guard for docs/onboarding.md, which carries the
-      # same "N tests across M files" claim but uses a plain prose form (no
-      # `# ` prefix). Mirrors the #151 guard; if onboarding drifts in the
-      # future, this step fails the CI job with the actual count so a
-      # one-line bump brings it back in sync.
-      - name: Verify onboarding.md test-count claim (#220)
-        run: |
-          set -euo pipefail
-          ACTUAL_TESTS=$(pytest --collect-only 2>/dev/null | tail -1 | awk '{print $1}')
-          ACTUAL_FILES=$(ls tests/test_*.py | wc -l | tr -d ' ')
-          CLAIM=$(grep -oE '[0-9]+ tests across [0-9]+ files' docs/onboarding.md | head -1)
-          if [ -z "$CLAIM" ]; then
-            echo "::error::docs/onboarding.md is missing the 'N tests across M files' claim"
-            exit 1
-          fi
-          EXPECTED_TESTS=$(echo "$CLAIM" | awk '{print $1}')
-          EXPECTED_FILES=$(echo "$CLAIM" | awk '{print $4}')
-          echo "onboarding.md claim: $CLAIM"
-          echo "Actual:              $ACTUAL_TESTS tests across $ACTUAL_FILES files"
-          if [ "$ACTUAL_TESTS" != "$EXPECTED_TESTS" ] || [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
-            echo "::error::docs/onboarding.md test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, onboarding.md says '$CLAIM'"
+          echo "Actual: $ACTUAL_TESTS tests across $ACTUAL_FILES files"
+          FAIL=0
+          for DOC in AGENTS.md docs/onboarding.md docs/audit-dryrun-idempotency.md docs/kind-validation.md; do
+            CLAIM=$(grep -oE '[0-9]+ tests across [0-9]+ files' "$DOC" | head -1 || true)
+            if [ -z "$CLAIM" ]; then
+              echo "::error::$DOC is missing the 'N tests across M files' claim"
+              FAIL=1
+              continue
+            fi
+            EXPECTED_TESTS=$(echo "$CLAIM" | awk '{print $1}')
+            EXPECTED_FILES=$(echo "$CLAIM" | awk '{print $4}')
+            echo "$DOC claim: $CLAIM"
+            if [ "$ACTUAL_TESTS" != "$EXPECTED_TESTS" ] || [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
+              echo "::error::$DOC test-count claim is stale: actual is $ACTUAL_TESTS tests / $ACTUAL_FILES files, $DOC says '$CLAIM'"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "All four claim locations must agree (issues #151/#220/#423):"
+            echo "  AGENTS.md + docs/onboarding.md + docs/audit-dryrun-idempotency.md"
+            echo "  + docs/kind-validation.md must all read:"
+            echo "  $ACTUAL_TESTS tests across $ACTUAL_FILES files"
             exit 1
           fi
       # Issue #387 — guard against the metrics-family prose claim drift that
