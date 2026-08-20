@@ -161,8 +161,18 @@ def test_cronjob_runs_entrypoint_from_pinned_operator_image():
     assert CRONJOB["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 0
     assert pod["serviceAccountName"] == PRUNE_SA["metadata"]["name"]
     container = pod["containers"][0]
-    # the operator image published on develop push — never a floating latest
-    assert container["image"] == "ghcr.io/anchapin/openstudio-server-operator:dev"
+    # Issue #291: pin to the same SHA256 digest as deploy/operator-deployment.yaml;
+    # the operator image is re-pinned by .github/workflows/release.yml on every
+    # develop push. The mutable `:dev` tag combined with `IfNotPresent` allowed the
+    # kubelet to retain a previously-cached image across restarts.
+    assert container["image"] == (
+        "ghcr.io/anchapin/openstudio-server-operator@sha256:"
+        "6681d2545970ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e"
+    )
+    # Issue #291: Always re-pulls the digest on every CronJob tick (10 min).
+    # The previous IfNotPresent policy left the kubelet free to keep a stale
+    # image if the digest-pinning invariant was ever bypassed.
+    assert container["imagePullPolicy"] == "Always"
     assert container["command"] == ["python", "-m", "openstudio_operator.prune_entrypoint"]
     env = {e["name"]: e for e in container["env"]}
     assert env["POD_NAMESPACE"]["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.namespace"
@@ -312,6 +322,30 @@ def test_storage_cronjob_pod_securitycontext_hardened():
 # CronJob) writable by the non-root UID the container runs as.
 OPERATOR_DOCS = list(yaml.safe_load_all((DEPLOY / "operator-deployment.yaml").read_text()))
 OPERATOR_DEPLOYMENT = next(d for d in OPERATOR_DOCS if d["kind"] == "Deployment")
+
+
+def test_cronjob_image_digest_matches_operator_deployment():
+    """Issue #291: both manifests must pin the same digest so the CronJob and
+    the operator deployment never disagree about which image is in service.
+    If they drift, a one-image-update CI job that only pins operator-deployment
+    would leave storage-cronjob pointing at a stale image. The release.yml
+    'Pin operator image by SHA256 digest' step is expected to re-pin BOTH
+    manifests in lockstep on every develop push (see issue #291 acceptance
+    criterion)."""
+    op_container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    op_image = op_container["image"]
+    assert "@sha256:" in op_image, (
+        f"operator-deployment image must be digest-pinned (got {op_image!r})"
+    )
+    cron_container = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    cron_image = cron_container["image"]
+    assert cron_image == op_image, (
+        f"storage-cronjob image {cron_image!r} must equal operator-deployment image "
+        f"{op_image!r}; release.yml must re-pin both manifests in lockstep"
+    )
+    assert cron_container["imagePullPolicy"] == "Always", (
+        "CronJob must use imagePullPolicy: Always so the digest is re-pulled on every tick"
+    )
 
 
 def _pod_securitycontext_problems(sc):
