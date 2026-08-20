@@ -43,7 +43,33 @@ from typing import Final
 
 import kopf
 
+from openstudio_operator import metrics as metrics_module
+
 logger = logging.getLogger(__name__)
+
+#: Backpressure cap (issue #310). The deferred-event queue holds Warning
+#: Events that need a kopf watch tick to emit. If the apiserver watch
+#: stream stalls, the queue grows unbounded — the three hardened call
+#: sites (redis-URL guard #116, redis-key-layout guard #163,
+#: status-store cap #171) all keep enqueueing regardless. ``1000`` is the
+#: floor: it is two orders of magnitude above any realistic single-CR
+#: backlog (the three callers dedupe to ~1 entry per CR) and three
+#: orders of magnitude above any healthy-tick backlog, so a cap hit
+#: always means the watch stream is unhealthy. Exceeding the cap drops
+#: the deferred event AND increments
+#: ``WARNINGS_DEFERRED_DROPPED_TOTAL{reason="queue_full"}`` so the loss
+#: is observable on /metrics — the silent-drop failure mode that this
+#: constant prevents is exactly the failure mode that motivated the
+#: Gauge / Counter pair.
+MAX_DEFERRED_WARNING_EVENTS: Final = 1000
+
+#: Drop-reason label vocabulary for :data:`WARNINGS_DEFERRED_DROPPED_TOTAL`.
+#: The initial reason is ``queue_full`` (deferral rejected because the
+#: queue was at ``MAX_DEFERRED_WARNING_EVENTS``). Exposed as a module
+#: constant so the test (and any future cap-eviction branch) can import
+#: the same string the production code uses — a typo in the test would
+#: silently miss the alert.
+DROP_REASON_QUEUE_FULL: Final = "queue_full"
 
 
 class QueuedKopfEventSink:
@@ -101,8 +127,31 @@ class QueuedKopfEventSink:
         waves (the cap-eviction reason
         :data:`openstudio_operator.status_store.STATUS_MAP_CAPPED_EVENT`
         is the third user of this queue).
+
+        Backpressure (issue #310): when
+        ``len(self._queue) >= MAX_DEFERRED_WARNING_EVENTS`` this call is
+        REJECTED — the deferred event is silently dropped
+        (from the user's perspective) and
+        ``WARNINGS_DEFERRED_DROPPED_TOTAL{reason="queue_full"}`` is
+        incremented. The user-facing Warning Event is lost in that
+        case; the /metrics counter is the only signal that the loss
+        happened, so an SRE alerting on its rate catches the
+        contract violation. The :data:`WARNINGS_DEFERRED_QUEUE_DEPTH`
+        Gauge is updated to ``len(self._queue)`` on every call —
+        whether the event was accepted or rejected — so a saturated
+        gauge pairs with a nonzero drop counter.
         """
-        self._queue.append((namespace, name, reason, message))
+        if len(self._queue) >= MAX_DEFERRED_WARNING_EVENTS:
+            metrics_module.WARNINGS_DEFERRED_DROPPED_TOTAL.labels(
+                reason=DROP_REASON_QUEUE_FULL,
+            ).inc()
+        else:
+            self._queue.append((namespace, name, reason, message))
+        # Always reflect the post-call queue depth in the Gauge — the
+        # Gauge is a state indicator (queue is at this depth right now),
+        # not a delta of this call. On a drop the depth is unchanged
+        # (still at the cap); on an accept it advances by 1.
+        metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(len(self._queue))
 
     def flush_for(self, *, namespace: str, name: str) -> int:
         """Drain every queued Warning Event for THIS CR; return count flushed.
@@ -119,12 +168,26 @@ class QueuedKopfEventSink:
         ``type="Warning"`` and the recorded ``reason``/``message``.
         The handler module is responsible for installing the
         ``@kopf.on.event`` wrapper that invokes this method.
+
+        Observability (issue #310): the
+        :data:`WARNINGS_DEFERRED_QUEUE_DEPTH` Gauge is updated to the
+        post-drain queue length on every flush — including no-op
+        flushes, so the Gauge tracks the queue state continuously
+        rather than oscillating between enqueue/defer ticks. When the
+        queue holds entries ONLY for this CR (the typical case) the
+        post-drain length is 0, which is the literal "reset to 0" the
+        acceptance criterion calls for; multi-CR backlogs are reported
+        faithfully (the residual length is the cross-CR deferred load).
         """
         pending = [
             msg for msg in self._queue
             if msg[0] == namespace and msg[1] == name
         ]
         if not pending:
+            # No-op flush still updates the Gauge — the queue state is
+            # unchanged but the call site fired, so we want the gauge
+            # to reflect the most recent observation regardless.
+            metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(len(self._queue))
             return 0
         for _ns, _nm, reason, message in pending:
             kopf.event(
@@ -137,6 +200,11 @@ class QueuedKopfEventSink:
             msg for msg in self._queue
             if not (msg[0] == namespace and msg[1] == name)
         ]
+        # Update Gauge to the post-drain length. Single-CR queues read
+        # 0 here (the literal "reset to 0" the issue calls for);
+        # multi-CR backlogs report the residual so the on-call can see
+        # the cross-CR load via a sustained nonzero value.
+        metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(len(self._queue))
         return len(pending)
 
     @property

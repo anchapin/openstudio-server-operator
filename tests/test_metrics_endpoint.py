@@ -39,6 +39,14 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_singleton_election_total",
     # Issue #255 — kopf.event emission failures (per reason).
     "openstudio_operator_events_emit_failures_total",
+    # Issue #310 — QueuedKopfEventSink backpressure drop counter. The
+    # sink rejects defer_to_next_tick calls once the queue hits
+    # MAX_DEFERRED_WARNING_EVENTS (1000); the Counter increments on each
+    # rejection with reason="queue_full" so the loss is observable on
+    # /metrics (no longer silent). Initial vocabulary is one reason; the
+    # label leaves room for a future per-reason-cap branch without a
+    # Counter rename.
+    "openstudio_operator_warnings_deferred_dropped_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
@@ -62,6 +70,7 @@ EXPECTED_COUNTER_FAMILIES = (
 #: and the eventual ``web_background_restarts_total`` increment — a heads-
 #: up display that gives SREs time to react before the gate trips.
 #:
+<<<<<<< HEAD
 #: Issue #312 — paired freshness timestamp gauges for ``resque_queue_
 #: depth`` and ``stall_window_elapsed_seconds``. Set to ``time.time()``
 #: on every successful read/update so dashboards can compute staleness
@@ -70,6 +79,15 @@ EXPECTED_COUNTER_FAMILIES = (
 #: unreachable, ApiException from ``_stall_condition_holds``, etc.) —
 #: without the freshness pair a prior tick's value masquerades as a
 #: live reading while the operator has in fact lost visibility.
+#:
+#: Issue #310 — ``warnings_deferred_queue_depth`` Gauge surfaces the
+#: in-process QueuedKopfEventSink queue depth on every defer / flush
+#: call. Unlabelled (the queue is process-wide, not per-CR), so
+#: cardinality stays bounded regardless of CR count. Sustained nonzero
+#: values mean the apiserver watch stream is stalled and Warning
+#: Events are piling up — a companion to the
+#: ``warnings_deferred_dropped_total`` Counter which fires when the
+#: cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded.
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -77,6 +95,7 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_stall_window_elapsed_seconds",
     "openstudio_operator_resque_queue_depth_fresh",
     "openstudio_operator_stall_window_fresh",
+    "openstudio_operator_warnings_deferred_queue_depth",
 )
 
 #: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
@@ -188,6 +207,13 @@ def test_metrics_http_server_serves_all_declared_counters():
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
     # below alongside the bare-form unlabelled gauges.
     metrics.RESQUE_QUEUE_DEPTH.labels(queue="__metrics_test_sentinel__").set(0)
+    # Issue #310 — pre-touch the labelled drop Counter so the family
+    # line is exposed. ``reason`` label vocabulary currently includes
+    # ``queue_full`` (the only drop path today); a future second reason
+    # adds a series, not a family rename.
+    metrics.WARNINGS_DEFERRED_DROPPED_TOTAL.labels(
+        reason="__metrics_test_sentinel__"
+    ).inc()
 
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
@@ -230,6 +256,11 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_events_emit_failures_total":
             assert (
                 'openstudio_operator_events_emit_failures_total{reason="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_warnings_deferred_dropped_total":
+            assert (
+                'openstudio_operator_warnings_deferred_dropped_total{reason="__metrics_test_sentinel__"}'
                 in response.text
             )
         else:

@@ -48,6 +48,7 @@ import pytest
 
 import openstudio_operator.events_sinks as sinks_module
 from openstudio_operator import handlers as handlers_pkg
+from openstudio_operator import metrics as metrics_module
 from openstudio_operator import status_store
 from openstudio_operator.events_sinks import QueuedKopfEventSink, get_default_sink
 
@@ -458,3 +459,259 @@ def test_legacy_drain_handlers_are_removed() -> None:
             f"_drain_queued_warning_events — a re-introduced legacy "
             f"drain means the same Warning Event could be emitted twice."
         )
+
+
+# --- 4. Issue #310 — backpressure cap + observability surface ----------------
+
+
+def test_max_deferred_warning_events_constant_is_1000() -> None:
+    """The :data:`MAX_DEFERRED_WARNING_EVENTS` constant is the published cap.
+
+    Issue #310 acceptance criterion: the queue is capped at 1000
+    entries. The constant must be module-level (not hidden in the
+    class) so the test, the documentation, and any future
+    reconfiguration surface import the same value the production code
+    enforces — a typo in a magic number would silently weaken the cap
+    without a CI signal.
+    """
+    assert sinks_module.MAX_DEFERRED_WARNING_EVENTS == 1000
+    assert isinstance(sinks_module.MAX_DEFERRED_WARNING_EVENTS, int)
+
+
+def test_defer_to_next_tick_sets_queue_depth_gauge() -> None:
+    """Every :meth:`defer_to_next_tick` advances ``WARNINGS_DEFERRED_QUEUE_DEPTH``.
+
+    The Gauge is the headline observability signal for #310 — an SRE
+    alerting on its sustained value catches a stalled apiserver
+    watch stream (the queue is growing because the drain handler is
+    not firing). Driving the defer directly + reading the Gauge value
+    is sufficient to verify the wiring; the actual production call
+    sites are exhaustively tested in the handler-level tests.
+    """
+    sink = QueuedKopfEventSink()
+    sink.clear()
+    # Reset the Gauge so the assertion is local to this test (the
+    # default REGISTRY is process-wide and other tests may have set it).
+    metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(0)
+    for i in range(1, 6):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"m{i}",
+        )
+        assert metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get() == float(i)
+
+
+def test_flush_for_resets_queue_depth_gauge_to_zero() -> None:
+    """A successful :meth:`flush_for` resets ``WARNINGS_DEFERRED_QUEUE_DEPTH``.
+
+    Acceptance criterion: "reset to 0 on every ``flush_for``". In the
+    single-CR case (every queued entry belongs to the flushed CR)
+    the post-drain queue is empty so the Gauge reads 0 — the literal
+    "reset to 0" the issue calls for. Multi-CR backlogs are reported
+    faithfully in the companion test below.
+    """
+    sink = QueuedKopfEventSink()
+    sink.clear()
+    metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(0)
+    for i in range(3):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"m{i}",
+        )
+    # Stub kopf.event so the flush emits without a real apiserver.
+    import unittest.mock
+    with unittest.mock.patch.object(sinks_module.kopf, "event"):
+        flushed = sink.flush_for(namespace="ns", name="osc")
+    assert flushed == 3
+    assert sink.queued == []
+    assert metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get() == 0.0
+
+
+def test_flush_for_reports_residual_queue_depth_for_other_crs() -> None:
+    """A flush that drains one CR still updates the Gauge to the residual depth.
+
+    The queue is process-wide and shared across all CRs — when a
+    flush drains CR-A the queue may still hold entries for CR-B. The
+    Gauge must report the residual faithfully (the cross-CR deferred
+    load is observable, not hidden by a "reset to 0" that would be
+    a lie). This is the same code path as the single-CR case; the
+    test pins the multi-CR behavior so a future maintainer who
+    hard-codes ``.set(0)`` after every flush is caught at CI.
+    """
+    sink = QueuedKopfEventSink()
+    sink.clear()
+    metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(0)
+    for i in range(2):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc-a", reason="R", message=f"a{i}",
+        )
+    for i in range(3):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc-b", reason="R", message=f"b{i}",
+        )
+    # Gauge reads 5 (the combined queue) before the flush.
+    assert metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get() == 5.0
+    import unittest.mock
+    with unittest.mock.patch.object(sinks_module.kopf, "event"):
+        flushed = sink.flush_for(namespace="ns", name="osc-a")
+    assert flushed == 2
+    # Residual queue still has the 3 osc-b entries — Gauge must read 3,
+    # NOT 0 (a "reset to 0" would mask the cross-CR backlog).
+    assert sink.queued == [
+        ("ns", "osc-b", "R", "b0"),
+        ("ns", "osc-b", "R", "b1"),
+        ("ns", "osc-b", "R", "b2"),
+    ]
+    assert metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get() == 3.0
+
+
+def test_queue_cap_drops_excess_deferrals_and_increments_drop_counter() -> None:
+    """Issue #310 acceptance criterion (b): the 1001st deferral is dropped.
+
+    Drives 1001 deferrals against a fresh sink. Asserts:
+
+    * The 1000th deferral succeeds (the queue holds exactly 1000).
+    * The 1001st deferral is REJECTED — the queue stays at 1000, the
+      user-facing Warning Event is silently lost (the only signal is
+      the /metrics Counter).
+    * ``WARNINGS_DEFERRED_DROPPED_TOTAL{reason="queue_full"}`` has
+      incremented by exactly 1.
+    * ``WARNINGS_DEFERRED_QUEUE_DEPTH`` reads 1000 (saturated at the
+      cap) — the drop does NOT advance the Gauge (the queue length
+      is unchanged; the Gauge is a state indicator, not a delta of
+      this call).
+
+    This is the regression fence for the silent-drop failure mode
+    the issue calls out: without the cap + counter the queue would
+    grow unbounded on a stalled apiserver watch stream and the only
+    operator-visible signal would be OOM.
+    """
+    sink = QueuedKopfEventSink()
+    sink.clear()
+    metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(0)
+
+    counter = metrics_module.WARNINGS_DEFERRED_DROPPED_TOTAL
+
+    def _total_for_reason(reason: str) -> float:
+        # ``counter._metrics`` is a dict keyed by a tuple of label values
+        # in the order declared by ``counter._labelnames`` — for our
+        # single-label counter ``('reason',)`` the first element is the
+        # reason string. ``prometheus_client`` 0.26.x exposes
+        # ``_value.get()`` on each per-series sample.
+        per_series = getattr(counter, "_metrics", {})
+        label_names = getattr(counter, "_labelnames", ())
+        if "reason" not in label_names:
+            return 0.0
+        reason_idx = label_names.index("reason")
+        total = 0.0
+        for label_values, snapshot in per_series.items():
+            if reason_idx < len(label_values) and label_values[reason_idx] == reason:
+                value_obj = getattr(snapshot, "_value", None)
+                if value_obj is not None and hasattr(value_obj, "get"):
+                    total += float(value_obj.get())
+        return total
+
+    baseline = _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
+
+    # Drive 1000 deferrals — every one is accepted, queue saturates at 1000.
+    for i in range(sinks_module.MAX_DEFERRED_WARNING_EVENTS):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"m{i}",
+        )
+    assert len(sink.queued) == sinks_module.MAX_DEFERRED_WARNING_EVENTS
+    assert (
+        metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get()
+        == float(sinks_module.MAX_DEFERRED_WARNING_EVENTS)
+    )
+    # No drops yet — the 1000 deferrals all fit.
+    assert _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL) == baseline
+
+    # The 1001st deferral must be REJECTED.
+    sink.defer_to_next_tick(
+        namespace="ns", name="osc", reason="R", message="m-overflow",
+    )
+    # Queue length is unchanged (still 1000), the rejected entry is
+    # silently dropped — the user-facing Warning Event is lost.
+    assert len(sink.queued) == sinks_module.MAX_DEFERRED_WARNING_EVENTS
+    assert sink.queued[-1] == ("ns", "osc", "R", "m999"), (
+        "The 1001st deferral was appended instead of dropped. The "
+        "backpressure cap (issue #310) is not enforced. See the "
+        "silent-drop failure mode the issue calls out."
+    )
+    # Gauge plateaus at the cap — the drop does NOT advance it.
+    assert (
+        metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH._value.get()
+        == float(sinks_module.MAX_DEFERRED_WARNING_EVENTS)
+    )
+    # The drop Counter increments by exactly 1 — the loss is observable.
+    assert (
+        _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
+        == baseline + 1
+    )
+
+
+def test_queue_cap_drops_subsequent_deferrals_until_drained() -> None:
+    """After a drop, further deferrals stay dropped until the queue drains.
+
+    The cap is enforced continuously — once the queue is saturated,
+    every subsequent deferral is dropped (and the Counter increments
+    on each one). Only a :meth:`flush_for` that empties the queue
+    re-opens the door. Pinning this here so a future maintainer who
+    treats the cap as a one-shot trigger (e.g. only the first drop
+    is counted) is caught at CI rather than silently dropping
+    every other event after the initial hit.
+    """
+    sink = QueuedKopfEventSink()
+    sink.clear()
+    metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(0)
+    counter = metrics_module.WARNINGS_DEFERRED_DROPPED_TOTAL
+
+    def _total_for_reason(reason: str) -> float:
+        # See the identical helper in
+        # ``test_queue_cap_drops_excess_deferrals_and_increments_drop_counter``
+        # for the rationale — ``_metrics`` keys are tuples of label
+        # values in ``_labelnames`` order.
+        per_series = getattr(counter, "_metrics", {})
+        label_names = getattr(counter, "_labelnames", ())
+        if "reason" not in label_names:
+            return 0.0
+        reason_idx = label_names.index("reason")
+        total = 0.0
+        for label_values, snapshot in per_series.items():
+            if reason_idx < len(label_values) and label_values[reason_idx] == reason:
+                value_obj = getattr(snapshot, "_value", None)
+                if value_obj is not None and hasattr(value_obj, "get"):
+                    total += float(value_obj.get())
+        return total
+
+    baseline = _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
+    cap = sinks_module.MAX_DEFERRED_WARNING_EVENTS
+
+    # Saturate + drop 5 more.
+    for i in range(cap + 5):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"m{i}",
+        )
+    assert len(sink.queued) == cap
+    # 5 deferrals were dropped (i in 1000..1004 inclusive; the 1000th
+    # is accepted, the next 5 are dropped).
+    assert (
+        _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
+        == baseline + 5
+    )
+
+    # Drain via a stubbed kopf.event (the sink uses kopf directly).
+    import unittest.mock
+    with unittest.mock.patch.object(sinks_module.kopf, "event"):
+        flushed = sink.flush_for(namespace="ns", name="osc")
+    assert flushed == cap
+    assert sink.queued == []
+
+    # Re-fill to the cap; further deferrals drop again.
+    for i in range(cap + 2):
+        sink.defer_to_next_tick(
+            namespace="ns", name="osc", reason="R", message=f"n{i}",
+        )
+    assert len(sink.queued) == cap
+    assert (
+        _total_for_reason(sinks_module.DROP_REASON_QUEUE_FULL)
+        == baseline + 5 + 2
+    )

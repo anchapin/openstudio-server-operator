@@ -285,6 +285,66 @@ EVENTS_EMIT_FAILURES_TOTAL = Counter(
     labelnames=["reason"],
 )
 
+# Issue #310 — Queue-depth observability + backpressure cap for
+# ``QueuedKopfEventSink`` (``openstudio_operator.events_sinks``). The sink
+# owns a single FIFO queue of deferred Warning Events
+# (``(namespace, name, reason, message)`` tuples) that grows on every
+# :meth:`QueuedKopfEventSink.defer_to_next_tick` and drains only on the next
+# OSCM watch tick via :meth:`QueuedKopfEventSink.flush_for`. If the
+# apiserver watch stream stalls the queue grows unbounded — three hardened
+# call sites (the redis-URL guard #116, the redis-key-layout guard #163,
+# the status-store cap #171) all assume the drain fires on the next watch
+# event and will keep enqueueing otherwise. The same observability-gap
+# family motivated #44 (Resque worker set) and #66 (key-layout), so this
+# Gauge is the symmetric signal for the deferred-event queue: a sustained
+# nonzero value means the watch stream is unhealthy and the deferred
+# events are piling up; a value above ``MAX_DEFERRED_WARNING_EVENTS`` would
+# have been impossible before the cap existed. Set in
+# :meth:`QueuedKopfEventSink.defer_to_next_tick` (to ``len(self._queue)``
+# after the append-or-drop) and in :meth:`QueuedKopfEventSink.flush_for`
+# (to the post-drain length — typically 0 when the queue was solely this
+# CR's entries, but the residual is reported faithfully so multi-CR
+# backlogs are visible). Unlabelled — the queue is process-wide, not
+# per-CR; one series for the whole sink keeps cardinality bounded.
+WARNINGS_DEFERRED_QUEUE_DEPTH = Gauge(
+    "openstudio_operator_warnings_deferred_queue_depth",
+    "Depth of the in-process QueuedKopfEventSink queue (issue #310). Set "
+    "after every defer_to_next_tick and flush_for. Sustained nonzero "
+    "values mean the apiserver watch stream is stalled and Warning "
+    "Events are piling up; the cap at MAX_DEFERRED_WARNING_EVENTS "
+    "(1000) prevents unbounded growth, but the backpressure cap is the "
+    "last line — a healthy cluster reads 0 on every drain.",
+)
+
+# Issue #310 — backpressure drop counter. When the queue hits
+# ``MAX_DEFERRED_WARNING_EVENTS`` (1000) the next
+# :meth:`QueuedKopfEventSink.defer_to_next_tick` call is DROPPED
+# (not appended) and this counter is incremented. Labelled by ``reason``
+# so a future second drop reason (e.g. a per-reason cap) can share the
+# series without losing the original semantics. The initial vocabulary
+# is ``queue_full`` — the deferral was rejected because the queue was
+# at the cap. Without this counter a sustained drop storm is silent
+# (the user-facing Warning Event is lost AND the only signal is the
+# gauge plateauing at the cap, which is ambiguous with a healthy cap-
+# saturated system). Alert on
+# ``rate(openstudio_operator_warnings_deferred_dropped_total{reason=
+# "queue_full"}[5m]) > 0`` — a nonzero drop rate means Warning Events
+# were silently dropped and the operator's at-least-once deferred-event
+# contract (issue #234) is broken.
+WARNINGS_DEFERRED_DROPPED_TOTAL = Counter(
+    "openstudio_operator_warnings_deferred_dropped_total",
+    "Deferred Warning Events dropped by QueuedKopfEventSink before "
+    "appending (issue #310). Incremented inside defer_to_next_tick "
+    "when ``len(self._queue) >= MAX_DEFERRED_WARNING_EVENTS`` — the "
+    "deferral is rejected, not queued, so the user-facing Warning Event "
+    "is lost. Labelled by ``reason`` (initial vocabulary: ``queue_full``) "
+    "so a future second drop reason can share the series without losing "
+    "the original semantics. The companion "
+    "``openstudio_operator_warnings_deferred_queue_depth`` Gauge hits "
+    "the cap when this counter increments.",
+    labelnames=["reason"],
+)
+
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard; issue #87 —
 #: unconditional emission. Monotonic max of distinct Resque worker ids the
 #: operator has EVER observed in process lifetime (web_background_monitor,
