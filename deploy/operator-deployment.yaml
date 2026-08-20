@@ -93,6 +93,22 @@ spec:
             # bundle path that would mask a misconfigured in-cluster CA.
             - name: OPENSTUDIO_TLS_CA_BUNDLE
               value: ""
+            # Issue #401 — optional bearer-token authN for /metrics. Default
+            # empty = open plaintext gated only by the metrics-ingress
+            # NetworkPolicy (#166) — the documented default; do NOT make the
+            # token mandatory. To enable per-cluster:
+            #   1. kubectl -n openstudio-server create secret generic \
+            #        openstudio-operator-metrics-token --from-literal=token=<secret>
+            #   2. uncomment the metrics-token volumeMount + volume below,
+            #   3. set this value to /var/run/openstudio-metrics/token,
+            #   4. point BOTH httpGet probes at /healthz (see the probe note
+            #      below) — the kubelet cannot present a Bearer token, so
+            #      401s on /metrics would restart-loop the pod.
+            # The server re-reads the token file on every request, so Secret
+            # rotation takes effect without an operator restart; a missing or
+            # empty file fails CLOSED (every /metrics request 401s).
+            - name: OPENSTUDIO_METRICS_TOKEN_FILE
+              value: ""
           ports:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with
@@ -107,6 +123,12 @@ spec:
           # unresponsive for failureThreshold * periodSeconds (~90s);
           # readiness removes the pod from Service endpoints during boot.
           # The new pod resumes from the persisted CR .status (D04).
+          #
+          # Issue #401 — when the /metrics bearer token is enabled, change
+          # BOTH probe paths from /metrics to /healthz: the kubelet cannot
+          # present an Authorization header, and a 401 on /metrics counts
+          # as probe failure (restart loop). /healthz serves a bare 200
+          # with no exposition data, so it leaks nothing.
           livenessProbe:
             httpGet:
               path: /metrics
@@ -145,6 +167,20 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # Issue #401 — uncomment together with the metrics-token volume
+            # below AND the OPENSTUDIO_METRICS_TOKEN_FILE env value above to
+            # enable bearer-token authN on /metrics:
+            # - name: metrics-token
+            #   mountPath: /var/run/openstudio-metrics
+            #   readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        # Issue #401 — uncomment together with the metrics-token volumeMount
+        # above AND the OPENSTUDIO_METRICS_TOKEN_FILE env value above:
+        # - name: metrics-token
+        #   secret:
+        #     secretName: openstudio-operator-metrics-token
+        #     items:
+        #       - key: token
+        #         path: token
