@@ -141,6 +141,13 @@ def test_prune_role_is_least_privilege_enumerated():
 
 
 def test_prune_rolebinding_wires_sa_to_role():
+    """The storage-pruner RoleBinding must reference BOTH the prune Role
+    (by name) and the prune ServiceAccount (as a single subject of kind
+    ServiceAccount). This is the wiring that lets the CronJob pod run
+    with the least-privilege Role from
+    ``test_prune_role_is_least_privilege_enumerated`` — a Role that no
+    pod can assume is structurally correct but operationally dead, so
+    this test pins the roleRef + subject triple as one atomic check."""
     assert PRUNE_ROLEBINDING["roleRef"]["name"] == PRUNE_ROLE["metadata"]["name"]
     subject = PRUNE_ROLEBINDING["subjects"][0]
     assert subject["name"] == PRUNE_SA["metadata"]["name"]
@@ -156,6 +163,18 @@ def test_cronjob_schedule_and_single_flight():
 
 
 def test_cronjob_runs_entrypoint_from_pinned_operator_image():
+    """The prune CronJob must (a) be wired to the least-privilege
+    ``openstudio-storage-pruner-sa`` ServiceAccount and the
+    ``Never``/``backoffLimit=0`` single-attempt shape, (b) pin its
+    container image to the same SHA256 digest as
+    ``deploy/operator-deployment.yaml`` (issue #291 regression fence —
+    the mutable ``:dev`` tag combined with ``IfNotPresent`` previously
+    let the kubelet retain a cached image across ticks), and (c) use
+    ``imagePullPolicy: Always`` so the digest is re-pulled every tick
+    (defense in depth in case the digest-pinning invariant is ever
+    bypassed). The POD_NAMESPACE downward-API env var is also pinned
+    because the prune entrypoint reads it for namespace-scoped
+    resource lookups."""
     pod = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]
     assert pod["restartPolicy"] == "Never"
     assert CRONJOB["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 0
@@ -251,11 +270,37 @@ def test_every_deploy_workload_container_has_hardening_baseline():
     """Issue #162 / #115 acceptance: every container in every deploy/
     workload enforces the same six-field hardening baseline. A regression
     here re-opens the same escalation surface #115 closed for the
-    operator and #114 closed for the rclone Job."""
+    operator and #114 closed for the rclone Job.
+
+    The six fields enforced below match the explicit list at the head of
+    the #162 section comment (`runAsNonRoot`, `runAsUser`, `seccompProfile`
+    + `allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
+    `capabilities.drop`). The targeted ``test_storage_cronjob_container_
+    securitycontext_complete`` re-asserts the same six fields on the cron
+    container specifically; this test is the broad walk across every
+    container the operator runs (operator Deployment + prune CronJob
+    today; future deployments inherit the same baseline by routing
+    through ``_iter_workload_containers``)."""
     offenders = []
     for path_name, kind, name, container in _iter_workload_containers():
         sc = container.get("securityContext") or {}
         problems = []
+        if sc.get("allowPrivilegeEscalation") is not False:
+            problems.append(
+                f"allowPrivilegeEscalation={sc.get('allowPrivilegeEscalation')!r} "
+                "(must be False)"
+            )
+        if sc.get("readOnlyRootFilesystem") is not True:
+            problems.append(
+                f"readOnlyRootFilesystem={sc.get('readOnlyRootFilesystem')!r} "
+                "(must be True)"
+            )
+        if (sc.get("capabilities") or {}).get("drop") != ["ALL"]:
+            problems.append(
+                f"capabilities.drop="
+                f"{(sc.get('capabilities') or {}).get('drop')!r} "
+                "(must be ['ALL'])"
+            )
         if sc.get("runAsNonRoot") is not True:
             problems.append(f"runAsNonRoot={sc.get('runAsNonRoot')!r}")
         run_as_user = sc.get("runAsUser")
@@ -272,7 +317,8 @@ def test_every_deploy_workload_container_has_hardening_baseline():
                 (path_name, kind, name, container.get("name"), problems)
             )
     assert not offenders, (
-        f"containers missing #115/#162 hardening baseline: {offenders}"
+        f"containers missing #115/#162 six-field hardening baseline: "
+        f"{offenders}"
     )
 
 
@@ -495,10 +541,15 @@ def test_network_policy_manifest_exists_and_is_namespaced():
 
 
 def test_network_policy_default_deny_for_operator_surface():
-    """Default-deny + explicit allow: at least one policy whose podSelector
-    selects every operator-managed pod (manage-by label) and whose egress
-    list is restrictive. Operators in the surface (Deployment, CronJob,
-    archival Jobs) cannot egress to the public Internet by default."""
+    """Default-deny shape: at least one NetworkPolicy named ``*-deny-egress``
+    exists in ``deploy/network-policy.yaml`` and its ``spec.egress`` list
+    is empty (the strictest restrictive shape — an explicit allow-list
+    policy must be added in a sibling policy to grant egress). The
+    podSelector scope (operator-managed surface only) is a separate
+    invariant covered by
+    ``test_deny_egress_policy_selector_is_not_empty`` (issue #154) and
+    the helm-chart isolation invariant by
+    ``test_deny_egress_does_not_select_helm_chart_pods``."""
     # Find a deny-all policy by name prefix
     deny_policies = [
         d for d in NETPOL_DOCS
@@ -909,4 +960,126 @@ def test_no_port_443_egress_block_uses_kube_dns_placeholder_selector():
     assert not offenders, (
         f"port-443 egress blocks use k8s-app: kube-dns placeholder "
         f"selector (#225 regression): {offenders}"
+    )
+
+
+# ---- Issue #315: meta-test for deploy-manifests test file integrity ----
+#
+# The #291 fix surfaced a regression-fence test that locked in the bug
+# pattern it was supposed to fence against (image tag instead of digest,
+# ``IfNotPresent`` instead of ``Always``). Issue #315 is a follow-up
+# audit of the OTHER ~30 tests in this file for the same class of
+# "comment claims a property the assertion does NOT enforce" failure.
+#
+# The meta-test below does not replace the per-assertion review
+# (that still has to happen by hand — see PR body for the audit
+# output). It enforces the minimal structural invariants every test in
+# this file MUST satisfy so the next audit has fewer false positives
+# to chase:
+#
+#   1. Every top-level ``def test_*`` function is well-formed
+#      (signature ``()`` or ``(fixtures)`` — no required args that
+#      would silently swallow a value at import time).
+#   2. Every test has a docstring. This is the cheapest fence against
+#      the "silent invariant" failure: an author who cannot articulate
+#      the invariant in a docstring cannot truthfully claim the
+#      assertion enforces it.
+#   3. Every test body has at least one ``assert`` statement OR a
+#      ``raise``. Empty bodies (or ``pass``-only bodies) pass pytest
+#      with a vacuous success — the #291 class of failure starts
+#      exactly there.
+#
+# This is intentionally a coarse structural check, not a semantic
+# "does the comment match the assertion" verifier. That semantic
+# check requires reading the test in context and is what the #315
+# audit PR body records; automating it would re-create the
+# "encode-the-bug-as-a-feature" failure mode in the verifier itself.
+
+
+import ast
+import sys
+from pathlib import Path
+
+
+def _collect_test_functions():
+    """Walk this module's AST and yield (name, FunctionDef) for every
+    top-level ``def test_*`` function. Nested defs (helpers prefixed
+    ``test_``) are excluded — the convention in this file is helpers
+    start with ``_`` and tests start with ``test``, so a top-level
+    ``test_*`` is a real test. Nested ``def`` inside a test body
+    (e.g. parametrized loops) is also excluded."""
+    module = sys.modules[__name__]
+    module_file = module.__file__
+    if not module_file:
+        raise RuntimeError(f"cannot find source file for {__name__!r}")
+    source = Path(module_file).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    tests = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            tests.append((node.name, node))
+    return tests
+
+
+def test_deploy_manifests_self_collect():
+    """Smoke test: ``_collect_test_functions`` finds this test plus every
+    other top-level ``test_*`` in the module. The audit meta-test below
+    uses the same walker, so this is the canary that the AST walk
+    itself is wired up correctly."""
+    found = {name for name, _ in _collect_test_functions()}
+    assert "test_deploy_manifests_self_collect" in found
+    # Cross-check against a hardcoded minimum so adding tests never
+    # silently shrinks the audit set (e.g. by renaming them out of the
+    # ``test_`` prefix). The number grows as new tests are added.
+    assert len(found) >= 28, (
+        f"expected at least 28 test_* functions in this file, found "
+        f"{len(found)}: {sorted(found)}"
+    )
+
+
+def test_every_test_function_has_docstring():
+    """#315 structural fence: every top-level ``test_*`` in this file
+    MUST have a docstring. The docstring is the only place the author
+    articulates the invariant the test enforces — without one, a
+    later reviewer cannot tell whether the assertion still matches the
+    comment claim, which is exactly the "asserts the bug as a feature"
+    failure mode #315 audits for. A test that is hard to document is a
+    test that is hiding its intent."""
+    missing = []
+    for name, node in _collect_test_functions():
+        doc = ast.get_docstring(node)
+        if not doc or not doc.strip():
+            missing.append(name)
+    assert not missing, (
+        "tests without docstrings — every test in this file must "
+        "articulate the invariant it enforces in the docstring "
+        "(issue #315 audit, regression-fence): "
+        f"{missing}"
+    )
+
+
+def test_every_test_function_has_assert_or_raise():
+    """#315 structural fence: every top-level ``test_*`` MUST contain at
+    least one ``assert`` statement OR ``raise`` statement in its body.
+    An empty test body (or ``pass``-only body) passes pytest with
+    vacuous success and is the structural shape the #291 bug-as-
+    feature regression fence took. Walking the AST catches it before
+    the test reaches CI."""
+    offenders = []
+    for name, node in _collect_test_functions():
+        has_assert_or_raise = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assert):
+                has_assert_or_raise = True
+                break
+            if isinstance(child, ast.Raise):
+                has_assert_or_raise = True
+                break
+        if not has_assert_or_raise:
+            offenders.append(name)
+    assert not offenders, (
+        "tests with no assert or raise — an empty body is a vacuous "
+        "pass and re-creates the #291 'asserts the bug as a feature' "
+        "shape (issue #315 audit, regression-fence): "
+        f"{offenders}"
     )
