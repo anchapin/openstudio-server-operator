@@ -39,6 +39,18 @@ spec:
       labels:
         app: worker
     spec:
+      # Issue #388 — PSS `restricted` hardening. Mirrors
+      # scripts/manifests/04-web.yaml + scripts/manifests/05-web-background
+      # .yaml (same Rails image, same Secret mounts). The worker scratch
+      # volume (`osdata-worker` emptyDir) is owned by UID 1000 via the
+      # pod-level fsGroup below, so the non-root container can still
+      # write to /mnt/openstudio.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
       containers:
         - name: worker
           image: nrel/openstudio-server:3.11.0@sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975
@@ -63,6 +75,20 @@ spec:
                 secretKeyRef:
                   name: openstudio-mongo
                   key: password
+          # Issue #388 — container-level PSS `restricted` baseline matching
+          # deploy/operator-deployment.yaml:95-103 and
+          # deploy/storage-cronjob.yaml:162-170. readOnlyRootFilesystem
+          # requires writable /tmp for OpenStudio / Resque buffering — the
+          # emptyDir volume below provides it.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
           lifecycle:
             preStop:
               exec:
@@ -86,6 +112,8 @@ spec:
           volumeMounts:
             - name: osdata-worker
               mountPath: /mnt/openstudio
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 250m
@@ -95,4 +123,6 @@ spec:
       terminationGracePeriodSeconds: 5200
       volumes:
         - name: osdata-worker
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}

@@ -500,47 +500,84 @@ def test_cronjob_pod_mounts_no_volumes_and_no_secret_refs():
 def _iter_workload_containers():
     """Yield (manifest_name, doc_kind, doc_name, container) for every
     container in every Deployment / StatefulSet / DaemonSet / Job /
-    CronJob under deploy/. Other kinds (CRD, RBAC, NetworkPolicy, Secret,
-    ServiceAccount, ScaledObject, ...) carry no containers and are
-    skipped. Manifests that fail to YAML-parse are skipped — the iterator
-    is defensive because `deploy/operator-deployment.yaml` historically
-    has hand-edited indentation quirks (#115-era work) that PyYAML rejects
-    even though `kubectl` accepts the same file."""
-    for path in sorted(DEPLOY.glob("*.yaml")):
-        try:
-            docs = list(yaml.safe_load_all(path.read_text()))
-        except yaml.YAMLError:
-            # Out-of-scope to repair an unrelated indentation bug here.
-            # The targeted `test_storage_cronjob_container_securitycontext_complete`
-            # and the file-level `kubectl apply --dry-run=client` walk
-            # (run by docs/validation.md) catch the same shape for the
-            # prune CronJob.
-            continue
-        for doc in docs:
-            if not doc:
+    CronJob under deploy/ AND every container in the kind-validation
+    helm-chart overlay under scripts/manifests/ (issue #388 widening).
+    Other kinds (CRD, RBAC, NetworkPolicy, Secret, ServiceAccount,
+    ScaledObject, Namespace, PV, PVC, Service, ...) carry no containers
+    and are skipped. Manifests that fail to YAML-parse are skipped — the
+    iterator is defensive because `deploy/operator-deployment.yaml`
+    historically has hand-edited indentation quirks (#115-era work) that
+    PyYAML rejects even though `kubectl` accepts the same file.
+
+    Issue #388 scope note: the scripts/manifests/ tree includes the
+    kind-validation stand-ins for the helm chart's StatefulSet-like
+    workloads (mongo, redis, NFS hostPath). Those workloads do NOT yet
+    carry the PSS `restricted` baseline (they're third-party images whose
+    entrypoints assume uid 0 to chown data dirs); follow-up issue #394
+    owns hardening them. This iterator SKIPS them explicitly so the
+    broadened glob doesn't fail on workloads the issue's scope guard
+    declared out of scope. The skipped filenames are the only point of
+    contact between #388 (Rails pods + namespace label) and #394
+    (stateful workloads) — when #394 lands, deleting these two entries
+    from the skip set is the only edit needed here.
+    """
+    manifests = [
+        ("deploy/", DEPLOY.glob("*.yaml")),
+        (
+            "scripts/manifests/",
+            sorted((Path(__file__).resolve().parents[1] / "scripts" / "manifests").glob("*.yaml")),
+        ),
+    ]
+    # Filenames whose containers are out of scope for #388 (see #394).
+    skipped_helm_overlay_files = {"01-mongo.yaml", "02-redis.yaml"}
+    for prefix, paths in manifests:
+        for path in paths:
+            # Use a stable label relative to the repo root, mirroring
+            # the pre-#388 path-only convention (the deploy/ iterator
+            # yielded `path.name` only, so emit both shapes for the new
+            # `scripts/manifests/<file>` group to keep error messages
+            # self-identifying).
+            if prefix == "deploy/":
+                label_prefix = ""
+            else:
+                label_prefix = prefix
+                if path.name in skipped_helm_overlay_files:
+                    continue
+            try:
+                docs = list(yaml.safe_load_all(path.read_text()))
+            except yaml.YAMLError:
+                # Out-of-scope to repair an unrelated indentation bug here.
+                # The targeted `test_storage_cronjob_container_securitycontext_complete`
+                # and the file-level `kubectl apply --dry-run=client` walk
+                # (run by docs/validation.md) catch the same shape for the
+                # prune CronJob.
                 continue
-            kind = doc.get("kind")
-            name = doc.get("metadata", {}).get("name", "<unnamed>")
-            if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
-                containers = (
-                    doc.get("spec", {})
-                    .get("template", {})
-                    .get("spec", {})
-                    .get("containers", [])
-                )
-                for c in containers:
-                    yield path.name, kind, name, c
-            elif kind == "CronJob":
-                containers = (
-                    doc.get("spec", {})
-                    .get("jobTemplate", {})
-                    .get("spec", {})
-                    .get("template", {})
-                    .get("spec", {})
-                    .get("containers", [])
-                )
-                for c in containers:
-                    yield path.name, kind, name, c
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                name = doc.get("metadata", {}).get("name", "<unnamed>")
+                label = f"{label_prefix}{path.name}"
+                if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+                    containers = (
+                        doc.get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                        .get("containers", [])
+                    )
+                    for c in containers:
+                        yield label, kind, name, c
+                elif kind == "CronJob":
+                    containers = (
+                        doc.get("spec", {})
+                        .get("jobTemplate", {})
+                        .get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                        .get("containers", [])
+                    )
+                    for c in containers:
+                        yield label, kind, name, c
 
 
 def test_every_deploy_workload_container_has_hardening_baseline():
@@ -850,37 +887,60 @@ def _pod_securitycontext_problems(sc):
 
 def _iter_deploy_workload_pod_specs():
     """Yield (manifest_name, doc_kind, doc_name, pod_spec) for every
-    Deployment / StatefulSet / DaemonSet / Job / CronJob under deploy/.
-    Mirrors `_iter_workload_containers` but yields the pod-level spec,
-    which is where `securityContext` (the #161 defense-in-depth block)
-    lives. Defensive YAML handling matches the container iterator —
-    hand-edited indentation quirks in some deploy/ manifests would
-    otherwise turn this into a parse-error tripwire unrelated to the
-    acceptance criterion."""
-    for path in sorted(DEPLOY.glob("*.yaml")):
-        try:
-            docs = list(yaml.safe_load_all(path.read_text()))
-        except yaml.YAMLError:
-            continue
-        for doc in docs:
-            if not doc:
+    Deployment / StatefulSet / DaemonSet / Job / CronJob under deploy/
+    AND the kind-validation helm-chart overlay under scripts/manifests/
+    (issue #388 widening). Mirrors `_iter_workload_containers` but
+    yields the pod-level spec, which is where `securityContext` (the
+    #161 defense-in-depth block) lives. Defensive YAML handling matches
+    the container iterator — hand-edited indentation quirks in some
+    deploy/ manifests would otherwise turn this into a parse-error
+    tripwire unrelated to the acceptance criterion.
+
+    Issue #388 scope note: same as `_iter_workload_containers` — the
+    stateful helm-chart stand-ins (mongo, redis) are explicitly skipped
+    because follow-up #394 owns their hardening. See that helper's
+    docstring for the #388/#394 division-of-labor rationale.
+    """
+    manifests = [
+        ("deploy/", DEPLOY.glob("*.yaml")),
+        (
+            "scripts/manifests/",
+            sorted((Path(__file__).resolve().parents[1] / "scripts" / "manifests").glob("*.yaml")),
+        ),
+    ]
+    skipped_helm_overlay_files = {"01-mongo.yaml", "02-redis.yaml"}
+    for prefix, paths in manifests:
+        for path in paths:
+            if prefix == "deploy/":
+                label_prefix = ""
+            else:
+                label_prefix = prefix
+                if path.name in skipped_helm_overlay_files:
+                    continue
+            try:
+                docs = list(yaml.safe_load_all(path.read_text()))
+            except yaml.YAMLError:
                 continue
-            kind = doc.get("kind")
-            name = doc.get("metadata", {}).get("name", "<unnamed>")
-            if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
-                pod_spec = (
-                    doc.get("spec", {}).get("template", {}).get("spec", {})
-                )
-                yield path.name, kind, name, pod_spec
-            elif kind == "CronJob":
-                pod_spec = (
-                    doc.get("spec", {})
-                    .get("jobTemplate", {})
-                    .get("spec", {})
-                    .get("template", {})
-                    .get("spec", {})
-                )
-                yield path.name, kind, name, pod_spec
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                name = doc.get("metadata", {}).get("name", "<unnamed>")
+                label = f"{label_prefix}{path.name}"
+                if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+                    pod_spec = (
+                        doc.get("spec", {}).get("template", {}).get("spec", {})
+                    )
+                    yield label, kind, name, pod_spec
+                elif kind == "CronJob":
+                    pod_spec = (
+                        doc.get("spec", {})
+                        .get("jobTemplate", {})
+                        .get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                    )
+                    yield label, kind, name, pod_spec
 
 
 def test_all_workloads_have_pod_level_securitycontext():
@@ -1728,3 +1788,236 @@ def test_prune_job_scope_vap_label_keys_match_archival_manifest():
     for key, value in ARCHIVAL_LABELS.items():
         assert key in full_expr
         assert f'"{value}"' in full_expr
+
+
+# ---- Issue #388: PSS `restricted` enforced at the namespace level ----
+#
+# The operator + prune CronJob + archival Job all declare PSS `restricted`
+# at the pod level (deploy/operator-deployment.yaml:47-52,
+# deploy/storage-cronjob.yaml:112-117, archival.py:225-232). Until #388
+# the namespace itself carried no PSS labels, so the per-pod
+# `securityContext` was defense-in-depth, not enforced: a future
+# workload added to `openstudio-server` with `runAsUser: 0` and
+# `privileged: true` would have passed kubelet admission. The fix adds
+# the three canonical PSS labels:
+#
+#   * pod-security.kubernetes.io/enforce=restricted — reject at admission.
+#   * pod-security.kubernetes.io/enforce-version=latest — pin to the PSS
+#     profile bundled with the running cluster (the documented way to
+#     stay current with new restricted-profile restrictions).
+#   * pod-security.kubernetes.io/audit=restricted — record non-compliant
+#     pods in the audit log without rejecting them, the "warn first"
+#     staging shape.
+#
+# The structural test below pins all three labels and their exact values
+# so a regression (typo, value drop, label removal) fails loudly at CI
+# rather than silently letting a permissive namespace through. Paired
+# with the helm-chart pod-level + container-level hardening covered by
+# the existing `_iter_workload_containers` and `_iter_deploy_workload_pod_specs`
+# walkers (which #388 widened to include scripts/manifests/*.yaml), the
+# combined posture is "enforced at the namespace AND defense-in-depth on
+# every pod".
+NAMESPACE_MANIFEST = (
+    Path(__file__).resolve().parents[1] / "scripts" / "manifests" / "00-namespace.yaml"
+)
+NAMESPACE_DOC = next(
+    iter(yaml.safe_load_all(NAMESPACE_MANIFEST.read_text()))
+)
+EXPECTED_PSS_LABELS = {
+    "pod-security.kubernetes.io/enforce": "restricted",
+    "pod-security.kubernetes.io/enforce-version": "latest",
+    "pod-security.kubernetes.io/audit": "restricted",
+}
+
+
+def test_namespace_has_pss_enforce_audit_labels():
+    """Issue #388 acceptance #1: the `openstudio-server` namespace
+    manifest carries the three Pod Security Standards labels
+    (`enforce`, `enforce-version`, `audit`). A regression that drops
+    any of the three turns the per-pod `securityContext` from
+    defense-in-depth into the only line of defense — silent if a
+    future workload forgets the pod-level block entirely."""
+    assert NAMESPACE_MANIFEST.exists(), (
+        f"{NAMESPACE_MANIFEST} is missing — the openstudio-server "
+        "namespace manifest is required for the PSS label gate (issue #388)"
+    )
+    assert NAMESPACE_DOC.get("kind") == "Namespace", (
+        f"scripts/manifests/00-namespace.yaml must declare a Namespace, "
+        f"got kind={NAMESPACE_DOC.get('kind')!r}"
+    )
+    assert NAMESPACE_DOC["metadata"]["name"] == "openstudio-server", (
+        f"namespace manifest must name `openstudio-server`, got "
+        f"{NAMESPACE_DOC['metadata']['name']!r}"
+    )
+    labels = NAMESPACE_DOC["metadata"].get("labels") or {}
+    missing = {
+        key: {"expected": value, "got": labels.get(key)}
+        for key, value in EXPECTED_PSS_LABELS.items()
+        if labels.get(key) != value
+    }
+    assert not missing, (
+        "openstudio-server namespace is missing the PSS `restricted` "
+        f"labels (issue #388): {missing}. Without these labels the "
+        "per-pod securityContext is defense-in-depth, not enforced — a "
+        "future workload with runAsUser: 0 / privileged: true would pass "
+        "kubelet admission. The labels must be: "
+        f"{EXPECTED_PSS_LABELS!r}."
+    )
+
+
+HELM_CHART_POD_BASELINE_FILES = (
+    "scripts/manifests/04-web.yaml",
+    "scripts/manifests/05-web-background.yaml",
+    "scripts/manifests/06-worker.yaml",
+)
+HELM_CHART_POD_NAMES = {
+    "scripts/manifests/04-web.yaml": "web",
+    "scripts/manifests/05-web-background.yaml": "web-background",
+    "scripts/manifests/06-worker.yaml": "worker",
+}
+
+
+def _helm_chart_pod_baseline_problems(rel_path):
+    """Return a list of human-readable problems with the helm-chart
+    pod manifest at `rel_path`; empty list means the manifest satisfies
+    the PSS `restricted` baseline. Shared between
+    ``test_helm_chart_pods_have_pod_level_securitycontext`` (pod-level)
+    and ``test_helm_chart_pods_have_container_securitycontext_baseline``
+    (container-level) so the two regression fences read the same way."""
+    manifest_path = Path(__file__).resolve().parents[1] / rel_path
+    docs = list(yaml.safe_load_all(manifest_path.read_text()))
+    deployment = next(
+        (d for d in docs if d and d.get("kind") == "Deployment"), None
+    )
+    if deployment is None:
+        return [f"{rel_path}: no Deployment doc found"]
+    pod_spec = deployment["spec"]["template"]["spec"]
+    problems = []
+    # Pod-level: defense-in-depth (mirrors operator + prune CronJob).
+    pod_sc = pod_spec.get("securityContext") or {}
+    if not pod_sc:
+        problems.append("pod-level securityContext missing")
+    else:
+        if pod_sc.get("runAsNonRoot") is not True:
+            problems.append(
+                f"pod-level runAsNonRoot={pod_sc.get('runAsNonRoot')!r} "
+                "(must be True)"
+            )
+        if not isinstance(pod_sc.get("runAsUser"), int) or pod_sc.get("runAsUser") == 0:
+            problems.append(
+                f"pod-level runAsUser={pod_sc.get('runAsUser')!r} "
+                "(must be non-zero int)"
+            )
+        if (pod_sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+            problems.append(
+                f"pod-level seccompProfile.type="
+                f"{(pod_sc.get('seccompProfile') or {}).get('type')!r} "
+                "(must be 'RuntimeDefault')"
+            )
+    # Container-level: six-field baseline (mirrors #115 / #162).
+    containers = pod_spec.get("containers") or []
+    if not containers:
+        problems.append("no containers in pod spec")
+    for c in containers:
+        c_name = c.get("name", "<unnamed>")
+        c_sc = c.get("securityContext") or {}
+        if not c_sc:
+            problems.append(f"container {c_name!r}: securityContext missing")
+            continue
+        if c_sc.get("allowPrivilegeEscalation") is not False:
+            problems.append(
+                f"container {c_name!r}: allowPrivilegeEscalation="
+                f"{c_sc.get('allowPrivilegeEscalation')!r} (must be False)"
+            )
+        if c_sc.get("readOnlyRootFilesystem") is not True:
+            problems.append(
+                f"container {c_name!r}: readOnlyRootFilesystem="
+                f"{c_sc.get('readOnlyRootFilesystem')!r} (must be True)"
+            )
+        if (c_sc.get("capabilities") or {}).get("drop") != ["ALL"]:
+            problems.append(
+                f"container {c_name!r}: capabilities.drop="
+                f"{(c_sc.get('capabilities') or {}).get('drop')!r} "
+                "(must be ['ALL'])"
+            )
+        if c_sc.get("runAsNonRoot") is not True:
+            problems.append(
+                f"container {c_name!r}: runAsNonRoot="
+                f"{c_sc.get('runAsNonRoot')!r} (must be True)"
+            )
+        if not isinstance(c_sc.get("runAsUser"), int) or c_sc.get("runAsUser") == 0:
+            problems.append(
+                f"container {c_name!r}: runAsUser={c_sc.get('runAsUser')!r} "
+                "(must be non-zero int)"
+            )
+        if (c_sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+            problems.append(
+                f"container {c_name!r}: seccompProfile.type="
+                f"{(c_sc.get('seccompProfile') or {}).get('type')!r} "
+                "(must be 'RuntimeDefault')"
+            )
+    return problems
+
+
+def test_helm_chart_pods_have_pod_level_securitycontext():
+    """Issue #388 acceptance #2 (pod-level half): the three Rails pods
+    in the kind-validation helm-chart overlay (web, web-background,
+    worker) carry a non-empty pod-level `securityContext` with
+    runAsNonRoot + non-zero runAsUser + seccompProfile
+    RuntimeDefault — the same shape as deploy/operator-deployment.yaml
+    :47-52 and deploy/storage-cronjob.yaml:112-117. Mirrors
+    ``test_all_workloads_have_pod_level_securitycontext`` but pinned to
+    the three issue #388 manifests so a regression that drops the pod-
+    level block on any of them fails with a targeted message naming
+    the exact file. (Stateful helm-chart stand-ins — mongo, redis, NFS
+    — are out of scope per the issue's scope guard; #394 owns them.)"""
+    offenders = {}
+    for rel_path in HELM_CHART_POD_BASELINE_FILES:
+        problems = _helm_chart_pod_baseline_problems(rel_path)
+        # Filter to pod-level problems only — the container-level check
+        # has its own dedicated test below.
+        pod_only = [
+            p for p in problems
+            if p.startswith("pod-level")
+            or p.endswith("securityContext missing")
+            and "container" not in p
+        ]
+        if pod_only:
+            offenders[rel_path] = pod_only
+    assert not offenders, (
+        "helm-chart pods are missing the #161/#388 pod-level "
+        "securityContext baseline (issue #388): "
+        f"{offenders}. The namespace label set in #388 turns this from "
+        "defense-in-depth to enforced — every workload must satisfy the "
+        "baseline or admission will reject it."
+    )
+
+
+def test_helm_chart_pods_have_container_securitycontext_baseline():
+    """Issue #388 acceptance #2 (container-level half): the three
+    Rails pods in the kind-validation helm-chart overlay carry the same
+    six-field container-level baseline the operator + prune CronJob
+    already enforce (allowPrivilegeEscalation=false,
+    readOnlyRootFilesystem=true, capabilities.drop=[ALL],
+    runAsNonRoot=true, runAsUser=<non-zero>, seccompProfile.type=
+    RuntimeDefault). Targeted per-file regression fence: a regression
+    that drops one field on one pod fails loudly with the file +
+    offending field name."""
+    offenders = {}
+    for rel_path in HELM_CHART_POD_BASELINE_FILES:
+        problems = _helm_chart_pod_baseline_problems(rel_path)
+        container_only = [
+            p for p in problems
+            if p.startswith("container ")
+            or p == "no containers in pod spec"
+            or p.endswith("securityContext missing")
+        ]
+        if container_only:
+            offenders[rel_path] = container_only
+    assert not offenders, (
+        "helm-chart pods are missing the #115/#162/#388 container-level "
+        "hardening baseline (issue #388): "
+        f"{offenders}. The same six fields the operator + prune CronJob "
+        "enforce must apply here so the PSS `restricted` namespace label "
+        "added by #388 does not reject these pods at admission."
+    )
