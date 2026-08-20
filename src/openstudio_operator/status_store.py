@@ -30,7 +30,6 @@ module's :func:`_parse_utc` is a thin wrapper that re-raises ``ValueError`` as
 from __future__ import annotations
 
 import random
-import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +37,7 @@ from typing import Any
 
 from kubernetes.client import ApiException, CustomObjectsApi
 
+from ._retry import _sleep
 from ._time import parse_iso_utc
 from .metrics import (
     STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL,
@@ -120,11 +120,6 @@ class StatusStoreError(Exception):
 
 class StatusStoreConflictError(StatusStoreError):
     """The status patch kept conflicting (409) past MAX_CONFLICT_RETRIES."""
-
-
-def _sleep(seconds: float) -> None:
-    """Separate seam so tests can record backoff instead of sleeping."""
-    time.sleep(seconds)
 
 
 def _conflict_backoff(attempt: int) -> float:

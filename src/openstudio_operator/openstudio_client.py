@@ -44,14 +44,11 @@ import requests
 
 from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS
 
+from ._retry import _sleep
 from ._time import parse_iso_utc
 from .redis_client import OperatorConfigError
 
 _TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
-
-
-def _sleep(seconds: float) -> None:
-    time.sleep(seconds)
 
 
 _PEM_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
