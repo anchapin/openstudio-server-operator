@@ -78,9 +78,10 @@ edge cases (`#246` `#247` `#248` `#249`).
   import time; the singleton guard (`#14`) cross-checks the Python
   registry against the kopf registry at gate time. The four pre-existing
   handlers (`analysis_sla`, `datapoint_watchdog`, `web_background_monitor`,
-  `worker_recycler`) remain registered with kopf directly; their IDs are
-  listed in `KNOWN_LEGACY_OSCM_HANDLER_IDS` so the cross-check passes
-  for them without retrofitting a `register()` call.
+  `worker_recycler`) were grandfathered via `KNOWN_LEGACY_OSCM_HANDLER_IDS`
+  so the cross-check passed for them without retrofitting a `register()`
+  call. (`#285` retires that whitelist — every OSCM handler now calls
+  `register()` explicitly.)
 - **`#251`** — `:func:`openstudio_operator._k8s.deployment_label_selector``
   + `:class:`openstudio_operator._k8s.DeploymentReader`` shared K8s
   helpers. The previously cross-imported `deployment_label_selector`
@@ -236,6 +237,16 @@ edge cases (`#246` `#247` `#248` `#249`).
   test count claim aligned to `529 tests across 28 files` (was 342/17
   pre-`#178`); `docs/kind-validation.md` acceptance criteria refreshed
   to the current 16+4+1 metric surface and the current test count.
+- **`#285`** — `KNOWN_LEGACY_OSCM_HANDLER_IDS` retired. The four
+  pre-`#250` OSCM timers (`analysis_sla`, `datapoint_watchdog`,
+  `web_background_monitor`, `worker_recycler`) now call
+  `register(handler_id, fn)` at module import time, so the singleton
+  guard's cross-check has no exemptions and the Python-level registry
+  is the SOLE source of truth for OSCM handler ids known to the gate.
+  New CI gate
+  `tests/test_singleton_registry_coverage.py::test_no_oscm_handler_orphan_or_legacy_whitelist`
+  pins both halves of the structural invariant (no orphan + no
+  whitelist); re-introducing either fails the test loudly.
 - **`#244`** — `README.md` + `AGENTS.md` Repository layout sections
   list the four new shared-utility modules (`events_sinks.py`, `_k8s.py`,
   `_oscm_handlers.py`, `logging_setup.py`).
