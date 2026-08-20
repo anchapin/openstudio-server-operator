@@ -409,6 +409,160 @@ def test_cronjob_image_digest_matches_operator_deployment():
     )
 
 
+# ---- Issue #306: storage-prune CronJob exposes /metrics on port 9090 -------
+#
+# The prune entrypoint now calls start_metrics_server() at the top of main()
+# (matching the operator's pattern) and the CronJob pod exposes the same
+# conventional Prometheus port (METRICS_PORT=9090). The endpoint is gated
+# by the parallel ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy
+# in deploy/network-policy.yaml — same Prometheus-style allow-list (namespace-
+# matched scraper + same-namespace peer) used for the operator's /metrics
+# (#166). The two targets are intentionally distinct policy objects because
+# the pod labels differ (the operator carries ``app: openstudio-operator`` and
+# the CronJob carries ``app.kubernetes.io/component: storage-pruner``);
+# widening the operator's policy with an OR selector would silently broaden
+# the surface, so the two-policy split is the regression fence.
+
+
+def test_storage_cronjob_exposes_metrics_port_9090():
+    """Issue #306 acceptance: the prune CronJob container exposes
+    containerPort 9090 (the same METRICS_PORT as the operator). Pre-fix
+    the CronJob had no `ports:` block at all — the prune entrypoint's
+    ``start_metrics_server()`` call bound the port on the pod IP but no
+    containerPort declaration meant a service / readiness probe could
+    not see it, and the scrape pattern was implicit. The post-fix shape
+    mirrors deploy/operator-deployment.yaml:88-91 (name: metrics,
+    containerPort: 9090) so the two scrape targets are structurally
+    identical."""
+    container = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    ports = container.get("ports") or []
+    metrics_ports = [
+        p for p in ports if p.get("containerPort") == 9090
+    ]
+    assert len(metrics_ports) == 1, (
+        f"prune CronJob must expose exactly one containerPort 9090, "
+        f"got {ports!r}"
+    )
+    assert metrics_ports[0].get("name") == "metrics", (
+        f"prune CronJob metrics port must be named 'metrics' to mirror "
+        f"deploy/operator-deployment.yaml:89, got {metrics_ports[0]!r}"
+    )
+
+
+def _storage_pruner_metrics_ingress_policy():
+    """Locate the storage-prune CronJob's dedicated ingress policy.
+
+    The operator's ``openstudio-operator-metrics-ingress`` policy (#166)
+    is selector-scoped to ``app: openstudio-operator`` (the operator pod
+    carries that label), so it does NOT select the CronJob pod — which
+    carries ``app.kubernetes.io/component: storage-pruner`` instead. The
+    two-policy split is the regression fence; this helper returns the
+    dedicated policy added by #306."""
+    matches = [
+        d for d in NETPOL_DOCS
+        if "storage-pruner-metrics-ingress" in d["metadata"]["name"]
+    ]
+    assert matches, (
+        "no openstudio-storage-pruner-metrics-ingress NetworkPolicy in "
+        "deploy/network-policy.yaml — the prune CronJob's /metrics on "
+        "port 9090 is unauthenticated and would be readable by every "
+        "in-cluster pod (#306)"
+    )
+    return matches[0]
+
+
+def test_storage_pruner_metrics_ingress_policy_selects_cronjob_pod():
+    """Issue #306 acceptance: the storage-prune CronJob's metrics-ingress
+    policy targets the CronJob pod via the
+    ``app.kubernetes.io/component: storage-pruner`` label — the SAME
+    label the CronJob pod template carries at
+    deploy/storage-cronjob.yaml:73-74 + :92-93. Mismatching the selector
+    would silently leave the endpoint unauthenticated against the
+    scraping allow-list."""
+    policy = _storage_pruner_metrics_ingress_policy()
+    assert policy["metadata"]["namespace"] == "openstudio-server"
+    assert "Ingress" in policy["spec"]["policyTypes"]
+    selector = policy["spec"]["podSelector"]["matchLabels"]
+    assert selector.get("app.kubernetes.io/component") == "storage-pruner"
+    # The operator pod does NOT carry that component label — verify the
+    # split is genuinely two policies, not one with a broad OR selector.
+    assert "app" not in selector or selector["app"] != "openstudio-operator", (
+        "storage-pruner-metrics-ingress should NOT select the operator "
+        "pod; the operator's metrics-ingress policy (#166) owns that "
+        "selector. A duplication would silently double the surface."
+    )
+
+
+def test_storage_pruner_metrics_ingress_restricts_to_port_9090():
+    """The only port allowed by the ingress rule is 9090/TCP — same
+    invariant as the operator's policy (#166). No plaintext risky ports,
+    no other operator surface leaks through this policy."""
+    policy = _storage_pruner_metrics_ingress_policy()
+    ingress_rules = policy["spec"]["ingress"]
+    assert ingress_rules, "ingress rules must not be empty"
+    allowed_ports = set()
+    for rule in ingress_rules:
+        for port in rule.get("ports", []):
+            assert port["protocol"] == "TCP", (
+                f"only TCP allowed on /metrics, got {port['protocol']}"
+            )
+            allowed_ports.add(port["port"])
+    assert allowed_ports == {9090}, (
+        f"storage-pruner /metrics ingress must allow only port 9090, "
+        f"got {allowed_ports}"
+    )
+
+
+def test_storage_pruner_metrics_ingress_has_prometheus_and_peer_allow():
+    """Same Prometheus-style allow-list as the operator's policy (#166 /
+    AGENTS.md "Working rules"): a namespace-matched scraper + a same-
+    namespace peer. Cluster admins running a different scraper namespace
+    MUST edit the label match — the test is the regression fence that
+    prompts the rename."""
+    policy = _storage_pruner_metrics_ingress_policy()
+    rule = policy["spec"]["ingress"][0]
+    from_selectors = rule["from"]
+    has_namespace_selector = any(
+        "namespaceSelector" in peer for peer in from_selectors
+    )
+    has_same_ns_peer = any(
+        peer.get("podSelector") == {} for peer in from_selectors
+    )
+    assert has_namespace_selector, (
+        "storage-pruner-metrics-ingress must include a namespaceSelector "
+        "pointing at the cluster's scraper namespace (default `prometheus`); "
+        "see AGENTS.md Working rules for the cluster-admin opt-in."
+    )
+    assert has_same_ns_peer, (
+        "storage-pruner-metrics-ingress must include an empty podSelector "
+        "to allow co-located scrapers (e.g. sidecar) in openstudio-server"
+    )
+
+
+def test_storage_cronjob_pod_labels_match_ingress_policy_selectors():
+    """Issue #306 regression fence: the CronJob pod template must carry
+    every label the new ingress policy requires. The CronJob carries
+    ``app.kubernetes.io/managed-by: openstudio-operator`` +
+    ``app.kubernetes.io/component: storage-pruner`` at lines :91-93;
+    dropping the managed-by label would silently deselect the CronJob
+    from BOTH the metrics-ingress (#306) AND the storage-egress (#112)
+    policies — the scrape would 0/1 and the storage egress would fall
+    back to the default-deny outcome. Mirrors #224's ``app: openstudio-
+    operator`` regression-fence pattern, scoped to the CronJob."""
+    cron_pod_labels = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["metadata"]["labels"]
+    policy = _storage_pruner_metrics_ingress_policy()
+    match_labels = policy["spec"]["podSelector"]["matchLabels"]
+    missing = {
+        key: {"selector_requires": value, "pod_has": cron_pod_labels.get(key)}
+        for key, value in match_labels.items()
+        if cron_pod_labels.get(key) != value
+    }
+    assert not missing, (
+        "storage-cronjob pod template is missing labels required by "
+        f"openstudio-storage-pruner-metrics-ingress (#306): {missing}"
+    )
+
+
 def _pod_securitycontext_problems(sc):
     """Return a list of human-readable problems with a pod-level
     securityContext dict; empty list means the baseline is satisfied.
@@ -902,6 +1056,14 @@ def test_operator_pod_template_carries_union_of_network_policy_matchlabels():
     operator_labels = OPERATOR_DEPLOYMENT["spec"]["template"]["metadata"]["labels"]
     offenders = []
     for policy in NETPOL_DOCS:
+        # Issue #306 — the storage-pruner-metrics-ingress policy is
+        # scoped to the CronJob pod (label `app.kubernetes.io/component:
+        # storage-pruner`), NOT the operator pod. The operator is
+        # explicitly out of scope here; the matching acceptance criterion
+        # for the new policy lives in
+        # `test_storage_cronjob_pod_labels_match_ingress_policy_selectors`.
+        if "storage-pruner-metrics-ingress" in policy["metadata"]["name"]:
+            continue
         match_labels = policy["spec"].get("podSelector", {}).get("matchLabels", {})
         if not match_labels:
             # matchExpressions-only selectors are out of scope for this

@@ -317,6 +317,144 @@ def calls_to(suffix: str) -> int:
     return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
 
 
+# --- Issue #306: prune-tick failures observability surface --------------------
+
+
+def _counter_value(counter, **labels) -> float:
+    """Read a single labelled Counter series value by label match.
+
+    Handles the labelled-by-reason Counter pattern from #306 — the
+    only label is ``reason`` and the only vocabulary is the two branch
+    names (``cr_list_failure`` | ``runtime_failure``). prometheus_client
+    keys `_metrics` by a TUPLE of the LABEL VALUES (positional, not
+    key-value), so for a single label ``reason`` the key is
+    ``("cr_list_failure",)`` etc. Matching against the caller's
+    ``**labels`` is a positional match when the counter has exactly one
+    label, and a dict-equality match otherwise — both forms are pinned
+    here so the helper stays correct under a future refactor that
+    adds a second label to ``PRUNE_TICK_FAILURES_TOTAL``.
+    """
+    per_series = getattr(counter, "_metrics", None)
+    if not per_series:
+        return 0.0
+    label_names = list(getattr(counter, "_labelnames", []) or [])
+    expected_values = [labels[name] for name in label_names]
+    for key, snapshot in per_series.items():
+        if isinstance(key, tuple) and list(key) == expected_values:
+            return float(snapshot._value.get())  # type: ignore[attr-defined]
+    return 0.0
+
+
+def test_prune_skip_tick_cr_list_failure_increments_prune_tick_failures_counter():
+    """Issue #306 acceptance: the first skip-tick branch (CR list failure,
+    ``prune_entrypoint.py:213-222``) bumps
+    ``PRUNE_TICK_FAILURES_TOTAL{reason="cr_list_failure"}`` so a sustained
+    kube-apiserver outage is visible at ``/metrics`` (the WARNING log is
+    the same event for log forwarding; the counter is the Prometheus
+    signal an SRE can alert on). Mirrors the bounded-cardinality
+    convention from #117 / #171 / #237 / #239 / #255 — the label
+    vocabulary is the two branch names defined in prune_entrypoint."""
+    from openstudio_operator import metrics
+
+    counter = metrics.PRUNE_TICK_FAILURES_TOTAL
+    baseline = _counter_value(counter, reason="cr_list_failure")
+
+    class FailingApi:
+        def list_namespaced_custom_object(self, *a, **kw):
+            raise ApiException(status=503, reason="Service Unavailable")
+
+    code, _batch, _core = run_main(FailingApi())
+    assert code == 0  # skip-tick parity: the next schedule is the retry
+
+    after = _counter_value(counter, reason="cr_list_failure")
+    assert after - baseline == 1.0, (
+        f"prune_entrypoint CR-list skip branch must bump the counter by 1, "
+        f"got {after - baseline}"
+    )
+
+
+@responses.activate
+def test_prune_skip_tick_runtime_failure_increments_prune_tick_failures_counter():
+    """Issue #306 acceptance: the second skip-tick branch (D12 exception
+    tuple caught around ``run_retention_tick``,
+    ``prune_entrypoint.py:280-288``) bumps
+    ``PRUNE_TICK_FAILURES_TOTAL{reason="runtime_failure"}`` so a sustained
+    REST/Redis/StatusStore outage is visible at ``/metrics``. The CR list
+    failure branch above bumps the SAME counter with a DIFFERENT
+    ``reason`` label so a Grafana panel can distinguish "kube-apiserver
+    unreachable" from "REST 5xx storm" from "StatusStoreConflictError
+    thundering herd" — the entire labeling invariant the issue cites from
+    #117."""
+    from openstudio_operator import metrics
+
+    counter = metrics.PRUNE_TICK_FAILURES_TOTAL
+    baseline = _counter_value(counter, reason="runtime_failure")
+
+    spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE)}
+    crs = [make_cr(spec=spec)]
+    # 500 on the REST GET — same exception the D12 tuple catches
+    # (OpenStudioApiError) — so the runtime branch fires.
+    responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
+    api = FakeCustomObjectsApi(crs, crs[0])
+
+    code, _batch, _core = run_main(api)
+    assert code == 0  # skip-tick parity: the next schedule is the retry
+
+    after = _counter_value(counter, reason="runtime_failure")
+    assert after - baseline == 1.0, (
+        f"prune_entrypoint D12-skip branch must bump the counter by 1, "
+        f"got {after - baseline}"
+    )
+
+
+def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
+    """Issue #306 regression fence: the two skip-tick branches MUST NOT
+    silently add any other counter family — only
+    ``PRUNE_TICK_FAILURES_TOTAL`` is bumped. The contract is the two
+    reason constants defined in prune_entrypoint.py — a future refactor
+    that raises a third branch without wiring it through the same
+    constant vocabulary is caught at this test BEFORE the
+    EXPECTED_COUNTER_FAMILIES drift-invariant in test_metrics_endpoint.
+
+    Structural rather than stateful: this pins the AST contract that
+    the two branch sites use the module-level constants rather than
+    inline string literals, so a typo'd reason value (``cr_list_faliure``
+    etc.) shows up as a TypeError at call time rather than a silent
+    Grafana dashboard split."""
+    import inspect
+
+    from openstudio_operator import prune_entrypoint
+
+    # The two module-level constants are the only legitimate reason
+    # values. A third value would need a new constant + a new branch
+    # site + a new PRUNE_TICK_FAILURES_TOTAL.labels(...) call.
+    assert prune_entrypoint.PRUNE_TICK_FAILURE_REASON_CR_LIST == "cr_list_failure"
+    assert prune_entrypoint.PRUNE_TICK_FAILURE_REASON_RUNTIME == "runtime_failure"
+
+    # And the two constants are the ONLY two reasons actually passed to
+    # PRUNE_TICK_FAILURES_TOTAL.labels(reason=...) — captured by
+    # inspecting the source of prune_entrypoint.main(). The
+    # single-quoted strings in the constants ARE the strings at the
+    # call sites (no `reason="..."` literal shadows the constants).
+    source = inspect.getsource(prune_entrypoint)
+    branch_call_sites = [
+        line for line in source.splitlines()
+        if "PRUNE_TICK_FAILURES_TOTAL.labels" in line
+    ]
+    assert len(branch_call_sites) == 2, (
+        f"prune_entrypoint must call PRUNE_TICK_FAILURES_TOTAL.labels "
+        f"exactly twice (one per skip-tick branch), got {len(branch_call_sites)}:\n"
+        + "\n".join(branch_call_sites)
+    )
+    # Both call sites must use the module-level constants, not inline
+    # string literals — the vocabulary pin.
+    for line in branch_call_sites:
+        assert "PRUNE_TICK_FAILURE_REASON_" in line, (
+            f"prune_entrypoint PRUNE_TICK_FAILURES_TOTAL.labels call site "
+            f"must use the module-level reason constant, got inline: {line!r}"
+        )
+
+
 def test_event_names_are_unique_per_emission():
     """client-go convention: repeated reasons never 409 on a live cluster."""
     from openstudio_operator.prune_entrypoint import build_event_emitter

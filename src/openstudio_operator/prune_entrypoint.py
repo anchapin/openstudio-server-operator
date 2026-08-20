@@ -61,6 +61,7 @@ from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.logging_setup import install_json_logging
+from openstudio_operator.metrics import PRUNE_TICK_FAILURES_TOTAL, start_metrics_server
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
 from openstudio_operator.singleton import (
@@ -78,6 +79,14 @@ EVENT_SOURCE_COMPONENT = "openstudio-storage-pruner"
 
 #: D12 skip-tick posture: same exception tuple the old kopf wrapper caught.
 _SKIP_TICK_EXCEPTIONS = (OpenStudioApiError, StatusStoreError, ApiException, ValueError)
+
+#: Issue #306 — ``reason`` label values for :data:`PRUNE_TICK_FAILURES_TOTAL`.
+#: One per skip-tick branch in :func:`main`. The exception class name is
+#: already in the WARNING log line via ``type(exc).__name__``; keeping the
+#: label vocabulary bounded to the two branch names mirrors the bounded
+#: cardinality convention from #117 / #171 / #237 / #239 / #255.
+PRUNE_TICK_FAILURE_REASON_CR_LIST = "cr_list_failure"
+PRUNE_TICK_FAILURE_REASON_RUNTIME = "runtime_failure"
 
 
 class CoreApi(Protocol):
@@ -193,6 +202,16 @@ def main(
     # emitted unstructured text that broke Loki/CloudWatch structured
     # queries; this is the replacement.
     install_json_logging()
+    # Issue #306 — serve /metrics on the conventional Prometheus port
+    # (METRICS_PORT, 9090). The function is idempotent (the first call
+    # binds the port; subsequent calls return the already-active port
+    # without a second bind), so repeated invocations between production
+    # ticks and unit tests are safe — in this isolated CronJob pod the
+    # port is guaranteed free on first boot, and the WARN log on bind
+    # failure is the only signal if a sibling process is already on it.
+    # Placement: right after the JSON log formatter is installed so any
+    # failure-to-bind warning is itself JSON-structured for Loki/CloudWatch.
+    start_metrics_server()
     if namespace is None:
         namespace = os.environ.get("POD_NAMESPACE")
     if not namespace:
@@ -219,6 +238,13 @@ def main(
     try:
         crs = _list_crs(custom_api, namespace)
     except (ApiException, ConfigException) as exc:
+        # Issue #306 — bump the skip-tick counter so the sustained degraded
+        # window is visible at /metrics. The WARNING log line is the same
+        # event for log forwarding; the counter is the Prometheus signal an
+        # SRE can alert on. The exception class name is preserved in the
+        # log line via ``type(exc).__name__``; the label vocabulary stays
+        # bounded to the two branch names defined above.
+        PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_CR_LIST).inc()
         logger.warning(
             "prune tick skipped, retrying next schedule — could not list OSCM CRs "
             "(%s: %s)",
@@ -286,6 +312,9 @@ def main(
     except _SKIP_TICK_EXCEPTIONS as exc:
         # ValueError: invalid storagePolicy (e.g. bad backend enum) — same
         # skip-tick posture as the old kopf wrapper; next schedule retries (D12).
+        # Issue #306 — bump the skip-tick counter for the Prometheus signal
+        # (the WARNING log line is the same event for log forwarding).
+        PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_RUNTIME).inc()
         logger.warning(
             "prune tick skipped, retrying next schedule (%s: %s)",
             type(exc).__name__,
