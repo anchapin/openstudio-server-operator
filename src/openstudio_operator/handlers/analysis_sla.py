@@ -376,7 +376,9 @@ def _grace_and_escalate(
             else:
                 message += " — soft stop issued"
             emit("Warning", ANALYSIS_SOFT_STOPPED_EVENT, message)
-            SOFT_STOPS_TOTAL.inc()
+            SOFT_STOPS_TOTAL.labels(
+                outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED
+            ).inc()
             store.set_soft_stop(
                 analysis_id,
                 SoftStopRecord(
@@ -530,12 +532,15 @@ def _escalate_analysis(
     # the next tick re-resolve the same victims and re-emit the Event
     # forever. The fix: catch per pod, accumulate evicted-vs-failed, stamp
     # the marker regardless of partial failure with the partial outcome.
+    # Issue #309 — outcome label is decided once per analysis at the end of
+    # the loop (not per-pod) because the partial-failure branch depends on
+    # the final ``failed_count``; the per-pod count is preserved via
+    # ``inc(evicted_count)`` below.
     evicted_count = 0
     failed_count = 0
     last_failure: ApiException | None = None
     for pod_name, _worker_id in victims:
         if dry_run:
-            WORKER_PODS_EVICTED_TOTAL.inc()
             evicted_count += 1
             continue
         try:
@@ -548,7 +553,6 @@ def _escalate_analysis(
                 namespace, pod_name, exc,
             )
             continue
-        WORKER_PODS_EVICTED_TOTAL.inc()
         evicted_count += 1
     if dry_run:
         outcome = ESCALATION_DRY_RUN
@@ -558,6 +562,8 @@ def _escalate_analysis(
         outcome = ESCALATION_EVICTED_PARTIAL
     else:
         outcome = ESCALATION_EVICTED
+    if evicted_count > 0:
+        WORKER_PODS_EVICTED_TOTAL.labels(outcome=outcome).inc(evicted_count)
     if last_failure is not None and evicted_count == 0:
         # All pods failed — re-raise so the wrapper's except branch can
         # observe it (and the tick counter can record the failure).

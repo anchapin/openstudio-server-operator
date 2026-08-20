@@ -136,31 +136,76 @@ def metric(name: str) -> float:
     return REGISTRY.get_sample_value(name) or 0.0
 
 
+def labelled_metric(name: str, labels: dict[str, str]) -> float:
+    """Read a labelled counter's value for a specific label combination.
+
+    Issue #309 — counters gained labels so the bare ``metric(name)`` form
+    (which returns None for labelled counters) no longer works for the
+    four action counters. This helper pins the label-key vocabularies
+    so the diff arithmetic in this walkthrough stays correct.
+    """
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def soft_stops_total() -> float:
+    """Sum every ``outcome`` series of ``soft_stops_total`` (issue #309)."""
+    total = 0.0
+    for outcome in ("issued", "dry-run"):
+        total += labelled_metric(
+            "openstudio_operator_soft_stops_total", {"outcome": outcome}
+        )
+    return total
+
+
+def workers_recycled_total() -> float:
+    """Sum every ``trigger`` series of ``workers_recycled_total`` (issue #309)."""
+    total = 0.0
+    for trigger in ("analysis-completed", "interval-elapsed"):
+        total += labelled_metric(
+            "openstudio_operator_workers_recycled_total", {"trigger": trigger}
+        )
+    return total
+
+
+def worker_pods_evicted_total() -> float:
+    """Sum every ``outcome`` series of ``worker_pods_evicted_total`` (issue #309)."""
+    total = 0.0
+    for outcome in ("evicted", "evicted-partial", "no-matching-pods", "dry-run"):
+        total += labelled_metric(
+            "openstudio_operator_worker_pods_evicted_total", {"outcome": outcome}
+        )
+    return total
+
+
+def analyses_deleted_total() -> float:
+    """Sum every ``outcome`` series of ``analyses_deleted_total`` (issue #309)."""
+    total = 0.0
+    for outcome in ("deleted",):
+        total += labelled_metric(
+            "openstudio_operator_analyses_deleted_total", {"outcome": outcome}
+        )
+    return total
+
+
 def fresh_cos() -> dict[str, float]:
     """Latest values of every counter the operator publishes — for before/after diffs."""
     return {
-        "openstudio_operator_soft_stops_total": metric("openstudio_operator_soft_stops_total"),
+        "openstudio_operator_soft_stops_total": soft_stops_total(),
         "openstudio_operator_datapoints_requeued_total": metric(
             "openstudio_operator_datapoints_requeued_total"
         ),
         "openstudio_operator_datapoints_requeue_exhausted_total": metric(
             "openstudio_operator_datapoints_requeue_exhausted_total"
         ),
-        "openstudio_operator_workers_recycled_total": metric(
-            "openstudio_operator_workers_recycled_total"
-        ),
-        "openstudio_operator_worker_pods_evicted_total": metric(
-            "openstudio_operator_worker_pods_evicted_total"
-        ),
+        "openstudio_operator_workers_recycled_total": workers_recycled_total(),
+        "openstudio_operator_worker_pods_evicted_total": worker_pods_evicted_total(),
         "openstudio_operator_web_background_restarts_total": metric(
             "openstudio_operator_web_background_restarts_total"
         ),
         "openstudio_operator_analyses_archived_total": metric(
             "openstudio_operator_analyses_archived_total"
         ),
-        "openstudio_operator_analyses_deleted_total": metric(
-            "openstudio_operator_analyses_deleted_total"
-        ),
+        "openstudio_operator_analyses_deleted_total": analyses_deleted_total(),
     }
 
 
@@ -300,7 +345,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
     analysis_id = "a1"
     spec_dry = {**SLA_SPEC, "dryRun": True}
     spec_real = {**SLA_SPEC, "dryRun": False}
-    cos_before = metric("openstudio_operator_soft_stops_total")
+    cos_before = soft_stops_total()
 
     # dryRun=True path: two ticks
     _soft_stop_path_responses(analysis_id)
@@ -322,7 +367,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
     )
     assert events_first == []
     assert api_dry.obj["status"]["softStops"][analysis_id]["outcome"] == "watching"
-    before = metric("openstudio_operator_soft_stops_total")
+    before = soft_stops_total()
     # Tick 2: 4h later, anchor past maxDuration → soft-stop.
     events_dry, emit_dry = make_emit()
     run_sla_tick(
@@ -340,7 +385,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
     assert events_dry[0][0] == "Warning"
     assert events_dry[0][1] == ANALYSIS_SOFT_STOPPED_EVENT
     assert "suppressed (spec.dryRun)" in events_dry[0][2]
-    assert metric("openstudio_operator_soft_stops_total") - before == 1
+    assert soft_stops_total() - before == 1
     assert api_dry.obj["status"]["softStops"][analysis_id]["outcome"] == "dry-run"
 
     # dryRun=False path: same two-tick shape, same one event, same
@@ -361,7 +406,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
         pod_api=FakePodApi([]),
         redis_client=redis_real,
     )
-    before = metric("openstudio_operator_soft_stops_total")
+    before = soft_stops_total()
     events_real, emit_real = make_emit()
     run_sla_tick(
         OpenStudioClient(BASE),
@@ -378,11 +423,11 @@ def test_dryrun_soft_stop_is_strict_suppression():
     assert events_real[0][:2] == events_dry[0][:2]
     assert "suppressed (spec.dryRun)" not in events_real[0][2]
     assert "issued" in events_real[0][2]
-    assert metric("openstudio_operator_soft_stops_total") - before == 1
+    assert soft_stops_total() - before == 1
     assert api_real.obj["status"]["softStops"][analysis_id]["outcome"] == "issued"
 
     # Net metric delta across both tickers' tick-2 fires: 2 (one per decision)
-    assert metric("openstudio_operator_soft_stops_total") - cos_before == 2
+    assert soft_stops_total() - cos_before == 2
 
 
 @responses.activate
@@ -400,7 +445,7 @@ def test_dryrun_escalation_is_strict_suppression():
     spec_dry = {**base, "dryRun": True}
     spec_real = {**base, "dryRun": False}
     anchored = {"softStops": {analysis_id: {"issuedAt": PAST_GRACE.isoformat(), "outcome": "issued"}}}
-    cos_before = metric("openstudio_operator_worker_pods_evicted_total")
+    cos_before = worker_pods_evicted_total()
 
     def run_one(spec: dict, *, real: bool):
         _escalation_path_responses(analysis_id)
@@ -409,7 +454,7 @@ def test_dryrun_escalation_is_strict_suppression():
         redis_client = _FakeRedisForDryRun(
             {"worker-1:1:requeued,simulations": [analysis_id]}
         )
-        before = metric("openstudio_operator_worker_pods_evicted_total")
+        before = worker_pods_evicted_total()
         store = StatusStore(NAMESPACE, NAME, api)
         cfg = OperatorConfig.from_spec(spec)
         events, emit = make_emit()
@@ -423,7 +468,7 @@ def test_dryrun_escalation_is_strict_suppression():
             pod_api=pods,
             redis_client=redis_client,
         )
-        return api, pods, events, metric("openstudio_operator_worker_pods_evicted_total") - before
+        return api, pods, events, worker_pods_evicted_total() - before
 
     # dryRun=True
     api_dry, pods_dry, events_dry, delta_dry = run_one(spec_dry, real=False)
@@ -444,7 +489,7 @@ def test_dryrun_escalation_is_strict_suppression():
     assert api_real.obj["status"]["softStops"][analysis_id]["escalationOutcome"] == "evicted"
 
     # Net: 2 deletes counted (one dry, one real) — the metric counts the decision.
-    assert metric("openstudio_operator_worker_pods_evicted_total") - cos_before == 2
+    assert worker_pods_evicted_total() - cos_before == 2
 
 
 # --- Module 2: zombie datapoint watchdog ---------------------------------------
@@ -557,13 +602,13 @@ def test_dryrun_worker_recycle_is_strict_suppression():
     """D11 contract: only the Deployment patch flips; event/metric/cooldown otherwise identical."""
     spec_dry = {**WR_SPEC, "dryRun": True}
     spec_real = {**WR_SPEC, "dryRun": False}
-    cos_before = metric("openstudio_operator_workers_recycled_total")
+    cos_before = workers_recycled_total()
 
     def run_one(spec: dict):
         _wr_responses()
         api = FakeCO(make_cr(spec))
         apps = FakeAppsWR()
-        before = metric("openstudio_operator_workers_recycled_total")
+        before = workers_recycled_total()
         store = StatusStore(NAMESPACE, NAME, api)
         cfg = OperatorConfig.from_spec(spec)
         events, emit = make_emit()
@@ -580,7 +625,7 @@ def test_dryrun_worker_recycle_is_strict_suppression():
             apps,
             events,
             trigger,
-            metric("openstudio_operator_workers_recycled_total") - before,
+            workers_recycled_total() - before,
             api,
         )
 
@@ -610,7 +655,7 @@ def test_dryrun_worker_recycle_is_strict_suppression():
     assert delta_real == 1
     assert api_real.obj["status"]["lastRecycleAt"] == NOW.isoformat()
 
-    assert metric("openstudio_operator_workers_recycled_total") - cos_before == 2
+    assert workers_recycled_total() - cos_before == 2
 
 
 # --- Module 4: retention pipeline (runs in the storage-prune CronJob, #78) -----
@@ -735,7 +780,7 @@ def test_dryrun_archival_delete_is_strict_suppression():
     }
     spec_dry = {**PRUNER_SPEC, "dryRun": True}
     spec_real = {**PRUNER_SPEC, "dryRun": False}
-    deleted_before = metric("openstudio_operator_analyses_deleted_total")
+    deleted_before = analyses_deleted_total()
     archived_before = metric("openstudio_operator_analyses_archived_total")
 
     def run_one(spec: dict):
@@ -792,7 +837,7 @@ def test_dryrun_archival_delete_is_strict_suppression():
     # - archived_total: +1 in both (verification observed in both)
     # - deleted_total: +1 in real only
     assert metric("openstudio_operator_analyses_archived_total") - archived_before == 2
-    assert metric("openstudio_operator_analyses_deleted_total") - deleted_before == 1
+    assert analyses_deleted_total() - deleted_before == 1
 
 
 # --- Module 5: web_background stall detector ----------------------------------
@@ -1179,21 +1224,15 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     # every mutation-suppressed Event carried the marker, every state
     # anchor advanced as in a real run.
     diffs = {
-        "openstudio_operator_soft_stops_total": metric(
-            "openstudio_operator_soft_stops_total"
-        )
+        "openstudio_operator_soft_stops_total": soft_stops_total()
         - cos["openstudio_operator_soft_stops_total"],
-        "openstudio_operator_worker_pods_evicted_total": metric(
-            "openstudio_operator_worker_pods_evicted_total"
-        )
+        "openstudio_operator_worker_pods_evicted_total": worker_pods_evicted_total()
         - cos["openstudio_operator_worker_pods_evicted_total"],
         "openstudio_operator_datapoints_requeued_total": metric(
             "openstudio_operator_datapoints_requeued_total"
         )
         - cos["openstudio_operator_datapoints_requeued_total"],
-        "openstudio_operator_workers_recycled_total": metric(
-            "openstudio_operator_workers_recycled_total"
-        )
+        "openstudio_operator_workers_recycled_total": workers_recycled_total()
         - cos["openstudio_operator_workers_recycled_total"],
         "openstudio_operator_web_background_restarts_total": metric(
             "openstudio_operator_web_background_restarts_total"
@@ -1203,9 +1242,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
             "openstudio_operator_analyses_archived_total"
         )
         - cos["openstudio_operator_analyses_archived_total"],
-        "openstudio_operator_analyses_deleted_total": metric(
-            "openstudio_operator_analyses_deleted_total"
-        )
+        "openstudio_operator_analyses_deleted_total": analyses_deleted_total()
         - cos["openstudio_operator_analyses_deleted_total"],
     }
     assert diffs == {

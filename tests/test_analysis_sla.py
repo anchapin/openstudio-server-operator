@@ -126,11 +126,43 @@ def calls_to(suffix: str) -> int:
 
 
 def soft_stops_total() -> float:
-    return REGISTRY.get_sample_value("openstudio_operator_soft_stops_total") or 0.0
+    """Sum across all label series of ``soft_stops_total``.
+
+    Issue #309 — the counter gained an ``outcome`` label, so the
+    prometheus-registry sample lookup has to sum every labelled series
+    (``{outcome=...}``) rather than reading the unlabelled ``_value``.
+    Cribbed from
+    ``tests/test_metrics_endpoint.py::_counter_total``'s labelled branch.
+    """
+    counter = REGISTRY.get_sample_value
+    total = 0.0
+    for outcome in ("issued", "dry-run"):
+        val = counter(
+            "openstudio_operator_soft_stops_total",
+            {"outcome": outcome},
+        )
+        total += val or 0.0
+    return total
 
 
 def pods_evicted_total() -> float:
-    return REGISTRY.get_sample_value("openstudio_operator_worker_pods_evicted_total") or 0.0
+    """Sum across all label series of ``worker_pods_evicted_total``.
+
+    Issue #309 — the counter gained an ``outcome`` label, so the
+    prometheus-registry sample lookup has to sum every labelled series
+    (``{outcome=...}``) rather than reading the unlabelled ``_value``.
+    Cribbed from
+    ``tests/test_metrics_endpoint.py::_counter_total``'s labelled branch.
+    """
+    counter = REGISTRY.get_sample_value
+    total = 0.0
+    for outcome in ("evicted", "evicted-partial", "no-matching-pods", "dry-run"):
+        val = counter(
+            "openstudio_operator_worker_pods_evicted_total",
+            {"outcome": outcome},
+        )
+        total += val or 0.0
+    return total
 
 
 def register_analyses_index(*analysis_ids: str) -> None:
