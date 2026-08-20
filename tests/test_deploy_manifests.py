@@ -1098,9 +1098,16 @@ def test_network_policy_metrics_ingress_restricts_to_port_9090():
 
 def test_network_policy_metrics_ingress_has_prometheus_and_peer_allow():
     """The from-block must (a) target the cluster's scraper namespace AND
-    (b) allow a same-namespace peer (empty podSelector). A cluster-admin
+    (b) allow a same-namespace peer only when that peer opts in via the
+    project label `app.kubernetes.io/component: metrics-scraper`. An empty
+    `podSelector: {}` is a regression — every helm-chart pod in
+    openstudio-server carries some `app.kubernetes.io/component` value
+    (web / web-background / worker / db / redis / queue / nfs), but none
+    of them is `metrics-scraper`, so an unscoped allow would let them
+    scrape the plaintext /metrics endpoint (issue #295). A cluster-admin
     namespaceSelector renaming is allowed; a wholesale removal of either
-    peer would silently re-open the endpoint."""
+    peer, or a return to `podSelector: {}`, would silently re-open the
+    endpoint."""
     policy = _metrics_ingress_policy()
     rule = policy["spec"]["ingress"][0]
     from_selectors = rule["from"]
@@ -1108,17 +1115,35 @@ def test_network_policy_metrics_ingress_has_prometheus_and_peer_allow():
     has_namespace_selector = any(
         "namespaceSelector" in peer for peer in from_selectors
     )
-    has_same_ns_peer = any(
-        peer.get("podSelector") == {} for peer in from_selectors
+    same_ns_peers = [
+        peer for peer in from_selectors if "podSelector" in peer
+    ]
+    has_label_scoped_peer = any(
+        peer["podSelector"].get("matchLabels", {}).get(
+            "app.kubernetes.io/component"
+        )
+        == "metrics-scraper"
+        for peer in same_ns_peers
+    )
+    has_empty_podselector = any(
+        peer.get("podSelector") == {} for peer in same_ns_peers
     )
     assert has_namespace_selector, (
         "metrics-ingress must include a namespaceSelector pointing at the "
         "cluster's scraper namespace (default `prometheus`); see AGENTS.md "
         "Working rules for the cluster-admin opt-in."
     )
-    assert has_same_ns_peer, (
-        "metrics-ingress must include an empty podSelector to allow "
-        "co-located scrapers (e.g. sidecar) in openstudio-server"
+    assert has_label_scoped_peer, (
+        "metrics-ingress must include a podSelector matching "
+        "{app.kubernetes.io/component: metrics-scraper} so the same-"
+        "namespace peer allow is opt-in only. See AGENTS.md /metrics "
+        "ingress rule (issue #295)."
+    )
+    assert not has_empty_podselector, (
+        "metrics-ingress must NOT use `podSelector: {}` — that selector "
+        "matches every pod in openstudio-server (web, web-background, "
+        "worker, db, redis, queue, nfs) and would re-open the plaintext "
+        "/metrics endpoint to every helm-chart pod (issue #295)."
     )
 
 

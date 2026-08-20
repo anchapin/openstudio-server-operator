@@ -223,10 +223,17 @@ spec:
 #     exactly so. Cluster admins running a different scraper (e.g.
 #     `monitoring`, `kube-prometheus-stack`) MUST edit the label match
 #     below. This is the opt-in noted in AGENTS.md.
-#   * `podSelector: {}` — same-namespace peer (e.g. a Prometheus
-#     sidecar, or a debug scraper). Empty selector matches every pod
-#     in `openstudio-server`, so a peer in the operator's namespace
-#     can scrape without crossing namespace boundaries.
+#   * `podSelector: {matchLabels: {app.kubernetes.io/component:
+#     metrics-scraper}}` — same-namespace peer that opted into being
+#     a scraper via the project label convention. The label is NOT a
+#     helm-chart default: any pod in `openstudio-server` carrying
+#     `app.kubernetes.io/component: metrics-scraper` is a metrics
+#     scraper the operator explicitly trusts. The helm-chart pods
+#     (`web`, `web-background`, `worker`, `mongo`, `redis`, `queue`,
+#     NFS) carry `app.kubernetes.io/component: web` /
+#     `web-background` / `worker` / `db` / `redis` / `queue` / `nfs`
+#     respectively — none match the `metrics-scraper` value, so they
+#     cannot scrape the plaintext /metrics endpoint.
 #
 # No `namespaceSelector` matching all namespaces is allowed (would be
 # a global allow) — the allow-list is the two peer selectors above.
@@ -262,7 +269,12 @@ spec:
               # Cluster-admin opt-in: rename to match the scraper's
               # namespace label (e.g. `monitoring`, `kube-prometheus-stack`).
               kubernetes.io/metadata.name: prometheus
-        - podSelector: {}  # same-namespace peer (e.g. metrics sidecar)
+        - podSelector:
+            matchLabels:
+              # Project label convention: only pods explicitly opting
+              # in to scraping may read /metrics. See the comment block
+              # above and AGENTS.md "Working rules" /metrics ingress.
+              app.kubernetes.io/component: metrics-scraper
       ports:
         - port: 9090
           protocol: TCP
