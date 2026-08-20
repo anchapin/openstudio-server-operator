@@ -38,6 +38,17 @@ CRD surface):
   Never keeps a failed pod's logs available for forensics instead of
   retrying in place; retries happen as fresh pods under the Job's backoff
   budget, which caps total attempts at 4.
+- ``ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS = 6 * 5200`` (issue #394): the
+  kubelet hard-kills a Job's pods after this many seconds regardless of
+  rclone state. The value is 6× the chart's worker
+  ``terminationGracePeriodSeconds`` (5200s in ``scripts/manifests/06-worker.yaml``)
+  — wide enough to absorb a healthy multi-GB upload + a single full
+  backoff budget (4 pods × backoffLimit), but bounded so a hung rclone
+  (TLS handshake stall, stuck TCP retransmit, S3 500 storm with no
+  response) is killed within minutes instead of running forever. The
+  paired upper-bound alert is the canonical "archival pipeline is wedged"
+  signal — see the README metrics table entry for
+  ``openstudio_operator_analyses_archived_total``.
 - ``TTL_SECONDS_AFTER_FINISHED = 86400``: finished Jobs self-delete after
   24h (the "ephemeral" half) while leaving a post-mortem window for failed
   uploads.
@@ -72,6 +83,10 @@ RCLONE_IMAGE_DIGEST = "sha256:25a2a208a8e3f4ad27ac5e7441cbfebdcea7953c8d7c9effa3
 RCLONE_REMOTE_NAME = "archive"
 RESTART_POLICY = "Never"
 ARCHIVAL_BACKOFF_LIMIT = 3
+# Issue #394 — upper bound on rclone wall-clock time. 6× the chart's worker
+# ``terminationGracePeriodSeconds`` (5200s). See module docstring for the
+# rationale and the README "wedged archival pipeline" alert.
+ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS = 6 * 5200
 TTL_SECONDS_AFTER_FINISHED = 24 * 3600
 
 # CRD storagePolicy.backend enum → rclone remote type. The only backend
@@ -206,6 +221,7 @@ def build_archival_job(
         },
         "spec": {
             "backoffLimit": ARCHIVAL_BACKOFF_LIMIT,
+            "activeDeadlineSeconds": ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS,
             "ttlSecondsAfterFinished": TTL_SECONDS_AFTER_FINISHED,
             "template": {
                 "metadata": {"labels": labels},

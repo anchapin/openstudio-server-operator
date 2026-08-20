@@ -16,6 +16,7 @@
   },
   "spec": {
     "backoffLimit": 3,
+    "activeDeadlineSeconds": 31200,
     "ttlSecondsAfterFinished": 86400,
     "template": {
       "metadata": {
