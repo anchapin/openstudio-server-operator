@@ -61,11 +61,22 @@ EXPECTED_COUNTER_FAMILIES = (
 #: ``StallWindowTracker`` state between the first sustained observation
 #: and the eventual ``web_background_restarts_total`` increment — a heads-
 #: up display that gives SREs time to react before the gate trips.
+#:
+#: Issue #312 — paired freshness timestamp gauges for ``resque_queue_
+#: depth`` and ``stall_window_elapsed_seconds``. Set to ``time.time()``
+#: on every successful read/update so dashboards can compute staleness
+#: (``time() - fresh``) and alert on a sustained gap. The data gauges
+#: advance on success but are NOT touched on the exception path (Redis
+#: unreachable, ApiException from ``_stall_condition_holds``, etc.) —
+#: without the freshness pair a prior tick's value masquerades as a
+#: live reading while the operator has in fact lost visibility.
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
     "openstudio_operator_redis_key_layout_status",
     "openstudio_operator_stall_window_elapsed_seconds",
+    "openstudio_operator_resque_queue_depth_fresh",
+    "openstudio_operator_stall_window_fresh",
 )
 
 #: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
@@ -508,6 +519,67 @@ def test_stall_window_elapsed_seconds_gauge_round_trip():
     assert metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 0.0
     exposition = generate_latest().decode()
     assert "# TYPE openstudio_operator_stall_window_elapsed_seconds gauge" in exposition
+
+
+# --- Issue #312 — freshness timestamp gauges -------------------------------------
+
+
+def test_stall_window_fresh_gauge_round_trip():
+    """Issue #312 acceptance: ``openstudio_operator_stall_window_fresh``
+    Gauge accepts Unix-epoch float values (the metric is set to
+    ``time.time()`` in ``run_stall_tick`` immediately after the
+    ``STALL_WINDOW_ELAPSED_SECONDS.set(...)`` sequence on both the
+    holding and broken paths). Unlabelled Gauge — one series, no
+    cardinality growth. Mirrors the issue #254 round-trip pattern; the
+    exposition shape is the bare ``<name> <value>`` line.
+    """
+    metrics.STALL_WINDOW_FRESH.set(1_700_000_000.5)
+    assert metrics.STALL_WINDOW_FRESH._value.get() == 1_700_000_000.5
+    metrics.STALL_WINDOW_FRESH.set(0.0)
+    assert metrics.STALL_WINDOW_FRESH._value.get() == 0.0
+    exposition = generate_latest().decode()
+    assert "# TYPE openstudio_operator_stall_window_fresh gauge" in exposition
+
+
+def test_resque_queue_depth_fresh_gauge_round_trip():
+    """Issue #312 acceptance: ``openstudio_operator_resque_queue_depth_fresh``
+    Gauge accepts Unix-epoch float values (the metric is set to
+    ``time.time()`` in ``_stall_condition_holds`` immediately after every
+    successful ``queue_depths()`` call). Unlabelled Gauge — one series,
+    process-wide (the Resque read site is unique); bounded cardinality.
+    The exposition shape mirrors :data:`STALL_WINDOW_FRESH`: bare
+    ``<name> <value>`` line, no labels.
+    """
+    metrics.RESQUE_QUEUE_DEPTH_FRESH.set(1_700_000_001.25)
+    assert metrics.RESQUE_QUEUE_DEPTH_FRESH._value.get() == 1_700_000_001.25
+    metrics.RESQUE_QUEUE_DEPTH_FRESH.set(0.0)
+    assert metrics.RESQUE_QUEUE_DEPTH_FRESH._value.get() == 0.0
+    exposition = generate_latest().decode()
+    assert "# TYPE openstudio_operator_resque_queue_depth_fresh gauge" in exposition
+
+
+def test_freshness_gauges_decouple_from_data_gauges_on_failure():
+    """Issue #312 acceptance: the data gauges can hold a stale prior-tick
+    value while the freshness gauges carry the last-successful-update
+    timestamp — that gap is exactly the staleness signal dashboards
+    alert on. The data/fresh pair must NOT be coupled through a shared
+    setter; each is independent and only the freshness gauges advance
+    on the "successful read" path. Verified here by setting a non-zero
+    data value, then a FRESH timestamp, and asserting both
+    independently — the staleness computation ``time() - fresh`` does
+    not depend on the data value at all.
+    """
+    metrics.STALL_WINDOW_ELAPSED_SECONDS.set(120.0)
+    metrics.STALL_WINDOW_FRESH.set(1_700_000_000.0)
+    assert metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 120.0
+    assert metrics.STALL_WINDOW_FRESH._value.get() == 1_700_000_000.0
+
+    # Resetting only the freshness gauge (simulating "we lost visibility")
+    # leaves the data gauge holding its prior value — the exact failure
+    # mode issue #312 fixes.
+    metrics.STALL_WINDOW_FRESH.set(0.0)
+    assert metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 120.0  # stale!
+    assert metrics.STALL_WINDOW_FRESH._value.get() == 0.0  # fresh=0 → dashboards alert
 
 
 # --- Issue #255 — kopf.event emission-failure counter --------------------------
