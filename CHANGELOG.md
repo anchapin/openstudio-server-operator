@@ -380,6 +380,22 @@ edge cases (`#246` `#247` `#248` `#249`).
 - (none — the legacy sites retired by `#234` / `#235` / `#251` /
   `#252` are described inline within their Changed bullets above)
 
+### Fixed
+- **`#402`** — the deferred Warning-Event queue survives operator
+  restarts. `QueuedKopfEventSink`'s queue was purely in-process, so a
+  crash while it held entries (exactly the stalled-watch-stream mode
+  `#310` designed for) silently dropped every queued Warning with no
+  `queue_full` drop to observe. Every ACCEPTED deferral now mirrors
+  into `status.deferredEvents` (new typed `StatusStore` accessors:
+  append / get / clear, 409-safe RMW per D04, `max_entries` backstop
+  at `MAX_DEFERRED_WARNING_EVENTS`), and `flush_for` drains the
+  persisted list FIRST, deduplicating in-memory twins — exactly-once
+  in the common path, at-least-once across restarts. Persistence is
+  armed from a `@kopf.on.startup` handler (not import time), so
+  test/library imports never touch a cluster. CRD `status.deferredEvents`
+  (typed array) added. `WARNINGS_DEFERRED_DROPPED_TOTAL{reason="queue_full"}`
+  semantics and the `WARNINGS_DEFERRED_QUEUE_DEPTH` Gauge are unchanged.
+
 ## [0.2.0] - 2026-08-19
 
 Auto-improvement-wave 10 consolidation: 32 issues closed in the recent

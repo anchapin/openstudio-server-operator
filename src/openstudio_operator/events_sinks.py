@@ -23,6 +23,19 @@ This module is the single home for that pattern. Future hardening
 a test seam) lives here — not as a fourth copy of the queue/defer/drain
 mechanism in ``handlers/__init__.py``.
 
+Issue #402 — the queue is also PERSISTED. Every accepted deferral is
+mirrored into the CR's ``status.deferredEvents`` array through a
+:class:`DeferredEventStore` (the :class:`StatusStore` RMW in production,
+wired by ``handlers/__init__.py`` from a ``@kopf.on.startup`` handler),
+and :meth:`QueuedKopfEventSink.flush_for` drains that persisted list
+FIRST, before the in-memory queue. A crashed operator therefore
+re-emits every queued Warning on its first OSCM watch tick after
+restart — the at-least-once contract #234/#310 promise, which the
+purely in-process queue broke (entries were silently lost, with no
+``queue_full`` drop to observe). Persistence failures (apiserver
+unreachable, 409 budget exhausted) degrade to the pre-#402 in-memory
+behavior: logged, never fatal to the deferral path.
+
 Scope guard:
     * Issue #164's :class:`openstudio_operator.events.EventEmitter` is a
       separate surface — it gates ``kopf.event`` per-tick on ``dry_run``
@@ -38,8 +51,8 @@ Scope guard:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from typing import Final
+from collections.abc import Callable, Mapping
+from typing import Final, Protocol
 
 import kopf
 
@@ -72,6 +85,43 @@ MAX_DEFERRED_WARNING_EVENTS: Final = 1000
 DROP_REASON_QUEUE_FULL: Final = "queue_full"
 
 
+class DeferredEventStore(Protocol):
+    """Structural interface for the ``status.deferredEvents`` surface (#402).
+
+    :class:`openstudio_operator.status_store.StatusStore` satisfies this
+    structurally (``get_deferred_events`` / ``append_deferred_event`` /
+    ``clear_deferred_events``); tests satisfy it with in-memory fakes. The
+    sink deliberately does NOT import the concrete store — the production
+    wiring happens in ``handlers/__init__.py`` (a ``@kopf.on.startup``
+    handler installs a factory that builds a ``StatusStore`` over
+    :func:`openstudio_operator.singleton.operator_custom_objects_api`), so
+    the dependency direction stays handlers → (events_sinks, status_store)
+    and importing this module never constructs a Kubernetes client.
+
+    ``max_entries`` on :meth:`append_deferred_event` is the persisted twin
+    of :data:`MAX_DEFERRED_WARNING_EVENTS` — the caller passes the same
+    cap so the ``.status`` array can never outgrow the in-memory queue's
+    own bound (defensive backstop against a clear-failure streak, not a
+    second backpressure gate — drops are still counted ONLY at
+    :meth:`QueuedKopfEventSink.defer_to_next_tick`).
+    """
+
+    def get_deferred_events(self) -> list[dict[str, str]]: ...
+
+    def append_deferred_event(
+        self, entry: Mapping[str, str], *, max_entries: int | None = None
+    ) -> None: ...
+
+    def clear_deferred_events(self) -> None: ...
+
+
+#: Builds the per-CR persistence adapter for a ``(namespace, name)`` pair.
+#: Installed on the default sink by the handlers entrypoint at operator
+#: startup (issue #402); ``None`` (the default) means in-memory-only —
+#: the exact pre-#402 behavior.
+DeferredEventStoreFactory = Callable[[str, str], DeferredEventStore]
+
+
 class QueuedKopfEventSink:
     """In-process queue of pending Warning Events, flushed by one drain handler.
 
@@ -96,13 +146,99 @@ class QueuedKopfEventSink:
     kopf-side state, so test isolation is a one-line ``clear()`` between
     tests against the module-level instance, or a fresh ``QueuedKopfEventSink()``
     for full isolation.
+
+    Issue #402 — an optional ``store_factory`` arms persistence: every
+    accepted deferral is mirrored into ``status.deferredEvents`` for the
+    CR, and :meth:`flush_for` drains the persisted list before the
+    in-memory queue. A factory of ``None`` (the default) keeps the sink
+    purely in-process — the pre-#402 behavior, and the mode every
+    pre-existing test of this class runs in.
     """
 
-    __slots__ = ("_queue",)
+    __slots__ = ("_queue", "_store_factory")
 
-    def __init__(self) -> None:
-        """Initialize an empty queue. Idempotent and cheap; safe to re-create per test."""
+    def __init__(self, store_factory: DeferredEventStoreFactory | None = None) -> None:
+        """Initialize an empty queue. Idempotent and cheap; safe to re-create per test.
+
+        ``store_factory`` (issue #402) optionally wires the CR
+        ``.status`` persistence surface; ``None`` disables persistence.
+        """
         self._queue: list[tuple[str, str, str, str]] = []
+        self._store_factory: DeferredEventStoreFactory | None = store_factory
+
+    def set_store_factory(self, factory: DeferredEventStoreFactory | None) -> None:
+        """Install/replace/disable the ``.status`` persistence factory (#402).
+
+        The handlers entrypoint calls this from a ``@kopf.on.startup``
+        handler (NOT at import time) so importing the handlers package in
+        tests or library contexts never arms persistence against whatever
+        kubeconfig the host happens to carry. ``None`` restores the
+        in-memory-only behavior.
+        """
+        self._store_factory = factory
+
+    @property
+    def store_factory(self) -> DeferredEventStoreFactory | None:
+        """The installed persistence factory, or ``None`` (test seam)."""
+        return self._store_factory
+
+    def _store_for(self, *, namespace: str, name: str) -> DeferredEventStore | None:
+        """Build the per-CR persistence adapter; ``None`` when unavailable.
+
+        Every failure mode (no factory installed, factory raising) maps to
+        ``None`` + a warning log — the deferral path runs from hardening
+        call sites (boot checks, the status_store RMW) that must never
+        crash because the persistence mirror is unavailable.
+        """
+        factory = self._store_factory
+        if factory is None:
+            return None
+        try:
+            return factory(namespace, name)
+        except Exception:
+            logger.warning(
+                "deferred-event store construction failed for %s/%s; "
+                "deferring in-memory only (issue #402 degradation to the "
+                "#234 behavior)",
+                namespace,
+                name,
+                exc_info=True,
+            )
+            return None
+
+    def _persist(
+        self, *, namespace: str, name: str, reason: str, message: str
+    ) -> None:
+        """Mirror one ACCEPTED deferral into ``status.deferredEvents`` (#402).
+
+        Best-effort: a failure (apiserver unreachable, 409 budget
+        exhausted, cap backstop) is logged and swallowed — the in-memory
+        queue still holds the entry, so the only lost guarantee is
+        crash-survivability for THIS entry, which is exactly the pre-#402
+        behavior. Never called on the drop branch: a backpressure drop
+        (``queue_full``) must not reach the persisted surface, or the
+        ``WARNINGS_DEFERRED_DROPPED_TOTAL`` accounting and the persisted
+        list would disagree.
+        """
+        store = self._store_for(namespace=namespace, name=name)
+        if store is None:
+            return
+        try:
+            store.append_deferred_event(
+                {"namespace": namespace, "name": name, "reason": reason, "message": message},
+                max_entries=MAX_DEFERRED_WARNING_EVENTS,
+            )
+        except Exception:
+            logger.warning(
+                "deferred-event persistence failed for %s/%s (reason=%s); "
+                "the in-memory queue still holds the entry — it is only "
+                "lost if the process dies before the next tick (issue #402 "
+                "degradation to the #234 behavior)",
+                namespace,
+                name,
+                reason,
+                exc_info=True,
+            )
 
     def defer_to_next_tick(
         self,
@@ -147,6 +283,14 @@ class QueuedKopfEventSink:
             ).inc()
         else:
             self._queue.append((namespace, name, reason, message))
+            # Issue #402 — mirror the accepted entry into the CR
+            # ``.status`` so a crash before the next tick does not
+            # silently lose the Warning. Persisted only on the accept
+            # branch, deliberately: a ``queue_full`` drop never touches
+            # the persisted surface (the drop counter is the account of
+            # record for backpressure losses, and its semantics are
+            # frozen by #310's scope guard).
+            self._persist(namespace=namespace, name=name, reason=reason, message=message)
         # Always reflect the post-call queue depth in the Gauge — the
         # Gauge is a state indicator (queue is at this depth right now),
         # not a delta of this call. On a drop the depth is unchanged
@@ -164,6 +308,19 @@ class QueuedKopfEventSink:
         Returns ``0`` when nothing is queued for this CR — the drain
         is a no-op in that case.
 
+        Issue #402 — the drain runs in two phases: the PERSISTED queue
+        (``status.deferredEvents`` for this CR) first, then the
+        in-memory queue. The persisted list is what survives an operator
+        crash: a restarted process starts with an empty ``_queue`` but
+        re-emits every persisted entry on its first watch tick. Entries
+        emitted from the persisted phase deduplicate their in-memory
+        twins (exact ``(namespace, name, reason, message)`` match), so
+        the common dual-write path emits each Warning exactly once while
+        the restart path re-emits it at least once. A failure to CLEAR
+        the persisted list leaves it in place — the next tick re-emits
+        it (at-least-once; a duplicate Kubernetes Event, never a silent
+        loss).
+
         Each flushed entry becomes one :func:`kopf.event` call with
         ``type="Warning"`` and the recorded ``reason``/``message``.
         The handler module is responsible for installing the
@@ -178,24 +335,75 @@ class QueuedKopfEventSink:
         post-drain length is 0, which is the literal "reset to 0" the
         acceptance criterion calls for; multi-CR backlogs are reported
         faithfully (the residual length is the cross-CR deferred load).
+        The Gauge's semantics are unchanged by #402: it still reports
+        the in-memory queue depth only (the persisted mirror is crash
+        insurance, not a second gauge source).
         """
         pending = [
             msg for msg in self._queue
             if msg[0] == namespace and msg[1] == name
         ]
-        if not pending:
+        # Phase 1 — the persisted queue (issue #402). A fresh store is
+        # built once and reused for the clear at the end of the phase.
+        persisted: list[dict[str, str]] = []
+        store = self._store_for(namespace=namespace, name=name)
+        if store is not None:
+            try:
+                persisted = store.get_deferred_events()
+            except Exception:
+                logger.warning(
+                    "deferred-event persistence read failed for %s/%s; "
+                    "draining the in-memory queue only (issue #402 "
+                    "degradation — persisted entries retry next tick)",
+                    namespace,
+                    name,
+                    exc_info=True,
+                )
+                persisted = []
+        if not pending and not persisted:
             # No-op flush still updates the Gauge — the queue state is
             # unchanged but the call site fired, so we want the gauge
             # to reflect the most recent observation regardless.
             metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(len(self._queue))
             return 0
-        for _ns, _nm, reason, message in pending:
+        emitted_keys: set[tuple[str, str, str, str]] = set()
+        flushed = 0
+        if persisted:
+            for entry in persisted:
+                reason = str(entry.get("reason") or "")
+                message = str(entry.get("message") or "")
+                kopf.event(
+                    {"metadata": {"namespace": namespace, "name": name}},
+                    type="Warning",
+                    reason=reason,
+                    message=message,
+                )
+                emitted_keys.add((namespace, name, reason, message))
+                flushed += 1
+            if store is not None:
+                try:
+                    store.clear_deferred_events()
+                except Exception:
+                    logger.warning(
+                        "deferred-event persistence clear failed for %s/%s; "
+                        "the persisted entries will re-emit on the next "
+                        "tick (at-least-once, issue #402)",
+                        namespace,
+                        name,
+                        exc_info=True,
+                    )
+        # Phase 2 — the in-memory queue, skipping tuples already emitted
+        # from the persisted phase (the dual-write dedup: exactly-once in
+        # the common path, at-least-once across restarts).
+        fresh = [msg for msg in pending if msg not in emitted_keys]
+        for _ns, _nm, reason, message in fresh:
             kopf.event(
                 {"metadata": {"namespace": namespace, "name": name}},
                 type="Warning",
                 reason=reason,
                 message=message,
             )
+            flushed += 1
         self._queue[:] = [
             msg for msg in self._queue
             if not (msg[0] == namespace and msg[1] == name)
@@ -205,7 +413,7 @@ class QueuedKopfEventSink:
         # multi-CR backlogs report the residual so the on-call can see
         # the cross-CR load via a sustained nonzero value.
         metrics_module.WARNINGS_DEFERRED_QUEUE_DEPTH.set(len(self._queue))
-        return len(pending)
+        return flushed
 
     @property
     def queued(self) -> list[tuple[str, str, str, str]]:
