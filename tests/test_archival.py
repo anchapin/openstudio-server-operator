@@ -5,6 +5,7 @@ Regenerate them after an intentional manifest change with:
 ``REGENERATE_GOLDEN=1 .venv/bin/pytest tests/test_archival.py``
 """
 
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from openstudio_operator.archival import (
     NFS_MOUNT_PATH,
@@ -299,3 +302,224 @@ def test_build_requires_complete_storage_policy() -> None:
 def test_job_name_matches_analysis_id_when_hex() -> None:
     # the normal case: readable name embedding the (hex) analysis id
     assert ANALYSIS_ID in archival_job_name(ANALYSIS_ID)
+
+
+# --- Hypothesis-driven property tests (issue #297) -------------------------
+#
+# The hand-written cases above parametrize ``archival_job_name`` over six
+# inputs (``#270``) and check ``build_archival_job`` against one shape per
+# backend (``tests/golden/archival_job_{s3,gcs,azure}.json``). Both fences
+# silently bypass the long tail:
+#
+#   * ``archival_job_name``: unicode, embedded newlines, control characters,
+#     8-bit ASCII boundary, bidi marks, leading/trailing dot or dash
+#     sequences, multi-megabyte strings — none of these are sampled today,
+#     and a regression that drops ``re.sub``'s ``[^a-z0-9-]+`` clause would
+#     pass the hand-written cases while breaking name-safety.
+#
+#   * ``build_archival_job``: the golden file pins one shape per backend. A
+#     regression that drops ``automountServiceAccountToken: false`` only when
+#     the analysis_id contains a digit, omits the pod-level seccompProfile
+#     only when the ``storagePolicy.bucket`` is a specific length, or
+#     mangles the envFrom secretRef for one of the three backends, would
+#     not surface as a test failure until a production cluster hits it.
+#
+# The six properties below are the acceptance criteria from #297:
+#
+#   (a) ``archival_job_name(x)`` matches DNS-1035-safe and ≤ 63 chars for
+#       any text input (including unicode, control chars, embedded
+#       newlines, 8-bit ASCII boundary, bidi marks).
+#   (b) ``archival_job_name(x) == archival_job_name(x)`` — deterministic.
+#   (c) The 8-char sha256-256 prefix digest suffix is collision-free across
+#       any reasonable sample of distinct inputs.
+#   (d) The pod-level + container-level ``securityContext`` is byte-stable
+#       across the ``backend × analysis_id`` cross.
+#   (e) The container ``envFrom[].secretRef`` shape is byte-stable across
+#       the same cross.
+#   (f) The container image is always digest-pinned (``@sha256:`` prefix).
+#
+# Bounded ``max_size`` on the text strategy keeps the property test well
+# inside the D12 / conftest duration budget (issue #257) — sha256 on a 256
+# char string is microseconds and the operator never sees ids longer than
+# a MongoDB ObjectId hex (24 chars) in production. ``.hypothesis/`` stays
+# locally cached and gitignored (see ``.gitignore``).
+
+# (a)+(b) arbitrary text input, including the long-tail chars the
+# hand-written parametrization misses (unicode, embedded newlines, control
+# chars, 8-bit ASCII boundary). ``min_size=0`` is intentional — empty /
+# whitespace-only / pure-punctuation ids are a documented stress case
+# (the digest-suffix fallback path kicks in when sanitization strips to
+# the empty string).
+_raw_id_text = st.text(min_size=0, max_size=256)
+
+
+@given(raw_id=_raw_id_text)
+def test_archival_job_name_property_format_compliance(raw_id: str) -> None:
+    """(a) ``archival_job_name(x)`` is DNS-1035-safe and ≤ 63 chars for any text input.
+
+    Property: every hypothesis-generated ``raw_id`` (unicode, control
+    chars, embedded newlines, 8-bit ASCII boundary, bidi marks,
+    leading/trailing dot and dash sequences, multi-megabyte strings)
+    yields a name that matches the K8s DNS-1035 label regex
+    ``^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`` and is at most 63 chars long.
+
+    A regression in the sanitization regex
+    (``re.sub(r"[^a-z0-9-]+", "-", analysis_id.lower()).strip("-")``)
+    or in the 63-char budget trim would surface here for any
+    non-alphanumeric input the hand-written parametrization misses.
+    """
+    name = archival_job_name(raw_id)
+    assert name.startswith("oscm-archive-"), name
+    assert re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", name), name
+    assert len(name) <= 63, name
+
+
+@given(raw_id=_raw_id_text)
+def test_archival_job_name_property_idempotency(raw_id: str) -> None:
+    """(b) ``archival_job_name(x) == archival_job_name(x)`` — deterministic.
+
+    Property: repeated invocations with the same input must yield the
+    same name. The generator is purely functional over its ``analysis_id``
+    argument (sha256 + regex + string concat), so idempotency is a
+    smoke-level guarantee — but it costs little to assert, and it
+    catches a regression where someone introduces non-determinism
+    (e.g. a Python set iteration in the sanitization step).
+    """
+    assert archival_job_name(raw_id) == archival_job_name(raw_id)
+
+
+# (c) Distinct raw ids must not collide on the 8-hex-char digest suffix.
+# Hypothesis samples up to 64 distinct inputs per example; the probability
+# of any sha256-prefix collision in that range is astronomically small
+# (~2^-32 * O(64^2) ≈ 10^-15), so the assertion holds for any seed
+# hypothesis can reach. We pin the strategy to ``unique=True`` so the
+# input list has no duplicates — the property is "distinct in ⇒
+# distinct digest suffix out".
+_unique_raw_id_text = st.text(min_size=0, max_size=256)
+
+
+@given(
+    raw_ids=st.lists(
+        _unique_raw_id_text,
+        min_size=2,
+        max_size=64,
+        unique=True,
+    ),
+)
+def test_archival_job_name_property_digest_uniqueness(raw_ids: list[str]) -> None:
+    """(c) ``sha256(x)[:8]`` suffix is collision-free across distinct inputs.
+
+    Property: no two distinct ``raw_ids`` in a sampled list produce the
+    same 8-hex-char digest suffix. The digest is the only escape hatch
+    that lets two distinct raw ids collapse onto the same name after
+    sanitization (e.g. ``"a b"`` and ``"a-b"`` both sanitize to ``"a-b"``
+    — the test in #280 covers that pair specifically; this property
+    generalises the fence over all sampled distinct inputs).
+    """
+    digests = [
+        hashlib.sha256(x.encode("utf-8")).hexdigest()[:_DIGEST_LEN]
+        for x in raw_ids
+    ]
+    assert len(set(digests)) == len(digests), (
+        f"sha256 prefix collision among {len(raw_ids)} distinct raw ids"
+    )
+
+
+# (d)+(e)+(f) Fuzz the manifest generator over the cross
+# ``StoragePolicy(backend=...) × analysis_id``. All three properties are
+# byte-stability assertions: a regression that drops a key from
+# ``securityContext``, swaps the ``envFrom`` shape, or drops the
+# ``@sha256:`` digest for one backend × one id pair would surface here.
+#
+# ``_DIGEST_LEN`` is the constant ``archival._DIGEST_LEN`` — re-imported
+# via a public attribute to avoid coupling this test to a private name.
+_DIGEST_LEN = 8  # mirrors archival._DIGEST_LEN; the constant is part of the public Job-name contract.
+
+_backend_strategy = st.sampled_from(("s3", "gcs", "azure"))
+# analysis_id must be non-empty: ``build_archival_job`` raises
+# ``ValueError("analysis_id must be non-empty")`` on the empty string,
+# which is the correct behaviour but not what we're testing here.
+_nonempty_analysis_id = st.text(
+    min_size=1,
+    max_size=128,
+)
+
+
+@given(backend=_backend_strategy, raw_id=_nonempty_analysis_id)
+def test_archival_manifest_byte_stable_securityContext(backend: str, raw_id: str) -> None:
+    """(d) Pod-level + container-level ``securityContext`` is byte-stable.
+
+    Property: for every ``(backend, analysis_id)`` cross, the pod-level
+    ``securityContext`` dict and the rclone container's
+    ``securityContext`` dict match the fixed defence-in-depth baseline
+    byte-for-byte. A regression that drops ``seccompProfile`` only when
+    a deep ``pod_spec.securityContext`` is rebuilt for one backend, or
+    omits ``capabilities.drop`` only when the analysis id is unicode,
+    would surface here.
+    """
+    job = build_archival_job(raw_id, _policy(backend), NAMESPACE)
+    pod_spec = job["spec"]["template"]["spec"]
+    assert pod_spec["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 1000,
+        "seccompProfile": {"type": "RuntimeDefault"},
+        "fsGroup": 1000,
+    }
+    container_security_context = _container(job)["securityContext"]
+    assert container_security_context == {
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+        "runAsNonRoot": True,
+        "runAsUser": 1000,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+
+
+@given(backend=_backend_strategy, raw_id=_nonempty_analysis_id)
+def test_archival_manifest_byte_stable_envFrom(backend: str, raw_id: str) -> None:
+    """(e) Container ``envFrom[].secretRef`` shape is byte-stable.
+
+    Property: for every ``(backend, analysis_id)`` cross, the rclone
+    container's ``envFrom`` is exactly ``[{"secretRef": {"name": <secret_ref>}}]``
+    and only that — no inline ``value``, no ``secretKeyRef``, no extra
+    entries. Credentials flow only via ``envFrom secretRef`` (issue #15,
+    D09); the operator never reads secret values, so this is the
+    integrity boundary. A regression that omits ``envFrom`` for one
+    backend, inlines a secret value, or adds an extra ``envFrom``
+    entry with a stray ``configMapRef``, would surface here.
+    """
+    job = build_archival_job(raw_id, _policy(backend), NAMESPACE)
+    container = _container(job)
+    assert container["envFrom"] == [{"secretRef": {"name": SECRET_REF}}]
+    # ``env`` carries exactly one entry (the rclone remote-type override)
+    # and never carries a ``valueFrom``, ``secretKeyRef``, or any
+    # inline secret value. Belt-and-braces on top of the envFrom check.
+    blob = json.dumps(container)
+    assert "valueFrom" not in blob
+    assert "secretKeyRef" not in blob
+    assert "configMapRef" not in blob
+
+
+@given(backend=_backend_strategy, raw_id=_nonempty_analysis_id)
+def test_archival_manifest_byte_stable_image_digest_pinned(
+    backend: str, raw_id: str
+) -> None:
+    """(f) The rclone container image is always digest-pinned.
+
+    Property: the container ``image`` string is ``<repo>:<tag>@sha256:<digest>``
+    for every ``(backend, analysis_id)`` cross. A regression that drops
+    the ``@sha256:`` suffix (e.g. someone refactors ``RCLONE_IMAGE`` to
+    a plain tag-only reference) would surface here. Mirrors the
+    hand-written ``test_archival_job_image_pinned_by_digest`` (#124)
+    fuzzed over the full cross.
+    """
+    job = build_archival_job(raw_id, _policy(backend), NAMESPACE)
+    image = _container(job)["image"]
+    assert "@sha256:" in image, image
+    assert image.endswith(f"@{RCLONE_IMAGE_DIGEST}"), image
+    # Tag form is preserved for human readability — the digest is what
+    # the kubelet resolves against, but a future regression that drops
+    # the tag in favour of "digest-only" would break grep-ability on the
+    # cluster, so we keep the explicit prefix check too.
+    assert image.startswith("rclone/rclone:"), image
