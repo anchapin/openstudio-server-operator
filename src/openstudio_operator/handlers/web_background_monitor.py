@@ -82,6 +82,7 @@ flipping ``spec.dryRun`` back to false changes only the mutation.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -97,8 +98,10 @@ from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_QUEUE_DEPTH,
+    RESQUE_QUEUE_DEPTH_FRESH,
     RESQUE_WORKERS_SEEN_MAX,
     STALL_WINDOW_ELAPSED_SECONDS,
+    STALL_WINDOW_FRESH,
     WEB_BACKGROUND_RESTARTS_TOTAL,
 )
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
@@ -399,6 +402,16 @@ def _stall_condition_holds(
     depths = redis_client.queue_depths()
     for queue_name, depth in depths.items():
         RESQUE_QUEUE_DEPTH.labels(queue=queue_name).set(depth)
+    # Issue #312 — paired freshness stamp set to ``time.time()`` on every
+    # successful LLEN read. The ``RESQUE_QUEUE_DEPTH`` gauge above advances
+    # on success but is NOT touched on the exception path (Redis
+    # unreachable, ApiException from ``stale_workers`` / ``worker_heartbeats``
+    # below). Without this stamp the previous tick's depth masquerades as
+    # a live reading while the operator has lost visibility. Set at the
+    # SAME site that advances the depth gauge so a dashboard's
+    # ``time() - RESQUE_QUEUE_DEPTH_FRESH`` computation matches the depth
+    # gauge's actual read time exactly.
+    RESQUE_QUEUE_DEPTH_FRESH.set(time.time())
     if not any(depth > 0 for depth in depths.values()):
         return False
     # Leg B: nobody is processing — every registered heartbeat is stale
@@ -531,6 +544,21 @@ def run_stall_tick(
         STALL_WINDOW_ELAPSED_SECONDS.set(max(elapsed, 0.0))
     else:
         STALL_WINDOW_ELAPSED_SECONDS.set(0.0)
+    # Issue #312 — paired freshness stamp set to ``time.time()`` on every
+    # successful post-observe update (both the holding and broken paths).
+    # The ``STALL_WINDOW_ELAPSED_SECONDS`` gauge above is updated on the
+    # same two paths but is NOT touched on the exception path
+    # (``RedisClientError`` | ``ApiException`` raised from
+    # ``_stall_condition_holds``) — so a prior tick's value can
+    # masquerade as a continuing stall window while the operator has in
+    # fact lost visibility. Set at the SAME site that updates the
+    # elapsed-gauge so a dashboard's
+    # ``time() - STALL_WINDOW_FRESH`` computation matches the elapsed-
+    # gauge's actual update time exactly. ``max(elapsed, 0.0)`` is a
+    # paranoid guard against negative elapsed values when ``now`` ticks
+    # backwards; the freshness stamp does not need the guard (we want
+    # the moment we last touched the gauge, not the underlying elapsed).
+    STALL_WINDOW_FRESH.set(time.time())
     if not sustained:
         return False
 

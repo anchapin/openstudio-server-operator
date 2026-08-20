@@ -665,6 +665,187 @@ def test_sensing_failure_raises_resets_tracker_and_is_retried():
     assert api.obj["status"]["lastWebBackgroundRestart"] == (NOW + minute(12)).isoformat()
 
 
+# --- Issue #312 — freshness timestamp gauges detect stale data ------------------
+
+
+import time as _time
+
+
+def queue_depth_fresh() -> float:
+    return REGISTRY.get_sample_value("openstudio_operator_resque_queue_depth_fresh") or 0.0
+
+
+def stall_window_fresh() -> float:
+    return REGISTRY.get_sample_value("openstudio_operator_stall_window_fresh") or 0.0
+
+
+def _reset_freshness_gauges() -> None:
+    """Reset the freshness gauges between tests.
+
+    Both gauges are process-level Prometheus singletons — without the
+    reset, an earlier test that touched them leaks the value into the
+    next test's ``time.time() > stale`` assertion. Mirrors
+    :func:`wbm_module.reset_leg2_safeguard_state` for the leg-2 gauge.
+    """
+    from openstudio_operator import metrics as _metrics
+
+    _metrics.RESQUE_QUEUE_DEPTH_FRESH.set(0.0)
+    _metrics.STALL_WINDOW_FRESH.set(0.0)
+
+
+def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick():
+    """Issue #312 acceptance: the freshness stamp for ``RESQUE_QUEUE_DEPTH``
+    advances on every sensing tick that successfully reads Redis, BEFORE
+    any leg evaluation runs (the same unconditional-advance pattern
+    from issue #87 / #238). The stamp is the ``time.time()`` value at
+    the moment ``queue_depths()`` returned — a monotonic timestamp
+    that dashboards use to compute staleness. Verified end-to-end via
+    the full ``run_stall_tick`` path (a normal sensing tick that
+    doesn't fire a restart still has to advance the freshness stamp).
+    """
+    from openstudio_operator import metrics as _metrics
+
+    _reset_freshness_gauges()
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    before = _time.time()
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW,
+        tracker=tracker,
+        redis=make_redis(NOW, simulations=2),
+    )
+    after = _time.time()
+
+    fresh = queue_depth_fresh()
+    assert before <= fresh <= after
+    assert _metrics.RESQUE_QUEUE_DEPTH_FRESH._value.get() == fresh
+
+
+def test_stall_window_fresh_advances_on_holding_and_broken_paths():
+    """Issue #312 acceptance: the freshness stamp for
+    ``STALL_WINDOW_ELAPSED_SECONDS`` advances on BOTH the holding path
+    (condition held, ``elapsed`` is set) and the broken path (condition
+    cleared, ``0.0`` is set). Verified by running a holding tick
+    followed by a broken tick and asserting the stamp strictly
+    increases across both — same site as the data gauge, so the
+    freshness/value pair stays locked together for the dashboard's
+    staleness computation.
+    """
+    from openstudio_operator import metrics as _metrics
+
+    _reset_freshness_gauges()
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # Holding tick (full stall condition): the elapsed-gauge is set to
+    # the elapsed seconds since first_observed (here 0 since NOW == NOW).
+    before_hold = _time.time()
+    tick(api, apps, pods, now=NOW, tracker=tracker, redis=stall_redis(NOW))
+    after_hold = _time.time()
+    fresh_after_hold = stall_window_fresh()
+    assert before_hold <= fresh_after_hold <= after_hold
+    assert _metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() >= 0.0
+
+    # Small sleep so the second timestamp strictly differs from the
+    # first (the gauge uses real-time ``time.time()``).
+    _time.sleep(0.01)
+
+    # Broken tick (queues drained): the elapsed-gauge is set to 0.0.
+    before_break = _time.time()
+    tick(
+        api,
+        apps,
+        pods,
+        now=NOW + minute(1),
+        tracker=tracker,
+        redis=stall_redis(NOW + minute(1), queued=False),
+    )
+    after_break = _time.time()
+    fresh_after_break = stall_window_fresh()
+    assert before_break <= fresh_after_break <= after_break
+    assert _metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 0.0
+    # Broken path strictly newer than holding path.
+    assert fresh_after_break > fresh_after_hold
+
+
+def test_freshness_gauges_stale_on_redis_failure():
+    """Issue #312 acceptance: the freshness stamp MUST NOT advance on
+    the exception path — a Redis/K8s-sensing failure must leave the
+    stamp untouched so dashboards can compute
+    ``time() - RESQUE_QUEUE_DEPTH_FRESH`` and alert on a sustained
+    gap. The data gauges can hold a prior tick's value (the failure
+    mode #312 fixes); the freshness gauges must NOT — that gap is
+    the alert signal.
+
+    Verifies both gauges in one tick using the same ``FlakyRedis`` that
+    the pre-#312 ``test_sensing_failure_raises_resets_tracker_and_is_
+    retried`` test exercises, then asserts the freshness stamps are
+    exactly the values from the prior successful tick (the issue-#312
+    regression fence: a future refactor that wraps the gauge writes in
+    a try/finally or bumps the freshness on exception would silently
+    unmask the failure and is caught here).
+    """
+    from openstudio_operator import metrics as _metrics
+
+    _reset_freshness_gauges()
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    tracker = StallWindowTracker()
+    wbm_module.reset_leg2_safeguard_state()
+
+    # Good tick: both freshness gauges advance to ~NOW.
+    good_redis = make_redis(NOW, simulations=2)
+    tick(api, apps, pods, now=NOW, tracker=tracker, redis=good_redis)
+    queue_fresh_before = queue_depth_fresh()
+    stall_fresh_before = stall_window_fresh()
+    assert queue_fresh_before > 0.0
+    assert stall_fresh_before > 0.0
+    # Note: in the good tick the condition doesn't hold (heartbeats are
+    # missing but the worker registry is empty — leg A holds but leg B
+    # holds vacuously; the stall will start to accumulate on the next
+    # tick). We don't depend on the data gauge here — only on the
+    # freshness stamps being non-zero after a successful tick.
+
+    # Allow some real time to pass so ``time.time()`` strictly advances.
+    _time.sleep(0.05)
+
+    # Flaky tick: the sensing raises — both freshness gauges must stay
+    # pinned at their pre-tick values.
+    class FlakyRedis:
+        def worker_heartbeats(self) -> dict[str, float | None]:
+            raise RedisClientError("SMEMBERS failed: connection reset")
+
+        def queue_depths(self) -> dict[str, int]:
+            raise RedisClientError("LLEN failed: connection reset")
+
+    with pytest.raises(RedisClientError):
+        tick(
+            api,
+            apps,
+            pods,
+            now=NOW + minute(1),
+            tracker=tracker,
+            redis=FlakyRedis(),
+        )
+
+    assert queue_depth_fresh() == queue_fresh_before
+    assert stall_window_fresh() == stall_fresh_before
+    # Belt-and-braces: the gauges' internal values are also untouched.
+    assert _metrics.RESQUE_QUEUE_DEPTH_FRESH._value.get() == queue_fresh_before
+    assert _metrics.STALL_WINDOW_FRESH._value.get() == stall_fresh_before
+
+
 # --- dryRun (D11) ----------------------------------------------------------------
 
 

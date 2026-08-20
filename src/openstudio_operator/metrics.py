@@ -98,6 +98,38 @@ RESQUE_QUEUE_DEPTH = Gauge(
     labelnames=["queue"],
 )
 
+# Issue #312 — ``RESQUE_QUEUE_DEPTH`` (above) advances only on a successful
+# Redis LLEN; on the exception path (Redis unreachable, ApiException, etc.)
+# the gauge holds its prior tick's value and masquerades as a live reading
+# while the operator has in fact lost visibility. A paired freshness
+# timestamp gauge set to ``time.time()`` immediately after each successful
+# read lets dashboards compute staleness (``time() - fresh``) and alert
+# on the gap — the same idiom as the rest of the Prometheus ecosystem
+# (``_created`` series). Set at the same site in
+# ``web_background_monitor._stall_condition_holds`` that advances
+# :data:`RESQUE_QUEUE_DEPTH`, BEFORE any leg evaluation runs, so the
+# freshness stamp is recorded on every sensing tick — matching the
+# unconditional-advance pattern of issue #87. Unlabelled: the freshness is
+# process-wide (the operator reads Resque from one place); bounded
+# cardinality (one series). Same docstring pointer convention as
+# :data:`STALL_WINDOW_FRESH` below.
+RESQUE_QUEUE_DEPTH_FRESH = Gauge(
+    "openstudio_operator_resque_queue_depth_fresh",
+    "Unix-epoch seconds of the most recent successful "
+    "``RESQUE_QUEUE_DEPTH`` read (issue #312). Set to ``time.time()`` "
+    "after every successful ``ReadOnlyRedisClient.queue_depths()`` call "
+    "in ``web_background_monitor._stall_condition_holds``. The "
+    "``RESQUE_QUEUE_DEPTH`` Gauge advances on success but is NOT "
+    "touched on the exception path (Redis unreachable, ApiException, "
+    "etc.) — so a stale value can masquerade as a live reading while the "
+    "operator has in fact lost visibility. Dashboards should compute "
+    "staleness as ``time() - openstudio_operator_resque_queue_depth_"
+    "fresh`` and alert on a sustained gap, the same idiom as the rest of "
+    "the Prometheus ecosystem's ``_created`` series. Set on EVERY "
+    "sensing tick that successfully reads Redis (the unconditional-"
+    "advance pattern from issue #87).",
+)
+
 # Issue #239 — singleton-guard election outcomes. The guard (D05, issue #14)
 # emits Warning ``SingletonConflict`` on losers and Normal
 # ``SingletonActive`` on the winner when > 1 CRs exist, plus a single info
@@ -186,6 +218,39 @@ STALL_WINDOW_ELAPSED_SECONDS = Gauge(
     "first sustained observation and the eventual restart — without this "
     "gauge, three or more Redis/K8s-leg ticks can accumulate toward a "
     "restart with nothing on the dashboard until the gate trips.",
+)
+
+# Issue #312 — ``STALL_WINDOW_ELAPSED_SECONDS`` (above) is set on the
+# holding/broken paths in ``run_stall_tick`` but NOT on the exception path
+# (``RedisClientError`` | ``ApiException`` from ``_stall_condition_holds``
+# → blind gap → tracker.reset() → re-raise). A successful prior tick's
+# value (some nonzero accumulated window) therefore masquerades as a
+# continuing stall window while the operator has in fact lost visibility.
+# A paired freshness timestamp gauge set to ``time.time()`` immediately
+# AFTER the ``STALL_WINDOW_ELAPSED_SECONDS.set(...)`` sequence on both
+# the holding and broken paths lets dashboards compute staleness
+# (``time() - fresh``) and alert on the gap — the same idiom as the rest
+# of the Prometheus ecosystem's ``_created`` series. Set at the SAME site
+# that already sets :data:`STALL_WINDOW_ELAPSED_SECONDS` in
+# ``run_stall_tick`` so the gauge tracks the gauge exactly. Unlabelled:
+# one series per process (the stall window is per-CR, but the gauge is
+# process-wide as in #254; the freshness follows the same scope).
+STALL_WINDOW_FRESH = Gauge(
+    "openstudio_operator_stall_window_fresh",
+    "Unix-epoch seconds of the most recent "
+    "``STALL_WINDOW_ELAPSED_SECONDS`` update (issue #312). Set to "
+    "``time.time()`` after every successful ``STALL_WINDOW_ELAPSED_"
+    "SECONDS.set(...)`` in ``web_background_monitor.run_stall_tick`` "
+    "(both the holding path at elapsed-seconds assignment and the "
+    "broken/restart-reset path). The ``STALL_WINDOW_ELAPSED_SECONDS`` "
+    "Gauge advances on the holding/broken paths but is NOT updated on "
+    "the exception path (``RedisClientError`` | ``ApiException`` "
+    "raised from ``_stall_condition_holds``) — so a prior tick's value "
+    "can masquerade as a continuing stall window while the operator has "
+    "in fact lost visibility. Dashboards should compute staleness as "
+    "``time() - openstudio_operator_stall_window_fresh`` and alert on "
+    "a sustained gap (the same idiom as the rest of the Prometheus "
+    "ecosystem's ``_created`` series).",
 )
 
 # Issue #255 — ``kopf.event`` emission failure counter. ``EventEmitter``
