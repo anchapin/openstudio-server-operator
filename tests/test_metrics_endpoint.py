@@ -39,6 +39,14 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_singleton_election_total",
     # Issue #255 — kopf.event emission failures (per reason).
     "openstudio_operator_events_emit_failures_total",
+    # Issue #306 — storage-prune CronJob skip-tick failures (per branch
+    # reason). The two skip-tick sites in prune_entrypoint.main() bump
+    # this counter (cr_list_failure, runtime_failure); the CronJob pod
+    # exposes the same /metrics endpoint on port 9090 as the operator,
+    # gated by the parallel ``openstudio-storage-pruner-metrics-ingress``
+    # NetworkPolicy. Mirrors the bounded-cardinality convention #117
+    # established for the handler timer wrappers.
+    "openstudio_operator_prune_tick_failures_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
@@ -172,6 +180,11 @@ def test_metrics_http_server_serves_all_declared_counters():
     # ``reason`` label vocabulary matches ``events_emitted_total`` so the
     # two can be rate-correlated on a dashboard.
     metrics.EVENTS_EMIT_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # Issue #306 — pre-touch the storage-prune CronJob's skip-tick failure
+    # counter. The two-branch vocabulary (cr_list_failure | runtime_failure)
+    # mirrors the two skip-tick sites in prune_entrypoint.main(); the
+    # CronJob pod exposes the same exposition format on port 9090.
+    metrics.PRUNE_TICK_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -219,6 +232,12 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_events_emit_failures_total":
             assert (
                 'openstudio_operator_events_emit_failures_total{reason="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_prune_tick_failures_total":
+            # Issue #306 — labelled by `reason` (cr_list_failure | runtime_failure).
+            assert (
+                'openstudio_operator_prune_tick_failures_total{reason="__metrics_test_sentinel__"}'
                 in response.text
             )
         else:
