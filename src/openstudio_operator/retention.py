@@ -313,7 +313,7 @@ def _delete_verified(
             logger.debug("delete of verified analysis %s suppressed (spec.dryRun)", analysis_id)
         return False
     client.delete_analysis(analysis_id)
-    ANALYSES_DELETED_TOTAL.inc()
+    ANALYSES_DELETED_TOTAL.labels(outcome="deleted").inc()
     emit("Normal", ANALYSIS_DELETED_EVENT, message)
     store.clear_archived_analysis(analysis_id)  # post-deletion prune (eager)
     return True

@@ -20,6 +20,18 @@ factories + public `list_datapoints()` (`#234` `#235` `#250` `#251`
 `#252`), per-handler exception coverage + live-fixture drift + Hypothesis
 edge cases (`#246` `#247` `#248` `#249`).
 
+### Changed
+- **`#309`** — outcome / trigger labels on the four unlabelled action
+  counters so the dashboard can distinguish distinct outcomes without
+  log scraping.
+  - `openstudio_operator_soft_stops_total{outcome}` (`issued` | `dry-run`)
+  - `openstudio_operator_workers_recycled_total{trigger}` (`analysis-completed` | `interval-elapsed`)
+  - `openstudio_operator_worker_pods_evicted_total{outcome}` (`evicted` | `evicted-partial` | `no-matching-pods` | `dry-run`)
+  - `openstudio_operator_analyses_deleted_total{outcome}` (`deleted`)
+  CI gate tests pin all four label vocabularies so a future refactor
+  that drops or renames a label is caught at CI rather than at the
+  on-call's Grafana board.
+
 ### Added
 - **`#256`** — structured JSON logs from the operator process (and the
   prune `CronJob`). `:func:`openstudio_operator.logging_setup.install_json_logging``

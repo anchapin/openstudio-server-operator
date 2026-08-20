@@ -187,7 +187,7 @@ def run_recycler_tick(
     if dry_run:
         message += " — patch suppressed (spec.dryRun)"
     emit("Normal", WORKER_RECYCLED_EVENT, message)
-    WORKERS_RECYCLED_TOTAL.inc()
+    WORKERS_RECYCLED_TOTAL.labels(trigger=trigger).inc()
     # Advances in dry-run too — see module docstring (D11 pacing choice).
     store.set_last_recycle_at(now)
     return trigger

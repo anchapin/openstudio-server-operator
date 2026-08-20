@@ -113,7 +113,26 @@ def analyses_payload(*statuses: str) -> list[dict]:
 
 
 def workers_recycled_total() -> float:
-    return REGISTRY.get_sample_value("openstudio_operator_workers_recycled_total") or 0.0
+    """Sum across all label series of ``workers_recycled_total``.
+
+    Issue #309 — the counter gained a ``trigger`` label, so the
+    prometheus-registry sample lookup has to sum every labelled series
+    (``{trigger=...}``) rather than reading the unlabelled ``_value``.
+    Cribbed from
+    ``tests/test_metrics_endpoint.py::_counter_total``'s labelled branch.
+    """
+    counter = REGISTRY.get_sample_value
+    total = 0.0
+    for trigger in (
+        "analysis-completed",
+        "interval-elapsed",
+    ):
+        val = counter(
+            "openstudio_operator_workers_recycled_total",
+            {"trigger": trigger},
+        )
+        total += val or 0.0
+    return total
 
 
 def register_analyses(payload: list[dict]) -> None:
