@@ -96,6 +96,7 @@ from openstudio_operator.config import (
 )
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
+    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_QUEUE_DEPTH,
     RESQUE_QUEUE_DEPTH_FRESH,
@@ -609,6 +610,35 @@ def web_background_monitor(
     **_: object,
 ) -> None:
     """Timer thin wrapper: wire config/redis/store/apis/events, run one tick."""
+    # Issue #308 — wall-clock observation of the wrapper invocation. The
+    # ``finally`` guarantees observation regardless of success or caught
+    # exception, so the slow-tick signal is independent of the failure
+    # counter and a sustained degradation between the healthy band and
+    # the eventual ``handler_tick_failures_total`` increment is visible.
+    _started = time.perf_counter()
+    try:
+        _web_background_monitor_impl(
+            body=body,
+            spec=spec,
+            namespace=namespace,
+            name=name,
+            logger=logger,
+        )
+    finally:
+        HANDLER_TICK_DURATION_SECONDS.labels(module="web_background_monitor").observe(
+            time.perf_counter() - _started
+        )
+
+
+def _web_background_monitor_impl(
+    *,
+    body: dict,
+    spec: dict,
+    namespace: str,
+    name: str,
+    logger: kopf.Logger,
+) -> None:
+    """Inner body of :func:`web_background_monitor` (issue #308)."""
     config = OperatorConfig.from_spec(spec)
     # Same idle posture as every sibling handler: an OSCM without serverUrl
     # is an incomplete CR, even though this monitor senses Redis + K8s only.

@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 import requests
 import responses
+from prometheus_client import generate_latest
 from responses import matchers
 
+from openstudio_operator import metrics
 from openstudio_operator.openstudio_client import (
     OpenStudioApiError,
     OpenStudioClient,
@@ -567,3 +569,177 @@ def test_request_json_not_called_outside_openstudio_client() -> None:
         f"calls at {found}. Add a public method to OpenStudioClient "
         f"and call that instead. See issue #252."
     )
+
+
+# --- Issue #308 — REST round-trip Histogram observation ----------------------
+
+
+def _histogram_count(histogram, **labels: str) -> float:
+    """Read a labelled Histogram's ``_count`` for the given label combo.
+
+    The cumulative observation count is exposed by the per-label
+    histogram child's ``_child_samples()`` walk as a sample named
+    ``<base>_count`` (label set is empty for this synthetic sample —
+    only the metric-level labels are present). Reading directly off
+    ``_buckets[-1]`` does NOT work: in-memory ``_buckets`` holds per-
+    bucket counts, NOT cumulative counts — the cumulative semantic is
+    only computed at sample-collection time. A labelled Histogram with
+    no observations does not expose its series in the ``_metrics``
+    dict, so a missing label combo reads as 0.0. A future refactor that
+    silently drops the observation site at the end of ``_request`` is
+    caught by the delta below, not at the ``_metrics``-shape check
+    (which would false-pass when the dict still has the old series
+    from a prior test).
+    """
+    child = histogram._metrics.get(tuple(labels.values()))
+    if child is None:
+        return 0.0
+    for sample in child._child_samples():
+        if sample.name.endswith("_count"):
+            return float(sample.value)
+    return 0.0
+
+
+@responses.activate
+def test_rest_request_duration_records_200_outcome_for_get(client):
+    """Issue #308 acceptance: ``REST_REQUEST_DURATION_SECONDS`` records
+    every successful GET under ``outcome="200"`` and the verb used.
+
+    The observation is read off the ``_sum`` attribute (Histograms
+    expose their cumulative sum on the underlying MutexValue just like
+    Counters expose their ``_value``); a delta of > 0 means the
+    production observation site at the end of ``_request`` ran. The
+    verb label is read back through the exposition to pin the label
+    cardinality — a future refactor that drops the ``method`` label
+    fails at this assertion, not at the on-call's Grafana board.
+    """
+    responses.get(f"{BASE}/analyses.json", json=[])
+    before = _histogram_count(metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="200")
+    client.list_analyses()
+    after = _histogram_count(metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="200")
+    assert after > before, (
+        "REST_REQUEST_DURATION_SECONDS did not record a 200 outcome "
+        "for the GET verb — the observation site at the end of "
+        "_request is missing (issue #308)."
+    )
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_rest_request_duration_seconds_count{method="GET",outcome="200"}'
+        in exposition
+    )
+
+
+@responses.activate
+def test_rest_request_duration_records_exception_outcome_for_failed_get(client):
+    """Issue #308 acceptance: ``REST_REQUEST_DURATION_SECONDS`` records
+    every ``OpenStudioApiError`` (4xx immediately, 5xx retries exhausted)
+    under ``outcome="exception"`` — separate from the success series so a
+    dashboard can alert on the degraded rate directly.
+    """
+    responses.get(f"{BASE}/analyses.json", status=500)
+    before = _histogram_count(
+        metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="exception"
+    )
+    with pytest.raises(OpenStudioApiError):
+        client.list_analyses()
+    after = _histogram_count(
+        metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="exception"
+    )
+    assert after > before, (
+        "REST_REQUEST_DURATION_SECONDS did not record an exception "
+        "outcome for a 5xx GET — the observation site at the end of "
+        "_request must run in the failure path too (issue #308)."
+    )
+    exposition = generate_latest().decode()
+    assert (
+        'openstudio_operator_rest_request_duration_seconds_count{method="GET",outcome="exception"}'
+        in exposition
+    )
+
+
+@responses.activate
+def test_rest_request_duration_records_exception_outcome_for_failed_post(client):
+    """Issue #308 acceptance: ``REST_REQUEST_DURATION_SECONDS`` records
+    every non-GET 5xx under ``outcome="exception"`` (issue #226 — POST
+    must NOT retry, the single attempt's 5xx propagates). The verb label
+    surfaces the asymmetry: a dashboard can tell a degraded POST rate
+    from a degraded GET rate on the same histogram.
+    """
+    responses.post(f"{BASE}/data_points/dp1/requeue", status=504, body="gateway timeout")
+    before = _histogram_count(
+        metrics.REST_REQUEST_DURATION_SECONDS, method="POST", outcome="exception"
+    )
+    with pytest.raises(OpenStudioApiError):
+        client.requeue_datapoint("dp1")
+    after = _histogram_count(
+        metrics.REST_REQUEST_DURATION_SECONDS, method="POST", outcome="exception"
+    )
+    assert after > before, (
+        "REST_REQUEST_DURATION_SECONDS did not record an exception "
+        "outcome for a 504 POST — the observation site must run in "
+        "the non-retryable 5xx path too (issue #308 + #226)."
+    )
+
+
+@responses.activate
+def test_rest_request_duration_observation_includes_retry_loop(client, sleeps):
+    """Issue #308 acceptance: the wall-clock observation covers the entire
+    retry envelope (sleeps included), not just the final attempt. The
+    test pins two backoff sleeps (1 s, 2 s) before the successful GET —
+    the observation must include that wall-clock so a slow retry that
+    eventually succeeds is visible to the on-call as a degraded tick,
+    not as a healthy one.
+    """
+    responses.get(f"{BASE}/analyses.json", status=503)
+    responses.get(f"{BASE}/analyses.json", status=502)
+    responses.get(f"{BASE}/analyses.json", json=[])
+    before = _histogram_count(metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="200")
+    docs = client.list_analyses()
+    assert docs == []
+    after = _histogram_count(metrics.REST_REQUEST_DURATION_SECONDS, method="GET", outcome="200")
+    # We can't assert a specific elapsed wall-clock — the test only
+    # cares that the retry-loop wall-clock is part of the observation.
+    # The deltas above + the sleeps fixture prove the path ran.
+    assert len(sleeps) == 2
+    assert after > before
+
+
+def test_rest_request_duration_label_cardinality_pinned() -> None:
+    """Issue #308 — pinned label vocabulary. ``method`` is the verbs the
+    operator actually uses (GET | POST | DELETE); ``outcome`` is the
+    terminal result the caller would see (``"200"`` | ``"exception"``).
+    A future refactor that adds a third outcome label — or replaces the
+    ``method`` label with a verb code — fails this pin at CI rather
+    than at the on-call's Grafana board.
+    """
+    # Drive one observation per (method, outcome) pair so the labelled
+    # series are registered in the histogram. The assertions read back
+    # the labelled exposition shape via ``generate_latest()``.
+    histogram = metrics.REST_REQUEST_DURATION_SECONDS
+    for method, outcome in (
+        ("GET", "200"),
+        ("GET", "exception"),
+        ("POST", "200"),
+        ("POST", "exception"),
+        ("DELETE", "200"),
+        ("DELETE", "exception"),
+    ):
+        histogram.labels(method=method, outcome=outcome).observe(0.05)
+    exposition = generate_latest().decode()
+    # Each (method, outcome) pair must register its own _count line.
+    for method, outcome in (
+        ("GET", "200"),
+        ("GET", "exception"),
+        ("POST", "200"),
+        ("POST", "exception"),
+        ("DELETE", "200"),
+        ("DELETE", "exception"),
+    ):
+        assert (
+            f'openstudio_operator_rest_request_duration_seconds_count{{method="{method}",outcome="{outcome}"}}'
+            in exposition
+        ), (
+            f"missing labelled series for method={method} outcome={outcome} "
+            "— a future refactor that drops a label value is caught here, "
+            "not at the on-call's Grafana board (issue #308)."
+        )

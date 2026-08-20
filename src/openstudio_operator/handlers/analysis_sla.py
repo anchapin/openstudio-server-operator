@@ -88,6 +88,7 @@ stop/escalation is re-attempted next poll, a recorded one never re-fires
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -103,6 +104,7 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
+    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     SOFT_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
@@ -599,6 +601,35 @@ def analysis_sla_monitor(
     **_: object,
 ) -> None:
     """Timer thin wrapper: wire config/client/store/kube/events/redis, run one tick."""
+    # Issue #308 — wall-clock observation of the wrapper invocation. The
+    # ``finally`` guarantees observation regardless of success or caught
+    # exception, so the slow-tick signal is independent of the failure
+    # counter and a sustained degradation between the healthy band and
+    # the eventual ``handler_tick_failures_total`` increment is visible.
+    _started = time.perf_counter()
+    try:
+        _analysis_sla_monitor_impl(
+            body=body,
+            spec=spec,
+            namespace=namespace,
+            name=name,
+            logger=logger,
+        )
+    finally:
+        HANDLER_TICK_DURATION_SECONDS.labels(module="analysis_sla").observe(
+            time.perf_counter() - _started
+        )
+
+
+def _analysis_sla_monitor_impl(
+    *,
+    body: dict,
+    spec: dict,
+    namespace: str,
+    name: str,
+    logger: kopf.Logger,
+) -> None:
+    """Inner body of :func:`analysis_sla_monitor` (issue #308)."""
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")

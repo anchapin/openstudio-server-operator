@@ -42,6 +42,8 @@ from typing import Any
 
 import requests
 
+from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS
+
 from ._time import parse_iso_utc
 
 _TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
@@ -134,45 +136,65 @@ class OpenStudioClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
     ) -> requests.Response:
-        url = f"{self._base}{path}"
-        last_error = ""
-        last_exc: Exception | None = None
-        for attempt in range(self._max_retries + 1):
-            if attempt:
-                _sleep(self._jittered_backoff(attempt))
-            try:
-                response = self._session.request(
-                    method, url, params=params, data=data, timeout=self._timeout
-                )
-            except _TRANSIENT_EXCEPTIONS as exc:
-                last_error = f"{exc.__class__.__name__}: {exc}"
-                last_exc = exc
-                continue
-            if response.status_code < 400:
-                return response
-            if response.status_code < 500:
-                raise OpenStudioApiError(
-                    f"{method} {path} returned HTTP {response.status_code}: "
-                    f"{response.text[:200]}"
-                )
-            # Issue #226: 5xx retries are GET-only. POST/PUT/DELETE/PATCH are non-idempotent
-            # by default (RFC 9110 §9.2.2); a 504 that follows a server-side commit must NOT
-            # re-fire the same request. ``DELETE /analyses/{id}`` is documented as idempotent
-            # in practice, but a 504 mid-cascade returns the operator to a tick where the
-            # cascade may have partially executed — the safer default is no retry, and any
-            # call site that wants retry-safe mutating behavior must opt in with its own
-            # idempotency-key design rather than inherit it from this client.
-            if method.upper() != "GET":
-                raise OpenStudioApiError(
-                    f"{method} {path} returned HTTP {response.status_code} (no retry: "
-                    f"non-GET verb is non-idempotent per RFC 9110 §9.2.2, see issue #226): "
-                    f"{response.text[:200]}"
-                )
-            last_error = f"HTTP {response.status_code}"
-            last_exc = None
-        raise OpenStudioApiError(
-            f"{method} {path} failed after {self._max_retries + 1} attempts: {last_error}"
-        ) from last_exc
+        # Issue #308 — observe wall-clock duration of every ``_request`` call,
+        # including the GET-only 3x retry envelope. The histogram is observed
+        # once at the END of the function (success or raised exception) so
+        # the entire retry-window wall-clock is part of the observation —
+        # exactly the data point an on-call needs when correlating slow
+        # ticks with REST degredation. ``outcome`` mirrors what the caller
+        # would see: ``"200"`` for any 2xx/3xx return, ``"exception"`` for
+        # any raised ``OpenStudioApiError`` (4xx immediately, 5xx retries
+        # exhausted, or non-GET 5xx per issue #226). ``method`` is the verb
+        # the operator actually uses (GET | POST | DELETE) so a per-verb
+        # split can tell the on-call which verb is responsible.
+        started = time.perf_counter()
+        outcome: str = "exception"
+        try:
+            url = f"{self._base}{path}"
+            last_error = ""
+            last_exc: Exception | None = None
+            for attempt in range(self._max_retries + 1):
+                if attempt:
+                    _sleep(self._jittered_backoff(attempt))
+                try:
+                    response = self._session.request(
+                        method, url, params=params, data=data, timeout=self._timeout
+                    )
+                except _TRANSIENT_EXCEPTIONS as exc:
+                    last_error = f"{exc.__class__.__name__}: {exc}"
+                    last_exc = exc
+                    continue
+                if response.status_code < 400:
+                    outcome = "200"
+                    return response
+                if response.status_code < 500:
+                    raise OpenStudioApiError(
+                        f"{method} {path} returned HTTP {response.status_code}: "
+                        f"{response.text[:200]}"
+                    )
+                # Issue #226: 5xx retries are GET-only. POST/PUT/DELETE/PATCH are non-idempotent
+                # by default (RFC 9110 §9.2.2); a 504 that follows a server-side commit must NOT
+                # re-fire the same request. ``DELETE /analyses/{id}`` is documented as idempotent
+                # in practice, but a 504 mid-cascade returns the operator to a tick where the
+                # cascade may have partially executed — the safer default is no retry, and any
+                # call site that wants retry-safe mutating behavior must opt in with its own
+                # idempotency-key design rather than inherit it from this client.
+                if method.upper() != "GET":
+                    raise OpenStudioApiError(
+                        f"{method} {path} returned HTTP {response.status_code} (no retry: "
+                        f"non-GET verb is non-idempotent per RFC 9110 §9.2.2, see issue #226): "
+                        f"{response.text[:200]}"
+                    )
+                last_error = f"HTTP {response.status_code}"
+                last_exc = None
+            raise OpenStudioApiError(
+                f"{method} {path} failed after {self._max_retries + 1} attempts: {last_error}"
+            ) from last_exc
+        finally:
+            elapsed = time.perf_counter() - started
+            REST_REQUEST_DURATION_SECONDS.labels(
+                method=method.upper(), outcome=outcome
+            ).observe(elapsed)
 
     def _request_json(
         self,
