@@ -93,6 +93,26 @@ jobs:
           bash scripts/check_mongo_password_unique.sh
         # pyyaml is already installed by the #150 step above; the Mongo
         # companion guards uses the same yaml.safe_load.
+      # Issue #301 — PR body must carry a `Scope guard:` block naming the
+      # issues this PR touches and declaring what is intentionally NOT
+      # being changed. Complements the #88 merge-subject hygiene rule
+      # (which only governs the closing/keep-open keyword). Runs only on
+      # pull_request events because pushes to develop don't carry a PR
+      # body — the body is written at PR-open time and re-checked on
+      # every push to the PR branch (the workflow-level
+      # `on.pull_request` trigger fires for each push).
+      - name: Check PR body scope-guard block (issue #301)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR_BODY:-}" ]; then
+            echo "::error::PR body is empty — issue #301 requires a 'Scope guard:' block. See docs/onboarding.md#scope-guard-issue-301."
+            exit 1
+          fi
+          printf '%s\n' "$PR_BODY" > /tmp/pr_body.md
+          bash scripts/check_pr_body_scope.sh --file /tmp/pr_body.md
 
   test:
     runs-on: ubuntu-latest
