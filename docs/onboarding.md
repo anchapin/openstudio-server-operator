@@ -56,7 +56,7 @@ existing handler module as a template, and start editing.
 |------|---------|-------|
 | Python | **3.12** | `Dockerfile` pins `python:3.12-slim` by digest (`#113`); local dev should match. `pyproject.toml` allows `>=3.11` but 3.12 is what CI and the container image use. |
 | `pip` | latest | used to install from `requirements.lock` (hash-pinned, `--require-hashes`) and then the editable package. |
-| `requirements.lock` | pinned | the source of truth for runtime deps (`#173`). Every package is pinned to an exact version with `--hash=sha256:...` annotations. Generated with `pip-compile --generate-hashes --output-file=requirements.lock pyproject.toml` (requires `pip-tools`); see `requirements.lock` header for the exact invocation. Never edit by hand. |
+| `requirements.lock` | pinned | the source of truth for runtime deps (`#173`) AND dev deps (`#298`). Every package is pinned to an exact version with `--hash=sha256:...` annotations. Generated with `pip-compile --extra=dev --generate-hashes --output-file=requirements.lock pyproject.toml` (requires `pip-tools`); see `requirements.lock` header for the exact invocation. The `tests/test_dependency_drift.py` CI gate fails the build if any `[project.optional-dependencies].dev` entry is missing its `--hash` line. Never edit by hand. |
 | `ruff` | **`>=0.16`** | pinned in `pyproject.toml` `[project.optional-dependencies].dev`. Local floor must match CI's floor — the `#68` incident (TRY004 + RUF059) was caused by an old local ruff that activated new CI rules. If `ruff --version` reports `<0.16`, upgrade before committing. |
 | `pytest` | `>=8.0` | installed by `pip install -e '.[dev]'`. **Use the venv pytest, not the system one** — the system pytest cannot resolve the `openstudio_operator` package import and reports `ModuleNotFoundError` for almost every test. |
 | `kubectl` + a cluster | for live validation only | `kopf run --module openstudio_operator.handlers` needs the CRD applied and the namespace `openstudio-server` reachable. The unit-test loop does NOT require a cluster. |
@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-596 tests across 28 files (run `.venv/bin/pytest --collect-only` to
+600 tests across 29 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
