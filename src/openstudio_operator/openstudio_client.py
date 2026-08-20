@@ -45,12 +45,61 @@ import requests
 from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS
 
 from ._time import parse_iso_utc
+from .redis_client import OperatorConfigError
 
 _TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 
 
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
+
+
+_PEM_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
+
+
+def _resolve_tls_ca_bundle() -> bool | str:
+    """Validate ``OPENSTUDIO_TLS_CA_BUNDLE`` and return the value ``requests.Session.verify`` expects.
+
+    Issue #296: the truthy-string fallthrough ``ca_bundle if ca_bundle else True``
+    silently accepted arbitrary non-empty env values (``"True"``, ``"1"``,
+    ``"yes"``, ``"on"``) and passed them to ``requests`` as CA-bundle paths. An
+    attacker who controls the operator pod env (or a misconfigured helm chart
+    that templated a boolean flag into the env var) could substitute a CA
+    bundle of their choosing and MITM the in-cluster REST traffic. The
+    ``BEGIN CERTIFICATE`` substring check pins the value to a real PEM bundle.
+
+    Returns ``True`` when the env var is unset or empty (system trust store —
+    the pinned regression fence from issue #242). Returns the bundle path on
+    success. Raises :class:`OperatorConfigError` on any validation failure so
+    the operator refuses to start the tick rather than degrading TLS
+    verification into an obscure ``requests`` ``SSLError`` at the first REST
+    call.
+    """
+    ca_bundle = os.environ.get("OPENSTUDIO_TLS_CA_BUNDLE")
+    if not ca_bundle:
+        return True
+    if not os.path.isfile(ca_bundle):
+        raise OperatorConfigError(
+            f"OPENSTUDIO_TLS_CA_BUNDLE={ca_bundle!r} does not name an existing "
+            f"file; refusing to start the tick with an unverifiable CA bundle "
+            f"(issue #296). Mount the PEM bundle as a Secret volume and set "
+            f"the env var to its in-pod path."
+        )
+    try:
+        with open(ca_bundle, encoding="utf-8") as bundle_file:
+            head = bundle_file.read(4096)
+    except OSError as exc:
+        raise OperatorConfigError(
+            f"OPENSTUDIO_TLS_CA_BUNDLE={ca_bundle!r} is not readable: {exc}; "
+            f"refusing to start the tick (issue #296)."
+        ) from exc
+    if _PEM_BEGIN_MARKER not in head:
+        raise OperatorConfigError(
+            f"OPENSTUDIO_TLS_CA_BUNDLE={ca_bundle!r} does not contain a "
+            f"{_PEM_BEGIN_MARKER!r} PEM marker in the first 4 KiB; refusing to "
+            f"treat it as a CA bundle (issue #296)."
+        )
+    return ca_bundle
 
 
 # Single source of truth for ISO-8601 → tz-aware UTC parsing (D12 boundary,
@@ -122,8 +171,13 @@ class OpenStudioClient:
         # ``os.environ.get('OPENSTUDIO_TLS_CA_BUNDLE', True)`` semantics; the
         # empty-string branch below preserves that without ruff's PLW1508
         # (``True`` default on ``os.environ.get`` is a string-returning API).
-        ca_bundle = os.environ.get("OPENSTUDIO_TLS_CA_BUNDLE")
-        self._session.verify = ca_bundle if ca_bundle else True
+        # Issue #296: the truthy-string path above accepted arbitrary non-empty
+        # values (``"True"``, ``"1"``, ``"yes"``) and handed them to ``requests``
+        # as a CA bundle path. ``_resolve_tls_ca_bundle`` validates the path
+        # exists and contains a ``BEGIN CERTIFICATE`` PEM marker; on failure it
+        # raises ``OperatorConfigError`` so the operator refuses to start the
+        # tick rather than degrading TLS verification to a runtime ``SSLError``.
+        self._session.verify = _resolve_tls_ca_bundle()
 
     def _jittered_backoff(self, retry: int) -> float:
         return random.uniform(0.5, 1.5) * self._backoff_base_seconds * 2 ** (retry - 1)
