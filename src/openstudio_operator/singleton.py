@@ -573,16 +573,15 @@ def install_singleton_guard(registry: object | None = None) -> int:
 
     Issue #250 — Python-level registry cross-check. Before wrapping each
     OSCM timer, the gate verifies the handler is registered in
-    :mod:`openstudio_operator._oscm_handlers` (either via an explicit
-    ``register(handler_id, fn)`` call in the handler module or via the
-    legacy-id back-compat set). A new OSCM timer that forgot to register
-    is logged at ERROR level and SKIPPED — the test
+    :mod:`openstudio_operator._oscm_handlers` (via an explicit
+    ``register(handler_id, fn)`` call in the handler module). A new OSCM
+    timer that forgot to register is logged at ERROR level and SKIPPED —
+    the test
     ``tests/test_singleton_registry_coverage.py::test_python_registry_includes_all_oscm_spawning_handlers``
     fails the build before the operator can boot with a silently
-    un-gated handler. The four existing handlers are pinned by
-    ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so this scope guard
-    ("do NOT modify the four existing handlers' registration paths") is
-    honored without updating their registration code.
+    un-gated handler. Issue #285 retired the legacy-id whitelist that
+    grandfathered the four pre-#250 timers — every OSCM handler must
+    now register explicitly, so this cross-check has no exemptions.
     """
     # Local import: avoiding a top-level dependency on the Python-level
     # registry so the gate's import graph stays shallow (the registry is
@@ -611,8 +610,8 @@ def install_singleton_guard(registry: object | None = None) -> int:
         # Issue #250 — cross-check the Python-level registry. A new OSCM
         # timer that forgot to call register() is logged loudly and the
         # wrap is SKIPPED so the test gate can fail before the operator
-        # boots with a silently un-gated handler. The four existing
-        # handlers are exempted by the legacy-id set.
+        # boots with a silently un-gated handler. Issue #285 retired the
+        # legacy-id set, so there are no exemptions.
         if not _oscm_handlers.is_registered(handler_id):
             logger.error(
                 "singleton guard (D05): OSCM timer %r is registered with kopf "

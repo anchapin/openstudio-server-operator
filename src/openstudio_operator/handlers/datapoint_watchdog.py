@@ -64,6 +64,7 @@ from datetime import UTC, datetime, timedelta
 
 import kopf
 
+from openstudio_operator._oscm_handlers import register as _register_oscm_handler
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -246,3 +247,10 @@ def zombie_datapoint_watchdog(
         return
     if requeued:
         logger.info("datapoint watchdog requeued %d zombie datapoint(s)", len(requeued))
+
+
+# Issue #285 — register this timer in the Python-level OSCM handler
+# registry so the singleton guard's cross-check passes without the
+# legacy-id whitelist (retired after #285 closed the grandfathering
+# window for the four pre-#250 timers).
+_register_oscm_handler("zombie_datapoint_watchdog", zombie_datapoint_watchdog)

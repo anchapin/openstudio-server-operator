@@ -880,14 +880,13 @@ def test_only_one_v1_api_construction_point_per_factory() -> None:
 # (:mod:`openstudio_operator._oscm_handlers`) that new handler modules
 # call at module import time via ``register(handler_id, fn)``, and
 # cross-check the kopf registry against the Python registry at gate
-# time inside ``install_singleton_guard``. The four existing handlers
-# (analysis_sla_monitor, zombie_datapoint_watchdog, web_background_monitor,
-# worker_recycler) are exempt from the explicit ``register()`` call
-# (issue scope guard: "do NOT modify the four existing handlers'
-# registration paths"); their IDs are listed in
-# ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so the cross-check
-# passes for them. A new OSCM timer that forgets to register fails this
-# test loudly.
+# time inside ``install_singleton_guard``. A new OSCM timer that forgets
+# to register fails this test loudly.
+#
+# Issue #285 retired the legacy-id whitelist
+# (``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS``) that grandfathered
+# the four pre-#250 timers — they register explicitly now, so the
+# cross-check has no exemptions.
 
 
 def test_python_registry_includes_all_oscm_spawning_handlers() -> None:
@@ -895,16 +894,14 @@ def test_python_registry_includes_all_oscm_spawning_handlers() -> None:
 
     The Python-level registry
     (:mod:`openstudio_operator._oscm_handlers`) is the declarative
-    seam: new handler modules call ``register(handler_id, fn)`` at
-    module import time, and the singleton guard cross-checks the
-    Python registry against the kopf registry at gate time. A new
-    OSCM timer that forgot to register would silently slip past the
-    gate (the gate wraps every OSCM timer in the kopf registry; the
-    Python registry is what the test pins here). The four existing
-    handlers are exempt from the explicit ``register()`` call via
-    ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` so the scope
-    guard ("do NOT modify the four existing handlers' registration
-    paths") is honored.
+    seam: every OSCM spawning handler module (existing or new) calls
+    ``register(handler_id, fn)`` at module import time, and the
+    singleton guard cross-checks the Python registry against the kopf
+    registry at gate time. A new OSCM timer that forgot to register
+    would silently slip past the gate (the gate wraps every OSCM timer
+    in the kopf registry; the Python registry is what the test pins
+    here). Issue #285 retired the legacy-id set that used to exempt
+    the four pre-#250 timers; the cross-check has no exemptions now.
     """
     from openstudio_operator import _oscm_handlers
 
@@ -915,43 +912,20 @@ def test_python_registry_includes_all_oscm_spawning_handlers() -> None:
     oscm = _oscm_spawning_handlers(registry)
     kopf_timer_ids = {getattr(h, "id", "?") for h in oscm}
 
-    # The Python-level registry is the union of the explicit registry
-    # entries (new handler modules) AND the legacy-id set (the four
-    # pre-#250 handlers exempted from the explicit ``register()`` call).
-    python_registry_ids = (
-        set(_oscm_handlers.REGISTRY.keys())
-        | set(_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS)
-    )
+    # Issue #285 — the Python-level registry is the sole source of
+    # truth for OSCM handler ids known to the gate. The legacy-id
+    # whitelist that used to be unioned in here is retired; every OSCM
+    # timer must register explicitly via ``register(handler_id, fn)``.
+    python_registry_ids = set(_oscm_handlers.REGISTRY.keys())
 
     missing = kopf_timer_ids - python_registry_ids
     assert not missing, (
         f"OSCM timer(s) registered with kopf but NOT in the Python-level "
-        f"registry (issue #250): {sorted(missing)}. New handler modules "
-        f"MUST call "
+        f"registry (issue #250 / #285): {sorted(missing)}. Every OSCM "
+        f"handler module MUST call "
         f"openstudio_operator._oscm_handlers.register(handler_id, fn) "
         f"at module import time. See "
-        f"tests/test_singleton_registry_coverage.py and issue #250."
-    )
-
-    # Guard against accidental expansion: a future maintainer who adds
-    # an explicit ``register()`` call for a legacy handler would
-    # silently expand the Python registry. That is harmless per se
-    # (the cross-check is membership-based, not value-based), but the
-    # legacy-id set is the canonical "no extra wiring needed" seal — a
-    # double-registration is a hint that the legacy handler is now
-    # meeting the new-style contract and could be removed from the
-    # legacy set in a follow-up. The test reports this so the
-    # maintainer can clean up.
-    explicit_legacy = (
-        set(_oscm_handlers.REGISTRY.keys())
-        & set(_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS)
-    )
-    assert not explicit_legacy, (
-        f"OSCM timer(s) in the legacy-id set ALSO have an explicit "
-        f"register() entry (issue #250): {sorted(explicit_legacy)}. "
-        f"Either remove the redundant register() call from the handler "
-        f"module, OR remove the id from "
-        f"_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS — pick one."
+        f"tests/test_singleton_registry_coverage.py and issues #250 / #285."
     )
 
 
@@ -993,8 +967,9 @@ def test_install_singleton_guard_skips_unregistered_oscm_handler(
 
     # Save and restore the Python registry around the call so the test
     # is hermetic against the suite-wide singleton-import side effect.
+    # Issue #285 retired KNOWN_LEGACY_OSCM_HANDLER_IDS — the legacy-id
+    # seam is no longer needed because the cross-check has no exemptions.
     saved_registry = dict(_oscm_handlers.REGISTRY)
-    saved_legacy = _oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS
     try:
         _oscm_handlers.REGISTRY.clear()
         with caplog.at_level(logging.ERROR, logger=singleton.logger.name):
@@ -1024,11 +999,95 @@ def test_install_singleton_guard_skips_unregistered_oscm_handler(
     finally:
         _oscm_handlers.REGISTRY.clear()
         _oscm_handlers.REGISTRY.update(saved_registry)
-        # KNOWN_LEGACY_OSCM_HANDLER_IDS is a frozenset; defensively
-        # reassign in case a future maintainer makes it mutable.
-        assert _oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS is saved_legacy, (
-            "KNOWN_LEGACY_OSCM_HANDLER_IDS is not a frozenset (it was "
-            "replaced by the test seam). Update the gate's cross-check "
-            "and the test in lockstep."
-        )
 
+
+# --- Issue #285 — Python-level registry is the sole source of truth ------------
+#
+# Issue #285: ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` was a
+# whitelist that exempted the four pre-#250 OSCM timers
+# (analysis_sla_monitor, zombie_datapoint_watchdog, web_background_monitor,
+# worker_recycler) from the explicit ``register()`` call. The whitelist was
+# a maintenance burden — every future OSCM spawning handler must NOT be
+# added to it (must call ``register()``), but a reviewer has to spot any
+# new entry the next time a handler ships. After the four legacy handlers
+# migrated, the whitelist was retired and the Python-level registry became
+# the SOLE source of truth for OSCM handler ids known to the singleton
+# guard's cross-check.
+#
+# This test pins both halves of the structural invariant at the CI gate:
+#
+# * no whitelist back-channel — ``KNOWN_LEGACY_OSCM_HANDLER_IDS`` is
+#   gone (or, defensively, empty), so a future OSCM handler cannot
+#   bypass the gate by being added to the whitelist instead of calling
+#   ``register()``;
+# * no orphan — every OSCM ``@kopf.timer`` registered by the operator
+#   has a corresponding ``register()`` call in its handler module,
+#   walked via the kopf spawning registry (the same registry the
+#   singleton guard cross-checks).
+#
+# The companion ``test_python_registry_includes_all_oscm_spawning_handlers``
+# pins the membership invariant in the more targeted form; this test is
+# the explicit regression fence for #285 — re-introducing either half of
+# the structural invariant (whitelist or orphan) fails this test loudly.
+def test_no_oscm_handler_orphan_or_legacy_whitelist() -> None:
+    """Issue #285: no orphan + no whitelist — the registry is sole source of truth.
+
+    After #285, the singleton guard's cross-check
+    (:func:`openstudio_operator.singleton.install_singleton_guard`) has
+    no exemptions: every OSCM spawning handler (existing or new) MUST
+    register explicitly via
+    :func:`openstudio_operator._oscm_handlers.register` at module
+    import time. This test pins the structural invariant at the CI gate
+    so a regression that re-introduces a whitelist back-channel OR
+    lets an OSCM timer skip ``register()`` fails loudly.
+
+    Walks the kopf spawning registry (the same registry the singleton
+    guard cross-checks at gate time) and asserts:
+
+    1. ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` does NOT exist
+       (or, defensively, is empty) — re-introducing the whitelist would
+       silently let a future OSCM handler bypass the gate, defeating
+       the entire purpose of the Python registry.
+    2. Every OSCM ``@kopf.timer`` registered with kopf has a
+       corresponding ``register()`` entry — no orphan; a handler that
+       registered with kopf but forgot ``register()`` would skip the
+       gate and run un-gated.
+    """
+    from openstudio_operator import _oscm_handlers
+
+    _ensure_handler_modules_loaded()
+
+    # 1. No whitelist back-channel. Issue #285 retired the legacy-id
+    # set; the singleton guard's cross-check has no exemptions. The
+    # constant itself must not exist — re-introducing it (even empty)
+    # would silently let a future OSCM handler bypass the gate.
+    assert not hasattr(_oscm_handlers, "KNOWN_LEGACY_OSCM_HANDLER_IDS"), (
+        "_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS must be retired "
+        "after issue #285 — the singleton guard's cross-check has no "
+        "exemptions. Every OSCM timer must call register() explicitly. "
+        "Re-introducing the constant (even empty) would silently let a "
+        "future OSCM handler bypass the gate. Remove the constant "
+        "entirely. See issue #285."
+    )
+
+    # 2. No orphan. Walk the kopf spawning registry and assert every
+    # OSCM timer id has a corresponding ``register()`` call. This is the
+    # structural complement of the membership assertion in
+    # ``test_python_registry_includes_all_oscm_spawning_handlers``: that
+    # test is the targeted gate; this assertion is the explicit
+    # regression fence for #285's "every entry has a corresponding
+    # register() call" acceptance criterion.
+    registry = kopf.get_default_registry()
+    _spawning_handlers_list(registry)  # boundary check: fails loudly if internals moved
+    oscm = _oscm_spawning_handlers(registry)
+    kopf_timer_ids = {getattr(h, "id", "?") for h in oscm}
+    python_registry_ids = set(_oscm_handlers.REGISTRY.keys())
+
+    orphans = kopf_timer_ids - python_registry_ids
+    assert not orphans, (
+        f"OSCM timer(s) registered with kopf but missing register() call "
+        f"in handler module (issue #285 — no whitelist exemption): "
+        f"{sorted(orphans)}. Every OSCM timer MUST call "
+        f"openstudio_operator._oscm_handlers.register(handler_id, fn) "
+        f"at module import time. See issue #285."
+    )

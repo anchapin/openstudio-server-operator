@@ -2,25 +2,26 @@
 
 The kopf registry is the operational register for the operator's
 ``@kopf.timer`` / ``@kopf.daemon`` handlers. The Python-level registry
-here provides a declarative seam that new handler modules call at module
-import time via :func:`register`, and the singleton guard (D05,
-:mod:`openstudio_operator.singleton`) cross-checks the two registries at
-gate time. The AST test in
+here provides a declarative seam that EVERY OSCM spawning handler
+module calls at module import time via :func:`register`, and the
+singleton guard (D05, :mod:`openstudio_operator.singleton`)
+cross-checks the two registries at gate time. The AST test in
 ``tests/test_singleton_registry_coverage.py::test_python_registry_includes_all_oscm_spawning_handlers``
 pins the agreement invariant so the failure mode that was the entire
 motivation of the existing coverage test — "a new OSCM timer registered
 without going through install_singleton_guard" — is now caught by the
 test too.
 
-The four OSCM handlers that PRE-DATE this registry (``analysis_sla_monitor``,
-``zombie_datapoint_watchdog``, ``web_background_monitor``, ``worker_recycler``)
-registered with kopf directly via their ``@kopf.timer`` decorators; per
-the issue scope guard the existing registration paths are NOT modified.
-Their IDs are listed in :data:`KNOWN_LEGACY_OSCM_HANDLER_IDS` so the
-cross-check passes for them without retrofitting a ``register()`` call
-into the handler modules. New handler modules MUST call
-:func:`register` at module import time (after the ``@kopf.timer``
-decorator).
+Issue #285 retired the legacy-id whitelist
+(``KNOWN_LEGACY_OSCM_HANDLER_IDS``) that grandfathered the four
+pre-#250 timers (``analysis_sla_monitor``, ``zombie_datapoint_watchdog``,
+``web_background_monitor``, ``worker_recycler``). Each of those handler
+modules now calls :func:`register` at import time, so the cross-check
+passes for them without a side-channel exemption. The Python registry
+is therefore the SOLE source of truth for OSCM handler ids known to the
+gate; a regression that adds a new OSCM ``@kopf.timer`` without
+``register()`` fails the test loudly before the operator can boot with
+a silently un-gated handler.
 
 Why both registries? The kopf registry is the OPERATIONAL one — kopf
 itself iterates over it to invoke the timer fns. The Python registry
@@ -39,33 +40,21 @@ from __future__ import annotations
 from collections.abc import Callable
 
 #: Process-wide registry of OSCM spawning handlers, keyed by handler id
-#: (the kopf ``id`` attribute on the timer registry entry). New handler
-#: modules call :func:`register` at module import time; the singleton guard
-#: cross-checks this dict against the kopf registry at gate time.
+#: (the kopf ``id`` attribute on the timer registry entry). Every OSCM
+#: spawning handler module calls :func:`register` at module import time;
+#: the singleton guard cross-checks this dict against the kopf registry
+#: at gate time. Issue #285 retired the legacy-id whitelist that used to
+#: grandfather the four pre-#250 timers — they register explicitly now.
 REGISTRY: dict[str, Callable] = {}
-
-#: Issue #250 — the four OSCM handlers that pre-dated the Python-level
-#: registry. Their IDs are whitelisted here so the cross-check passes
-#: without retrofitting a ``register()`` call into the handler modules
-#: (scope guard: "do NOT modify the four existing handlers' registration
-#: paths — only add the new registry decorator"). New handler modules
-#: MUST NOT add to this set; they call :func:`register` instead.
-KNOWN_LEGACY_OSCM_HANDLER_IDS: frozenset[str] = frozenset(
-    {
-        "analysis_sla_monitor",
-        "zombie_datapoint_watchdog",
-        "web_background_monitor",
-        "worker_recycler",
-    }
-)
 
 
 def register(handler_id: str, fn: Callable) -> Callable:
     """Register an OSCM ``@kopf.timer`` / ``@kopf.daemon`` handler.
 
-    New handler modules call this at module import time — after the
-    ``@kopf.timer`` decorator is applied and after the function is
-    defined — so the Python-level registry knows about the handler before
+    Every OSCM spawning handler module (existing or new) MUST call this
+    at module import time — after the ``@kopf.timer`` decorator is
+    applied and after the function is defined — so the Python-level
+    registry knows about the handler before
     :func:`openstudio_operator.singleton.install_singleton_guard` runs.
     The singleton guard cross-checks the Python registry against the kopf
     registry; a missing entry fails the new
@@ -102,12 +91,13 @@ def register(handler_id: str, fn: Callable) -> Callable:
 def is_registered(handler_id: str) -> bool:
     """Return whether ``handler_id`` is an OSCM handler known to the registry.
 
-    Encompasses BOTH the explicit :func:`register` entries AND the
-    legacy IDs in :data:`KNOWN_LEGACY_OSCM_HANDLER_IDS`. The singleton
-    guard's cross-check uses this function so the legacy-vs-new
-    distinction is invisible to the gate.
+    Membership is membership of the explicit :func:`register` dict. Issue
+    #285 retired the legacy-id set that used to short-circuit this check
+    for the four pre-#250 timers — every OSCM handler must now register
+    explicitly, so the gate's cross-check is membership-based against
+    :data:`REGISTRY` alone.
     """
-    return handler_id in REGISTRY or handler_id in KNOWN_LEGACY_OSCM_HANDLER_IDS
+    return handler_id in REGISTRY
 
 
 def reset_registry() -> None:
@@ -119,8 +109,6 @@ def reset_registry() -> None:
     :func:`openstudio_operator.singleton.install_singleton_guard`
     cross-check uses ``REGISTRY`` membership (not the value), so a
     duplicate entry is benign — but tests that assert the explicit-set
-    shape (e.g. "no new handler registered") need a clean slate. The
-    legacy-id set is module-level and immutable; this seam clears only
-    the dynamic entries.
+    shape (e.g. "no new handler registered") need a clean slate.
     """
     REGISTRY.clear()

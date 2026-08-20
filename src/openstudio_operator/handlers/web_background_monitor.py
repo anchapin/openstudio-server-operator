@@ -128,6 +128,7 @@ from openstudio_operator._constants import (
     WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
 )
 from openstudio_operator._k8s import deployment_label_selector
+from openstudio_operator._oscm_handlers import register as _register_oscm_handler
 
 POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 
@@ -622,3 +623,10 @@ def web_background_monitor(
         return
     if fired:
         logger.warning("web_background stall confirmed — Deployment restart issued")
+
+
+# Issue #285 — register this timer in the Python-level OSCM handler
+# registry so the singleton guard's cross-check passes without the
+# legacy-id whitelist (retired after #285 closed the grandfathering
+# window for the four pre-#250 timers).
+_register_oscm_handler("web_background_monitor", web_background_monitor)
