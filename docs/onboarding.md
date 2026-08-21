@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-753 tests across 38 files (run `.venv/bin/pytest --collect-only` to
+756 tests across 38 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -441,9 +441,12 @@ The second half of the AGENTS.md ValidatingAdmissionPolicies bullet:
 `batch/jobs create|update|delete` verbs to Jobs carrying BOTH
 `app.kubernetes.io/managed-by=openstudio-operator` AND
 `app.kubernetes.io/component=archival` — the labels `archival.py`
-stamps on every archival Job (the CEL checks `object` for
-CREATE/UPDATE and `oldObject` for DELETE). RBAC still grants the
-verbs; the VAP does the label narrowing RBAC cannot express. Same
+stamps on every archival Job — AND named `oscm-archive-*`
+(`metadata.name.startsWith("oscm-archive-")`, the deterministic-name
+convention of `archival.py::archival_job_name`; labels alone are
+spoofable by the very SA the policy constrains, #398) (the CEL checks
+`object` for CREATE/UPDATE and `oldObject` for DELETE). RBAC still
+grants the verbs; the VAP does the narrowing RBAC cannot express. Same
 K8s 1.30+ requirement and `failurePolicy: Fail` stance as #293.
 
 Failure modes:
@@ -455,8 +458,9 @@ Failure modes:
   [`tests/test_deploy_manifests.py::test_prune_job_scope_vap_label_keys_match_archival_manifest`](../../tests/test_deploy_manifests.py)
   builds a real Job via `build_archival_job` and asserts the VAP's
   label pairs match what `archival.py` emits.
-- Relaxing the CEL validations (dropping a label requirement or the
-  `oldObject` DELETE-side clause) fails
+- Relaxing the CEL validations (dropping a label requirement, the
+  `oscm-archive-` name-pattern clause (#398), or the `oldObject`
+  DELETE-side clause) fails
   `test_prune_job_scope_vap_validations_require_archival_labels` and
   the rest of the `test_prune_job_scope_vap_*` family.
 

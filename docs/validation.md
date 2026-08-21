@@ -41,7 +41,7 @@ referenced the deleted `handlers/storage_pruner.py`; those lines predate the
 | Phase 4 — KEDA autoscaling | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication) | **live** | Replaces custom Redis HPA-floor handler in #77; operator owns zero autoscaling surface and emits no `hpa_floor_adjustments_total` counter |
 | Singleton guard (D05) | `src/openstudio_operator/singleton.py`, installed from `handlers/__init__.py` | **live** | Passive oldest-CR-per-namespace guard; Warning Event + loud log on second CR |
 | VAP pod-delete scope (#293) | `deploy/pod-delete-admission-policy.yaml` (cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the operator SA's `pods/delete` to pods labeled `app=worker` — a constraint RBAC cannot express (`PolicyRule` has no `labelSelector`). Requires K8s 1.30+ (`admissionregistration.k8s.io/v1` GA); pre-1.30 clusters must skip it |
-| VAP prune batch/jobs scope (#294) | `deploy/storage-cronjob.yaml` (embedded cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the prune SA's `batch/jobs` create/update/delete to Jobs carrying both `app.kubernetes.io/managed-by=openstudio-operator` and `app.kubernetes.io/component=archival`. Requires K8s 1.30+; pre-1.30 clusters must skip it |
+| VAP prune batch/jobs scope (#294) | `deploy/storage-cronjob.yaml` (embedded cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the prune SA's `batch/jobs` create/update/delete to Jobs carrying both `app.kubernetes.io/managed-by=openstudio-operator` and `app.kubernetes.io/component=archival` and named `oscm-archive-*` (labels alone are spoofable — the name pattern from `archival.py::archival_job_name` is the second factor, #398). Requires K8s 1.30+; pre-1.30 clusters must skip it |
 
 ## Ground rules (from AGENTS.md)
 
@@ -96,7 +96,8 @@ the four that change how you interpret curl output here:
   2. `deploy/storage-cronjob.yaml` (#294) — prune SA's `batch/jobs`
      create/update/delete restricted to Jobs carrying both
      `app.kubernetes.io/managed-by=openstudio-operator` and
-     `app.kubernetes.io/component=archival`; the same manifest ships the
+     `app.kubernetes.io/component=archival` and named `oscm-archive-*`
+     (#398); the same manifest ships the
      prune CronJob with its SA/Role.
 
   Both policies are cluster-scoped and independent of each other; both
