@@ -83,7 +83,8 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol
 
 import kopf
@@ -96,7 +97,6 @@ from openstudio_operator.config import (
 )
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
-    HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_QUEUE_DEPTH,
     RESQUE_QUEUE_DEPTH_FRESH,
     RESQUE_WORKERS_SEEN_MAX,
@@ -116,7 +116,6 @@ from openstudio_operator.status_store import (
     PLURAL,
     VERSION,
     StatusStore,
-    StatusStoreError,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +137,7 @@ from openstudio_operator._k8s import (
 )
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
+    run_oscm_tick,
 )
 from openstudio_operator._oscm_handlers import (
     register_fn as _register_oscm_handler,
@@ -596,6 +596,16 @@ def run_stall_tick(
     return True
 
 
+@dataclass(frozen=True)
+class _StallTimerClients:
+    """Client bundle the stall monitor's ``wire`` closure builds each tick (#473)."""
+
+    redis_client: ReadOnlyRedisClient
+    apps_api: WorkerDeploymentApi
+    pods_api: PodLister
+    tracker: StallWindowTracker
+
+
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="web_background_monitor")
 def web_background_monitor(
@@ -606,56 +616,61 @@ def web_background_monitor(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer handler: wire config/redis/store/apis/events, run one tick.
+    """Timer handler: delegate the wrapper wiring to the shared tick-runner.
 
-    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
-    decorator (issue #395, replacing the per-module #308 wrapper) observes
-    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
+    Issue #473: config parse, the empty-serverUrl idle check, store /
+    emitter / kube-API construction, the failure counter, and the skip log
+    all live in :func:`openstudio_operator._oscm_handlers.run_oscm_tick`;
+    this module contributes only its client wiring (Redis + apps + core +
+    the stall-window tracker) and the :func:`run_stall_tick` call. The
+    shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395) still observes the wall-clock duration on
+    ``HANDLER_TICK_DURATION_SECONDS.labels
     (module="web_background_monitor")`` in a ``finally`` — regardless of
     success or caught exception.
     """
-    config = OperatorConfig.from_spec(spec)
-    # Same idle posture as every sibling handler: an OSCM without serverUrl
-    # is an incomplete CR, even though this monitor senses Redis + K8s only.
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — web_background monitor idle this tick")
-        return
-    redis_client = get_read_only_redis_client(config.redis_url)
-    store = StatusStore(namespace, name, operator_custom_objects_api())
-    apps_api = operator_apps_api()
-    pods_api = operator_core_api()
-    tracker = _get_tracker(namespace, name)
-    # Issue #164 — single source of truth for Event emission; class wraps
-    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
-    # shim so the existing ``emit("Warning", REASON, message)`` call site
-    # below keeps working unchanged.
-    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
-    try:
-        fired = run_stall_tick(
-            redis_client,
+    def wire(config: OperatorConfig) -> _StallTimerClients:
+        return _StallTimerClients(
+            redis_client=get_read_only_redis_client(config.redis_url),
+            apps_api=operator_apps_api(),
+            pods_api=operator_core_api(),
+            tracker=_get_tracker(namespace, name),
+        )
+
+    def tick(
+        *,
+        config: OperatorConfig,
+        store: StatusStore,
+        emit: EventEmitter,
+        deps: _StallTimerClients,
+        now: datetime,
+    ) -> bool:
+        return run_stall_tick(
+            deps.redis_client,
             store,
             config,
-            apps_api,
-            pods_api,
+            deps.apps_api,
+            deps.pods_api,
             namespace=namespace,
-            now=datetime.now(UTC),
+            now=now,
             emit=emit,
-            tracker=tracker,
+            tracker=deps.tracker,
         )
-    except (RedisClientError, StatusStoreError, ApiException) as exc:
-        HANDLER_TICK_FAILURES_TOTAL.labels(
-            namespace=namespace,
-            name=name,
-            module="web_background_monitor",
-            error_type=type(exc).__name__,
-        ).inc()
-        logger.warning(
-            "web_background monitor tick skipped, retrying next poll (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-        return
+
+    fired = run_oscm_tick(
+        spec=spec,
+        body=body,
+        namespace=namespace,
+        name=name,
+        logger=logger,
+        module="web_background_monitor",
+        tick_label="web_background monitor",
+        idle_label="web_background monitor",
+        custom_objects_api=operator_custom_objects_api,
+        wire=wire,
+        tick=tick,
+    )
     if fired:
         logger.warning("web_background stall confirmed — Deployment restart issued")
 
