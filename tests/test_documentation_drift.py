@@ -3,7 +3,10 @@ embed the legacy pre-#150 ``openstudio`` Redis password in a ``redis://`` URL.
 Issue #409 extends the same gate to the REST contract doc
 (``docs/contracts/openstudio-server-v3.11.0-rest.md``), which still cited the
 literal as the *default* Redis password after #150/#219 rotated it into the
-``openstudio-rotated`` placeholder.
+``openstudio-rotated`` placeholder. Issue #408 adds the README layout drift
+gate: every file under ``deploy/`` must appear in README.md's
+``## Repository layout`` tree with a per-file issue citation, so a new
+manifest fails the build until it is documented.
 
 Why this test exists
 --------------------
@@ -29,11 +32,15 @@ outside the exemption window of such a marker.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KIND_VALIDATION_DOC = REPO_ROOT / "docs" / "kind-validation.md"
 CONTRACTS_DOC = REPO_ROOT / "docs" / "contracts" / "openstudio-server-v3.11.0-rest.md"
+README_DOC = REPO_ROOT / "README.md"
+DEPLOY_DIR = REPO_ROOT / "deploy"
+README_LAYOUT_HEADING = "## Repository layout"
 
 # Broader than the original `redis://:openstudio@` form (issue #409): the
 # acceptance criterion greps for the bare credential literal so a Mongo-style
@@ -140,3 +147,79 @@ def test_contracts_doc_cites_rotated_placeholder_and_rotation_scripts() -> None:
             f"The contract doc must point readers at `{script}` "
             "(rotate-before-applying caveat, issues #409 / #150 / #219)."
         )
+
+
+def readme_layout_section_lines() -> list[str]:
+    """Return the lines of README.md's ``## Repository layout`` section only.
+
+    Scoping to the section (up to the next ``## `` heading) means a manifest
+    name mentioned elsewhere in the README (a test command, a runbook pointer)
+    cannot mask layout drift (issue #408).
+    """
+    lines = README_DOC.read_text(encoding="utf-8").splitlines()
+    section: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.startswith(README_LAYOUT_HEADING):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section:
+            section.append(line)
+    assert section, "README.md must contain a '## Repository layout' section"
+    return section
+
+
+def test_readme_layout_lists_every_deploy_file() -> None:
+    """Issue #408: the README layout tree must enumerate every file under
+    ``deploy/`` so load-bearing manifests (the cluster-scoped admission
+    policy, the network policy, the credential Secrets, the quota and priority
+    classes) are not invisible to first-time contributors. The directory is
+    globbed at test time, so a future manifest that ships undocumented fails
+    here until the README catches up.
+    """
+    layout = "\n".join(readme_layout_section_lines())
+    missing = sorted(
+        path.name for path in DEPLOY_DIR.glob("*.yaml") if path.name not in layout
+    )
+    assert not missing, (
+        "README.md §Repository layout does not mention every deploy/ manifest "
+        f"(issue #408). Undocumented files: {missing}. Add each one to the "
+        "layout tree with a per-file comment citing the introducing issue."
+    )
+
+
+# Primary introducing issue per manifest (from AGENTS.md §Layout and the
+# file headers). Foundational files (crd.yaml, rbac.yaml,
+# operator-deployment.yaml) predate the issue-tracking convention and are
+# intentionally absent.
+DEPLOY_INTRODUCING_ISSUES = {
+    "keda-scaledobject.yaml": "#77",
+    "redis-credentials-secret.yaml": "#77",
+    "mongo-credentials-secret.yaml": "#219",
+    "storage-cronjob.yaml": "#78",
+    "network-policy.yaml": "#112",
+    "pod-delete-admission-policy.yaml": "#293",
+    "priority-class.yaml": "#414",
+    "resource-quota.yaml": "#400",
+}
+
+
+def test_readme_deploy_entries_cite_introducing_issue() -> None:
+    """Issue #408 acceptance: each documented deploy/ entry that has a known
+    introducing issue must cite an issue number on its layout line.
+    """
+    section_lines = readme_layout_section_lines()
+    offenders: list[str] = []
+    for basename, issue in sorted(DEPLOY_INTRODUCING_ISSUES.items()):
+        entry_lines = [line for line in section_lines if basename in line]
+        if not entry_lines:
+            offenders.append(f"{basename}: not listed in README layout")
+            continue
+        if not re.search(r"#\d+", entry_lines[0]):
+            offenders.append(f"{basename}: layout comment cites no issue (expected {issue})")
+    assert not offenders, (
+        "README.md §Repository layout deploy/ entries must cite the "
+        f"introducing issue per file (issue #408). Offenders: {offenders}"
+    )

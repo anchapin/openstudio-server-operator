@@ -249,13 +249,18 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 ```
 .
 ├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (GHCR + releases)
-├── deploy/                     # CRD, RBAC (namespaced Role only), operator Deployment, KEDA, CronJob
+├── deploy/                     # CRD, RBAC, operator Deployment, KEDA, credential Secrets, CronJob, policies
 │   ├── crd.yaml                # OpenStudioClusterManager CRD
 │   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
-│   ├── operator-deployment.yaml
+│   ├── operator-deployment.yaml  # single-replica operator Deployment (strategy: Recreate)
 │   ├── keda-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication (#77)
-│   ├── redis-credentials-secret.yaml  # Redis password for KEDA (#77)
-│   └── storage-cronjob.yaml    # prune CronJob (#78)
+│   ├── redis-credentials-secret.yaml  # Redis password Secret for KEDA (#77; literal rotated out by #150)
+│   ├── mongo-credentials-secret.yaml  # Mongo credentials Secret for the web/db auth boundary (#219)
+│   ├── storage-cronjob.yaml    # prune CronJob (#78)
+│   ├── network-policy.yaml     # NetworkPolicy for the operator surface + /metrics ingress allow (#112, #166)
+│   ├── pod-delete-admission-policy.yaml  # cluster-scoped ValidatingAdmissionPolicy narrowing pods/delete (#293)
+│   ├── priority-class.yaml     # PriorityClass for operator Deployment + prune CronJob (#414)
+│   └── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
 ├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
