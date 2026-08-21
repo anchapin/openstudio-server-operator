@@ -23,6 +23,7 @@ from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
     datapoint_watchdog,
+    dry_run_audit,
     web_background_monitor,
     worker_recycler,
 )
