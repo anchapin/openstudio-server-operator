@@ -51,8 +51,9 @@ EXPECTED_COUNTER_FAMILIES = (
     # Issue #255 — kopf.event emission failures (per reason).
     "openstudio_operator_events_emit_failures_total",
     # Issue #306 — storage-prune CronJob skip-tick failures (per branch
-    # reason). The two skip-tick sites in prune_entrypoint.main() bump
-    # this counter (cr_list_failure, runtime_failure); the CronJob pod
+    # reason). The three bump sites in prune_entrypoint.main() fire this
+    # counter (cr_list_failure, runtime_failure, and the #392 exit-3
+    # redis_url_empty guard); the CronJob pod
     # exposes the same /metrics endpoint on port 9090 as the operator,
     # gated by the parallel ``openstudio-storage-pruner-metrics-ingress``
     # NetworkPolicy. Mirrors the bounded-cardinality convention #117

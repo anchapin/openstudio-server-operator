@@ -174,8 +174,10 @@ def test_metrics_http_server_serves_all_declared_counters():
         reason="__metrics_test_sentinel__",
     ).inc()
     # Issue #306 — pre-touch the storage-prune CronJob's skip-tick failure
-    # counter. The two-branch vocabulary (cr_list_failure | runtime_failure)
-    # mirrors the two skip-tick sites in prune_entrypoint.main(); the
+    # counter. The three-value vocabulary (cr_list_failure |
+    # runtime_failure | redis_url_empty) mirrors the three bump sites in
+    # prune_entrypoint.main() (two skip-tick branches + the #392 exit-3
+    # guard); the
     # CronJob pod exposes the same exposition format on port 9090.
     metrics.PRUNE_TICK_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
     # Issue #309 — pre-touch the four action counters that gained

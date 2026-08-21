@@ -324,8 +324,9 @@ def _counter_value(counter, **labels) -> float:
     """Read a single labelled Counter series value by label match.
 
     Handles the labelled-by-reason Counter pattern from #306 — the
-    only label is ``reason`` and the only vocabulary is the two branch
-    names (``cr_list_failure`` | ``runtime_failure``). prometheus_client
+    only label is ``reason`` and the only vocabulary is the three branch
+    names (``cr_list_failure`` | ``runtime_failure`` |
+    ``redis_url_empty``). prometheus_client
     keys `_metrics` by a TUPLE of the LABEL VALUES (positional, not
     key-value), so for a single label ``reason`` the key is
     ``("cr_list_failure",)`` etc. Matching against the caller's
@@ -353,7 +354,7 @@ def test_prune_skip_tick_cr_list_failure_increments_prune_tick_failures_counter(
     the same event for log forwarding; the counter is the Prometheus
     signal an SRE can alert on). Mirrors the bounded-cardinality
     convention from #117 / #171 / #237 / #239 / #255 — the label
-    vocabulary is the two branch names defined in prune_entrypoint."""
+    vocabulary is the three branch names defined in prune_entrypoint."""
     from openstudio_operator import metrics
 
     counter = metrics.PRUNE_TICK_FAILURES_TOTAL
@@ -407,17 +408,58 @@ def test_prune_skip_tick_runtime_failure_increments_prune_tick_failures_counter(
     )
 
 
+def test_prune_exit3_redis_url_empty_increments_prune_tick_failures_counter():
+    """Issue #392 acceptance: the exit-3 empty-``spec.redisUrl`` guard
+    bumps ``PRUNE_TICK_FAILURES_TOTAL{reason="redis_url_empty"}`` so a
+    sustained wedge (chart upgrade drops the redis-secret KeyRef, CR
+    omits redisUrl entirely) is visible at ``/metrics`` — the #306
+    dashboard alert ``rate(prune_tick_failures_total[5m]) > 0`` covers
+    the redisUrl guard too. Exit-code contract unchanged: 3 still means
+    redisUrl empty (pinned by the #180 test above), and the counter bump
+    happens on EVERY failed Job, which is exactly the per-tick cadence
+    the rate() alert needs."""
+    from openstudio_operator import metrics
+    from openstudio_operator.prune_entrypoint import (
+        PRUNE_TICK_FAILURE_REASON_REDIS_URL_EMPTY,
+    )
+
+    assert PRUNE_TICK_FAILURE_REASON_REDIS_URL_EMPTY == "redis_url_empty"
+
+    counter = metrics.PRUNE_TICK_FAILURES_TOTAL
+    baseline = _counter_value(counter, reason="redis_url_empty")
+    # The label value is distinct from the two #306 skip-tick reasons so
+    # a Grafana panel can tell the redisUrl wedge apart from the
+    # kube-apiserver / REST-outage skips — pinned by asserting the exit-3
+    # path leaves the other two series untouched.
+    cr_baseline = _counter_value(counter, reason="cr_list_failure")
+    rt_baseline = _counter_value(counter, reason="runtime_failure")
+
+    spec = {"serverUrl": BASE, "redisUrl": ""}
+    crs = [make_cr(spec=spec)]
+    code, _batch, _core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+
+    assert code == 3  # exit-code contract unchanged (issues #116, #180)
+
+    after = _counter_value(counter, reason="redis_url_empty")
+    assert after - baseline == 1.0, (
+        f"prune_entrypoint exit-3 redisUrl guard must bump the counter by 1, "
+        f"got {after - baseline}"
+    )
+    assert _counter_value(counter, reason="cr_list_failure") == cr_baseline
+    assert _counter_value(counter, reason="runtime_failure") == rt_baseline
+
+
 def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
-    """Issue #306 regression fence: the two skip-tick branches MUST NOT
+    """Issue #306 regression fence: the counter branches MUST NOT
     silently add any other counter family — only
-    ``PRUNE_TICK_FAILURES_TOTAL`` is bumped. The contract is the two
+    ``PRUNE_TICK_FAILURES_TOTAL`` is bumped. The contract is the three
     reason constants defined in prune_entrypoint.py — a future refactor
-    that raises a third branch without wiring it through the same
+    that raises a fourth branch without wiring it through the same
     constant vocabulary is caught at this test BEFORE the
     EXPECTED_COUNTER_FAMILIES drift-invariant in test_metrics_endpoint.
 
     Structural rather than stateful: this pins the AST contract that
-    the two branch sites use the module-level constants rather than
+    the branch sites use the module-level constants rather than
     inline string literals, so a typo'd reason value (``cr_list_faliure``
     etc.) shows up as a TypeError at call time rather than a silent
     Grafana dashboard split."""
@@ -425,13 +467,14 @@ def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
 
     from openstudio_operator import prune_entrypoint
 
-    # The two module-level constants are the only legitimate reason
-    # values. A third value would need a new constant + a new branch
+    # The three module-level constants are the only legitimate reason
+    # values. A fourth value would need a new constant + a new branch
     # site + a new PRUNE_TICK_FAILURES_TOTAL.labels(...) call.
     assert prune_entrypoint.PRUNE_TICK_FAILURE_REASON_CR_LIST == "cr_list_failure"
     assert prune_entrypoint.PRUNE_TICK_FAILURE_REASON_RUNTIME == "runtime_failure"
+    assert prune_entrypoint.PRUNE_TICK_FAILURE_REASON_REDIS_URL_EMPTY == "redis_url_empty"
 
-    # And the two constants are the ONLY two reasons actually passed to
+    # And the three constants are the ONLY reasons actually passed to
     # PRUNE_TICK_FAILURES_TOTAL.labels(reason=...) — captured by
     # inspecting the source of prune_entrypoint.main(). The
     # single-quoted strings in the constants ARE the strings at the
@@ -441,12 +484,13 @@ def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
         line for line in source.splitlines()
         if "PRUNE_TICK_FAILURES_TOTAL.labels" in line
     ]
-    assert len(branch_call_sites) == 2, (
+    assert len(branch_call_sites) == 3, (
         f"prune_entrypoint must call PRUNE_TICK_FAILURES_TOTAL.labels "
-        f"exactly twice (one per skip-tick branch), got {len(branch_call_sites)}:\n"
+        f"exactly three times (one per failure branch: CR-list skip, D12 "
+        f"runtime skip, exit-3 redisUrl guard #392), got {len(branch_call_sites)}:\n"
         + "\n".join(branch_call_sites)
     )
-    # Both call sites must use the module-level constants, not inline
+    # Every call site must use the module-level constants, not inline
     # string literals — the vocabulary pin.
     for line in branch_call_sites:
         assert "PRUNE_TICK_FAILURE_REASON_" in line, (
