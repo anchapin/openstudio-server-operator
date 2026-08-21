@@ -9,13 +9,17 @@ beyond the ``[dev]`` extra.
 """
 
 import copy
+import logging
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import responses
+from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.handlers import worker_recycler as worker_recycler_module
 from openstudio_operator.handlers.worker_recycler import (
     DEFAULT_WORKER_DEPLOYMENT,
     MERGE_PATCH_CONTENT_TYPE,
@@ -26,7 +30,7 @@ from openstudio_operator.handlers.worker_recycler import (
     run_recycler_tick,
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
-from openstudio_operator.status_store import StatusStore
+from openstudio_operator.status_store import StatusStore, StatusStoreConflictError
 
 BASE = "http://web.test"
 NAMESPACE = "openstudio-server"
@@ -574,3 +578,224 @@ def test_run_recycler_tick_accepts_mappingview_body_in_event_emitter():
     assert apps.patches == []
     assert emitter.suppressed_count == 1
     assert emitter.dry_run is True
+
+
+# --- Issue #467 — tick-level error/recovery paths (D12) -------------------------
+#
+# The wrapper-level exception TUPLE is pinned by test_timer_wrapper_failures.py
+# (issue #231) with a MOCKED run_recycler_tick. These tests close the remaining
+# gap: real errors arising INSIDE run_recycler_tick — REST 5xx through the real
+# client's retry envelope, real 409s through the real StatusStore RMW, and a
+# raw kubernetes ApiException from the Deployment-patch seam. The worker
+# recycler's wrapper catches the 3-tuple (OpenStudioApiError, StatusStoreError,
+# ApiException) — wider than datapoint_watchdog's 2-tuple (#493 owns
+# standardizing) — so every error here lands in the skip-tick branch.
+
+
+class ConflictingFakeCustomObjectsApi(FakeCustomObjectsApi):
+    """Merge-patch fake whose first ``patch_conflicts`` patches raise 409.
+
+    Same synthetic-409 approach as tests/test_status_store.py — exercised here
+    through the full tick so the store's bounded retry is observed from the
+    recycler's point of view, not the store's.
+    """
+
+    def __init__(self, obj: dict, patch_conflicts: int = 0) -> None:
+        super().__init__(obj)
+        self.remaining_conflicts = patch_conflicts
+        self.conflicts_seen = 0
+
+    def patch_namespaced_custom_object_status(
+        self, group, version, namespace, plural, name, body, _content_type=None
+    ):
+        if self.remaining_conflicts > 0:
+            self.remaining_conflicts -= 1
+            self.conflicts_seen += 1
+            raise ApiException(status=409, reason="Conflict")
+        return super().patch_namespaced_custom_object_status(
+            group, version, namespace, plural, name, body, _content_type=_content_type
+        )
+
+
+class ExplodingAppsV1Api:
+    """``patch_namespaced_deployment`` always raises (K8s API-server down).
+
+    Mirrors ExplodingPatchFakeCustomObjectsApi in test_datapoint_watchdog.py,
+    but on the Deployment-patch seam instead of the status seam.
+    """
+
+    def __init__(self) -> None:
+        self.patch_attempts = 0
+
+    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
+        self.patch_attempts += 1
+        raise ApiException(status=500, reason="Internal Server Error")
+
+
+def tick_failures_total(namespace: str, name: str, module: str, error_type: str) -> float:
+    """Read the labelled HANDLER_TICK_FAILURES_TOTAL sample (issue #117 shape)."""
+    return (
+        REGISTRY.get_sample_value(
+            "openstudio_operator_handler_tick_failures_total",
+            {"namespace": namespace, "name": name, "module": module, "error_type": error_type},
+        )
+        or 0.0
+    )
+
+
+def analyses_calls() -> int:
+    return sum(
+        1 for call in responses.calls if call.request.url.startswith(f"{BASE}/analyses.json")
+    )
+
+
+def call_wrapper(monkeypatch, api=None, apps=None):
+    """Invoke the production kopf timer wrapper directly (same direct-call
+    pattern as test_timer_wrapper_failures.py) with both k8s seams stubbed."""
+    if api is None:
+        api = FakeCustomObjectsApi(make_cr())
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.worker_recycler.operator_custom_objects_api",
+        lambda: api,
+    )
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.worker_recycler.operator_apps_api",
+        lambda: apps if apps is not None else FakeAppsV1Api(),
+    )
+    return worker_recycler_module.worker_recycler(
+        body=make_cr(),
+        spec=SPEC,
+        namespace=NAMESPACE,
+        name=NAME,
+        logger=logging.getLogger("test"),
+    )
+
+
+@responses.activate
+def test_sustained_503_on_list_analyses_exhausts_client_retries_and_wrapper_skips_tick(
+    monkeypatch, caplog
+):
+    """Issue #467 (a): GET /analyses.json 503s on every attempt → the client's
+    GET-only 3× retry envelope exhausts (4 attempts) → OpenStudioApiError raises
+    out of run_recycler_tick → the wrapper swallows it, bumps
+    HANDLER_TICK_FAILURES_TOTAL with all four labels, logs the skip-tick
+    warning, and returns None (D12: the next poll retries naturally)."""
+    responses.get(f"{BASE}/analyses.json", status=503)
+    client_sleeps: list[float] = []
+    monkeypatch.setattr("openstudio_operator.openstudio_client._sleep", client_sleeps.append)
+    api = FakeCustomObjectsApi(make_cr())  # gate open, tick dies at the poll
+    apps = FakeAppsV1Api()
+
+    before = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "OpenStudioApiError")
+    result = call_wrapper(monkeypatch, api=api, apps=apps)
+    after = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "OpenStudioApiError")
+
+    assert result is None, "wrapper must swallow OpenStudioApiError and return None (D12)"
+    # max_retries=3 → 4 total GET attempts on /analyses.json, all 503.
+    assert analyses_calls() == 4
+    # Jittered backoff sleeps before each RETRY (not before the first attempt).
+    assert len(client_sleeps) == 3
+    # after/before both read the exact 4-label sample — the delta == 1 IS the
+    # label-exactness proof (a wrong namespace/name/module/error_type reads 0.0).
+    assert after - before == 1.0
+    assert "worker recycler tick skipped, retrying next poll (OpenStudioApiError" in caplog.text
+    # D04 recovery anchor: the tick died before any mutation or status write.
+    assert apps.patches == []
+    assert api.patch_calls == 0
+    assert api.obj["status"] == {}
+
+
+@responses.activate
+def test_status_409_during_set_last_recycle_at_resolved_by_store_bounded_retry(monkeypatch):
+    """Issue #467 (b): one 409 on the anchor write (``set_last_recycle_at``)
+    → StatusStore re-reads and re-applies internally → the tick completes with
+    the recycle recorded. No exception; exactly one landed patch."""
+    store_sleeps: list[float] = []
+    monkeypatch.setattr("openstudio_operator.status_store._sleep", store_sleeps.append)
+    api = ConflictingFakeCustomObjectsApi(make_cr(), patch_conflicts=1)
+    register_analyses(analyses_payload("completed"))
+    apps = FakeAppsV1Api()
+
+    trigger, events = tick(api, apps)
+
+    assert trigger == TRIGGER_ANALYSIS_COMPLETED
+    assert api.conflicts_seen == 1
+    # One backoff sleep inside the store's retry, then success.
+    assert len(store_sleeps) == 1
+    # The conflict was seen by the fake but not counted as a landed patch.
+    assert api.patch_calls == 1
+    assert len(apps.patches) == 1
+    assert api.obj["status"]["lastRecycleAt"] == NOW.isoformat()
+    assert len(events) == 1
+    assert events[0][:2] == ("Normal", WORKER_RECYCLED_EVENT)
+
+
+@responses.activate
+def test_api_exception_from_deployment_patch_is_caught_by_wrapper(monkeypatch, caplog):
+    """Issue #467 (c) — pins CURRENT behavior; #493 owns any change.
+
+    A raw kubernetes ApiException from the Deployment-patch seam
+    (rolling_restart_deployment → patch_namespaced_deployment, K8s API-server
+    down) raises out of run_recycler_tick. Unlike datapoint_watchdog's
+    2-tuple wrapper, this wrapper's except tuple includes ApiException, so it
+    is caught: skip-tick warning, HANDLER_TICK_FAILURES_TOTAL bump with
+    error_type="ApiException", clean None return. The restart was ATTEMPTED
+    but never anchored — next tick re-attempts it (D12)."""
+    register_analyses(analyses_payload("completed"))
+    apps = ExplodingAppsV1Api()
+    api = FakeCustomObjectsApi(make_cr())
+    metric_before = workers_recycled_total()
+
+    before = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "ApiException")
+    result = call_wrapper(monkeypatch, api=api, apps=apps)
+    after = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "ApiException")
+
+    assert result is None, "wrapper must swallow ApiException and return None (3-tuple)"
+    assert apps.patch_attempts == 1
+    assert after - before == 1.0
+    assert "worker recycler tick skipped, retrying next poll (ApiException" in caplog.text
+    # The patch raised BEFORE the Event/counter/anchor lines ran.
+    assert api.patch_calls == 0
+    assert api.obj["status"] == {}
+    assert workers_recycled_total() - metric_before == 0
+
+
+@responses.activate
+def test_sustained_anchor_409_after_restart_fired_raises_benign_delete_then_anchor_race(
+    monkeypatch,
+):
+    """Issue #467 (d) — pins CURRENT behavior; the module docstring documents
+    this as the accepted delete-then-anchor race (D12, worker_recycler.py:36-40:
+    "Patch before anchor: if the anchor write fails, the next tick re-attempts
+    one (harmless) extra rolling restart").
+
+    Sustained 409s past MAX_CONFLICT_RETRIES → StatusStoreConflictError raises
+    out of run_recycler_tick (a StatusStoreError subclass, so the wrapper's
+    catch turns it into a skip-tick, not a crash). The restart FIRED but the
+    anchor never recorded — proving the race window is benign: the next tick
+    reads the missing lastRecycleAt as an open gate and re-fires exactly one
+    extra rolling restart, then anchors successfully."""
+    monkeypatch.setattr("openstudio_operator.status_store._sleep", lambda _s: None)
+    api = ConflictingFakeCustomObjectsApi(make_cr(), patch_conflicts=99)
+    register_analyses(analyses_payload("completed"))
+    register_analyses(analyses_payload("completed"))  # next tick's poll
+    apps = FakeAppsV1Api()
+
+    with pytest.raises(StatusStoreConflictError, match="409"):
+        tick(api, apps)
+
+    # The restart happened before the failed anchor write; nothing was anchored.
+    assert len(apps.patches) == 1
+    assert api.conflicts_seen == 5  # MAX_CONFLICT_RETRIES bound observed
+    assert "lastRecycleAt" not in api.obj["status"]
+
+    # Recovery: conflicts settle → the unanchored recycle re-fires once (the
+    # documented harmless extra restart), then the anchor lands and the gate
+    # closes behind it.
+    api.remaining_conflicts = 0
+    trigger, events = tick(api, apps)
+
+    assert trigger == TRIGGER_ANALYSIS_COMPLETED
+    assert len(apps.patches) == 2
+    assert api.obj["status"]["lastRecycleAt"] == NOW.isoformat()
+    assert len(events) == 1
