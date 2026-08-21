@@ -1,5 +1,6 @@
 """Smoke tests for the Prometheus /metrics endpoint (issue #17)."""
 
+import re
 import socket
 import subprocess
 import sys
@@ -323,6 +324,20 @@ def test_metrics_http_server_serves_all_declared_counters():
             assert (
                 'openstudio_operator_resque_queue_depth{queue="__metrics_test_sentinel__"}'
                 in response.text
+            )
+        elif name == "openstudio_operator_metrics_server_bound":
+            # Issue #393 — labelled by (addr, port); the label VALUES depend
+            # on which bind attempt was first in this pytest process (this
+            # test's own start, or an earlier handlers-package import that
+            # bound 0.0.0.0:9090), and the VALUE is 1.0 unless that first
+            # attempt failed (e.g. port 9090 occupied on a dev laptop). Pin
+            # the label KEYS (alphabetical: addr < port) + a 0.0/1.0 value
+            # via regex; the deterministic success/failure paths live in the
+            # subprocess tests below.
+            assert re.search(
+                r'openstudio_operator_metrics_server_bound'
+                r'\{addr="[^"]+",port="[0-9]+"\} [01]\.0',
+                response.text,
             )
         else:
             assert f"\n{name} " in response.text
@@ -1046,3 +1061,138 @@ def test_handler_tick_duration_histogram_uses_issue_308_bucket_set():
         'openstudio_operator_handler_tick_duration_seconds_bucket{le="+Inf",module="analysis_sla"}'
         in exposition
     )
+
+
+# --- Issue #393 — metrics-server bind-outcome Gauge ------------------------------
+
+
+def test_metrics_server_bound_gauge_success_path():
+    """Issue #393 acceptance: a successful bind advances the gauge to 1.0
+    with the configured ``(addr, port)`` labels, and the series appears in
+    the LIVE /metrics scrape. Runs in a subprocess (the same pattern as
+    ``test_handlers_import_starts_metrics_server``): ``start_metrics_server``
+    is process-idempotent, so the first-attempt semantics can only be
+    exercised deterministically in a fresh process."""
+    code = textwrap.dedent(
+        """
+        import socket
+        from contextlib import closing
+
+        import requests
+        from openstudio_operator.metrics import start_metrics_server
+
+        with closing(socket.socket()) as sock:
+            sock.bind(("127.0.0.1", 0))
+            free_port = sock.getsockname()[1]
+        port = start_metrics_server(port=free_port, addr="127.0.0.1")
+        assert port == free_port, (port, free_port)
+
+        response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
+        assert response.status_code == 200, response.status_code
+        assert "# TYPE openstudio_operator_metrics_server_bound gauge" in response.text
+        # Labels are alphabetical (addr < port); pin the exact series + value.
+        assert (
+            f'openstudio_operator_metrics_server_bound{{addr="127.0.0.1",'
+            f'port="{free_port}"}} 1.0' in response.text
+        )
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_metrics_server_bound_gauge_bind_failure_path():
+    """Issue #393 acceptance: a bind failure (port already in use) sets the
+    gauge to 0.0 with the attempted ``(addr, port)`` labels AND the WARNING
+    log still fires. The 0.0 is asserted from the default REGISTRY
+    exposition — the durable record for the post-mortem, since a dead bind
+    means THIS pod's /metrics is unscrapeable (the self-referential edge
+    documented in the README row)."""
+    code = textwrap.dedent(
+        """
+        import logging
+        import socket
+        from contextlib import closing
+
+        from prometheus_client import generate_latest
+        from openstudio_operator.metrics import start_metrics_server
+
+        records = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        capture = _Capture(level=logging.WARNING)
+        metrics_logger = logging.getLogger("openstudio_operator.metrics")
+        metrics_logger.addHandler(capture)
+        metrics_logger.setLevel(logging.WARNING)
+
+        with closing(socket.socket()) as blocker:
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            busy_port = blocker.getsockname()[1]
+
+            result = start_metrics_server(port=busy_port, addr="127.0.0.1")
+            assert result is None, result
+
+        exposition = generate_latest().decode()
+        assert (
+            f'openstudio_operator_metrics_server_bound{{addr="127.0.0.1",'
+            f'port="{busy_port}"}} 0.0' in exposition
+        )
+        # The WARNING log still fires (the gauge supplements the log, it
+        # does not replace it).
+        warnings = [
+            r for r in records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            "Cannot serve /metrics" in r.getMessage() for r in warnings
+        ), [r.getMessage() for r in warnings]
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_metrics_server_bound_gauge_never_retouched_after_first_attempt():
+    """Issue #393 acceptance: the gauge records the FIRST bind attempt only.
+    A failed first attempt (port in use → 0.0) followed by a successful
+    retry on a different port must NOT flip the gauge to 1.0 nor add a
+    second labelled series — first-attempt semantics, per the issue body."""
+    code = textwrap.dedent(
+        """
+        import socket
+        from contextlib import closing
+
+        from prometheus_client import generate_latest
+        from openstudio_operator.metrics import start_metrics_server
+
+        with closing(socket.socket()) as blocker:
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            busy_port = blocker.getsockname()[1]
+            assert start_metrics_server(port=busy_port, addr="127.0.0.1") is None
+
+        with closing(socket.socket()) as sock:
+            sock.bind(("127.0.0.1", 0))
+            free_port = sock.getsockname()[1]
+        # Retry on a free port binds successfully...
+        assert start_metrics_server(port=free_port, addr="127.0.0.1") == free_port
+
+        exposition = generate_latest().decode()
+        series = [
+            line
+            for line in exposition.splitlines()
+            if line.startswith("openstudio_operator_metrics_server_bound{")
+        ]
+        # ...but the gauge still records the FIRST attempt only: exactly one
+        # series, the failed one, at 0.0 — no 1.0 series for the retry.
+        assert len(series) == 1, series
+        assert (
+            f'openstudio_operator_metrics_server_bound{{addr="127.0.0.1",'
+            f'port="{busy_port}"}} 0.0' in series[0]
+        )
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

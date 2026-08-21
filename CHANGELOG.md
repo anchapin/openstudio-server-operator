@@ -33,6 +33,19 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#393`** — `openstudio_operator_metrics_server_bound{addr,port}`:
+  metrics-server bind-outcome gauge. `start_metrics_server()` catches
+  `OSError` and only logged a WARNING — the operator continued with
+  `/metrics` dead and no /metrics-side signal distinguished "operator
+  wedged" from "metrics endpoint never bound". The gauge records the
+  FIRST bind attempt (`1.0` bound / `0.0` OSError, labelled by the
+  configured bind target) and is never re-touched; it covers both authN
+  modes (the plain and #401 bearer-token servers share the single
+  `except OSError` branch). README documents the alert
+  `metrics_server_bound == 0` as the canonical "Prometheus scrape is
+  down because of US" signal (pair with blackbox `up == 0` — a dead bind
+  is unscrapeable from the pod itself). Registry now 19 counters +
+  8 gauges + 3 histograms.
 - **`#403`** — `openstudio_operator_singleton_loser_skips_total{module,namespace,name}`:
   per-tick singleton-guard loser suppression counter, bumped inside the
   `_gated` wrapper's `if not active:` branch on every suppressed tick. The
