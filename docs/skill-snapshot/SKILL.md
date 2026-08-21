@@ -77,6 +77,37 @@ creates the PR (see Phase 3c § Recovery for the creation logic).
 For each sub-agent in the wave, the orchestrator actively verifies PR creation
 instead of passively waiting for a done signal:
 
+**§0. Placeholder substitution contract (issue #382).** Every bash snippet
+below is a *template*, not runnable bash. Before executing (or committing the
+result of) any snippet, the orchestrator substitutes:
+
+| Placeholder | Substitution |
+| --- | --- |
+| `{N}` | real issue number (e.g. `370`) |
+| `{slug}` | slug from the Phase 3a worktree name — lowercase, hyphen-joined first 3 words of the issue title (e.g. `pre-report-back-git-status`); the existing worktree name is authoritative |
+| `issue-{N}-{slug}` | worktree directory name (emerges from the two substitutions above; must match Phase 3a) |
+| `{PR_NUMBER}` | PR number recorded in `wave-state.json` for the current issue |
+| `{affected_file}` | primary test file inferred from the issue body (wave-planner `extractFileRefs` output, or the first `tests/test_X.py` mentioned) |
+| `#M` / `NEXT_ISSUE="#M"` | next-priority open issue from the same wave, substituted as `#<number>`; the literal `n/a` when no follow-up exists |
+
+The canonical renderer is the repo helper
+`scripts/render_orchestrator_snippet.py` (stdlib-only; template via
+`--template-file` / `--template` / stdin; prints runnable bash):
+
+```bash
+python scripts/render_orchestrator_snippet.py \
+  --template-file phase3c-step15.sh.tpl \
+  --issue-number 370 --slug pre-report-back-git-status \
+  --affected-file tests/test_events_emit_failures.py \
+  --pr-number 412 --next-issue 383 > phase3c-step15.sh
+```
+
+The helper fails loudly (nonzero exit) when any `{placeholder}` or `#M`
+survives substitution, so a snippet can never fail silently the way verbatim
+execution would. **`#M` must never be committed verbatim** — in PR bodies and
+commit messages it is always substituted with `#<real-issue>` or `n/a`
+before the orchestrator runs the edit.
+
 **Per-sub-agent verification (parallel for all in wave):**
 
 1. **Hard timeout**: Start a 5-minute timer when the sub-agent is spawned.
@@ -88,9 +119,9 @@ instead of passively waiting for a done signal:
     before the orchestrator creates a PR. Catches the #311-style failure
     mode where a sub-agent reports "done" with uncommitted changes or
     failing tests left in the worktree.
-    ```bash
-    # Step 1.5: pre-PR verification
-    # Verify the sub-agent's worktree has all changes committed + tests pass
+     ```bash
+     # Step 1.5: pre-PR verification (render via §0 before running)
+     # Verify the sub-agent's worktree has all changes committed + tests pass
     cd ../worktrees/issue-{N}-{slug}
     if [[ -n "$(git status --porcelain)" ]]; then
       echo "Sub-agent left uncommitted changes in worktree; aborting PR creation"
@@ -218,13 +249,14 @@ ${KEYWORD} #{N}"
         # Scope guard already present — record PR number in wave-state.json
         :
       else
-        # Auto-fix: append the default scope-guard line (issue #365;
-        # fence from issue #301). Set NEXT_ISSUE to the next-priority
-        # open issue in the same wave, or leave "#M" as a placeholder
-        # the orchestrator substitutes before editing. The shape uses
-        # "#M" so the appended block always satisfies all four
-        # check_pr_body_scope.sh assertions (keyword, scope guard line,
-        # issue reference, rationale phrase).
+         # Auto-fix: append the default scope-guard line (issue #365;
+         # fence from issue #301). Set NEXT_ISSUE to the next-priority
+         # open issue in the same wave, or leave "#M" as a placeholder
+         # the orchestrator substitutes before editing (see §0; #M is
+         # never committed verbatim — always #<real-issue> or n/a). The
+         # shape uses "#M" so the appended block always satisfies all
+         # four check_pr_body_scope.sh assertions (keyword, scope guard
+         # line, issue reference, rationale phrase).
         NEXT_ISSUE="#M"
         gh pr edit {PR_NUMBER} --body "${BODY}
 
