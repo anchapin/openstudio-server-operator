@@ -45,6 +45,28 @@ edge cases (`#246` `#247` `#248` `#249`).
   `rate(openstudio_operator_rest_retries_total[5m]) > 0` as the
   early-degrade companion to `outcome="exception"`. Registry now 20
   counters + 8 gauges + 3 histograms.
+- **`#468`** — `deploy/prometheustrule.yaml` (14 alerts in 5 groups:
+  per-module tick-failure rate, REST exception rate, singleton
+  conflict, `metrics_server_bound == 0`, deferred-dropped rate,
+  `redis_key_layout_status == 0`, stall-window accumulation, prune
+  tick failures, both #312 freshness staleness expressions; exact
+  `openstudio_operator_*` family names; `release: prometheus` pickup
+  label documented in the manifest header) + `deploy/grafana-dashboard.json`
+  (12 panels: action counters with outcome/trigger breakouts, tick-duration
+  histograms, Resque queue gauges + freshness; `${DS_PROMETHEUS}`
+  templated). New `tests/test_monitoring_artifacts.py` (8 tests) is the
+  drift gate: every family referenced by the rules must exist in
+  `tests/_metrics_inventory.py`, the dashboard must parse and reference
+  the action counters, and RBAC must hold no `prometheusrules` verbs.
+- **`#472`** — `analysis_datapoint_count` gains a `view` label
+  (`analyses_per_tick` at the SLA observe site vs
+  `started_datapoints_per_tick` at the watchdog site). The histogram
+  previously merged two different units with no distinguishing label —
+  p99 of the mixture answered neither "how big are our analyses" nor
+  "how many datapoints are in flight", and cadence shifts reweighted
+  the mixture without any workload change (#179's correlation goal
+  defeated). Two pin tests assert each tick never touches the other
+  series. Family name unchanged (inventory tuples untouched).
 - **`#383`** — `scripts/check_stale_worktrees.sh`: stale-worktree
   pre-flight visibility check for wave orchestration. Lists every
   `issue-*` directory under the worktrees dir (default
