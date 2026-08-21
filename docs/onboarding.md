@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-728 tests across 37 files (run `.venv/bin/pytest --collect-only` to
+730 tests across 37 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -691,6 +691,7 @@ discussion first and an updated audit doc row.
 | Verify what an HTTP call does and does not do | [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./contracts/openstudio-server-v3.11.0-rest.md) |
 | Confirm a D11/D04 invariant holds | [`docs/audit-dryrun-idempotency.md`](./audit-dryrun-idempotency.md) |
 | Run the kind recipe for a real cluster | [`docs/kind-validation.md`](./kind-validation.md) |
+| Turn on kube-apiserver audit logging for the operator's API surface | [`docs/audit-policy.md`](./audit-policy.md) (#399) |
 | See the validated runbook for production pre-reqs | [`docs/validation.md`](./validation.md) |
 | Look up a fixed identifier (CRD/RBAC/namespace) | [`AGENTS.md`](../AGENTS.md) "Fixed identifiers" |
 | Remind yourself which Working rule applies | [`AGENTS.md`](../AGENTS.md) "Working rules" |

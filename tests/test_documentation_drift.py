@@ -6,7 +6,12 @@ literal as the *default* Redis password after #150/#219 rotated it into the
 ``openstudio-rotated`` placeholder. Issue #408 adds the README layout drift
 gate: every file under ``deploy/`` must appear in README.md's
 ``## Repository layout`` tree with a per-file issue citation, so a new
-manifest fails the build until it is documented.
+manifest fails the build until it is documented. Issue #399 adds the
+audit-policy gate: ``docs/audit-policy.md`` must keep a kube-apiserver
+``audit.k8s.io/v1`` fragment whose four resource rules cover the operator's
+entire mutating API surface, and ``docs/onboarding.md`` must keep
+cross-linking it, so the SOC2/PCI recipe cannot silently rot out from
+under the acceptance criteria.
 
 Why this test exists
 --------------------
@@ -41,6 +46,8 @@ CONTRACTS_DOC = REPO_ROOT / "docs" / "contracts" / "openstudio-server-v3.11.0-re
 README_DOC = REPO_ROOT / "README.md"
 DEPLOY_DIR = REPO_ROOT / "deploy"
 README_LAYOUT_HEADING = "## Repository layout"
+AUDIT_POLICY_DOC = REPO_ROOT / "docs" / "audit-policy.md"
+ONBOARDING_DOC = REPO_ROOT / "docs" / "onboarding.md"
 
 # Broader than the original `redis://:openstudio@` form (issue #409): the
 # acceptance criterion greps for the bare credential literal so a Mongo-style
@@ -222,4 +229,69 @@ def test_readme_deploy_entries_cite_introducing_issue() -> None:
     assert not offenders, (
         "README.md §Repository layout deploy/ entries must cite the "
         f"introducing issue per file (issue #408). Offenders: {offenders}"
+    )
+
+
+# Issue #399 — the kube-apiserver audit recipe. Each tuple is a (name, markers)
+# pair: every marker string must appear in docs/audit-policy.md's fenced
+# fragment. The exact quoting matches the committed fragment by design (same
+# convention as ROTATED_REDIS_URL above): a reformatted fragment that drops a
+# rule or un-scopes a verb fails here instead of shipping a weakened audit
+# trail.
+AUDIT_POLICY_FRAGMENT_HEADER = ("apiVersion: audit.k8s.io/v1", "kind: Policy")
+AUDIT_POLICY_RESOURCE_RULES = {
+    "openstudioclustermanagers (CR + status subresource)": (
+        'group: "energy.nrel.gov"',
+        'resources: ["openstudioclustermanagers", "openstudioclustermanagers/status"]',
+    ),
+    "apps/deployments (patch only)": (
+        'verbs: ["patch"]',
+        'resources: ["deployments"]',
+    ),
+    "batch/jobs (create/delete)": (
+        'verbs: ["create", "delete"]',
+        'resources: ["jobs"]',
+    ),
+    "core/pods (delete only)": (
+        'verbs: ["delete"]',
+        'resources: ["pods"]',
+    ),
+}
+
+
+def test_audit_policy_doc_keeps_the_four_resource_rules() -> None:
+    """Issue #399 acceptance: ``docs/audit-policy.md`` must ship a
+    kube-apiserver ``audit.k8s.io/v1`` Policy fragment whose four resource
+    rules cover the operator's entire mutating API surface (the OSCM CR and
+    its ``.status``, Deployment rolling-restart patches, archival-Job
+    create/delete, soft-stop pod deletes) at ``RequestResponse`` level.
+    """
+    content = AUDIT_POLICY_DOC.read_text(encoding="utf-8")
+    for marker in AUDIT_POLICY_FRAGMENT_HEADER:
+        assert marker in content, (
+            f"docs/audit-policy.md must contain the audit Policy header line "
+            f"`{marker}` (issue #399)."
+        )
+    assert "level: RequestResponse" in content, (
+        "docs/audit-policy.md must record the operator's surface at "
+        "RequestResponse level (issue #399 acceptance criterion)."
+    )
+    for rule_name, markers in AUDIT_POLICY_RESOURCE_RULES.items():
+        for marker in markers:
+            assert marker in content, (
+                f"docs/audit-policy.md fragment lost the `{rule_name}` rule "
+                f"(expected marker `{marker}`). If the rule moved or was "
+                "reworded, update AUDIT_POLICY_RESOURCE_RULES in the same "
+                "commit — do not delete the rule (issue #399 is the "
+                "SOC2/PCI audit fence)."
+            )
+
+
+def test_onboarding_cross_links_audit_policy_doc() -> None:
+    """Issue #399 acceptance: ``docs/onboarding.md`` must keep the audit-policy
+    recipe discoverable next to the kind-validation walkthrough pointer."""
+    content = ONBOARDING_DOC.read_text(encoding="utf-8")
+    assert "./audit-policy.md" in content, (
+        "docs/onboarding.md must cross-link docs/audit-policy.md (issue #399) "
+        "— keep it next to the kind-validation row in 'Pointers to other docs'."
     )
