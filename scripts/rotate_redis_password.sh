@@ -9,16 +9,20 @@
 # `scripts/create-kind-cluster.sh` + `scripts/deploy-openstudio-stack.sh` from
 # a fresh checkout published that password in their cluster's Secrets.
 #
-# After #150, those files ship the placeholder `openstudio-rotated`. This
-# script generates a fresh 32-char random password and applies it across the
-# whole stack in one shot:
+# After #150, those files ship the placeholder `openstudio-rotated`
+# (post-#462, deploy/redis-credentials-secret.yaml ships the unusable
+# sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` instead). This script generates a
+# fresh 32-char random password and applies it across the whole stack in
+# one shot:
 #
 #   1. Generates a 32-char hex password (override with `REDIS_PASSWORD=...`).
-#   2. Substitutes `openstudio-rotated` -> <password> in
+#   2. Substitutes every committed placeholder -> <password> in
 #      scripts/manifests/02-redis.yaml, 04-web.yaml, 05-web-background.yaml,
-#      06-worker.yaml, AND in deploy/redis-credentials-secret.yaml. The
-#      substituted copies are applied via `kubectl apply -f -` (stdin) so the
-#      working tree stays clean — the committed placeholder is preserved.
+#      06-worker.yaml (kind-recipe placeholder `openstudio-rotated`), AND in
+#      deploy/redis-credentials-secret.yaml (unusable sentinel
+#      `CHANGE_ME_RUN_ROTATE_SCRIPT`, issue #462). The substituted copies
+#      are applied via `kubectl apply -f -` (stdin) so the working tree
+#      stays clean — the committed placeholders are preserved.
 #   3. Applies the resulting manifests and updates the live
 #      `openstudio-redis` Secret in the `openstudio-server` namespace.
 #   4. Prints the password to stdout so you can record it for fixture
@@ -48,11 +52,14 @@ NAMESPACE="${NAMESPACE:-openstudio-server}"
 SECRET_NAME="openstudio-redis"
 PRINT_ONLY=0
 
-# Files that contain the placeholder (must match the rotation target).
-# Each entry: <path>:<sed-substitution-args-for-yaml-key-password>
+# Files that contain a placeholder (must match the rotation target).
+# Each entry: <path>:<placeholder-token-present-in-that-file>
 # We use python instead of sed because YAML quoting / multi-line strings can
-# trip sed (e.g. the `stringData: { password: openstudio-rotated }` block in
-# the Secret has comments interleaved).
+# trip sed (e.g. the `stringData: { password: ... }` block in the Secret has
+# comments interleaved). Two placeholder tokens exist post-#462: the
+# kind-recipe manifests keep `openstudio-rotated` while the deploy/ Secret
+# ships the unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` — the
+# substitution below replaces whichever token each file carries.
 ROTATE_FILES=(
     "$REPO_ROOT/scripts/manifests/02-redis.yaml"
     "$REPO_ROOT/scripts/manifests/04-web.yaml"
@@ -106,10 +113,15 @@ else
     fi
 fi
 
-# Guard against the legacy literal accidentally re-appearing as the rotation
-# target (would defeat the whole point of the script).
+# Guard against a publicly-known literal accidentally re-appearing as the
+# rotation target (would defeat the whole point of the script).
 if [[ "$password" == "openstudio" ]]; then
     echo "ERROR: REDIS_PASSWORD=openstudio is the legacy literal (issue #150). Pick a different value." >&2
+    exit 1
+fi
+if [[ "$password" == "CHANGE_ME_RUN_ROTATE_SCRIPT" ]]; then
+    echo "ERROR: REDIS_PASSWORD=CHANGE_ME_RUN_ROTATE_SCRIPT is the committed sentinel (issue #462)." >&2
+    echo "       It is publicly known — pick a per-cluster random value." >&2
     exit 1
 fi
 
@@ -144,7 +156,7 @@ fi
 
 # --- 3. Substitute + apply each manifest via stdin ---------------------------
 # We pipe substituted copies to `kubectl apply -f -` so the working tree stays
-# clean (the committed placeholder is preserved across rotations). Python is
+# clean (the committed placeholders are preserved across rotations). Python is
 # used for the substitution because YAML quoting / multi-line values can trip
 # sed.
 
@@ -154,7 +166,11 @@ apply_substituted() {
 import sys, pathlib
 src = pathlib.Path(r'''$src''')
 text = src.read_text()
-new = text.replace('openstudio-rotated', r'''$password''')
+new = text
+# kind-recipe manifests carry 'openstudio-rotated'; the deploy/ Secret
+# carries the #462 sentinel — replace whichever is present.
+for placeholder in ('CHANGE_ME_RUN_ROTATE_SCRIPT', 'openstudio-rotated'):
+    new = new.replace(placeholder, r'''$password''')
 if new == text:
     sys.exit(f'WARNING: no placeholder found in {src}; manifest already substituted or stale?')
 sys.stdout.write(new)

@@ -40,8 +40,16 @@ the kind cluster in [docs/kind-validation.md#live-capture-evidence-2026-08-19-is
    autoscalers on the same Deployment oscillate. The kind recipe's
    `scripts/manifests/06-worker.yaml` no longer includes the chart HPA,
    so a fresh `scripts/deploy-openstudio-stack.sh` does not apply it.
-3. `kubectl apply -f deploy/redis-credentials-secret.yaml` (Redis
-   password for KEDA's TriggerAuthentication — operator never sees it).
+3. The Redis password Secret for KEDA's TriggerAuthentication (operator
+   never sees it). The committed manifest ships only the unusable sentinel
+   `CHANGE_ME_RUN_ROTATE_SCRIPT` (#462) — install a real per-cluster
+   password with `scripts/rotate_redis_password.sh` first; plain
+   `kubectl apply -f deploy/redis-credentials-secret.yaml` installs a
+   non-working credential (see
+   [docs/onboarding.md](./docs/onboarding.md) §"Redis password is not a
+   fixed literal (#150)"). Same rule for Mongo:
+   `scripts/rotate_mongo_password.sh` before any
+   `kubectl apply -f deploy/mongo-credentials-secret.yaml`.
 4. `kubectl apply -f deploy/keda-scaledobject.yaml`.
 
 The operator's Role has no `horizontalpodautoscalers` verbs; autoscaling
@@ -254,8 +262,8 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 │   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
 │   ├── operator-deployment.yaml  # single-replica operator Deployment (strategy: Recreate)
 │   ├── keda-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication (#77)
-│   ├── redis-credentials-secret.yaml  # Redis password Secret for KEDA (#77; literal rotated out by #150)
-│   ├── mongo-credentials-secret.yaml  # Mongo credentials Secret for the web/db auth boundary (#219)
+│   ├── redis-credentials-secret.yaml  # Redis password Secret for KEDA (#77; committed value is the unusable sentinel, #462 — rotate before use)
+│   ├── mongo-credentials-secret.yaml  # Mongo credentials Secret for the web/db auth boundary (#219; committed value is the unusable sentinel, #462 — rotate before use)
 │   ├── storage-cronjob.yaml    # prune CronJob (#78)
 │   ├── network-policy.yaml     # NetworkPolicy for the operator surface + /metrics ingress allow (#112, #166)
 │   ├── pod-delete-admission-policy.yaml  # cluster-scoped ValidatingAdmissionPolicy narrowing pods/delete (#293)

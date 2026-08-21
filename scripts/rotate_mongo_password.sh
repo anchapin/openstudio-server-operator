@@ -11,19 +11,22 @@
 # password in their cluster's Secrets. The #150 PR closed the same shape of
 # leak for Redis; this script is the Mongo companion.
 #
-# After #219, those files ship the placeholder `openstudio-rotated` (the
+# After #219, those files ship the placeholder `openstudio-rotated`
+# (post-#462, deploy/mongo-credentials-secret.yaml ships the unusable
+# sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` instead; the
 # web/web-background/worker env vars now mount their credentials from the
 # `openstudio-mongo` Secret via `valueFrom.secretKeyRef`). This script
 # generates a fresh 32-char random password and applies it across the whole
 # stack in one shot:
 #
 #   1. Generates a 32-char hex password (override with `MONGO_PASSWORD=...`).
-#   2. Substitutes `openstudio-rotated` -> <password> in
-#      scripts/manifests/01-mongo.yaml (MONGO_INITDB_ROOT_PASSWORD value)
-#      AND in deploy/mongo-credentials-secret.yaml (stringData.password).
-#      The substituted copies are applied via `kubectl apply -f -` (stdin)
-#      so the working tree stays clean — the committed placeholder is
-#      preserved.
+#   2. Substitutes every committed placeholder -> <password> in
+#      scripts/manifests/01-mongo.yaml (MONGO_INITDB_ROOT_PASSWORD value,
+#      placeholder `openstudio-rotated`) AND in
+#      deploy/mongo-credentials-secret.yaml (stringData.password, unusable
+#      sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT`, issue #462). The substituted
+#      copies are applied via `kubectl apply -f -` (stdin) so the working
+#      tree stays clean — the committed placeholders are preserved.
 #   3. Applies the resulting manifests and updates the live
 #      `openstudio-mongo` Secret in the `openstudio-server` namespace.
 #   4. Prints the password to stdout so you can record it for fixture
@@ -58,10 +61,13 @@ NAMESPACE="${NAMESPACE:-openstudio-server}"
 SECRET_NAME="openstudio-mongo"
 PRINT_ONLY=0
 
-# Files that contain the placeholder (must match the rotation target).
+# Files that contain a placeholder (must match the rotation target).
 # We use python instead of sed because YAML quoting / multi-line strings can
-# trip sed (e.g. the `stringData: { password: openstudio-rotated }` block in
-# the Secret has comments interleaved).
+# trip sed (e.g. the `stringData: { password: ... }` block in the Secret has
+# comments interleaved). Two placeholder tokens exist post-#462: the
+# kind-recipe manifest keeps `openstudio-rotated` while the deploy/ Secret
+# ships the unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` — the
+# substitution below replaces whichever token each file carries.
 #
 # `scripts/manifests/01-mongo.yaml` holds the MONGO_INITDB_ROOT_PASSWORD
 # value that the db pod's bootstrap reads from.
@@ -121,10 +127,15 @@ else
     fi
 fi
 
-# Guard against the legacy literal accidentally re-appearing as the rotation
-# target (would defeat the whole point of the script).
+# Guard against a publicly-known literal accidentally re-appearing as the
+# rotation target (would defeat the whole point of the script).
 if [[ "$password" == "openstudio" ]]; then
     echo "ERROR: MONGO_PASSWORD=openstudio is the legacy literal (issue #219). Pick a different value." >&2
+    exit 1
+fi
+if [[ "$password" == "CHANGE_ME_RUN_ROTATE_SCRIPT" ]]; then
+    echo "ERROR: MONGO_PASSWORD=CHANGE_ME_RUN_ROTATE_SCRIPT is the committed sentinel (issue #462)." >&2
+    echo "       It is publicly known — pick a per-cluster random value." >&2
     exit 1
 fi
 
@@ -159,7 +170,7 @@ fi
 
 # --- 3. Substitute + apply each manifest via stdin ---------------------------
 # We pipe substituted copies to `kubectl apply -f -` so the working tree stays
-# clean (the committed placeholder is preserved across rotations). Python is
+# clean (the committed placeholders are preserved across rotations). Python is
 # used for the substitution because YAML quoting / multi-line values can trip
 # sed.
 
@@ -169,7 +180,11 @@ apply_substituted() {
 import sys, pathlib
 src = pathlib.Path(r'''$src''')
 text = src.read_text()
-new = text.replace('openstudio-rotated', r'''$password''')
+new = text
+# the kind-recipe manifest carries 'openstudio-rotated'; the deploy/
+# Secret carries the #462 sentinel — replace whichever is present.
+for placeholder in ('CHANGE_ME_RUN_ROTATE_SCRIPT', 'openstudio-rotated'):
+    new = new.replace(placeholder, r'''$password''')
 if new == text:
     sys.exit(f'WARNING: no placeholder found in {src}; manifest already substituted or stale?')
 sys.stdout.write(new)

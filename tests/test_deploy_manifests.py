@@ -3079,3 +3079,52 @@ def test_no_deploy_container_exceeds_limit_range_defaults():
         f"workload genuinely needs more, adjust the LimitRange "
         f"defaults and the steady-state test together): {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #462 — the deploy/ credential Secret manifests must ship ONLY the
+# unusable sentinel placeholder. The pre-#462 committed value
+# ``openstudio-rotated`` was a real, publicly-known credential: the
+# documented apply order listed plain ``kubectl apply`` of the Secret
+# manifests as a valid path, so fresh installs that skipped the rotation
+# scripts got a guessable password guarding Redis (the Resque queue
+# fabric) and Mongo — the exact leak class #150/#219 closed, renamed.
+# The shell guards (scripts/check_redis_password_unique.sh,
+# scripts/check_mongo_password_unique.sh) enforce the same rule in CI;
+# this test mirrors it at pytest level.
+# ---------------------------------------------------------------------------
+
+_CREDENTIAL_SECRET_SENTINEL = "CHANGE_ME_RUN_ROTATE_SCRIPT"
+_CREDENTIAL_SECRET_MANIFESTS = (
+    "redis-credentials-secret.yaml",
+    "mongo-credentials-secret.yaml",
+)
+
+
+def test_credential_secret_manifests_ship_only_sentinel_placeholder():
+    """Issue #462 acceptance: both deploy/ credential Secrets carry exactly
+    the unusable sentinel ``CHANGE_ME_RUN_ROTATE_SCRIPT`` as
+    ``stringData.password`` — never a real (or real-looking) committed
+    credential. Any other value is a CWE-798 hardcoded default because the
+    manifests are public; per-cluster passwords are installed only via
+    scripts/rotate_redis_password.sh / scripts/rotate_mongo_password.sh,
+    which substitute at apply time so the working tree keeps the sentinel.
+    Mirrors the sentinel rule the shell guards enforce, so the regression
+    fails CI even when the shell gate is skipped locally."""
+    offenders = []
+    for basename in _CREDENTIAL_SECRET_MANIFESTS:
+        docs = list(yaml.safe_load_all((DEPLOY / basename).read_text()))
+        secrets = [d for d in docs if d and d.get("kind") == "Secret"]
+        assert secrets, f"{basename}: no Secret doc found (manifest malformed?)"
+        for secret in secrets:
+            password = (secret.get("stringData") or {}).get("password")
+            if password != _CREDENTIAL_SECRET_SENTINEL:
+                offenders.append(
+                    (basename, secret.get("metadata", {}).get("name"), password)
+                )
+    assert not offenders, (
+        f"deploy/ credential Secrets must ship only the unusable sentinel "
+        f"'{_CREDENTIAL_SECRET_SENTINEL}' as stringData.password (issue #462 "
+        f"— committed real credentials are CWE-798 defaults; install "
+        f"per-cluster passwords via the rotation scripts): {offenders}"
+    )

@@ -8,6 +8,13 @@
 # CI step so the build fails before the operator image is published if anyone
 # reverts the rotation.
 #
+# Issue #462 extends the gate: deploy/mongo-credentials-secret.yaml must
+# carry ONLY the unusable sentinel placeholder
+# `CHANGE_ME_RUN_ROTATE_SCRIPT` as stringData.password. The pre-#462
+# committed value (`openstudio-rotated`) was a real, publicly-known
+# credential — a renamed survivor of the #219 leak class — so the Secret
+# check is now "value must equal the sentinel, else fail".
+#
 # The guard parses YAML with python's yaml.safe_load so it checks VALUE
 # positions (not just text presence) — comments / image names / namespace
 # labels that happen to contain `openstudio` are NOT flagged. Only the
@@ -17,7 +24,9 @@
 #     (MONGO_INITDB_ROOT_USERNAME is intentionally literal — see #219 for
 #      the "username stays literal, only the password rotates" convention
 #      that mirrors #150's empty Redis username.)
-#   - deploy/mongo-credentials-secret.yaml: stringData.password
+#   - deploy/mongo-credentials-secret.yaml: stringData.password (must be
+#     exactly the #462 sentinel; stringData.username is intentionally
+#     literal and never flagged)
 #   - scripts/manifests/04-web.yaml / 05-web-background.yaml / 06-worker.yaml:
 #     MONGO_USER / MONGO_PASSWORD env entries — the literal `openstudio` as
 #     the `value:` is flagged; `valueFrom.secretKeyRef` references are the
@@ -51,13 +60,15 @@ for arg in "$@"; do
 done
 
 LEGACY="openstudio"
+SENTINEL="CHANGE_ME_RUN_ROTATE_SCRIPT"
 
-python3 - "$REPO_ROOT" "$LEGACY" "$VERBOSE" <<'PY'
+python3 - "$REPO_ROOT" "$LEGACY" "$SENTINEL" "$VERBOSE" <<'PY'
 import sys, pathlib, yaml
 
 repo_root = pathlib.Path(sys.argv[1])
-legacy = sys.argv[2]   # 'openstudio'
-verbose = sys.argv[3] == "1"
+legacy = sys.argv[2]    # 'openstudio'
+sentinel = sys.argv[3]  # 'CHANGE_ME_RUN_ROTATE_SCRIPT' (issue #462)
+verbose = sys.argv[4] == "1"
 
 failures: list[str] = []
 
@@ -129,6 +140,24 @@ def check_secret_password(doc: dict, where: str) -> None:
             f"scripts/rotate_mongo_password.sh."
         )
 
+def check_secret_password_sentinel(doc: dict, where: str) -> None:
+    """Issue #462: the committed deploy/ credential Secret must carry
+    exactly the unusable sentinel placeholder. Any other value — the
+    `openstudio-rotated` placeholder that survived #219, another
+    real-looking literal, or a missing key — is a committed credential
+    (CWE-798) and fails the build. stringData.username is intentionally
+    literal and never flagged.
+    """
+    if doc.get("kind") != "Secret":
+        return
+    string_data = doc.get("stringData") or {}
+    password = string_data.get("password")
+    if password != sentinel:
+        fail(f"{where}: Secret stringData.password must be the unusable "
+             f"sentinel '{sentinel}' (issue #462); got {password!r}. "
+             f"Committed real credentials are CWE-798 defaults — install a "
+             f"per-cluster password via scripts/rotate_mongo_password.sh.")
+
 # --- mongo manifest ----------------------------------------------------------
 mongo_manifest = repo_root / "scripts/manifests/01-mongo.yaml"
 for doc in load_yaml(mongo_manifest):
@@ -142,11 +171,11 @@ ok("scripts/manifests/01-mongo.yaml: no legacy literal in MONGO_INITDB_ROOT_PASS
 # --- Secret manifest ---------------------------------------------------------
 secret_manifest = repo_root / "deploy/mongo-credentials-secret.yaml"
 for doc in load_yaml(secret_manifest):
-    check_secret_password(
-        doc,
-        f"deploy/mongo-credentials-secret.yaml secret/{doc['metadata'].get('name', '?')}",
-    )
+    where = f"deploy/mongo-credentials-secret.yaml secret/{doc['metadata'].get('name', '?')}"
+    check_secret_password(doc, where)
+    check_secret_password_sentinel(doc, where)
 ok("deploy/mongo-credentials-secret.yaml: no legacy literal in password")
+ok("deploy/mongo-credentials-secret.yaml: password is the #462 sentinel")
 
 # --- web / web-background / worker manifests ---------------------------------
 for name in ("04-web.yaml", "05-web-background.yaml", "06-worker.yaml"):
@@ -162,17 +191,22 @@ for name in ("04-web.yaml", "05-web-background.yaml", "06-worker.yaml"):
 
 if failures:
     print(
-        f"\nFAIL: {len(failures)} legacy-mongo-password violation(s) found (issue #219).",
+        f"\nFAIL: {len(failures)} password-placeholder violation(s) found "
+        f"(issues #219/#462).",
         file=sys.stderr,
     )
     print(
         "  The literal 'openstudio' was the publicly-known kind-recipe Mongo\n"
         "  password. It MUST NOT appear as a password value in source. See\n"
         "  scripts/rotate_mongo_password.sh to install a per-cluster random\n"
-        "  password (companion to scripts/rotate_redis_password.sh from #150).",
+        "  password (companion to scripts/rotate_redis_password.sh from #150).\n"
+        "  deploy/mongo-credentials-secret.yaml must ship only the unusable\n"
+        "  sentinel CHANGE_ME_RUN_ROTATE_SCRIPT (issue #462) — any other\n"
+        "  committed value is a publicly-known credential.",
         file=sys.stderr,
     )
     sys.exit(1)
 
-print("OK: no legacy 'openstudio' literal in any Mongo password position (issue #219).")
+print("OK: no legacy 'openstudio' literal in any Mongo password position (issue #219);")
+print(f"deploy/mongo-credentials-secret.yaml ships the #462 sentinel '{sentinel}'.")
 PY
