@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-722 tests across 36 files (run `.venv/bin/pytest --collect-only` to
+727 tests across 37 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -141,6 +141,38 @@ bash scripts/check_editable_install.sh               # verify without re-install
 resolves `openstudio_operator` inside the current checkout, and exits
 `1` with a `remedy:` line otherwise. Add it to the top of your local
 test script.
+
+---
+
+## Stale worktree pre-flight check (#383)
+
+Prior sessions can leave worktree directories under `../worktrees/`
+whose branches were deleted on merge (or which belong to *other*
+projects sharing the parent dir). `git worktree prune` cannot see them,
+so they accumulate on disk and a new orchestrator may mistake the
+leftovers for in-progress work. Run the visibility check BEFORE
+creating new worktrees — Phase 0/0a of a wave cycle:
+
+```bash
+bash scripts/check_stale_worktrees.sh                       # list only (always safe)
+bash scripts/check_stale_worktrees.sh --worktrees-dir /home/alex/Projects/worktrees
+```
+
+It prints one `STALE worktree: <dir> (no matching branch)` line per
+`issue-*` directory backed by no local branch (`fix/` `feat/` `docs/`
+`chore/` + dirname) and not registered in `git worktree list`, plus a
+summary. If the count exceeds the threshold (default 5), a `WARNING`
+line says to surface a Warning event and confirm with the user before
+proceeding. List mode exits `0` and never deletes anything; deletion
+is opt-in and confirmed:
+
+```bash
+bash scripts/check_stale_worktrees.sh --prune-stale-worktrees            # still list-only
+bash scripts/check_stale_worktrees.sh --prune-stale-worktrees --yes \
+    --min-age-days 30        # actually deletes stale dirs older than 30d
+```
+
+Regression tests: `tests/test_stale_worktree_check.py`.
 
 ---
 
