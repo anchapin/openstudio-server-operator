@@ -19,6 +19,7 @@ import kopf
 
 from openstudio_operator import singleton, status_store
 from openstudio_operator.client_factory import get_read_only_redis_client
+from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
@@ -29,10 +30,7 @@ from openstudio_operator.handlers import (  # noqa: F401
 )
 from openstudio_operator.logging_setup import install_json_logging
 from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS, start_metrics_server
-from openstudio_operator.redis_client import (
-    OperatorConfigError,
-    RedisClientError,
-)
+from openstudio_operator.redis_client import RedisClientError
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +162,10 @@ def _check_redis_key_layout_for_cr(
     try:
         get_read_only_redis_client(redis_url).validate_key_layout()
     except OperatorConfigError as exc:
+        # Layout drift (issue #44). Since #475 this class lives in config.py
+        # and is NOT a RedisClientError subclass, so the ordering of this
+        # except ladder no longer depends on subclassing — the layout-drift
+        # branch is reachable only here, by name, which is the intent.
         logger.warning(
             "redis_key_layout=degraded namespace=%s name=%s reason=%s: %s",
             ns,

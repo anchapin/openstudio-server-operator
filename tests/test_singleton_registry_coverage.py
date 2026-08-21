@@ -34,11 +34,9 @@ import kopf
 import pytest
 
 from openstudio_operator import singleton
+from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.handlers import _check_redis_key_layout_for_cr
-from openstudio_operator.redis_client import (
-    OperatorConfigError,
-    RedisClientError,
-)
+from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import GROUP, PLURAL
 
 # Every handler module the operator ships under ``openstudio_operator.handlers/``

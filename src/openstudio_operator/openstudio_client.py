@@ -46,7 +46,7 @@ from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS, REST_RETR
 
 from ._retry import _sleep
 from ._time import parse_iso_utc
-from .redis_client import OperatorConfigError
+from .config import OperatorConfigError
 
 _TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 

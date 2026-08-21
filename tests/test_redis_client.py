@@ -271,9 +271,19 @@ def test_validate_key_layout_raises_when_registry_key_missing(fake, client):
         client.validate_key_layout()
 
 
-def test_validate_key_layout_is_a_subclass_of_redis_client_error():
-    """Existing call sites ``except RedisClientError:`` must still catch this."""
-    assert issubclass(OperatorConfigError, RedisClientError)
+def test_operator_config_error_is_config_reexport_and_not_a_redis_error():
+    """Issue #475: ``OperatorConfigError`` lives in ``config.py`` (neutral
+    home); the ``redis_client`` name is a compatibility re-export of the
+    SAME class, and it is no longer a ``RedisClientError`` subclass —
+    callers that need it must catch it explicitly."""
+    from openstudio_operator.config import OperatorConfigError as Canonical
+
+    assert redis_client.OperatorConfigError is Canonical, (
+        "redis_client.OperatorConfigError must re-export config.OperatorConfigError (#475)"
+    )
+    assert not issubclass(OperatorConfigError, RedisClientError), (
+        "OperatorConfigError must not be catchable via except RedisClientError (#475)"
+    )
 
 
 def test_validate_key_layout_does_not_use_write_commands():

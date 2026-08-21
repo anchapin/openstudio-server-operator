@@ -79,8 +79,11 @@ Error discipline: no in-client retry — Redis reads ride the same ~30s poll cad
 the REST client, so a failed tick is skipped and the next poll retries naturally.
 ``redis.RedisError`` is wrapped in ``RedisClientError`` for callers. Operator
 configuration mismatches (wrong DB, wrong prefix — what ``validate_key_layout`` is
-designed to catch) raise :class:`OperatorConfigError` instead, which is a
-subclass so existing callers that catch ``RedisClientError`` continue to handle it.
+designed to catch) raise :class:`OperatorConfigError` instead. Issue #475 moved
+that class to :mod:`openstudio_operator.config` (neutral home) and severed its
+historical ``RedisClientError`` parentage, so callers must catch it explicitly —
+``except RedisClientError`` no longer sees it. This module re-exports it for
+compatibility with existing importers.
 """
 
 from __future__ import annotations
@@ -93,6 +96,12 @@ from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import redis
+
+# Compat re-export (issue #475): ``OperatorConfigError`` now lives in
+# ``config.py`` and no longer subclasses ``RedisClientError`` — see the
+# comment block beside ``RedisClientError`` below. Imported here so the
+# ``validate_key_layout`` raise sites and historical importers keep working.
+from .config import OperatorConfigError
 
 READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"})
 
@@ -162,16 +171,17 @@ class RedisClientError(RuntimeError):
     """Raised when a read against the Redis queue fabric fails or returns garbage."""
 
 
-class OperatorConfigError(RedisClientError):
-    """Raised when the operator's configured key layout does not match the live Redis.
-
-    Issue #44: the centralized key constants (``WORKER_REGISTRY_KEY`` etc.) are
-    inferred from Resque convention and may not match the real v3.11.0 layout.
-    :meth:`ReadOnlyRedisClient.validate_key_layout` raises this on the first call
-    so a misconfiguration fails LOUD at operator startup, not silently at the
-    first stall-condition evaluation. Subclasses :class:`RedisClientError` so the
-    existing ``except RedisClientError:`` call sites continue to handle it.
-    """
+# Issue #475 — ``OperatorConfigError`` moved to ``config.py`` (the neutral
+# home beside the other config validation) and no longer subclasses
+# ``RedisClientError``: the REST client raises it for TLS CA-bundle
+# misconfiguration (issue #296), and the old Redis parentage made
+# ``except RedisClientError`` blocks accidentally swallow REST TLS-config
+# failures. The import above is the compatibility re-export (the #305
+# kubeconfig-loader pattern): existing ``redis_client.OperatorConfigError``
+# importers keep working and the ``validate_key_layout`` raise sites below
+# keep their historical type. New code should import from
+# ``openstudio_operator.config``. Callers that catch it must do so
+# explicitly — it is no longer reachable via ``except RedisClientError``.
 
 
 #: Issue #463 — the URL shape accepted for the SECRET-sourced Redis URL
@@ -290,7 +300,9 @@ class ReadOnlyRedisClient:
         Uses ``SCAN MATCH resque:*`` to walk the keyspace without blocking the
         Redis server, then asserts the centralized constants are consistent with
         what the live v3.11.0 server actually writes. Raises
-        :class:`OperatorConfigError` (which subclasses :class:`RedisClientError`)
+        :class:`OperatorConfigError` (issue #475: defined in
+        :mod:`openstudio_operator.config`, re-exported here; NOT a
+        ``RedisClientError`` subclass — catch it explicitly)
         when the layout diverges, so a misconfiguration fails LOUD at boot
         rather than silently at the first stall-condition evaluation.
 

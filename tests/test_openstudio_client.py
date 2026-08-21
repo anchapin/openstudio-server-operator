@@ -11,12 +11,13 @@ from prometheus_client import generate_latest
 from responses import matchers
 
 from openstudio_operator import metrics
+from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.openstudio_client import (
     OpenStudioApiError,
     OpenStudioClient,
     _parse_timestamp,
 )
-from openstudio_operator.redis_client import OperatorConfigError
+from openstudio_operator.redis_client import RedisClientError
 
 BASE = "http://web.test"
 
@@ -533,6 +534,26 @@ def test_openstudio_tls_ca_bundle_existing_file_without_pem_marker(monkeypatch, 
     monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", str(not_a_bundle))
     with pytest.raises(OperatorConfigError, match="BEGIN CERTIFICATE"):
         OpenStudioClient(BASE)
+
+
+def test_tls_misconfiguration_is_not_catchable_as_redis_client_error(monkeypatch):
+    """Issue #475 acceptance criterion: a REST TLS misconfiguration must NOT
+    be catchable as ``RedisClientError``.
+
+    ``OperatorConfigError`` historically subclassed ``RedisClientError``
+    (it was declared in redis_client.py), so REST TLS-config failures could
+    be accidentally swallowed by Redis-focused ``except`` blocks — an
+    upside-down hierarchy at the client layer. It now lives in config.py
+    with no Redis parentage; this test fails loudly if the subclass chain
+    ever grows a Redis link again.
+    """
+    monkeypatch.setenv("OPENSTUDIO_TLS_CA_BUNDLE", "/nonexistent/ca-bundle.pem")
+    with pytest.raises(OperatorConfigError) as excinfo:
+        OpenStudioClient(BASE)
+    assert not isinstance(excinfo.value, RedisClientError), (
+        "OperatorConfigError must not be a RedisClientError — REST TLS-config "
+        "failures must not be catchable by Redis-focused except blocks (#475)"
+    )
 
 
 @responses.activate
