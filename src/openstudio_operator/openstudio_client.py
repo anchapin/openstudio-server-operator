@@ -42,7 +42,7 @@ from typing import Any
 
 import requests
 
-from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS
+from openstudio_operator.metrics import REST_REQUEST_DURATION_SECONDS, REST_RETRIES_TOTAL
 
 from ._retry import _sleep
 from ._time import parse_iso_utc
@@ -206,6 +206,11 @@ class OpenStudioClient:
             last_exc: Exception | None = None
             for attempt in range(self._max_retries + 1):
                 if attempt:
+                    # Issue #471 — count every re-attempt so a retry storm
+                    # is separable from a slow success: the duration
+                    # histogram below observes only the terminal outcome,
+                    # and the backoff sleeps silently inflate its buckets.
+                    REST_RETRIES_TOTAL.labels(method=method.upper()).inc()
                     _sleep(self._jittered_backoff(attempt))
                 try:
                     response = self._session.request(

@@ -734,6 +734,43 @@ REST_REQUEST_DURATION_SECONDS = Histogram(
     buckets=_REST_REQUEST_BUCKETS,
 )
 
+# Issue #471 — REST retry-attempt counter. ``OpenStudioClient._request``
+# retries GETs up to ``max_retries`` times on transient failures (5xx,
+# connection errors, timeouts) with jittered ~1s/2s/4s backoff, but the
+# only telemetry was ``REST_REQUEST_DURATION_SECONDS`` — observed once at
+# the END of the call. A GET that failed twice with 5xx and succeeded on
+# attempt 3 was recorded identically to a clean first-try success
+# (``outcome="200"``, the backoff sleeps silently inflating the duration
+# bucket): during a v3.11.0 degrade the operator multiplies its own load
+# up to 4x on every poll of every handler while /metrics shows only
+# mildly slower 200s — the retry amplification that turns a partial
+# outage into a full one is invisible. This Counter is incremented on
+# EVERY re-attempt (at the top of the retry loop, before the backoff
+# sleep) so a retry storm is separable from a slow success — the
+# dimension the duration histogram structurally cannot carry. Labelled
+# by ``method`` only (GET | POST | DELETE — the same vocabulary as the
+# duration histogram) and intentionally NOT by CR ``namespace``/``name``:
+# the client is CR-agnostic (issue #311's CR-identity labels apply at
+# the handler layer, not inside the transport), matching the sibling
+# ``rest_request_duration_seconds`` convention. Alert on
+# ``rate(openstudio_operator_rest_retries_total[5m]) > 0`` as the
+# early-degrade companion to ``outcome="exception"``.
+REST_RETRIES_TOTAL = Counter(
+    "openstudio_operator_rest_retries_total",
+    "REST retry attempts made inside OpenStudioClient._request's GET-only "
+    "retry loop (issue #471). Incremented once per RE-attempt (not once "
+    "per call) before the jittered backoff sleep — a GET that fails twice "
+    "with 5xx and succeeds on attempt 3 records exactly 2, distinguishing "
+    "a retry storm from a slow success (the duration histogram observes "
+    "only the terminal outcome, with the backoff sleeps inflating its "
+    "buckets). Labelled by ``method`` (GET | POST | DELETE — the same "
+    "vocabulary as rest_request_duration_seconds; no CR-identity labels — "
+    "the client is CR-agnostic). Alert on "
+    "``rate(openstudio_operator_rest_retries_total[5m]) > 0`` as the "
+    "early-degrade companion to outcome=\"exception\".",
+    labelnames=["method"],
+)
+
 #: Re-exported alias for back-compat with the historical ``DEFAULT_METRICS_PORT``
 #: identifier and any external callers that import it from this module (issue #165
 #: consolidated the port into :data:`openstudio_operator._constants.METRICS_PORT`).

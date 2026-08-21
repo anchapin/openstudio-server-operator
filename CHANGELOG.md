@@ -33,6 +33,18 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#471`** — `openstudio_operator_rest_retries_total{method}`: REST
+  retry-attempt counter, incremented once per RE-attempt inside
+  `OpenStudioClient._request`'s GET-only retry loop (before the jittered
+  backoff sleep) — a GET that fails twice with 5xx and succeeds on
+  attempt 3 records exactly 2. Separates a retry storm from a slow
+  success: the #308 duration histogram observes only the terminal
+  outcome (`outcome="200"` with the backoff sleeps silently inflating
+  the bucket), so the operator's retry amplification during a v3.11.0
+  degrade was invisible at `/metrics`. README documents the alert
+  `rate(openstudio_operator_rest_retries_total[5m]) > 0` as the
+  early-degrade companion to `outcome="exception"`. Registry now 20
+  counters + 8 gauges + 3 histograms.
 - **`#383`** — `scripts/check_stale_worktrees.sh`: stale-worktree
   pre-flight visibility check for wave orchestration. Lists every
   `issue-*` directory under the worktrees dir (default

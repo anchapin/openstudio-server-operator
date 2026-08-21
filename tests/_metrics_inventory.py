@@ -67,6 +67,14 @@ EXPECTED_COUNTER_FAMILIES = (
     # label leaves room for a future per-reason-cap branch without a
     # Counter rename.
     "openstudio_operator_warnings_deferred_dropped_total",
+    # Issue #471 — REST retry-attempt counter. Incremented once per
+    # RE-attempt inside OpenStudioClient._request's GET-only retry loop
+    # (before the backoff sleep), so a retry storm is separable from a
+    # slow success — the dimension the #308 duration histogram (which
+    # observes only the terminal outcome) structurally cannot carry.
+    # Labelled by ``method`` only (no CR-identity labels — the client
+    # is CR-agnostic, matching the sibling duration histogram).
+    "openstudio_operator_rest_retries_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87

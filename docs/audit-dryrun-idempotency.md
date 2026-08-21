@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (814 tests across 40 files, current count)
+ruff check . && pytest                       # both green (816 tests across 40 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **19 counters + 8 gauges + 3 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 8 gauges + 3 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
