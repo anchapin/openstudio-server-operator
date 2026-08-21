@@ -7,18 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Auto-improvement-loop iteration 2 (post-0.2.0): 34 new issues opened
-(`#224`–`#257`), 38 total closed (4 pre-existing + 34 new) across 14
-priority-ordered waves with dependency-aware merging. Major themes:
-critical `NetworkPolicy` gaps (`#224` `#225`), least-privilege
-`verbs:[*]` violation on the OSCM CR (`#228`), Mongo credential rotation
-(`#219`), `OpenStudioClient` hardening (`#227` `#226` `#242`), structured
-JSON log emission (`#256`), `/metrics` expansion 12+1+1 → 16+4+1
-(`#237` `#238` `#239` `#253` `#254` `#255`), operator-side `events_sinks.py`
-collapse + Redis factory centralization + handler registry + k8s client
-factories + public `list_datapoints()` (`#234` `#235` `#250` `#251`
-`#252`), per-handler exception coverage + live-fixture drift + Hypothesis
-edge cases (`#246` `#247` `#248` `#249`).
+Auto-improvement-loop sessions post-0.2.0 (2026-08-20 → 2026-08-21):
+three full audits opened `#387`–`#417` and `#462`–`#507`; waves closed
+the security/reliability/observability headliners — credential fences
+(`#462` sentinel Secrets, `#463` Redis secretRef), scheduler
+observability (`#469` heartbeat gauge, `#471` REST retries counter,
+`#468` PrometheusRule + Grafana), prune-failure surfacing (`#470`),
+the `#473` tick-runner extraction ending four-copy wrapper drift, and
+the `#475` exception-hierarchy fix — alongside the earlier iteration's
+NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 
 ### Changed
 - **`#309`** — outcome / trigger labels on the four unlabelled action
@@ -29,8 +26,23 @@ edge cases (`#246` `#247` `#248` `#249`).
   - `openstudio_operator_worker_pods_evicted_total{outcome}` (`evicted` | `evicted-partial` | `no-matching-pods` | `dry-run`)
   - `openstudio_operator_analyses_deleted_total{outcome}` (`deleted`)
   CI gate tests pin all four label vocabularies so a future refactor
-  that drops or renames a label is caught at CI rather than at the
-  on-call's Grafana board.
+  that drops or renames a label is caught at CI rather than at
+  the on-call's Grafana board.
+- **`#473`** — `_oscm_handlers.run_oscm_tick(...)` + `SKIP_TICK_EXCEPTIONS`
+  now own the entire kopf timer-wrapper tail: config parse, empty-
+  serverUrl idle check, StatusStore/EventEmitter construction, the
+  `handler_tick_failures_total` increment, and the single
+  "tick skipped, retrying next poll" log line (one site in `src/`).
+  The four `@kopf.timer` wrappers (still `register_fn`-registered —
+  singleton-guard AST gate green) delegate via `wire` + `tick` closures.
+  The canonical skip tuple is the UNION of the four historical per-module
+  tuples — `(OpenStudioApiError, StatusStoreError, ApiException,
+  RedisClientError)` — so no handler silently lost a catch (the copies
+  had already diverged: `analysis_sla` alone caught `RedisClientError`,
+  `datapoint_watchdog` alone omitted `ApiException`). The onboarding
+  "add a new OSCM timer handler" 5-step pattern shrinks accordingly.
+  The remaining half of `#395`: timing + rolling-restart went first;
+  this extracts the wrapper wiring itself.
 
 ### Added
 - **`#469`** — `openstudio_operator_handler_last_tick_timestamp{module}`:
@@ -541,6 +553,32 @@ edge cases (`#246` `#247` `#248` `#249`).
 ### Docs
 - **`#465`** — AGENTS.md `deploy/` inventory lists all 11 manifests
   (`priority-class.yaml` #414, `resource-quota.yaml` #400 were missing).
+
+### Fixed
+- **`#470`** — the storage-prune CronJob no longer masks failures behind
+  exit 0. Exit-code table (documented in `prune_entrypoint.py`'s
+  docstring): `0` ok · `3` empty `spec.redisUrl` (#392) · `4` CR-list
+  failure · `5` D12 runtime-failure tuple. Failed exits mark the Job
+  FAILED so `failedJobsHistoryLimit` (3) + Job monitoring alert — the
+  loud transport for a sustained retention-pipeline failure, since
+  `prune_tick_failures_total` is a per-pod-lifetime counter that a
+  30–60 s scrape effectively never samples (`rate()` is mathematically
+  meaningless). README triage documents the `kubectl get jobs` check;
+  `OpenStudioOperatorPruneJobFailed` (see `#469`'s entry) keys on
+  `kube_job_status_failed` instead of the stale rate expression.
+- **`#475`** — `OperatorConfigError` moves to `config.py` as a direct
+  `Exception` subclass (canonical home; `redis_client` keeps an
+  identity-verified compat re-export, the `#305` pattern). The REST
+  client no longer imports any symbol from `redis_client` — a TLS
+  misconfiguration raises an error whose name no longer says Redis.
+  The hazard was catch-tuple conflation: `except RedisClientError`
+  blocks accidentally swallowed REST TLS-config failures while other
+  handlers treated the identical failure as a crash.
+  `SKIP_TICK_EXCEPTIONS` carries `OperatorConfigError` explicitly — the
+  pre-refactor wrappers caught it at runtime via Redis parentage, so
+  explicit membership restores the exact historical runtime set (D12:
+  wiring/config failure → counter-bumped skip + retry next poll, where
+  a fixed Secret, CR spec, or re-mounted CA bundle is picked up live).
 
 ## [0.2.0] - 2026-08-19
 
