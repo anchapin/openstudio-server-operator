@@ -613,9 +613,12 @@ one-shot inside the operator pod against the live Redis (the CR default
 workers as fresh epoch floats:
 
 ```
+# PRE-#150 capture log, not a current recipe — the literal password used at
+# capture time has been scrubbed to the `openstudio-rotated` placeholder
+# (issue #410; run scripts/rotate_redis_password.sh for a per-cluster value).
 $ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
 from openstudio_operator.redis_client import ReadOnlyRedisClient
-c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+c = ReadOnlyRedisClient('redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379')
 c.validate_key_layout(); print('validate_key_layout: PASS (no raise)')"
 validate_key_layout: PASS (no raise)
 # same exec, worker_heartbeats():
@@ -631,7 +634,9 @@ throwaway `redis:6.0.9` pod against Service `queue` matches the direct
 `redis-cli` DBSIZE, and `INFO keyspace` confirms all keys live in db0:
 
 ```
-$ redis-cli -u redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379 DBSIZE
+# PRE-#150 capture log, not a current recipe — password scrubbed to the
+# `openstudio-rotated` placeholder (issue #410).
+$ redis-cli -u redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379 DBSIZE
 6
 $ ... INFO keyspace
 # Keyspace
@@ -1192,9 +1197,11 @@ at initialization) and the OSCM CR are both deleted.
   resque:workers:heartbeat` hash is still present):
 
   ```
+  # PRE-#150 capture log, not a current recipe — password scrubbed to the
+  # `openstudio-rotated` placeholder (issue #410).
   $ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
   from openstudio_operator.redis_client import ReadOnlyRedisClient
-  c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+  c = ReadOnlyRedisClient('redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379')
   c.validate_key_layout(); print('validate_key_layout: PASS (no raise)')"
   validate_key_layout: PASS (no raise)
   ```
@@ -1217,10 +1224,12 @@ at initialization) and the OSCM CR are both deleted.
   every worker (live exec):
 
   ```
+  # PRE-#150 capture log, not a current recipe — password scrubbed to the
+  # `openstudio-rotated` placeholder (issue #410).
   $ kubectl -n openstudio-server exec deploy/openstudio-operator -- python -c "\
   import json
   from openstudio_operator.redis_client import ReadOnlyRedisClient
-  c = ReadOnlyRedisClient('redis://:openstudio@queue.openstudio-server.svc.cluster.local:6379')
+  c = ReadOnlyRedisClient('redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379')
   for wid in c._execute('smembers', 'resque:workers'):
     raw = c._execute('get', f'resque:worker:{wid}')
     rec = json.loads(raw) if raw else None
@@ -1539,7 +1548,7 @@ HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
       `/metrics` confirms the counter is GONE at runtime (Section 6).
 - [x] **Unit and Kind validation tests pass without HPA floor
       reconciliation dependencies** — VERIFIED: `ruff check .` clean,
-      `pytest` 702 tests across 35 files (current count per
+      `pytest` 706 tests across 36 files (current count per
       `pytest --collect-only`); the operator boots
       end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
       drives scaling, and the operator's `/metrics` exposes the
