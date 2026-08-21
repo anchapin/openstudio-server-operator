@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-840 tests across 40 files (run `.venv/bin/pytest --collect-only` to
+841 tests across 41 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -192,7 +192,17 @@ step and `tests/test_singleton_registry_coverage.py` will fail loudly
 2. **Register exactly one `@kopf.timer`** for the OSCM resource using
    `_SPEC["group"]/_SPEC["version"]/_SPEC["plural"]` from
    `src/openstudio_operator/config.py`. The handler's `id` is what the
-   singleton guard will look up.
+   singleton guard will look up. The timer body is a thin delegate to
+   `run_oscm_tick` in `src/openstudio_operator/_oscm_handlers.py`
+   (issue #473): the shared runner owns config parse, the
+   empty-`serverUrl` idle check, store/emitter construction, the
+   canonical `SKIP_TICK_EXCEPTIONS` tuple, the
+   `HANDLER_TICK_FAILURES_TOTAL` increment, and the single skip-tick
+   log line — your module supplies only a `wire` closure (its specific
+   clients) and a `tick` closure (the `run_*_tick` invocation), plus
+   any result-specific tail logging. Do NOT copy a pre-#473 ~35-line
+   wrapper; the four existing modules are the canonical `wire`/`tick`
+   templates.
 
 3. **Add the module to the import block** in
    `src/openstudio_operator/handlers/__init__.py`. The import block is

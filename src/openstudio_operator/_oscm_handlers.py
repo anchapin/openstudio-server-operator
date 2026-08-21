@@ -39,8 +39,19 @@ two always agree without a hand-maintained test set.
 from __future__ import annotations
 
 import functools
+import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TypeVar
+
+from kubernetes.client import ApiException
+
+from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import EventEmitter
+from openstudio_operator.openstudio_client import OpenStudioApiError
+from openstudio_operator.redis_client import RedisClientError
+from openstudio_operator.status_store import StatusStore, StatusStoreError
 
 #: Process-wide registry of OSCM spawning handlers, keyed by handler id
 #: (the kopf ``id`` attribute on the timer registry entry). Every OSCM
@@ -190,3 +201,111 @@ def observe_tick_duration(*, module: str):
         return wrapper
 
     return decorator
+
+
+# Shared OSCM timer tick-runner (issue #473).
+#
+# The four OSCM timer handlers each carried a near-identical ~35-line
+# wrapper around their ``run_*_tick`` call: ``OperatorConfig.from_spec``,
+# the empty-``serverUrl`` idle warning, ``StatusStore`` /
+# ``EventEmitter`` / kube-API construction, and a try/tick/except tail
+# that bumped ``HANDLER_TICK_FAILURES_TOTAL`` and logged the per-handler
+# skip-tick warning. Only the client wiring
+# and the tick invocation differed — and the copy-pasted except tuples
+# had already drifted (analysis_sla caught RedisClientError;
+# datapoint_watchdog omitted ApiException; web_background_monitor omitted
+# OpenStudioApiError). #473 centralizes the wrapper the same way #395
+# centralized the timing half and #234 collapsed the queue/drain sinks:
+# each handler module now contributes ONLY its ``wire`` closure (the
+# per-module clients) and its ``tick`` closure (the ``run_*_tick`` call).
+
+#: The canonical skip-tick exception tuple (issue #473): the UNION of the
+#: four historical per-wrapper tuples, so no handler silently lost a
+#: catch in the unification. Wiring failures skip the tick and retry on
+#: the next poll (D12); anything outside this tuple propagates to kopf as
+#: an uncaught handler error (fail-closed, pinned by the issue #249
+#: negative tests in ``tests/test_timer_wrapper_failures.py``).
+SKIP_TICK_EXCEPTIONS: tuple[type[Exception], ...] = (
+    OpenStudioApiError,
+    StatusStoreError,
+    ApiException,
+    RedisClientError,
+)
+
+_DepsT = TypeVar("_DepsT")
+_ResultT = TypeVar("_ResultT")
+
+
+def run_oscm_tick(
+    *,
+    spec: dict,
+    body: dict,
+    namespace: str,
+    name: str,
+    logger: logging.Logger,
+    module: str,
+    tick_label: str,
+    idle_label: str,
+    custom_objects_api: Callable[[], object],
+    wire: Callable[[OperatorConfig], _DepsT],
+    tick: Callable[..., _ResultT],
+) -> _ResultT | None:
+    """Run one OSCM timer tick through the shared wrapper wiring (issue #473).
+
+    Owns everything the four handler wrappers used to duplicate:
+
+    * ``OperatorConfig.from_spec(spec)`` — the single config path;
+    * the empty-``spec.serverUrl`` idle check — logs ``"<idle_label> idle
+      this tick"`` and returns ``None`` WITHOUT touching the failure
+      counter (an incomplete CR is not a tick failure);
+    * ``StatusStore(namespace, name, custom_objects_api())`` — the caller
+      passes its module-level factory so tests can monkeypatch the name
+      in the handler module's namespace exactly as before;
+    * ``EventEmitter(body=body, dry_run=config.dry_run)`` — the D11 gate;
+    * the try/tick/except tail — a tick raising anything in
+      :data:`SKIP_TICK_EXCEPTIONS` increments
+      ``HANDLER_TICK_FAILURES_TOTAL.labels(namespace, name, module,
+      error_type)`` exactly once and logs the single per-handler
+      skip-tick warning (the sole ``%``-formatted site of that wording
+      in ``src/``); anything else propagates.
+
+    The handler module contributes the two closures:
+
+    * ``wire(config)`` — build the module's own clients (REST client,
+      Redis client, core/apps APIs, tracker caches, …); runs OUTSIDE the
+      try so a raising constructor still propagates uncounted, exactly
+      like the pre-#473 wrappers;
+    * ``tick(config=..., store=..., emit=..., deps=..., now=...)`` —
+      invoke the module's ``run_*_tick``; receives the constructed
+      wiring plus ``now=datetime.now(UTC)``.
+
+    Returns the tick's return value, or ``None`` when the tick was
+    skipped (idle CR or caught wiring/tick failure) — the D12 "retry
+    next poll" posture.
+    """
+    config = OperatorConfig.from_spec(spec)
+    if not config.server_url:
+        logger.warning("spec.serverUrl is empty — %s idle this tick", idle_label)
+        return None
+    store = StatusStore(namespace, name, custom_objects_api())
+    emit = EventEmitter(body=body, dry_run=config.dry_run)
+    deps = wire(config)
+    now = datetime.now(UTC)
+    try:
+        return tick(config=config, store=store, emit=emit, deps=deps, now=now)
+    except SKIP_TICK_EXCEPTIONS as exc:
+        from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
+
+        HANDLER_TICK_FAILURES_TOTAL.labels(
+            namespace=namespace,
+            name=name,
+            module=module,
+            error_type=type(exc).__name__,
+        ).inc()
+        logger.warning(
+            "%s tick skipped, retrying next poll (%s: %s)",
+            tick_label,
+            type(exc).__name__,
+            exc,
+        )
+        return None

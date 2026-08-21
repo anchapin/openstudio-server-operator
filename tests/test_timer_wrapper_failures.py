@@ -13,7 +13,9 @@ that wires :func:`OperatorConfig.from_spec`, constructs
 :class:`EventEmitter` (D11 gate), calls ``datetime.now(UTC)``, returns
 early on empty ``spec.serverUrl``, and increments
 ``HANDLER_TICK_FAILURES_TOTAL.labels(module=<name>, error_type=<class>)``
-on its module-specific exception tuple is **not** directly tested. Issue
+on the canonical skip-tick tuple (see the ``_oscm_handlers`` constants
+below — issue #473 unified the four former per-module tuples onto
+``SKIP_TICK_EXCEPTIONS``) is **not** directly tested. Issue
 #231 closes that gap.
 
 Acceptance criterion (issue #231):
@@ -173,12 +175,18 @@ def _stub_operator_k8s_client(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # --- per-wrapper exception tuples (issue #231) ---------------------------------
 #
-# Each wrapper declares its own ``except`` tuple; parametrising over every
-# member catches a regression that narrows the tuple (e.g. drops
-# ``RedisClientError`` from analysis_sla on a careless refactor) at the CI
-# gate. The wrapper-level tuple list is the source of truth (handlers/*.py
-# at the @kopf.timer wrappers); keep these constants aligned with the
-# production code or this test will silently miss the dropped exception.
+# Issue #473 replaced the four divergent per-wrapper ``except`` tuples
+# with ONE canonical tuple — ``_oscm_handlers.SKIP_TICK_EXCEPTIONS``,
+# the union of the historical per-module tuples — shared by all four
+# wrappers via ``run_oscm_tick``. The parametrised sets below enumerate
+# each wrapper's HISTORICAL tuple members (the union superset is pinned
+# by ``tests/test_oscm_tick_runner.py``); every listed member must still
+# be caught by the shared tuple. Parametrising over every member catches
+# a regression that narrows the tuple (e.g. drops
+# ``RedisClientError`` from analysis_sla on a careless refactor) at the
+# CI gate. ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` is the source of
+# truth; keep these constants a subset of it or this test will silently
+# miss the dropped exception.
 
 ANALYSIS_SLA_EXCEPTIONS: tuple[pytest.param, ...] = (
     pytest.param(OpenStudioApiError("api"), id="OpenStudioApiError"),
@@ -217,14 +225,16 @@ def test_analysis_sla_monitor_wrapper_counts_module_specific_exception(
 ) -> None:
     """Issue #231: ``analysis_sla_monitor`` fires the counter on every tuple member.
 
-    The wrapper declares
-    ``except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError)``
-    — a regression that drops one of those classes (the most likely silent
+    Since #473 the wrapper catches the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` —
+    ``(OpenStudioApiError, StatusStoreError, ApiException, RedisClientError)``,
+    identical to analysis_sla's historical 4-tuple (the union's superset).
+    A regression that drops one of those classes (the most likely silent
     edit is removing ``RedisClientError`` because the SLA monitor
     primarily talks REST) would re-raise on the dropped branch, which
     then propagates out of the wrapper as an uncaught kopf handler error.
-    Parametrising over the entire tuple asserts the wrapper's catch is
-    exactly the documented set.
+    Parametrising over the entire set asserts the wrapper's catch still
+    covers the documented members.
     """
     monkeypatch.setattr(analysis_sla, "run_sla_tick", _raise(exc))
 
@@ -307,14 +317,15 @@ def test_zombie_datapoint_watchdog_wrapper_counts_module_specific_exception(
     _stub_operator_k8s_client: None,
     exc: BaseException,
 ) -> None:
-    """Issue #231: ``zombie_datapoint_watchdog`` fires the counter on its 2-tuple.
+    """Issue #231: ``zombie_datapoint_watchdog`` fires the counter on its historical tuple members.
 
-    The watchdog declares
-    ``except (OpenStudioApiError, StatusStoreError)`` — narrower than the
-    SLA wrapper because the watchdog never touches the K8s API or Redis.
-    Adding an exception class on a careless edit would silently widen the
-    tuple (a less dangerous regression, but the test pins the documented
-    set exactly).
+    Pre-#473 the watchdog declared ``except (OpenStudioApiError,
+    StatusStoreError)``; #473 moved all four wrappers onto the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` union, so those members (and
+    the rest of the union) are caught. Parametrising over the historical
+    set keeps the CI gate that a tuple-narrowing regression re-raises on
+    a dropped branch, which would propagate out of the wrapper as an
+    uncaught kopf handler error.
     """
     monkeypatch.setattr(datapoint_watchdog, "run_watchdog_tick", _raise(exc))
 
@@ -383,12 +394,12 @@ def test_worker_recycler_wrapper_counts_module_specific_exception(
     _stub_operator_k8s_client: None,
     exc: BaseException,
 ) -> None:
-    """Issue #231: ``worker_recycler`` fires the counter on its 3-tuple.
+    """Issue #231: ``worker_recycler`` fires the counter on its historical tuple members.
 
-    The recycler declares
-    ``except (OpenStudioApiError, StatusStoreError, ApiException)`` —
-    same K8s+REST surface as the SLA monitor, minus Redis (the recycler
-    never reads from Redis). The test pins that distinction.
+    Pre-#473 the recycler declared ``except (OpenStudioApiError,
+    StatusStoreError, ApiException)`` — K8s+REST, no Redis; #473 moved
+    all four wrappers onto the shared ``_oscm_handlers.SKIP_TICK_EXCEPTIONS``
+    union, so those members are still caught.
     """
     monkeypatch.setattr(worker_recycler, "run_recycler_tick", _raise(exc))
 
@@ -452,14 +463,15 @@ def test_web_background_monitor_wrapper_counts_module_specific_exception(
     _stub_operator_k8s_client: None,
     exc: BaseException,
 ) -> None:
-    """Issue #231: ``web_background_monitor`` fires the counter on its 3-tuple.
+    """Issue #231: ``web_background_monitor`` fires the counter on its historical tuple members.
 
-    The web_background monitor is the only wrapper that **does not**
-    catch :class:`OpenStudioApiError` — it never talks to the OpenStudio
-    REST surface, only Redis and the K8s API. The tuple is
-    ``(RedisClientError, StatusStoreError, ApiException)``. The test pins
-    the absence of ``OpenStudioApiError`` and the presence of every other
-    class.
+    Pre-#473 the web_background monitor was the only wrapper that did
+    **not** catch :class:`OpenStudioApiError` — it never talks to the
+    OpenStudio REST surface, only Redis and the K8s API; its tuple was
+    ``(RedisClientError, StatusStoreError, ApiException)``. #473 moved
+    all four wrappers onto the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` union, so those members are
+    still caught.
     """
     monkeypatch.setattr(web_background_monitor, "run_stall_tick", _raise(exc))
 
@@ -565,11 +577,12 @@ def test_analysis_sla_monitor_does_not_count_out_of_tuple_exception(
     monkeypatch: pytest.MonkeyPatch,
     _stub_operator_k8s_client: None,
 ) -> None:
-    """``ValueError`` (not in analysis_sla's 4-tuple) must NOT increment the counter.
+    """``ValueError`` (outside the shared skip tuple) must NOT increment the counter.
 
-    The wrapper declares
-    ``except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError)``
-    — a regression that adds ``ValueError`` to that tuple (e.g. a
+    Since #473 analysis_sla_monitor catches the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` —
+    ``(OpenStudioApiError, StatusStoreError, ApiException, RedisClientError)``.
+    A regression that adds ``ValueError`` to that tuple (e.g. a
     well-meaning "let's catch more things") would silently widen the
     counter's trigger set. The negative case here pins the tuple's exact
     membership: out-of-tuple classes propagate out, the counter stays
@@ -598,16 +611,15 @@ def test_zombie_datapoint_watchdog_does_not_count_out_of_tuple_exception(
     monkeypatch: pytest.MonkeyPatch,
     _stub_operator_k8s_client: None,
 ) -> None:
-    """``ValueError`` (not in datapoint_watchdog's 2-tuple) must NOT increment the counter.
+    """``ValueError`` (outside the shared skip tuple) must NOT increment the counter.
 
-    The watchdog declares
-    ``except (OpenStudioApiError, StatusStoreError)`` — narrower than
-    the SLA wrapper because the watchdog never touches the K8s API or
-    Redis. A future patch that adds ``RedisClientError`` to the
-    watchdog's tuple (the watchdog never reads Redis, so this would be
-    a bug, not a feature) would silently widen the catch and the
-    counter would start firing on Redis connectivity issues that the
-    watchdog cannot actually hit.
+    Since #473 the watchdog catches the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` union (its historical 2-tuple
+    ``(OpenStudioApiError, StatusStoreError)`` was the narrowest of the
+    four — see ``test_raw_api_exception_from_status_patch_is_counted_by_
+    shared_skip_tuple`` in ``tests/test_datapoint_watchdog.py`` for the
+    widening's behavioral pin). ``ValueError`` is not in the union: it
+    must propagate, not silently start counting.
     """
     monkeypatch.setattr(datapoint_watchdog, "run_watchdog_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
 
@@ -631,14 +643,14 @@ def test_worker_recycler_does_not_count_out_of_tuple_exception(
     monkeypatch: pytest.MonkeyPatch,
     _stub_operator_k8s_client: None,
 ) -> None:
-    """``ValueError`` (not in worker_recycler's 3-tuple) must NOT increment the counter.
+    """``ValueError`` (outside the shared skip tuple) must NOT increment the counter.
 
-    The recycler declares
-    ``except (OpenStudioApiError, StatusStoreError, ApiException)`` —
-    K8s+REST, no Redis. A future patch that adds ``RedisClientError``
-    would be wrong on its face (the recycler never reads Redis) but
-    would silently widen the counter's trigger set unless this test
-    pins the tuple's exact membership.
+    Since #473 the recycler catches the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` union (its historical tuple
+    was ``(OpenStudioApiError, StatusStoreError, ApiException)`` —
+    K8s+REST, no Redis). ``ValueError`` is not in the union: it must
+    propagate, not silently start counting — otherwise the
+    ``error_type`` label cardinality would drift undetected.
     """
     monkeypatch.setattr(worker_recycler, "run_recycler_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
 
@@ -662,16 +674,15 @@ def test_web_background_monitor_does_not_count_out_of_tuple_exception(
     monkeypatch: pytest.MonkeyPatch,
     _stub_operator_k8s_client: None,
 ) -> None:
-    """``ValueError`` (not in web_background_monitor's 3-tuple) must NOT increment the counter.
+    """``ValueError`` (outside the shared skip tuple) must NOT increment the counter.
 
-    The web_background monitor is the only wrapper that does NOT catch
-    :class:`OpenStudioApiError` — it never talks to the OpenStudio REST
-    surface, only Redis and the K8s API. The tuple is
-    ``(RedisClientError, StatusStoreError, ApiException)``. A future
-    patch that adds ``OpenStudioApiError`` to the tuple (e.g. a
-    well-meaning "let's catch all the operator's exception types") would
-    silently widen the counter's trigger set; this negative case pins
-    that absence at CI.
+    Since #473 the web_background monitor catches the shared
+    ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` union (its historical tuple
+    ``(RedisClientError, StatusStoreError, ApiException)`` did NOT
+    include :class:`OpenStudioApiError` — it never talks to the
+    OpenStudio REST surface). ``ValueError`` is not in the union: it
+    must propagate, not silently start counting — otherwise the
+    ``error_type`` label cardinality would drift undetected.
     """
     monkeypatch.setattr(web_background_monitor, "run_stall_tick", _raise(_OUT_OF_TUPLE_EXCEPTION))
 
