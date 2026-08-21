@@ -30,11 +30,24 @@ CR for both actors.
 Exit codes (the CronJob's own backoffLimit is 0 — a failed pod is not
 retried in place; the next schedule IS the retry):
 
-* ``0`` — tick ran, or was skipped idly (no CR / no serverUrl / archiveToS3
-  false / D12 transient failure logged as a warning). Skip-tick parity with
-  the old kopf wrapper, which logged and returned.
+* ``0`` — tick ran, or was skipped idly (no CR / no serverUrl /
+  archiveToS3 false).
 * ``2`` — wiring error (no POD_NAMESPACE, unparseable cluster state) — loud,
   surfaces as a Failed CronJob Job.
+* ``3`` — empty ``spec.redisUrl`` on the active CR (#392 / #180 / #116
+  fence) — the prune actor is a no-op until the field is set.
+* ``4`` — could not list OSCM CRs (kube-apiserver unreachable, RBAC
+  regression). Issue #470: the #306 ``PRUNE_TICK_FAILURES_TOTAL`` counter
+  is process-local to a pod that serves ONE tick and exits within
+  seconds — a 30-60 s Prometheus scrape samples it zero-to-one times and
+  every run resets it to zero, so ``rate()`` is meaningless. The Failed
+  Job (``failedJobsHistoryLimit`` + Job-status alerting) is the durable
+  signal for a sustained CR-list outage.
+* ``5`` — D12 runtime failure inside the tick (REST 5xx storm,
+  ``StatusStoreConflictError`` herd, invalid storagePolicy). Same #470
+  rationale as ``4``: nonzero so a sustained retention-pipeline failure
+  — the slow-motion NFS-full outage — alerts via failed Jobs, not just
+  WARNING logs and a decorative counter.
 * unexpected exceptions propagate (non-zero) — visible, retried next run.
 
 RBAC: the entrypoint's ServiceAccount (``deploy/storage-cronjob.yaml``)
@@ -235,7 +248,13 @@ def main(
             type(exc).__name__,
             exc,
         )
-        return 0
+        # Issue #470 — exit nonzero (4): the counter above is process-local
+        # to this one-tick pod and effectively unscrapeable (see the module
+        # docstring's exit-code table), so the Failed CronJob Job is the
+        # durable signal a sustained kube-apiserver/RBAC outage leaves
+        # behind. The D12 retry posture is unchanged — backoffLimit is 0,
+        # the next schedule IS the retry.
+        return 4
 
     cr = singleton.resolve_active_cr(crs)  # D05: oldest CR wins, same rule as the operator
     if cr is None:
@@ -311,7 +330,15 @@ def main(
             type(exc).__name__,
             exc,
         )
-        return 0
+        # Issue #470 — exit nonzero (5): the counter above is process-local
+        # to this one-tick pod and effectively unscrapeable (see the module
+        # docstring's exit-code table), so a sustained retention-pipeline
+        # failure (REST 5xx storm, StatusStoreConflictError herd, the #398
+        # admission policy silently blocking archival Job creation) surfaces
+        # as Failed CronJob Jobs that failedJobsHistoryLimit + Job-status
+        # alerting catch. The D12 retry posture is unchanged — backoffLimit
+        # is 0, the next schedule IS the retry.
+        return 5
 
     if result.deleted:
         logger.info(
