@@ -1,0 +1,331 @@
+# PrometheusRule alert definitions for the openstudio-server-operator /metrics
+# surface (issue #468).
+#
+# The alert expressions below are the machine-readable transcription of the
+# canonical "Alert on ..." docstrings in src/openstudio_operator/metrics.py and
+# the README.md metrics table — every family referenced here is asserted to
+# exist in tests/_metrics_inventory.py by tests/test_monitoring_artifacts.py,
+# so a metrics-family rename fails CI instead of silently breaking the alert.
+#
+# APPLY + PICKUP
+# --------------
+# This manifest is applied by the CLUSTER ADMIN (kubectl apply -f deploy/),
+# NOT by the operator: the operator's namespaced Role
+# (deploy/rbac.yaml) intentionally holds no `prometheusrules` verbs, and the
+# operator never creates or mutates PrometheusRule objects. The resource is
+# namespaced (monitoring.coreos.com/v1) and lives in `openstudio-server` so a
+# Prometheus instance that selects rules per-namespace picks it up alongside
+# the scrape target.
+#
+# Rule-selector label: kube-prometheus-stack's default Prometheus
+# `ruleSelector` matches `release: <helm-release-name>`; the stock release
+# name is `prometheus`, so that label is shipped below for default pickup.
+# If your Prometheus was installed under a different release name (e.g.
+# `kube-prometheus-stack` or `monitoring`), change the label to match your
+# `ruleSelector.matchLabels`, or add this manifest's labels to the selector.
+# Clusters not running the Prometheus Operator can transcribe the `expr`
+# strings into static rule files — they are plain PromQL.
+#
+# SCRAPE PREREQUISITE
+# -------------------
+# The expressions assume a Prometheus scrape config for the operator Pod's
+# plaintext :9090/metrics endpoint (see README.md#metrics; the ingress is
+# gated by the `openstudio-operator-metrics-ingress` NetworkPolicy, issue
+# #166 — the scraper must run in the `prometheus` namespace or carry
+# `app.kubernetes.io/component: metrics-scraper`). The storage-prune
+# CronJob exposes the same families on its own pod; both targets surface the
+# `prune_tick_failures_total` alert below.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: openstudio-operator-alerts
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/name: openstudio-operator
+    app.kubernetes.io/part-of: openstudio-server
+    # kube-prometheus-stack default ruleSelector match (see header). Rename
+    # to your release if it is not `prometheus`.
+    release: prometheus
+spec:
+  groups:
+    # ---------------------------------------------------------------------
+    # Handler health — the four OSCM timer wrappers (analysis_sla,
+    # datapoint_watchdog, worker_recycler, web_background_monitor) plus the
+    # REST client, the event path, and the status store they share.
+    # ---------------------------------------------------------------------
+    - name: openstudio-operator.handlers
+      rules:
+        # metrics.py HANDLER_TICK_FAILURES_TOTAL (#117) — sustained nonzero
+        # rate per (module, error_type) tells the on-call which downstream
+        # (REST, Redis, k8s API) is degraded.
+        - alert: OpenStudioOperatorHandlerTickFailures
+          expr: rate(openstudio_operator_handler_tick_failures_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Operator handler ticks are failing ({{ $labels.module }} / {{ $labels.error_type }})
+            description: >-
+              Sustained nonzero rate of openstudio_operator_handler_tick_failures_total
+              for module {{ $labels.module }} with error type {{ $labels.error_type }}
+              — the timer wrapper is silently skipping ticks (D12 retry-on-next-poll).
+              Check which downstream is degraded: REST (OpenStudioApiError), Redis
+              (RedisClientError), or the k8s API (ApiException / StatusStoreError).
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py REST_REQUEST_DURATION_SECONDS (#308) — the histogram's
+        # _count series labelled outcome="exception" is the canonical
+        # REST-degraded signal (4xx immediately, 5xx retries exhausted,
+        # non-GET 5xx per #226).
+        - alert: OpenStudioOperatorRestExceptionRate
+          expr: rate(openstudio_operator_rest_request_duration_seconds_count{outcome="exception"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: OpenStudio REST calls are raising ({{ $labels.method }})
+            description: >-
+              Sustained nonzero rate on
+              openstudio_operator_rest_request_duration_seconds_count{outcome="exception"}
+              for method {{ $labels.method }} — the 3x retry envelope is exhausted or the
+              call failed before retry. Cross-check the operator pod's JSON logs for the
+              OpenStudioApiError detail and the web Service health.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py EVENTS_EMIT_FAILURES_TOTAL (#255) — the operator cannot
+        # post Kubernetes Events; distinct from handler_tick_failures.
+        - alert: OpenStudioOperatorEventEmitFailures
+          expr: rate(openstudio_operator_events_emit_failures_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Operator cannot post Kubernetes Events ({{ $labels.reason }})
+            description: >-
+              Sustained nonzero rate of openstudio_operator_events_emit_failures_total
+              — kopf.event posting is failing (apiserver unreachable or rejecting).
+              Distinct from handler_tick_failures_total: actions may still be firing
+              while their Events are lost.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL (#119) — a CR
+        # status write was lost when the 409 retry budget ran out.
+        - alert: OpenStudioOperatorStatusConflictRetriesExhausted
+          expr: rate(openstudio_operator_status_conflict_retries_exhausted_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Status-store RMW retry budget exhausted ({{ $labels.namespace }}/{{ $labels.name }})
+            description: >-
+              Sustained nonzero rate of
+              openstudio_operator_status_conflict_retries_exhausted_total — status-store
+              read-modify-write cycles are losing the 409 race faster than the retry
+              budget absorbs. Cross-check status_conflicts_total and the singleton guard:
+              multiple writers on one CR is the usual cause (D05).
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+    # ---------------------------------------------------------------------
+    # Singleton guard (D05) — one OSCM CR per namespace, oldest wins.
+    # ---------------------------------------------------------------------
+    - name: openstudio-operator.singleton
+      rules:
+        # metrics.py SINGLETON_ELECTION_TOTAL (#239) — change-gated: fires on
+        # the transition into a multi-CR namespace. Also the signal that
+        # catches a silently-unwrapped guard (kopf internals changed shape).
+        - alert: OpenStudioOperatorSingletonConflict
+          expr: rate(openstudio_operator_singleton_election_total{outcome="conflict"}[5m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Singleton-guard conflict in namespace {{ $labels.namespace }}
+            description: >-
+              Nonzero rate on openstudio_operator_singleton_election_total{outcome="conflict"}
+              — more than one OSCM CR exists in the namespace and the singleton guard
+              (D05) elected the oldest. Delete the loser CRs (their SingletonConflict
+              Warning Events name the winner). A conflict with no matching Warning
+              Events means the guard is silently bypassed — check
+              tests/test_singleton_registry_coverage.py against the deployed kopf version.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py SINGLETON_LOSER_SKIPS_TOTAL (#403) — the per-tick twin:
+        # the change-gated election counter is silent for a STABLE multi-CR
+        # namespace; this one fires on every suppressed loser tick.
+        - alert: OpenStudioOperatorSingletonLoserSkips
+          expr: rate(openstudio_operator_singleton_loser_skips_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Sustained singleton-guard loser suppressions ({{ $labels.namespace }}/{{ $labels.name }})
+            description: >-
+              Sustained nonzero rate of openstudio_operator_singleton_loser_skips_total
+              — a stable multi-CR configuration: every tick of CR
+              {{ $labels.namespace }}/{{ $labels.name }} (module {{ $labels.module }}) is
+              being suppressed by the singleton guard. Delete the loser CR.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+    # ---------------------------------------------------------------------
+    # Observability substrate — the metrics endpoint itself, the deferred-
+    # Warning-event sink, and the Redis key-layout validator.
+    # ---------------------------------------------------------------------
+    - name: openstudio-operator.substrate
+      rules:
+        # metrics.py METRICS_SERVER_BOUND (#393) — the canonical "Prometheus
+        # scrape is down because of US" signal. Pair with blackbox-exporter
+        # up==0: when the bind failed this pod's /metrics is dead, so the
+        # 0.0 cannot be scraped from the pod itself on the SAME restart —
+        # the gauge is the durable record for post-mortems.
+        - alert: OpenStudioOperatorMetricsServerUnbound
+          expr: openstudio_operator_metrics_server_bound == 0
+          labels:
+            severity: critical
+          annotations:
+            summary: /metrics server failed to bind ({{ $labels.addr }}:{{ $labels.port }})
+            description: >-
+              openstudio_operator_metrics_server_bound == 0 — the /metrics server's
+              first bind attempt raised OSError on {{ $labels.addr }}:{{ $labels.port }}
+              (port already in use or unbindable address). The operator keeps running
+              with /metrics dead; only the WARNING log and this gauge record it.
+              Restart the pod after freeing the port.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py WARNINGS_DEFERRED_DROPPED_TOTAL (#310) — Warning Events
+        # are being silently lost past the sink's 1000-entry cap.
+        - alert: OpenStudioOperatorWarningsDeferredDropped
+          expr: rate(openstudio_operator_warnings_deferred_dropped_total[5m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Deferred Warning Events are being dropped ({{ $labels.reason }})
+            description: >-
+              Nonzero rate of openstudio_operator_warnings_deferred_dropped_total — the
+              QueuedKopfEventSink hit MAX_DEFERRED_WARNING_EVENTS (1000) and deferred
+              Warning Events are being dropped, breaking the at-least-once deferred-event
+              contract (#234). The apiserver watch stream is likely stalled; pair with
+              the warnings_deferred_queue_depth gauge on the dashboard.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py REDIS_KEY_LAYOUT_STATUS (#253) — 0.0 for every terminal
+        # status other than ok (degraded | unreachable | error | skipped).
+        - alert: OpenStudioOperatorRedisKeyLayoutInvalid
+          expr: openstudio_operator_redis_key_layout_status == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Redis key-layout validation is not ok
+            description: >-
+              openstudio_operator_redis_key_layout_status == 0 — the boot-time validator
+              (#163) did not return ok. The post-#44 failure mode follows: a live
+              v3.11.0 layout drift takes resque_workers_seen_max silent, the stall
+              condition fires vacuously, and the operator periodic-restarts
+              web_background while everything looks healthy.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py RESQUE_WORKERS_SEEN_MAX (#44/#87) — 0 with a reachable
+        # Redis means no workers are registered: the fleet is gone OR the
+        # centralized Resque key constants drifted from the live layout.
+        - alert: OpenStudioOperatorNoResqueWorkers
+          expr: openstudio_operator_resque_workers_seen_max == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: No Resque workers observed
+            description: >-
+              openstudio_operator_resque_workers_seen_max == 0 — the operator has never
+              observed a worker in resque:workers this process lifetime (the gauge is
+              emitted every poll since #87). Either the worker fleet is gone or the
+              centralized Resque key constants do not match the live v3.11.0 layout —
+              the stall-condition leg 2 is vacuously true and web_background restarts
+              will fire while everything looks healthy.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+    # ---------------------------------------------------------------------
+    # web_background stall window + queue-fabric freshness (#254 / #312).
+    # ---------------------------------------------------------------------
+    - name: openstudio-operator.stall
+      rules:
+        # metrics.py STALL_WINDOW_ELAPSED_SECONDS (#254) — early warning
+        # between the first sustained observation and the eventual
+        # web_background_restarts_total increment. The action gate itself
+        # is the CRD's spec.stallWindowMinutes (policy, not hardcoded); the
+        # 60s threshold here is a fixed fraction chosen to page BEFORE the
+        # typical window closes — tune per cluster if stallWindowMinutes is
+        # set low.
+        - alert: OpenStudioOperatorStallWindowAccumulating
+          expr: openstudio_operator_stall_window_elapsed_seconds > 60
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: web_background stall window is accumulating
+            description: >-
+              openstudio_operator_stall_window_elapsed_seconds has been above 60s for
+              2m — the sustained queue-stall condition is holding and the window is
+              accumulating toward the web_background restart gate
+              (spec.stallWindowMinutes). Heads-up before the restart fires: check the
+              Resque queue depths and web_background pod health now.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py RESQUE_QUEUE_DEPTH_FRESH (#312) — the data gauge is NOT
+        # touched on the exception path; this staleness expression is the
+        # only signal that the operator has LOST visibility (Redis
+        # unreachable, ApiException) while the last depth reading
+        # masquerades as live. 300s = 5 missed sensing ticks (cadence 60s).
+        - alert: OpenStudioOperatorResqueQueueDepthStale
+          expr: time() - openstudio_operator_resque_queue_depth_fresh > 300
+          labels:
+            severity: warning
+          annotations:
+            summary: Resque queue-depth reading is stale (>5 missed ticks)
+            description: >-
+              time() - openstudio_operator_resque_queue_depth_fresh > 300 — no
+              successful queue_depths() Redis read for over five sensing ticks (cadence
+              60s). The resque_queue_depth gauge is holding a stale value: the operator
+              has lost visibility into the queue fabric (Redis unreachable or the read
+              path raising). Do not trust the depth gauges until freshness recovers.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py STALL_WINDOW_FRESH (#312) — the same staleness idiom for
+        # the stall-window gauge: a stale nonzero value masquerades as a
+        # continuing stall across a blind gap (tracker.reset() on the
+        # exception path).
+        - alert: OpenStudioOperatorStallWindowStale
+          expr: time() - openstudio_operator_stall_window_fresh > 300
+          labels:
+            severity: warning
+          annotations:
+            summary: Stall-window reading is stale (>5 missed ticks)
+            description: >-
+              time() - openstudio_operator_stall_window_fresh > 300 — no successful
+              run_stall_tick update for over five sensing ticks (cadence 60s). The
+              stall_window_elapsed_seconds gauge may be showing a stale accumulated
+              window across a blind gap (RedisClientError / ApiException path).
+              Investigate the web_background monitor's downstreams before trusting (or
+              acting on) the stall display.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+    # ---------------------------------------------------------------------
+    # Storage-prune CronJob (#306) — separate process, same /metrics port.
+    # ---------------------------------------------------------------------
+    - name: openstudio-operator.prune
+      rules:
+        # metrics.py PRUNE_TICK_FAILURES_TOTAL (#306) — the three skip-tick
+        # branches (cr_list_failure | runtime_failure | redis_url_empty);
+        # the #392 exit-3 redisUrl wedge is covered by the same counter.
+        - alert: OpenStudioOperatorPruneTickFailures
+          expr: rate(openstudio_operator_prune_tick_failures_total[5m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Storage-prune CronJob ticks are failing ({{ $labels.reason }})
+            description: >-
+              Nonzero rate of openstudio_operator_prune_tick_failures_total for reason
+              {{ $labels.reason }} — the prune entrypoint is skipping ticks (K8s API CR
+              list failure, a caught D12 exception, or the empty-spec.redisUrl guard
+              #392). The storage-archival backlog grows while this fires; investigate
+              the upstream cause (RBAC, apiserver, NFS, redis-secret KeyRef).
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
