@@ -347,6 +347,49 @@ STALL_WINDOW_FRESH = Gauge(
     "ecosystem's ``_created`` series).",
 )
 
+# Issue #469 — every runtime signal in the registry is EVENT-DRIVEN:
+# HANDLER_TICK_FAILURES_TOTAL increments only when a tick runs and fails,
+# HANDLER_TICK_DURATION_SECONDS observes only when a tick executes,
+# SINGLETON_ELECTION_TOTAL fires only when enforce() runs. If ticks stop
+# being scheduled ENTIRELY — the kopf registry internals shift so
+# install_singleton_guard returns 0 and the timers are silently unwrapped
+# (the exact failure mode AGENTS.md documents for the kopf pin), the CR is
+# deleted, or the kopf scheduling loop wedges — every series goes flat and
+# every dashboard reads green while the operator does nothing. Flat
+# counters are the classic absence alert most SRE setups miss. This gauge
+# generalizes the #312 freshness-pair idiom to the scheduler itself: a
+# per-module last-tick timestamp set at the END of every ``run_oscm_tick``
+# invocation (the single shared wrapper since #473) makes "operator
+# stopped working" a one-line staleness alert. Labelled by ``module``
+# (the same bounded vocabulary as HANDLER_TICK_FAILURES_TOTAL and the
+# tick-duration histogram — analysis_sla | datapoint_watchdog |
+# worker_recycler | web_background_monitor; 4 series). The event-driven
+# ``dry_run_audit`` watch handler (@kopf.on.event, NOT a timer) is
+# CONSCIOUSLY EXCLUDED — it ticks on CR events, not on a cadence, so
+# there is no interval against which a staleness gap could be
+# thresholded.
+HANDLER_LAST_TICK_TIMESTAMP = Gauge(
+    "openstudio_operator_handler_last_tick_timestamp",
+    "Unix-epoch seconds of the most recent completed ``run_oscm_tick`` "
+    "invocation per module (issue #469) — the scheduler heartbeat. Set "
+    "to ``time.time()`` in a ``finally`` at the END of every invocation "
+    "of the single shared tick-runner ``_oscm_handlers.run_oscm_tick`` "
+    "(#473), on EVERY terminal path: successful tick, caught skip-tuple "
+    "failure (a failing-but-scheduled tick is alive; a flat gauge is "
+    "not), the empty-``spec.serverUrl`` idle return, and even a "
+    "propagating uncaught exception — the heartbeat answers whether the "
+    "scheduler is invoking this module's timer AT ALL, not whether the "
+    "tick is succeeding (that is HANDLER_TICK_FAILURES_TOTAL's job). "
+    "NOT stamped by ``dry_run_audit`` — an @kopf.on.event watch handler, "
+    "event-driven with no cadence to be stale against (consciously "
+    "excluded, #469). Alert on the staleness gap: ``time() - "
+    "openstudio_operator_handler_last_tick_timestamp{module=...} > 3 * "
+    "<interval>`` — per-module intervals live in ``_constants.py`` "
+    "(analysis_sla 30 s → 90, datapoint_watchdog 60 s → 180, "
+    "worker_recycler 300 s → 900, web_background_monitor 60 s → 180).",
+    labelnames=["module"],
+)
+
 # Issue #255 — ``kopf.event`` emission failure counter. ``EventEmitter``
 # routes every Event through ``kopf.event`` (issue #164). When the
 # apiserver is unreachable, kopf's event posting raises; the exception

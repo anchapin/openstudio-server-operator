@@ -200,6 +200,13 @@ def test_metrics_http_server_serves_all_declared_counters():
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
     # below alongside the bare-form unlabelled gauges.
     metrics.RESQUE_QUEUE_DEPTH.labels(queue="__metrics_test_sentinel__").set(0)
+    # Issue #469 — pre-touch the labelled scheduler-heartbeat Gauge so
+    # the family's sample series is exposed. Labelled by ``module``
+    # (the four OSCM timer module names, same vocabulary as
+    # ``handler_tick_failures_total`` / the #308 duration histogram).
+    metrics.HANDLER_LAST_TICK_TIMESTAMP.labels(
+        module="__metrics_test_sentinel__"
+    ).set(0)
     # Issue #310 — pre-touch the labelled drop Counter so the family
     # line is exposed. ``reason`` label vocabulary currently includes
     # ``queue_full`` (the only drop path today); a future second reason
@@ -352,6 +359,14 @@ def test_metrics_http_server_serves_all_declared_counters():
                 r'openstudio_operator_metrics_server_bound'
                 r'\{addr="[^"]+",port="[0-9]+"\} [01]\.0',
                 response.text,
+            )
+        elif name == "openstudio_operator_handler_last_tick_timestamp":
+            # Issue #469 — labelled by ``module`` (the four OSCM timer
+            # module names, same vocabulary as the failure counter).
+            assert (
+                'openstudio_operator_handler_last_tick_timestamp'
+                '{module="__metrics_test_sentinel__"}'
+                in response.text
             )
         else:
             assert f"\n{name} " in response.text

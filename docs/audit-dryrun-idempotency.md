@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (841 tests across 41 files, current count)
+ruff check . && pytest                       # both green (844 tests across 41 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 8 gauges + 3 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 9 gauges + 3 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
@@ -254,7 +254,12 @@ and `stall_window_elapsed_seconds`). The post-#312 → 19+7+3 expansion is
 the change-gated #239 election counter). The post-#403 → 19+8+3 expansion
 is #393 (metrics-server bind-outcome gauge — the first bind attempt's
 `1.0`/`0.0` record; D11-exempt like the rest of the registry, and set
-once at process start, before any dry-run-gated action could exist).
+once at process start, before any dry-run-gated action could exist). The
+expansion to 20+9+3 is #469 (handler last-tick scheduler-heartbeat gauge
+`handler_last_tick_timestamp{module}` — stamped to `time.time()` at the
+end of every `run_oscm_tick` invocation on every terminal path; the only
+signal whose flatness means the scheduler itself is dead, generalizing
+the #312 freshness-pair idiom to the timers).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -316,6 +321,7 @@ unlabelled counter here is exactly the regression #181 guards against.
 | `openstudio_operator_stall_window_fresh` | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) (#312) | Last-successful-update Unix timestamp for the `stall_window_elapsed_seconds` data gauge. Set to `time.time()` immediately after the `STALL_WINDOW_ELAPSED_SECONDS.set(...)` sequence on both the holding and broken paths. | n/a — staleness pair for `stall_window_elapsed_seconds`; mirrors the `resque_queue_depth_fresh` round-trip pattern. Resetting only the freshness gauge (simulating "we lost visibility") leaves the data gauge holding its prior value — the exact failure mode #312 fixes. |
 | `openstudio_operator_warnings_deferred_queue_depth` | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) (#310) | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. | n/a — observability for QueuedKopfEventSink backpressure. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up. Companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000). |
 | `openstudio_operator_metrics_server_bound` | `metrics` (`start_metrics_server` first bind attempt) (#393) | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address). Never re-touched after the first attempt. **Labelled by `(addr, port)`** (the configured bind target — `0.0.0.0:9090` in the stock deployment; 1 series, fixed cardinality). Covers both authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). | n/a — the canonical "Prometheus scrape is down because of US" signal (`== 0`). Self-referential edge: a failed bind means this pod's `/metrics` is unscrapeable, so the `0.0` is the durable post-mortem record and pairs with blackbox-exporter `up == 0`; the WARNING log still fires. Not a decision counter — does not follow the §2 anchor pairing convention. |
+| `openstudio_operator_handler_last_tick_timestamp` | all four timer wrappers via the shared tick-runner `_oscm_handlers.run_oscm_tick` (#473) (#469) | Unix-epoch seconds of the most recent COMPLETED `run_oscm_tick` invocation per module — the scheduler heartbeat. Set to `time.time()` in a `finally` at the END of every invocation, on EVERY terminal path (successful tick, empty-`serverUrl` idle return, caught skip-tuple failure, propagating uncaught exception). **Labelled by `module`** (the four OSCM timer module names — same vocabulary as `handler_tick_failures_total`; 4 series). The event-driven `dry_run_audit` watch handler (`@kopf.on.event`, not a timer) is consciously EXCLUDED — no cadence to be stale against. | n/a — the only signal whose FLATNESS means the scheduler itself is dead (kopf internals shift so `install_singleton_guard` returns 0 and the timers are silently unwrapped; the CR is deleted; the scheduling loop wedges). Every other family is event-driven and reads green while nothing runs. Alert: `time() - handler_last_tick_timestamp{module=...} > 3 * <interval>` (per-module intervals in `_constants.py`). D11-exempt (in-process metric); dry-run-transparent. |
 
 ### Histograms
 
