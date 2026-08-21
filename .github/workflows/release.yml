@@ -125,40 +125,49 @@ jobs:
           # Issue #155: generate the SLSA provenance predicate inline via jq
           # rather than referencing a committed release-slsa.json file
           # (which never existed in the repo; that was the original bug).
-          # The predicate is a valid in-toto Statement with predicateType
-          # https://slsa.dev/provenance/v1 that references the workflow ref
-          # + the digest emitted by the build step. Output goes to /tmp
-          # because the runner cleans that up automatically.
+          # Issue #456: the predicate is a SLSA **v0.2** Statement because
+          # `cosign attest/verify-attestation --type slsaprovenance`
+          # validates the v0.2 schema, where `builder`, `metadata`,
+          # `invocation`, and `materials` are top-level predicate fields.
+          # The earlier v1 shape (`buildDefinition`/`runDetails`) failed
+          # with `required field builder missing` on every run. Output goes
+          # to /tmp because the runner cleans that up automatically.
           jq -n \
             --arg digest "${DIGEST#sha256:}" \
             --arg ref "${{ github.ref }}" \
             --arg ref_name "${{ github.ref_name }}" \
             --arg repo "${{ github.repository }}" \
             --arg sha "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
             '{
               "_type": "https://in-toto.io/Statement/v0.1",
-              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicateType": "https://slsa.dev/provenance/v0.2",
               "subject": [{
                 "name": ("ghcr.io/" + $repo + ":" + $ref_name),
                 "digest": {"sha256": $digest}
               }],
               "predicate": {
-                "buildDefinition": {
-                  "buildType": "https://slsa.dev/github-actions-run/v1",
-                  "externalParameters": {
-                    "workflow": ".github/workflows/release.yml",
-                    "repository": $repo,
-                    "ref": $ref,
-                    "sha": $sha
-                  },
-                  "resolvedDependencies": []
+                "builder": {
+                  "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
                 },
-                "runDetails": {
-                  "builder": {
-                    "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
+                "buildType": "https://slsa.dev/github-actions-run/v1",
+                "invocation": {
+                  "configSource": {
+                    "uri": ("git+https://github.com/" + $repo + "@" + $ref),
+                    "digest": {"sha1": $sha},
+                    "entryPoint": ".github/workflows/release.yml"
                   },
-                  "metadata": {"invocationId": $sha}
-                }
+                  "environment": {"runner": "github-hosted"}
+                },
+                "metadata": {
+                  "buildInvocationID": ("https://github.com/" + $repo + "/actions/runs/" + $run_id),
+                  "completeness": {"parameters": true, "environment": true, "materials": true},
+                  "reproducible": false
+                },
+                "materials": [{
+                  "uri": ("git+https://github.com/" + $repo + "@" + $ref),
+                  "digest": {"sha1": $sha}
+                }]
               }
             }' > /tmp/release-slsa.json
           cosign sign --yes "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
@@ -212,40 +221,49 @@ jobs:
           # Issue #155: generate the SLSA provenance predicate inline via jq
           # rather than referencing a committed release-slsa.json file
           # (which never existed in the repo; that was the original bug).
-          # The predicate is a valid in-toto Statement with predicateType
-          # https://slsa.dev/provenance/v1 that references the workflow ref
-          # + the digest emitted by the build step. Output goes to /tmp
-          # because the runner cleans that up automatically.
+          # Issue #456: the predicate is a SLSA **v0.2** Statement because
+          # `cosign attest/verify-attestation --type slsaprovenance`
+          # validates the v0.2 schema, where `builder`, `metadata`,
+          # `invocation`, and `materials` are top-level predicate fields.
+          # The earlier v1 shape (`buildDefinition`/`runDetails`) failed
+          # with `required field builder missing` on every run. Output goes
+          # to /tmp because the runner cleans that up automatically.
           jq -n \
             --arg digest "${DIGEST#sha256:}" \
             --arg ref "${{ github.ref }}" \
             --arg ref_name "${{ github.ref_name }}" \
             --arg repo "${{ github.repository }}" \
             --arg sha "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
             '{
               "_type": "https://in-toto.io/Statement/v0.1",
-              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicateType": "https://slsa.dev/provenance/v0.2",
               "subject": [{
                 "name": ("ghcr.io/" + $repo + ":" + $ref_name),
                 "digest": {"sha256": $digest}
               }],
               "predicate": {
-                "buildDefinition": {
-                  "buildType": "https://slsa.dev/github-actions-run/v1",
-                  "externalParameters": {
-                    "workflow": ".github/workflows/release.yml",
-                    "repository": $repo,
-                    "ref": $ref,
-                    "sha": $sha
-                  },
-                  "resolvedDependencies": []
+                "builder": {
+                  "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
                 },
-                "runDetails": {
-                  "builder": {
-                    "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
+                "buildType": "https://slsa.dev/github-actions-run/v1",
+                "invocation": {
+                  "configSource": {
+                    "uri": ("git+https://github.com/" + $repo + "@" + $ref),
+                    "digest": {"sha1": $sha},
+                    "entryPoint": ".github/workflows/release.yml"
                   },
-                  "metadata": {"invocationId": $sha}
-                }
+                  "environment": {"runner": "github-hosted"}
+                },
+                "metadata": {
+                  "buildInvocationID": ("https://github.com/" + $repo + "/actions/runs/" + $run_id),
+                  "completeness": {"parameters": true, "environment": true, "materials": true},
+                  "reproducible": false
+                },
+                "materials": [{
+                  "uri": ("git+https://github.com/" + $repo + "@" + $ref),
+                  "digest": {"sha1": $sha}
+                }]
               }
             }' > /tmp/release-slsa.json
           cosign sign --yes "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
