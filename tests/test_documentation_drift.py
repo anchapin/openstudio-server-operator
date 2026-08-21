@@ -1,5 +1,9 @@
 """Documentation drift gate (issue #410): the kind-validation runbook must not
 embed the legacy pre-#150 ``openstudio`` Redis password in a ``redis://`` URL.
+Issue #409 extends the same gate to the REST contract doc
+(``docs/contracts/openstudio-server-v3.11.0-rest.md``), which still cited the
+literal as the *default* Redis password after #150/#219 rotated it into the
+``openstudio-rotated`` placeholder.
 
 Why this test exists
 --------------------
@@ -12,14 +16,15 @@ that runbook still carried ``redis://:openstudio@queue...`` URLs after #150
 landed. A reader who copies one into a fresh kind cluster gets an auth error
 (the committed placeholder is ``openstudio-rotated``); a reader who copies one
 into a pre-#150 cluster silently re-introduces the literal the shell guard
-exists to keep out of source.
+exists to keep out of source. The contract doc (the REST ground truth per
+AGENTS.md) had the same defect in prose (issue #409).
 
 Historical capture logs are the one legitimate home for the literal: a capture
 transcribed before #150 is authentic evidence and may keep it — but only when
 the block is explicitly introduced by a leading ``PRE-#150`` marker line so no
-reader can mistake it for a current recipe. This test fails the build when a
-legacy ``redis://:openstudio@`` URL appears anywhere in
-``docs/kind-validation.md`` outside the exemption window of such a marker.
+reader can mistake it for a current recipe. These tests fail the build when the
+legacy ``openstudio@`` credential literal appears anywhere in either doc
+outside the exemption window of such a marker.
 """
 
 from __future__ import annotations
@@ -28,10 +33,18 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KIND_VALIDATION_DOC = REPO_ROOT / "docs" / "kind-validation.md"
+CONTRACTS_DOC = REPO_ROOT / "docs" / "contracts" / "openstudio-server-v3.11.0-rest.md"
 
-LEGACY_URL_SUBSTRING = "redis://:openstudio@"
+# Broader than the original `redis://:openstudio@` form (issue #409): the
+# acceptance criterion greps for the bare credential literal so a Mongo-style
+# citation cannot sneak past either. The rotated placeholder never matches —
+# `openstudio-rotated@` has `-rotated` between the literal and the `@`.
+LEGACY_URL_SUBSTRING = "openstudio@"
 HISTORICAL_CAPTURE_MARKER = "PRE-#150"
 EXEMPTION_WINDOW_LINES = 8
+
+ROTATED_REDIS_URL = "redis://:openstudio-rotated@queue:6379"
+ROTATION_SCRIPTS = ("scripts/rotate_redis_password.sh", "scripts/rotate_mongo_password.sh")
 
 FENCE = "```"
 LEGACY_DBSIZE_LINE = (
@@ -100,3 +113,30 @@ def test_legacy_url_is_exempt_only_within_capture_label_window() -> None:
 def test_rotated_placeholder_url_is_never_flagged() -> None:
     lines = [ROTATED_CLIENT_LINE]
     assert legacy_password_urls_outside_capture_labels(lines) == []
+
+
+def test_contracts_doc_has_no_legacy_credential_urls() -> None:
+    content = CONTRACTS_DOC.read_text(encoding="utf-8")
+    offenders = legacy_password_urls_outside_capture_labels(content.splitlines())
+    assert not offenders, (
+        "docs/contracts/openstudio-server-v3.11.0-rest.md cites the legacy "
+        "pre-#150 credential literal `openstudio@...` outside a labeled "
+        "historical-capture section (issue #409). Cite the `openstudio-rotated` "
+        "placeholder with the rotate-before-applying caveat, or prefix the "
+        "capture block with a `PRE-#150 capture log, not a current recipe` "
+        f"marker line. Offending lines: {offenders!r}"
+    )
+
+
+def test_contracts_doc_cites_rotated_placeholder_and_rotation_scripts() -> None:
+    content = CONTRACTS_DOC.read_text(encoding="utf-8")
+    assert ROTATED_REDIS_URL in content, (
+        "The contract doc's queue-fabric section must cite the committed "
+        "`openstudio-rotated` Redis placeholder URL, not a bare literal "
+        "(issues #409 / #150)."
+    )
+    for script in ROTATION_SCRIPTS:
+        assert script in content, (
+            f"The contract doc must point readers at `{script}` "
+            "(rotate-before-applying caveat, issues #409 / #150 / #219)."
+        )

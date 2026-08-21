@@ -1548,7 +1548,7 @@ HPA reports `desiredReplicas = 5` (capped at `maxReplicaCount: 5`).
       `/metrics` confirms the counter is GONE at runtime (Section 6).
 - [x] **Unit and Kind validation tests pass without HPA floor
       reconciliation dependencies** — VERIFIED: `ruff check .` clean,
-      `pytest` 715 tests across 36 files (current count per
+      `pytest` 717 tests across 36 files (current count per
       `pytest --collect-only`); the operator boots
       end-to-end on kind, the KEDA ScaledObject is Ready, the HPA
       drives scaling, and the operator's `/metrics` exposes the
