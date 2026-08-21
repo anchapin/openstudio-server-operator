@@ -1850,6 +1850,367 @@ def test_prune_job_scope_vap_label_keys_match_archival_manifest():
         assert f'"{value}"' in full_expr
 
 
+# ---- Issue #398: the prune-scope VAP must also pin the Job NAME ----
+#
+# The #294 policy constrained the prune SA's batch/jobs verbs by LABELS
+# only — but labels are spoofable by the very SA the policy constrains:
+# a compromised prune pod can stamp
+# app.kubernetes.io/managed-by=openstudio-operator +
+# app.kubernetes.io/component=archival on ANY Job it spawns, and
+# `metadata.name` was not part of the CEL rule, so a Job named
+# `kube-system-cleanup` with the right labels passed admission. The
+# deterministic names `archival.py::archival_job_name` generates
+# (`oscm-archive-<sanitized-id>-<sha256-8>`) give the natural second
+# factor: `metadata.name.startsWith("oscm-archive-")` ANDed inside BOTH
+# the object clause (CREATE/UPDATE) and the oldObject clause (DELETE).
+#
+# The pinned dependency set has no CEL engine, so the "fails admission /
+# passes admission" acceptance criterion is expressed with the minimal
+# interpreter below. It covers exactly the constructs this policy's CEL
+# uses — has(), dotted field paths, string map indexing, == / !=,
+# && / || with CEL's error-absorption truth tables, ! and
+# string.startsWith() — and evaluates the MANIFEST'S OWN expression
+# text, not a re-implementation of its semantics (the
+# encode-the-bug-as-a-feature trap #315 audits for).
+
+import re
+
+_OSCM_ARCHIVE_NAME_PREFIX = "oscm-archive-"
+
+
+class _CelError(Exception):
+    """A CEL evaluation error, mirroring CEL's error values: `&&`/`||`
+    absorb them per their truth tables, and any error escaping a
+    validation expression rejects the request under `failurePolicy:
+    Fail` — the default-deny stance test_prune_job_scope_vap_
+    failure_policy_is_fail pins."""
+
+
+_CEL_TOKEN = re.compile(
+    r"\s*(?:(?P<op>\|\||&&|==|!=|!|[()\[\],.])"
+    r"|(?P<str>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
+    r"|(?P<ident>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _cel_tokenize(text):
+    """Split a CEL expression into (kind, value) tokens; raises
+    _CelError on any construct the interpreter does not recognize."""
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        match = _CEL_TOKEN.match(text, pos)
+        if match is None:
+            if text[pos:].strip():
+                raise _CelError(f"unparsable CEL near {text[pos:pos + 20]!r}")
+            break
+        pos = match.end()
+        if match.group("op"):
+            tokens.append(("op", match.group("op")))
+        elif match.group("str") is not None:
+            raw = match.group("str")[1:-1]
+            tokens.append(("str", re.sub(r"\\(.)", r"\1", raw)))
+        else:
+            tokens.append(("ident", match.group("ident")))
+    return tokens
+
+
+class _CelParser:
+    """Recursive-descent parser for the CEL subset this repo's
+    ValidatingAdmissionPolicies use. Precedence: `||` < `&&` < `!` <
+    comparison < postfix (field select, map index, method call)."""
+
+    def __init__(self, tokens):
+        self._tokens = tokens
+        self._i = 0
+
+    def parse(self):
+        node = self._parse_or()
+        if self._i != len(self._tokens):
+            raise _CelError(f"trailing tokens: {self._tokens[self._i:]!r}")
+        return node
+
+    def _peek(self):
+        return self._tokens[self._i] if self._i < len(self._tokens) else (None, None)
+
+    def _take(self, kind=None, value=None):
+        token = self._peek()
+        if kind is not None and (
+            token[0] != kind or (value is not None and token[1] != value)
+        ):
+            raise _CelError(f"expected {kind} {value!r}, got {token!r}")
+        self._i += 1
+        return token
+
+    def _parse_or(self):
+        node = self._parse_and()
+        while self._peek() == ("op", "||"):
+            self._take()
+            node = ("or", node, self._parse_and())
+        return node
+
+    def _parse_and(self):
+        node = self._parse_unary()
+        while self._peek() == ("op", "&&"):
+            self._take()
+            node = ("and", node, self._parse_unary())
+        return node
+
+    def _parse_unary(self):
+        if self._peek() == ("op", "!"):
+            self._take()
+            return ("not", self._parse_unary())
+        return self._parse_comparison()
+
+    def _parse_comparison(self):
+        left = self._parse_postfix()
+        if self._peek() in (("op", "=="), ("op", "!=")):
+            operator = self._take()[1]
+            right = self._parse_postfix()
+            return ("eq" if operator == "==" else "ne", left, right)
+        return left
+
+    def _parse_postfix(self):
+        if self._peek() == ("ident", "has") and self._tokens[self._i + 1] == ("op", "("):
+            self._take()
+            self._take("op", "(")
+            path = self._parse_postfix()
+            self._take("op", ")")
+            return ("has", path)
+        node = self._parse_atom()
+        while True:
+            if self._peek() == ("op", "."):
+                self._take()
+                name = self._take("ident")[1]
+                if self._peek() == ("op", "("):
+                    self._take()
+                    args = [self._parse_or()]
+                    while self._peek() == ("op", ","):
+                        self._take()
+                        args.append(self._parse_or())
+                    self._take("op", ")")
+                    node = ("call", node, name, args)
+                else:
+                    node = ("select", node, name)
+            elif self._peek() == ("op", "["):
+                self._take()
+                key = self._parse_or()
+                self._take("op", "]")
+                node = ("index", node, key)
+            else:
+                return node
+
+    def _parse_atom(self):
+        kind, value = self._peek()
+        if (kind, value) == ("op", "("):
+            self._take()
+            node = self._parse_or()
+            self._take("op", ")")
+            return node
+        if kind == "str":
+            self._take()
+            return ("lit", value)
+        if kind == "ident":
+            self._take()
+            if value == "true":
+                return ("lit", True)
+            if value == "false":
+                return ("lit", False)
+            return ("var", value)
+        raise _CelError(f"unexpected token {value!r}")
+
+
+def _cel_field(receiver, key):
+    """One map/object lookup step; missing keys error exactly like CEL's
+    field selection on a map, which is what makes the policy's `has()`
+    guards load-bearing."""
+    if not isinstance(receiver, dict):
+        raise _CelError(f"cannot select {key!r} from {type(receiver).__name__}")
+    if key not in receiver:
+        raise _CelError(f"no such key {key!r}")
+    value = receiver[key]
+    if value is None:
+        raise _CelError(f"key {key!r} is null")
+    return value
+
+
+def _cel_eval(node, ctx):
+    """Evaluate a parsed CEL node against {root-name: value} context.
+    Missing/null roots error (CEL exposes `object`/`oldObject` as null
+    for DELETE/CREATE respectively), which the `&&`/`||` truth tables
+    absorb the same way the API server does."""
+    kind = node[0]
+    if kind == "lit":
+        return node[1]
+    if kind == "var":
+        if node[1] not in ctx:
+            raise _CelError(f"unknown root {node[1]!r}")
+        value = ctx[node[1]]
+        if value is None:
+            raise _CelError(f"{node[1]!r} is null for this operation")
+        return value
+    if kind == "select":
+        return _cel_field(_cel_eval(node[1], ctx), node[2])
+    if kind == "index":
+        return _cel_field(_cel_eval(node[1], ctx), _cel_eval(node[2], ctx))
+    if kind == "has":
+        target = node[1]
+        if target[0] in ("select", "index"):
+            receiver = _cel_eval(target[1], ctx)
+            key = target[2] if target[0] == "select" else _cel_eval(target[2], ctx)
+            if not isinstance(receiver, dict):
+                raise _CelError("has() receiver is not a map/object")
+            return key in receiver
+        _cel_eval(target, ctx)
+        return True
+    if kind == "call":
+        receiver = _cel_eval(node[1], ctx)
+        args = [_cel_eval(arg, ctx) for arg in node[3]]
+        if node[2] == "startsWith" and len(args) == 1:
+            if not isinstance(receiver, str) or not isinstance(args[0], str):
+                raise _CelError("startsWith requires string receiver and argument")
+            return receiver.startswith(args[0])
+        raise _CelError(f"unsupported method {node[2]!r}")
+    if kind in ("eq", "ne"):
+        equal = _cel_eval(node[1], ctx) == _cel_eval(node[2], ctx)
+        return equal if kind == "eq" else not equal
+    if kind in ("and", "or"):
+        operands = []
+        for child in node[1:]:
+            try:
+                value = _cel_eval(child, ctx)
+            except _CelError:
+                operands.append(None)  # sentinel: evaluation error
+            else:
+                operands.append(value if isinstance(value, bool) else None)
+        if kind == "and":
+            if any(op is False for op in operands):
+                return False
+            if any(op is None for op in operands):
+                raise _CelError("error in && operand")
+            return True
+        if any(op is True for op in operands):
+            return True
+        if any(op is None for op in operands):
+            raise _CelError("error in || operand")
+        return False
+    if kind == "not":
+        value = _cel_eval(node[1], ctx)
+        if not isinstance(value, bool):
+            raise _CelError("! applied to non-bool")
+        return not value
+    raise _CelError(f"unknown node kind {kind!r}")
+
+
+def _cel_allows(expression, *, obj, old):
+    """Admission decision for one validation expression: True when the
+    expression evaluates truthy (request allowed), False when it
+    evaluates falsy OR errors — a CEL error denies under
+    `failurePolicy: Fail`, so both paths are rejections."""
+    ctx = {"object": obj, "oldObject": old}
+    tree = _CelParser(_cel_tokenize(expression)).parse()
+    try:
+        return _cel_eval(tree, ctx) is True
+    except _CelError:
+        return False
+
+
+def test_prune_job_scope_vap_validations_require_oscm_archive_name_prefix():
+    """Issue #398 acceptance (structural fence, same convention as the
+    label tests above): the CEL must conjoin a
+    `metadata.name.startsWith("oscm-archive-")` clause INSIDE both the
+    object clause (CREATE/UPDATE) and the oldObject clause (DELETE) —
+    not bolted on as a third disjunct, which a spoofed name could
+    satisfy independently of the labels."""
+    full_expr = _strip_cel_whitespace(
+        " ".join(v["expression"] for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"])
+    )
+    assert full_expr.count("||") == 1, (
+        "expected exactly one top-level disjunction (object-side clause "
+        f"|| oldObject-side clause); got: {full_expr!r}"
+    )
+    object_clause, old_object_clause = full_expr.split("||")
+    for side, clause in (("object", object_clause), ("oldObject", old_object_clause)):
+        assert f"{side}.metadata.name.startsWith(\"{_OSCM_ARCHIVE_NAME_PREFIX}\")" in clause, (
+            f"{side}-side clause missing the startsWith name check "
+            f"(issue #398): {clause!r}"
+        )
+        # The name clause must sit inside the same conjunction as the
+        # label checks: each clause is has() && label && label && name.
+        assert clause.count("&&") >= 3, (
+            f"{side}-side clause must AND the name check with both label "
+            f"checks (issue #398); got: {clause!r}"
+        )
+        assert "app.kubernetes.io/managed-by" in clause
+        assert "app.kubernetes.io/component" in clause
+
+
+def test_prune_job_scope_vap_rejects_spoofed_job_name_with_archival_labels():
+    """Issue #398 acceptance: a Job named `kube-system-cleanup` carrying
+    the CORRECT archival labels must FAIL admission on both the CREATE
+    and DELETE paths. Before #398 the labels were the only gate and
+    `metadata.name` was unchecked, so a compromised prune SA could
+    label any Job archival and pass. The manifest's own CEL text is
+    evaluated against the simulated request with the minimal
+    interpreter above — an expression that is false OR errors denies
+    under `failurePolicy: Fail`."""
+    spoofed = {
+        "metadata": {
+            "name": "kube-system-cleanup",
+            "labels": dict(ARCHIVAL_LABELS),
+        }
+    }
+    expression = PRUNE_JOB_SCOPE_VAP["spec"]["validations"][0]["expression"]
+    assert _cel_allows(expression, obj=spoofed, old=None) is False, (
+        "CREATE of a spoof-named Job carrying the archival labels must "
+        "be rejected at admission time (issue #398)"
+    )
+    assert _cel_allows(expression, obj=None, old=spoofed) is False, (
+        "DELETE of a spoof-named Job carrying the archival labels must "
+        "be rejected at admission time (issue #398)"
+    )
+
+
+def test_prune_job_scope_vap_accepts_real_archival_job_name():
+    """Issue #398 acceptance + drift fence: an archival Job whose name
+    AND labels come from the real generators (archival.py::
+    build_archival_job / archival_job_name) must PASS admission on both
+    the CREATE and DELETE paths. If archival.py ever changes its name
+    prefix or label set without the VAP following, the retention
+    pipeline stalls at its own spawn — this fails loudly, the same
+    pairing discipline as
+    test_prune_job_scope_vap_label_keys_match_archival_manifest."""
+    from openstudio_operator.archival import archival_job_name, build_archival_job
+    from openstudio_operator.config import StoragePolicy
+
+    job = build_archival_job(
+        "64f0c8e2a1b3c4d5e6f7a8b9",
+        StoragePolicy(
+            archive_to_s3=True,
+            backend="s3",
+            bucket="os-archives",
+            secret_ref="os-archive-creds",
+        ),
+        "openstudio-server",
+    )
+    name = job["metadata"]["name"]
+    assert name == archival_job_name("64f0c8e2a1b3c4d5e6f7a8b9")
+    assert name.startswith(_OSCM_ARCHIVE_NAME_PREFIX), (
+        f"archival_job_name drifted from the {_OSCM_ARCHIVE_NAME_PREFIX!r} "
+        f"prefix the VAP enforces (issue #398): {name!r}"
+    )
+    expression = PRUNE_JOB_SCOPE_VAP["spec"]["validations"][0]["expression"]
+    assert _cel_allows(expression, obj=job, old=None) is True, (
+        "CREATE of a real archival Job must pass admission — the CEL "
+        "name/label requirements must match what archival.py emits "
+        "(issues #294, #398)"
+    )
+    assert _cel_allows(expression, obj=None, old=job) is True, (
+        "DELETE of a real archival Job must pass admission (failed-Job "
+        "cleanup path; issues #294, #398)"
+    )
+
+
 # ---- Issue #388: PSS `restricted` enforced at the namespace level ----
 #
 # The operator + prune CronJob + archival Job all declare PSS `restricted`

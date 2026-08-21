@@ -45,11 +45,12 @@ rules:
   # Issue #294: these verbs alone scope the prune SA to `batch/jobs` with NO
   # constraint on Job name or label — a compromised prune pod could spawn
   # arbitrary Jobs (any image, any service account, including one that
-  # overrides the `oscm-archive-*` name pattern and exfiltrates cluster
-  # credentials). The constraint that labels the Jobs "must be archival" is
-  # enforced by the ValidatingAdmissionPolicy below; the RBAC list above
-  # stays the same shape because RBAC `PolicyRule` has no `labelSelector`
-  # and `resourceNames` only accepts exact strings (no globs).
+  # exfiltrates cluster credentials). The constraint that Jobs must be
+  # archival-labelled AND named `oscm-archive-*` is enforced by the
+  # ValidatingAdmissionPolicy below (issues #294, #398); the RBAC list
+  # above stays the same shape because RBAC `PolicyRule` has no
+  # `labelSelector` and `resourceNames` only accepts exact strings (no
+  # globs).
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "create", "delete"]
@@ -216,6 +217,23 @@ spec:
 # exfiltration path and constraining them would also block the prune
 # pod's own watch-by-deterministic-name lookup.
 #
+# Issue #398 — the label match alone is spoofable by the very SA this
+# policy constrains: a compromised prune pod can stamp the two archival
+# labels on ANY Job it spawns, and `metadata.name` was not part of the
+# CEL rule (a Job named `kube-system-cleanup` with the right labels
+# passed). The rule therefore ALSO requires
+# `metadata.name.startsWith("oscm-archive-")` on both the `object` and
+# `oldObject` clauses — the deterministic-name convention of
+# `archival.py::archival_job_name`
+# (`oscm-archive-<sanitized-id>-<sha256-8>`), which every legitimate
+# archival Job carries. Labels + name pattern together mean a
+# compromised SA must spoof BOTH factors to pivot off the storage
+# egress. `metadata.name` is safe to read unguarded here: it is a
+# required field on Job CREATE/UPDATE admission, and on DELETE the
+# clause is reached only via `oldObject` (existing object — always
+# named); a `generateName` spawn sees an empty name at admission and
+# fails `startsWith` — fail-closed, which is the correct stance.
+#
 # Requires: Kubernetes 1.30+ (ValidatingAdmissionPolicy v1 GA).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -226,10 +244,14 @@ metadata:
     app.kubernetes.io/component: archival-admission
   annotations:
     energy.nrel.gov/description: |
-      Issue #294 — constrain the prune SA's batch/jobs verbs to archival
-      Jobs only. Combined with the Role at lines 45-47, the prune SA can
-      only create/delete Jobs that carry the archival labels, so a
-      compromised prune pod cannot spawn arbitrary Jobs.
+      Issues #294 + #398 — constrain the prune SA's batch/jobs verbs
+      to archival Jobs only: both archival labels AND the
+      `oscm-archive-*` deterministic-name prefix from archival.py.
+      Combined with the Role above, the prune SA can only
+      create/delete Jobs that look exactly like the ones retention
+      spawns, so a compromised prune pod cannot spawn arbitrary Jobs
+      (labels alone are spoofable; the name pattern is the second
+      factor).
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -245,16 +267,22 @@ spec:
     - expression: |
         (has(object.metadata.labels) &&
          object.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
-         object.metadata.labels["app.kubernetes.io/component"] == "archival") ||
+         object.metadata.labels["app.kubernetes.io/component"] == "archival" &&
+         object.metadata.name.startsWith("oscm-archive-")) ||
         (has(oldObject.metadata.labels) &&
          oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
-         oldObject.metadata.labels["app.kubernetes.io/component"] == "archival")
+         oldObject.metadata.labels["app.kubernetes.io/component"] == "archival" &&
+         oldObject.metadata.name.startsWith("oscm-archive-"))
       message: |
-        Jobs in openstudio-server must be labelled with BOTH
+        Jobs in openstudio-server must be named with the
+        `oscm-archive-` prefix (the deterministic-name convention of
+        archival.py::archival_job_name) AND labelled with BOTH
         app.kubernetes.io/managed-by=openstudio-operator AND
-        app.kubernetes.io/component=archival (issue #294). The prune
-        SA's batch/jobs verbs are scoped to archival Jobs only; any
-        other Job create/update/delete attempt is rejected.
+        app.kubernetes.io/component=archival (issues #294, #398). The
+        prune SA's batch/jobs verbs are scoped to archival Jobs only;
+        labels alone are spoofable, so the name pattern is the second
+        factor — any other Job create/update/delete attempt is
+        rejected.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
