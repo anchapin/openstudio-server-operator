@@ -67,6 +67,18 @@ k8s API unavailable — only surfaces as one of these counters, never as a pod
 restart. The scrape target is the operator Pod on port 9090 (matches the
 `containerPort` in `deploy/operator-deployment.yaml`).
 
+**Shipped alerting & dashboard artifacts (issue #468):** the canonical
+alert expressions in the table below are transcribed into
+`deploy/prometheustrule.yaml` — a `monitoring.coreos.com/v1` PrometheusRule
+applied by the cluster admin (the operator's Role deliberately holds no
+`prometheusrules` verbs); it ships the `release: prometheus` label for
+kube-prometheus-stack default pickup — rename the label if your release
+differs. `deploy/grafana-dashboard.json` renders the four OSCM timers'
+action counters, the tick-duration histograms, and the Resque queue gauges
++ freshness (datasource templated as `${DS_PROMETHEUS}`).
+`tests/test_monitoring_artifacts.py` fails CI if either artifact
+references a metric family missing from `tests/_metrics_inventory.py`.
+
 **Source of truth:** the family names below mirror
 `tests/_metrics_inventory.py` — the canonical `EXPECTED_COUNTER_FAMILIES`,
 `EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES` tuples shared by
@@ -257,7 +269,7 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 ```
 .
 ├── .github/workflows/          # ci.yml (lint+test+branch guard), release.yml (GHCR + releases)
-├── deploy/                     # CRD, RBAC, operator Deployment, KEDA, credential Secrets, CronJob, policies
+├── deploy/                     # CRD, RBAC, operator Deployment, KEDA, credential Secrets, CronJob, policies, alerting
 │   ├── crd.yaml                # OpenStudioClusterManager CRD
 │   ├── rbac.yaml               # operator Role (no HPA verbs, no batch verbs post-#77/#78)
 │   ├── operator-deployment.yaml  # single-replica operator Deployment (strategy: Recreate)
@@ -268,7 +280,9 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 │   ├── network-policy.yaml     # NetworkPolicy for the operator surface + /metrics ingress allow (#112, #166)
 │   ├── pod-delete-admission-policy.yaml  # cluster-scoped ValidatingAdmissionPolicy narrowing pods/delete (#293)
 │   ├── priority-class.yaml     # PriorityClass for operator Deployment + prune CronJob (#414)
-│   └── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
+│   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
+│   ├── prometheustrule.yaml    # PrometheusRule alert definitions for the /metrics surface (#468)
+│   └── grafana-dashboard.json  # Grafana dashboard JSON — action counters, tick histograms, Resque gauges (#468)
 ├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
