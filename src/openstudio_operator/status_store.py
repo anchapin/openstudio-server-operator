@@ -100,6 +100,9 @@ def _emit_status_map_event(_namespace: str, _name: str, _reason: str, _message: 
     """
 
 
+_default_event_sink: EmitStatusEvent = _emit_status_map_event
+
+
 def set_event_sink(sink: EmitStatusEvent | None) -> None:
     """Install/replace the map-cap event sink.
 
@@ -108,11 +111,7 @@ def set_event_sink(sink: EmitStatusEvent | None) -> None:
     ``monkeypatch.setattr`` or by calling this directly. Idempotent.
     """
     global _emit_status_map_event
-    _emit_status_map_event = sink if sink is not None else _noop_event_sink
-
-
-def _noop_event_sink(_namespace: str, _name: str, _reason: str, _message: str) -> None:
-    """Default sink when ``set_event_sink(None)`` is called. Pure no-op."""
+    _emit_status_map_event = sink if sink is not None else _default_event_sink
 
 
 class StatusStoreError(Exception):
