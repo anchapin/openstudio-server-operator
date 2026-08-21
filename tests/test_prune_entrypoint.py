@@ -4,7 +4,11 @@ Covers the wiring around :func:`openstudio_operator.retention.run_retention_tick
 D05 oldest-CR resolution, idle exits, the D11 dryRun gate flowing from the
 ACTIVE CR's spec through the entrypoint into the tick, K8s Event emission
 parity (the operator's ``kopf.event`` equivalent), and the D12 skip-tick
-exit-code posture. The tick logic itself is covered by test_retention.py.
+exit-code posture — including the #470 nonzero exits (4 = CR-list failure,
+5 = D12 runtime-failure tuple) that make a sustained prune failure visible
+as Failed CronJob Jobs, since the #306 counter is per-pod-lifetime and
+effectively unscrapeable. The tick logic itself is covered by
+test_retention.py.
 """
 
 import copy
@@ -278,7 +282,12 @@ def test_real_run_spawns_the_archival_job():
 
 
 @responses.activate
-def test_transient_api_failure_exits_zero_and_retries_next_schedule():
+def test_transient_api_failure_exits_five_and_retries_next_schedule():
+    """Issue #470 — the D12 runtime-failure tuple (REST 5xx here) exits 5,
+    not 0: the Failed CronJob Job is the durable sustained-failure signal
+    (``PRUNE_TICK_FAILURES_TOTAL`` is process-local to a one-tick pod and
+    effectively unscrapeable). The retry posture is unchanged — the next
+    schedule IS the retry (backoffLimit 0)."""
     spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE)}
     crs = [make_cr(spec=spec)]
     responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
@@ -286,12 +295,14 @@ def test_transient_api_failure_exits_zero_and_retries_next_schedule():
 
     code, batch, core = run_main(api)
 
-    assert code == 0  # skip-tick parity: the next schedule is the retry
+    assert code == 5  # loud failure: failedJobsHistoryLimit + Job alerting
     assert batch.creates == [] and core.events == []
 
 
 @responses.activate
-def test_invalid_storage_policy_exits_zero():
+def test_invalid_storage_policy_exits_five():
+    """ValueError (bad backend enum) is inside the D12 runtime-failure tuple,
+    so it inherits the same #470 exit-5 contract as the REST failure above."""
     bad_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": {**STORAGE, "backend": "ftp"}}
     crs = [make_cr(spec=bad_spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
@@ -299,17 +310,20 @@ def test_invalid_storage_policy_exits_zero():
 
     code, batch, _ = run_main(api)
 
-    assert code == 0
+    assert code == 5
     assert batch.creates == []
 
 
-def test_cr_list_failure_exits_zero():
+def test_cr_list_failure_exits_four():
+    """Issue #470 — a kube-apiserver/RBAC failure listing OSCM CRs exits 4,
+    not 0, so a sustained CR-list outage leaves Failed Jobs behind (the
+    durable signal; see the prune_entrypoint docstring exit-code table)."""
     class FailingApi:
         def list_namespaced_custom_object(self, *a, **kw):
             raise ApiException(status=503, reason="Service Unavailable")
 
     code, batch, core = run_main(FailingApi())
-    assert code == 0
+    assert code == 4
     assert batch.creates == [] and core.events == []
 
 
@@ -365,7 +379,7 @@ def test_prune_skip_tick_cr_list_failure_increments_prune_tick_failures_counter(
             raise ApiException(status=503, reason="Service Unavailable")
 
     code, _batch, _core = run_main(FailingApi())
-    assert code == 0  # skip-tick parity: the next schedule is the retry
+    assert code == 4  # issue #470: loud CR-list failure (Failed Job signal)
 
     after = _counter_value(counter, reason="cr_list_failure")
     assert after - baseline == 1.0, (
@@ -399,7 +413,7 @@ def test_prune_skip_tick_runtime_failure_increments_prune_tick_failures_counter(
     api = FakeCustomObjectsApi(crs, crs[0])
 
     code, _batch, _core = run_main(api)
-    assert code == 0  # skip-tick parity: the next schedule is the retry
+    assert code == 5  # issue #470: loud runtime failure (Failed Job signal)
 
     after = _counter_value(counter, reason="runtime_failure")
     assert after - baseline == 1.0, (

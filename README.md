@@ -263,7 +263,24 @@ kubectl logs -n openstudio-server deploy/openstudio-operator \
 # Prune-CronJob failure triage (logs ship from a completed Job):
 kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
   | jq -c 'select(.level!="INFO") | {ts:.timestamp, level, msg:.message}'
+
+# Sustained prune failure — the durable signal is FAILED Jobs, not metrics:
+kubectl get jobs -n openstudio-server -l app.kubernetes.io/component=storage-pruner \
+  --sort-by=.metadata.creationTimestamp
 ```
+
+**Sustained prune failures surface as failed CronJob Jobs (#470).** The
+prune entrypoint exits nonzero on every failure branch — `3` empty
+`spec.redisUrl` (#392), `4` CR-list failure, `5` D12 runtime failure
+(see the exit-code table in `prune_entrypoint.py`'s module docstring) —
+so `failedJobsHistoryLimit` + K8s Job-status alerting catch a sustained
+retention-pipeline failure (REST 5xx storm, StatusStore conflict herd,
+the #398 admission policy blocking archival Jobs). The
+`openstudio_operator_prune_tick_failures_total{reason}` counter is
+per-pod-lifetime — the pod starts a metrics server, runs one tick, and
+exits within seconds, so a 30-60 s scrape samples it zero-to-one times
+and every run resets it to zero (`rate()` over it is meaningless). Alert
+on failed Jobs; treat the counter as best-effort.
 
 ## Repository layout
 
