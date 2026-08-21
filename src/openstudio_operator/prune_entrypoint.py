@@ -81,12 +81,18 @@ EVENT_SOURCE_COMPONENT = "openstudio-storage-pruner"
 _SKIP_TICK_EXCEPTIONS = (OpenStudioApiError, StatusStoreError, ApiException, ValueError)
 
 #: Issue #306 — ``reason`` label values for :data:`PRUNE_TICK_FAILURES_TOTAL`.
-#: One per skip-tick branch in :func:`main`. The exception class name is
+#: One per failure branch in :func:`main`. The exception class name is
 #: already in the WARNING log line via ``type(exc).__name__``; keeping the
-#: label vocabulary bounded to the two branch names mirrors the bounded
+#: label vocabulary bounded to the three branch names mirrors the bounded
 #: cardinality convention from #117 / #171 / #237 / #239 / #255.
 PRUNE_TICK_FAILURE_REASON_CR_LIST = "cr_list_failure"
 PRUNE_TICK_FAILURE_REASON_RUNTIME = "runtime_failure"
+#: Issue #392 — the exit-3 empty-``spec.redisUrl`` guard. Not a skip-tick
+#: branch (exit code 3, the loud CronJob Failed-pod signal), but the same
+#: sustained-wedge observability gap applies: without a counter bump a
+#: chart upgrade that drops the redis-secret KeyRef is invisible at
+#: ``/metrics`` until someone reads ``kubectl get jobs`` output.
+PRUNE_TICK_FAILURE_REASON_REDIS_URL_EMPTY = "redis_url_empty"
 
 
 class CoreApi(Protocol):
@@ -221,7 +227,7 @@ def main(
         # event for log forwarding; the counter is the Prometheus signal an
         # SRE can alert on. The exception class name is preserved in the
         # log line via ``type(exc).__name__``; the label vocabulary stays
-        # bounded to the two branch names defined above.
+        # bounded to the three branch names defined above.
         PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_CR_LIST).inc()
         logger.warning(
             "prune tick skipped, retrying next schedule — could not list OSCM CRs "
@@ -257,6 +263,13 @@ def main(
     # visibly (the next schedule IS the retry — the CronJob's backoffLimit=0
     # means a Failed pod is not retried in place).
     if not config.redis_url:
+        # Issue #392 — bump the failure counter BEFORE the Event/log/return
+        # so the sustained wedge is visible at /metrics: the #306 dashboard
+        # alert ``rate(prune_tick_failures_total[5m]) > 0`` now covers the
+        # redisUrl guard too. Same bounded-vocabulary convention as the two
+        # skip-tick branches; exit-code contract unchanged (3 = redisUrl
+        # empty).
+        PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_REDIS_URL_EMPTY).inc()
         emit(
             "Warning",
             "RedisURLEmpty",
