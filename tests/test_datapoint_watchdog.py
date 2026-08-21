@@ -9,9 +9,12 @@ directly; the kopf timer wrapper is thin wiring.
 """
 
 import copy
+import logging
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import responses
+from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
 from openstudio_operator.config import OperatorConfig
@@ -20,9 +23,10 @@ from openstudio_operator.handlers.datapoint_watchdog import (
     DATAPOINT_REQUEUE_EXHAUSTED_EVENT,
     DATAPOINT_REQUEUED_EVENT,
     run_watchdog_tick,
+    zombie_datapoint_watchdog,
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
-from openstudio_operator.status_store import StatusStore
+from openstudio_operator.status_store import StatusStore, StatusStoreConflictError
 
 BASE = "http://web.test"
 NAMESPACE = "openstudio-server"
@@ -467,3 +471,197 @@ def test_run_watchdog_tick_accepts_mappingview_body_in_event_emitter():
     # Dry-run gate still records exactly the one requeue Normal Event.
     assert emitter.suppressed_count == 1
     assert emitter.dry_run is True
+
+
+# --- Issue #466 — tick-level error/recovery paths (D12) -------------------------
+#
+# The wrapper-level exception tuple is pinned by test_timer_wrapper_failures.py
+# (issue #231) with a MOCKED run_watchdog_tick. These tests close the remaining
+# gap: real errors arising INSIDE run_watchdog_tick — REST 5xx through the real
+# client's retry envelope, real 409s through the real StatusStore RMW, and raw
+# kubernetes ApiExceptions re-raised verbatim by the store's non-409 path.
+
+
+class ConflictingFakeCustomObjectsApi(FakeCustomObjectsApi):
+    """Merge-patch fake whose first ``patch_conflicts`` patches raise 409.
+
+    Same synthetic-409 approach as tests/test_status_store.py — exercised here
+    through the full tick so the store's bounded retry is observed from the
+    watchdog's point of view, not the store's.
+    """
+
+    def __init__(self, obj: dict, patch_conflicts: int = 0) -> None:
+        super().__init__(obj)
+        self.remaining_conflicts = patch_conflicts
+        self.conflicts_seen = 0
+
+    def patch_namespaced_custom_object_status(
+        self, group, version, namespace, plural, name, body, _content_type=None
+    ):
+        if self.remaining_conflicts > 0:
+            self.remaining_conflicts -= 1
+            self.conflicts_seen += 1
+            raise ApiException(status=409, reason="Conflict")
+        return super().patch_namespaced_custom_object_status(
+            group, version, namespace, plural, name, body, _content_type=_content_type
+        )
+
+
+class ExplodingPatchFakeCustomObjectsApi(FakeCustomObjectsApi):
+    """Every status patch raises a raw non-409 ApiException (API-server blip).
+
+    StatusStore._patch_status re-raises non-409 ApiExceptions verbatim
+    (status_store.py: ``if exc.status != 409: raise``) — so this surfaces a
+    raw kubernetes exception at the tick boundary, not a StatusStoreError.
+    """
+
+    def patch_namespaced_custom_object_status(
+        self, group, version, namespace, plural, name, body, _content_type=None
+    ):
+        raise ApiException(status=500, reason="Internal Server Error")
+
+
+def tick_failures_total(namespace: str, name: str, module: str, error_type: str) -> float:
+    """Read the labelled HANDLER_TICK_FAILURES_TOTAL sample (issue #117 shape)."""
+    return (
+        REGISTRY.get_sample_value(
+            "openstudio_operator_handler_tick_failures_total",
+            {"namespace": namespace, "name": name, "module": module, "error_type": error_type},
+        )
+        or 0.0
+    )
+
+
+def started_view_calls() -> int:
+    # ``calls_to`` suffix-matches, but the light view carries a query string
+    # (?status=1&jobs=started) — count by prefix instead.
+    return sum(
+        1 for call in responses.calls if call.request.url.startswith(f"{BASE}/data_points/status")
+    )
+
+
+def call_wrapper(monkeypatch, status: dict | None = None, api=None):
+    """Invoke the production kopf timer wrapper directly (same direct-call
+    pattern as test_timer_wrapper_failures.py) with the k8s seam stubbed."""
+    if api is None:
+        api = FakeCustomObjectsApi(make_cr(status=status))
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.datapoint_watchdog.operator_custom_objects_api",
+        lambda: api,
+    )
+    return zombie_datapoint_watchdog(
+        body=make_cr(),
+        spec=SPEC,
+        namespace=NAMESPACE,
+        name=NAME,
+        logger=logging.getLogger("test"),
+    )
+
+
+@responses.activate
+def test_sustained_503_on_started_view_exhausts_client_retries_and_wrapper_skips_tick(
+    monkeypatch, caplog
+):
+    """Issue #466 (a): GET /data_points/status 503s on every attempt → the
+    client's GET-only 3× retry envelope exhausts (4 attempts) → OpenStudioApiError
+    raises out of run_watchdog_tick → the wrapper swallows it, bumps
+    HANDLER_TICK_FAILURES_TOTAL with all four labels, logs the skip-tick
+    warning, and returns None (D12: the next poll retries naturally)."""
+    responses.get(f"{BASE}/data_points/status", status=503)
+    client_sleeps: list[float] = []
+    monkeypatch.setattr("openstudio_operator.openstudio_client._sleep", client_sleeps.append)
+    api = FakeCustomObjectsApi(make_cr())  # never reached — tick dies on the first call
+
+    before = tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "OpenStudioApiError")
+    result = call_wrapper(monkeypatch, api=api)
+    after = tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "OpenStudioApiError")
+
+    assert result is None, "wrapper must swallow OpenStudioApiError and return None (D12)"
+    # max_retries=3 → 4 total GET attempts on the light view, all 503.
+    assert started_view_calls() == 4
+    # Jittered backoff sleeps before each RETRY (not before the first attempt).
+    assert len(client_sleeps) == 3
+    # after/before both read the exact 4-label sample — the delta == 1 IS the
+    # label-exactness proof (a wrong namespace/name/module/error_type reads 0.0).
+    assert after - before == 1.0
+    assert "datapoint watchdog tick skipped, retrying next poll (OpenStudioApiError" in caplog.text
+    # D04 recovery anchor: the tick died before any status write — nothing recorded.
+    assert api.obj["status"] == {}
+
+
+@responses.activate
+def test_status_409_during_set_requeue_resolved_by_store_bounded_retry(monkeypatch):
+    """Issue #466 (b): one 409 on the requeue-recording status patch (the
+    issue's ``mark_datapoint_requeued`` — the store call is ``set_requeue``)
+    → StatusStore re-reads and re-applies internally → the tick completes
+    with the requeue recorded and the pacing clock reset. No exception."""
+    store_sleeps: list[float] = []
+    monkeypatch.setattr("openstudio_operator.status_store._sleep", store_sleeps.append)
+    api = ConflictingFakeCustomObjectsApi(
+        make_cr(status={"startedSince": {"d1": (NOW - timedelta(minutes=60)).isoformat()}}),
+        patch_conflicts=1,
+    )
+    register_started("d1")
+    register_requeue("d1")
+
+    requeued, events = tick(api)
+
+    assert requeued == ["d1"]
+    assert api.conflicts_seen == 1
+    # One backoff sleep inside the store's retry, then success.
+    assert len(store_sleeps) == 1
+    # set_requeue success + pacing set_started_since success = 2 landed patches.
+    assert api.patch_calls == 2
+    assert api.obj["status"]["requeues"]["d1"] == {"count": 1, "lastRequeuedAt": NOW.isoformat()}
+    assert api.obj["status"]["startedSince"]["d1"] == NOW.isoformat()
+    assert len(events) == 1
+    assert events[0][:2] == ("Normal", DATAPOINT_REQUEUED_EVENT)
+
+
+@responses.activate
+def test_sustained_status_409_raises_out_of_tick_with_requeue_unrecorded(monkeypatch):
+    """Issue #466 (b, raise side): 409s past MAX_CONFLICT_RETRIES →
+    StatusStoreConflictError raises out of run_watchdog_tick (caught by the
+    wrapper's StatusStoreError branch). The REST requeue already fired but
+    was NOT recorded — exactly the documented D12 recovery shape: "unrecorded
+    requeues are re-attempted next poll, recorded ones never re-fire"."""
+    monkeypatch.setattr("openstudio_operator.status_store._sleep", lambda _s: None)
+    api = ConflictingFakeCustomObjectsApi(
+        make_cr(status={"startedSince": {"d1": (NOW - timedelta(minutes=60)).isoformat()}}),
+        patch_conflicts=99,
+    )
+    register_started("d1")
+    register_requeue("d1")
+
+    with pytest.raises(StatusStoreConflictError, match="409"):
+        tick(api)
+
+    # The mutation happened before the failed status write; nothing was anchored.
+    assert calls_to("/requeue") == 1
+    assert "requeues" not in api.obj["status"]
+
+
+@responses.activate
+def test_raw_api_exception_from_status_patch_propagates_uncounted(monkeypatch, caplog):
+    """Issue #466 (c) — pins CURRENT behavior; #493 owns any change.
+
+    The wrapper's except tuple is ``(OpenStudioApiError, StatusStoreError)``
+    — narrower than the analysis_sla / worker_recycler / web_background_monitor
+    wrappers, which all additionally catch ApiException. StatusStore re-raises
+    non-409 ApiExceptions verbatim, so a raw kubernetes ApiException escapes
+    BOTH run_watchdog_tick and the wrapper: no counter bump, no skip-tick
+    warning — kopf logs it as an uncaught handler error. #493 owns
+    standardizing the skip-tick exception set; this test pins the behavior as
+    it ships today."""
+    api = ExplodingPatchFakeCustomObjectsApi(make_cr())
+    register_started("d1")
+
+    before = tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "ApiException")
+    with pytest.raises(ApiException):
+        call_wrapper(monkeypatch, api=api)
+
+    assert tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "ApiException") == before
+    assert "tick skipped" not in caplog.text
+    # The tick died at the very first status write (first observation clock).
+    assert api.patch_calls == 0
+    assert api.obj["status"] == {}
