@@ -33,6 +33,23 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#463`** — `spec.redisCredentials.secretRef` (`{name, key}`): Redis
+  credentials move out of the CR spec into a Secret holding the FULL
+  `redis://:password@queue:6379` URL. `config.py` parses it,
+  `client_factory.get_read_only_redis_client` resolves it via one
+  namespaced `CoreV1` Secret get (the bounded "never reads Secrets"
+  exception, `get`-only grant in `deploy/rbac.yaml`) and PREFERs it over
+  an inline `spec.redisUrl` when both are present; the `lru_cache` key
+  grows to `(redisUrl, secretRef, namespace)`. The CRD pattern for
+  `spec.redisUrl` now REJECTS embedded credentials (`@` userinfo) at
+  apply time (credential-free inline URLs stay valid; stored CRs are
+  grandfathered), the secretRef name is pattern-locked to
+  `^openstudio-redis[a-z0-9-]*$` (#240-style fence), the resolved URL is
+  fence-checked against the in-cluster pattern (#390 SSRF fence preserved
+  on the Secret path), and the #116 `RedisUrlEmpty` guard stays silent
+  when a secretRef is set. Resolution failures raise
+  `RedisCredentialResolutionError` (subclass of `RedisClientError`) and
+  are not cached — a Secret created later is picked up on the next tick.
 - **`#471`** — `openstudio_operator_rest_retries_total{method}`: REST
   retry-attempt counter, incremented once per RE-attempt inside
   `OpenStudioClient._request`'s GET-only retry loop (before the jittered

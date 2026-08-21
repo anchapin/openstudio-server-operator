@@ -8,6 +8,7 @@ without a matching ``config.py`` change (or vice versa) fails CI.
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 import openstudio_operator
@@ -22,6 +23,8 @@ CRD_YAML = Path(__file__).resolve().parents[1] / "deploy" / "crd.yaml"
 CRD_SPEC_FIELD_MAP = {
     "serverUrl": "server_url",
     "redisUrl": "redis_url",
+    "redisCredentials.secretRef.name": "redis_credentials.secret_ref.name",
+    "redisCredentials.secretRef.key": "redis_credentials.secret_ref.key",
     "dryRun": "dry_run",
     "targetWorkerDeployment": "target_worker_deployment",
     "targetWebBackgroundDeployment": "target_web_background_deployment",
@@ -68,8 +71,14 @@ def _crd_spec_leaves() -> dict[str, dict]:
 
 
 def _get_attr(obj: object, dotted: str) -> object:
+    # Optional-aware traversal (#463): paths may descend through an Optional
+    # dataclass (redis_credentials.secret_ref is None on a bare config), so
+    # getattr on a None parent yields None instead of crashing. Stale
+    # mappings are still caught loudly by
+    # test_config_from_spec_round_trips_every_crd_field, which resolves the
+    # same paths through a fully-populated config.
     for part in dotted.split("."):
-        obj = getattr(obj, part)
+        obj = getattr(obj, part) if obj is not None else None
     return obj
 
 
@@ -167,6 +176,56 @@ def test_config_from_spec_camelcase():
 
 def test_config_from_spec_empty_equals_defaults():
     assert OperatorConfig.from_spec({}) == OperatorConfig()
+
+
+# --- Issue #463 — spec.redisCredentials.secretRef parsing ---------------------
+
+
+def test_config_parses_redis_credentials_secret_ref():
+    """Issue #463: a well-formed secretRef maps to RedisSecretRef(name, key)."""
+    cfg = OperatorConfig.from_spec(
+        {
+            "redisCredentials": {
+                "secretRef": {"name": "openstudio-redis", "key": "redis-url"}
+            }
+        }
+    )
+    assert cfg.redis_credentials.secret_ref is not None
+    assert cfg.redis_credentials.secret_ref.name == "openstudio-redis"
+    assert cfg.redis_credentials.secret_ref.key == "redis-url"
+
+
+def test_config_redis_credentials_absent_by_default():
+    """No redisCredentials in the spec → secret_ref None (inline URL path)."""
+    assert OperatorConfig().redis_credentials.secret_ref is None
+    assert (
+        OperatorConfig.from_spec({"redisUrl": "redis://queue:6379"}).redis_credentials
+    ).secret_ref is None
+
+
+def test_config_rejects_malformed_secret_ref():
+    """Issue #463: a present-but-malformed secretRef is LOUD (ValueError).
+
+    The CRD's ``required: [name, key]`` makes these unreachable through the
+    API server; the raise is the defensive assertion for hand-crafted specs —
+    credential misconfiguration must never be silently treated as absent.
+    """
+    with pytest.raises(ValueError, match="secretRef"):
+        OperatorConfig.from_spec({"redisCredentials": {"secretRef": {"name": "s"}}})
+    with pytest.raises(ValueError, match="secretRef"):
+        OperatorConfig.from_spec(
+            {"redisCredentials": {"secretRef": {"name": "s", "key": ""}}}
+        )
+    with pytest.raises(ValueError, match="secretRef"):
+        OperatorConfig.from_spec({"redisCredentials": {"secretRef": "openstudio-redis"}})
+
+
+def test_config_tolerates_empty_redis_credentials_object():
+    """``redisCredentials: {}`` (secretRef absent) is NOT malformed — CRD
+    ``required`` only fires when the object is set, so ``{}`` is the same
+    as omitting the field (K8s structural pruning default-fills it)."""
+    cfg = OperatorConfig.from_spec({"redisCredentials": {}})
+    assert cfg.redis_credentials.secret_ref is None
 
 
 def test_crd_spec_field_map_complete():

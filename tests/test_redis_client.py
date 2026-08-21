@@ -341,6 +341,73 @@ def test_credentials_come_only_from_redis_url():
     assert kwargs["port"] == 6379
 
 
+# --- Secret-sourced URL validation (issue #463) ----------------------------
+
+
+def test_secret_url_validation_accepts_credentialed_in_cluster_url():
+    """Issue #463: the Secret key holds the FULL URL — credentials are the
+    point of the Secret, so both the empty-user helm-recipe shape and the
+    ``user:password`` shape pass the in-cluster fence."""
+    from openstudio_operator.redis_client import redis_url_from_secret_value
+
+    for good in (
+        "redis://:rotated-pw@queue:6379",
+        "redis://user:pass@queue.openstudio-server.svc.cluster.local:6379/1",
+        "redis://queue:6379",  # credential-free is legal too (no-auth dev)
+    ):
+        assert redis_url_from_secret_value(good, secret_name="s", secret_key="k") == good
+
+
+def test_secret_url_validation_rejects_off_cluster_and_non_redis():
+    """The #390 SSRF fence is preserved on the Secret path: moving the URL
+    out of the CRD-validated spec into a Secret must not become a side door
+    to off-cluster hosts or non-Redis schemes."""
+    from openstudio_operator.redis_client import (
+        RedisCredentialResolutionError,
+        redis_url_from_secret_value,
+    )
+
+    for bad in (
+        "redis://:pw@attacker.example.com:6379",
+        "http://queue:6379",
+        "not-a-url",
+        "",
+    ):
+        with pytest.raises(RedisCredentialResolutionError, match="openstudio-redis"):
+            redis_url_from_secret_value(
+                bad, secret_name="openstudio-redis", secret_key="redis-url"
+            )
+
+
+def test_secret_url_validation_error_names_the_secret_and_key():
+    """The failure message must point the operator at the exact Secret/key
+    to fix — and must NOT carry the credential itself (only the diagnostic
+    scheme://host:port shape)."""
+    from openstudio_operator.redis_client import (
+        RedisCredentialResolutionError,
+        redis_url_from_secret_value,
+    )
+
+    with pytest.raises(RedisCredentialResolutionError) as excinfo:
+        redis_url_from_secret_value(
+            "redis://:supersecret@attacker.example.com:6379",
+            secret_name="openstudio-redis",
+            secret_key="redis-url",
+        )
+    message = str(excinfo.value)
+    assert "openstudio-redis" in message and "redis-url" in message
+    assert "supersecret" not in message
+    assert "attacker.example.com" in message  # host diagnostics stay visible
+
+
+def test_redis_credential_resolution_error_subclasses_client_error():
+    """Existing ``except RedisClientError:`` call sites keep handling the
+    Secret-path failures (D12 posture: skip the tick, retry next poll)."""
+    from openstudio_operator.redis_client import RedisCredentialResolutionError
+
+    assert issubclass(RedisCredentialResolutionError, RedisClientError)
+
+
 def test_redis_errors_are_wrapped_as_client_errors(fake, client, monkeypatch):
     def _boom(*args, **kwargs):
         raise redis.exceptions.ConnectionError("queue fabric unreachable")

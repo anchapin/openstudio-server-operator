@@ -29,6 +29,40 @@ DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
+class RedisSecretRef:
+    """Names the Secret key holding the FULL ``redis://...`` URL (issue #463).
+
+    ``spec.redisCredentials.secretRef: {name, key}`` points at one Secret
+    key whose value is the complete connection URL
+    (``redis://:password@queue:6379``) — NOT the bare password. Full-URL
+    semantics avoid URL-reconstruction logic in the operator (no userinfo
+    surgery to inject a password into a credential-free URL) and match the
+    value the helm recipe already templates into the web / worker
+    ``REDIS_URL`` env vars. The operator resolves it via
+    :func:`openstudio_operator.client_factory.get_read_only_redis_client`
+    (the bounded "operator never reads secrets" exception, #463).
+    """
+
+    name: str
+    key: str
+
+
+@dataclass(frozen=True)
+class RedisCredentials:
+    """``spec.redisCredentials`` — Secret-sourced Redis credentials (#463).
+
+    ``secret_ref`` is ``None`` when the CR does not set it; the operator
+    then falls back to the inline ``spec.redisUrl`` (which the #463-tightened
+    CRD pattern forbids carrying credentials, so credential-free inline URLs
+    remain valid for no-auth dev clusters). When BOTH are present the
+    secretRef wins — the resolution preference is issue #463's acceptance
+    criterion.
+    """
+
+    secret_ref: RedisSecretRef | None = None
+
+
+@dataclass(frozen=True)
 class AnalysisPolicy:
     max_duration_minutes: int = 180
     graceful_stop_timeout_minutes: int = 15
@@ -64,10 +98,41 @@ class StoragePolicy:
     purge_completed_nfs_files: bool = True
 
 
+def _redis_secret_ref_from_spec(raw: object) -> RedisSecretRef | None:
+    """Parse ``spec.redisCredentials.secretRef`` (#463); malformed → loud.
+
+    Returns ``None`` when the CR does not set the field (the default —
+    inline ``spec.redisUrl`` remains the active credential source). A
+    present-but-malformed value raises ``ValueError``: credential
+    misconfiguration must be loud, never silently treated as absent (the
+    CRD's ``required: [name, key]`` makes this unreachable through the API
+    server; the raise is the defensive assertion for hand-crafted specs).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        # ValueError (not TypeError) on purpose: one exception type is the
+        # public contract of this parser — callers catch ValueError for every
+        # malformed-secretRef shape alike.
+        raise ValueError(  # noqa: TRY004 — uniform parse-error type
+            f"spec.redisCredentials.secretRef must be an object with 'name' and "
+            f"'key' (issue #463); got {type(raw).__name__}: {raw!r}"
+        )
+    name = raw.get("name")
+    key = raw.get("key")
+    if not isinstance(name, str) or not name or not isinstance(key, str) or not key:
+        raise ValueError(
+            f"spec.redisCredentials.secretRef requires non-empty string 'name' and "
+            f"'key' (issue #463); got name={name!r}, key={key!r}"
+        )
+    return RedisSecretRef(name=name, key=key)
+
+
 @dataclass(frozen=True)
 class OperatorConfig:
     server_url: str = ""
     redis_url: str = DEFAULT_REDIS_URL
+    redis_credentials: RedisCredentials = field(default_factory=RedisCredentials)
     dry_run: bool = False
     target_worker_deployment: str = ""
     target_web_background_deployment: str = ""
@@ -85,9 +150,13 @@ class OperatorConfig:
         worker = spec.get("workerPolicy", {})
         web_background = spec.get("webBackgroundPolicy", {})
         storage = spec.get("storagePolicy", {})
+        redis_credentials = spec.get("redisCredentials") or {}
         return cls(
             server_url=spec.get("serverUrl", ""),
             redis_url=spec.get("redisUrl", DEFAULT_REDIS_URL),
+            redis_credentials=RedisCredentials(
+                secret_ref=_redis_secret_ref_from_spec(redis_credentials.get("secretRef")),
+            ),
             dry_run=spec.get("dryRun", False),
             target_worker_deployment=spec.get("targetWorkerDeployment", ""),
             target_web_background_deployment=spec.get("targetWebBackgroundDeployment", ""),

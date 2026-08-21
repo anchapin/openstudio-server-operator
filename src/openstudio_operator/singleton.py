@@ -727,6 +727,22 @@ def _check(namespace: str | None, logger: logging.Logger) -> None:
 _redis_url_warned: set[tuple[str, str]] = set()
 
 
+def _has_redis_secret_ref(spec: dict) -> bool:
+    """Whether ``spec.redisCredentials.secretRef`` is populated (issue #463).
+
+    Tolerant shape check (the CRD enforces ``{name, key}`` strings; this
+    runs on raw watch bodies, so it must not raise on hand-crafted specs):
+    any dict carrying non-empty ``name`` and ``key`` counts as set.
+    """
+    credentials = spec.get("redisCredentials")
+    if not isinstance(credentials, dict):
+        return False
+    secret_ref = credentials.get("secretRef")
+    if not isinstance(secret_ref, dict):
+        return False
+    return bool(secret_ref.get("name")) and bool(secret_ref.get("key"))
+
+
 def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
     """Emit a one-time ``RedisUrlEmpty`` Warning Event per CR with empty ``spec.redisUrl`` (issue #116).
 
@@ -737,10 +753,16 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
     ``(namespace, name)`` so the message is at most once per CR per operator
     restart.
 
+    Issue #463: a CR that sets ``spec.redisCredentials.secretRef`` has a
+    Secret-sourced URL — an empty ``spec.redisUrl`` is then the RECOMMENDED
+    production shape, not a misconfiguration, so the guard stays silent for
+    it (the URL resolves at client-construction time; a missing Secret/key
+    surfaces there as ``RedisCredentialResolutionError`` on the Redis paths).
+
     The Warning Event is emitted directly via :func:`kopf.event` (the same
     kopf chokepoint :func:`_emit_kopf_event` uses for the SINGLETON_* events
     above). :func:`_check` is only called from :func:`singleton_guard_startup`
-    (``@kopf.on.startup``) and :func:`singleton_guard_event`
+    (``@kopf.on.startup``) and :func:`singleton_guard_event``
     (``@kopf.on.event``), both active kopf callbacks where ``settings_var``
     is populated and the posting engine is enabled — so the queue/defer/drain
     detour through :mod:`openstudio_operator.handlers` is unnecessary, and
@@ -762,16 +784,19 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
         if (ns, nm) in _redis_url_warned:
             continue
         spec = item.get("spec") or {}
-        if str(spec.get("redisUrl") or "") == "":
+        if str(spec.get("redisUrl") or "") == "" and not _has_redis_secret_ref(spec):
             _redis_url_warned.add((ns, nm))
             logger.warning(
                 "OSCM %s/%s has empty spec.redisUrl — issue #116: the operator "
                 "cannot service Modules 3/5 (worker recycler + web_background "
-                "stall). Set spec.redisUrl explicitly to redis://<user>:<pwd>"
-                "@queue.<namespace>.svc.cluster.local:6379 (or set the URL via "
-                "the helm-chart values override). The previous default "
-                "`redis://:openstudio@queue...` baked a public-facing password "
-                "into every published CRD and has been removed.",
+                "stall). Set spec.redisCredentials.secretRef to a Secret key "
+                "holding the full redis://:password@queue.<namespace>"
+                ".svc.cluster.local:6379 URL (recommended, issue #463), or set "
+                "spec.redisUrl explicitly to a CREDENTIAL-FREE redis:// URL "
+                "(inline passwords are rejected at apply time since #463). "
+                "The previous default `redis://:openstudio@queue...` baked a "
+                "public-facing password into every published CRD and has been "
+                "removed.",
                 ns, nm,
             )
             _emit_kopf_event(
@@ -779,12 +804,14 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
                 "Warning",
                 "RedisUrlEmpty",
                 (
-                    "spec.redisUrl is empty (issue #116). Operator Modules "
-                    "3/5 (worker recycler + web_background stall) will be "
-                    "no-ops until you set this field explicitly. The "
+                    "spec.redisUrl is empty and spec.redisCredentials.secretRef "
+                    "is unset (issue #116). Operator Modules 3/5 (worker "
+                    "recycler + web_background stall) will be no-ops until a "
+                    "Redis URL is configured. Recommended: store the full "
+                    "redis://:password@queue... URL in a Secret and reference "
+                    "it via spec.redisCredentials.secretRef (issue #463). The "
                     "previous default exposed the kind-recipe password "
-                    "`openstudio` and has been removed; helm-chart users "
-                    "should derive the URL from the Redis-secret KeyRef."
+                    "`openstudio` and has been removed."
                 ),
             )
 

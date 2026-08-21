@@ -421,12 +421,24 @@ _REDIS_URL_BAD = (
     # Bare scheme, no host: no Service to talk to, no admission.
     "redis://",
 )
-_REDIS_URL_GOOD = (
-    # Helm-recipe Service URL — the value ``scripts/manifests/*.yaml``
-    # substitutes into the web / web-background / worker ``REDIS_URL``
-    # env vars. This is the headline acceptance case from the issue.
+# Issue #463: URLs with EMBEDDED CREDENTIALS — the helm-recipe shapes that
+# were the pre-#463 pattern's headline acceptance cases are now REJECTED.
+# The CR spec is stored plaintext in etcd, returned verbatim to every
+# get/list principal, and mirrored into GitOps repos; the password belongs
+# in a Secret referenced via spec.redisCredentials.secretRef.
+_REDIS_URL_EMBEDDED_CREDS = (
+    # Empty-user + password (the helm-recipe REDIS_URL shape).
     "redis://:openstudio-rotated@queue:6379",
-    # Bare Service label, no auth, with port — used by ``test_prune_entrypoint``
+    "redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379",
+    # user:password form.
+    "redis://user:password@queue:6379",
+    # Credentialed FQDN with a db selector (the pre-#463
+    # test_config_from_spec_camelcase value).
+    "redis://:secret@queue.openstudio-server.svc.cluster.local:6379/1",
+)
+_REDIS_URL_GOOD = (
+    # Credential-free bare Service label with port — the post-#463 inline
+    # shape (auth-less dev cluster), also used by ``test_prune_entrypoint``
     # and other test fixtures.
     "redis://queue:6379",
     # Two-label namespaced Service form (no .svc suffix): legal in-cluster
@@ -434,16 +446,11 @@ _REDIS_URL_GOOD = (
     "redis://queue.openstudio-server:6379",
     # Three-label namespaced Service form ending in .svc.
     "redis://queue.openstudio-server.svc:6379",
-    # Four-label full FQDN ending in .svc.cluster.local — the form
-    # ``singleton.py:773`` documents and ``test_smoke.py:115`` exercises.
-    "redis://:openstudio-rotated@queue.openstudio-server.svc.cluster.local:6379",
-    # Full FQDN with a Redis db-number selector — the value the #160-style
-    # ``test_config_from_spec_camelcase`` test applies.
-    "redis://:secret@queue.openstudio-server.svc.cluster.local:6379/1",
-    # Standard ``user:password@`` auth (the helm-recipe form is empty-user
-    # ``:password@``, but a future user-managed Secret could include a
-    # non-empty user).
-    "redis://user:password@queue:6379",
+    # Four-label full FQDN ending in .svc.cluster.local — the credential-free
+    # twin of the form ``singleton.py``'s #116 guidance documents.
+    "redis://queue.openstudio-server.svc.cluster.local:6379",
+    # Full FQDN with a Redis db-number selector, credential-free.
+    "redis://queue.openstudio-server.svc.cluster.local:6379/1",
 )
 _REDIS_URL_EMPTY = ""  # documented empty-default escape hatch (#116)
 
@@ -464,10 +471,11 @@ def test_redis_url_rejects_off_cluster_host():
 
 
 def test_redis_url_accepts_in_cluster_forms():
-    """Issue #390 acceptance (b): ``redis://:openstudio-rotated@queue:6379``
-    and every other in-cluster DNS shape the helm-recipe + tests use must
-    pass. The pattern must not be so strict that it rejects the
-    legitimately-managed URLs."""
+    """Issue #390 acceptance (b), post-#463 form: every CREDENTIAL-FREE
+    in-cluster DNS shape the helm-recipe + tests use must pass. The pattern
+    must not be so strict that it rejects the legitimately-managed URLs —
+    but since #463 "legitimate" no longer includes embedded credentials
+    (see ``test_redis_url_rejects_embedded_credentials_463``)."""
     schema = _spec_field("redisUrl")
     for good in _REDIS_URL_GOOD:
         assert _matches_pattern(good, schema), (
@@ -508,11 +516,102 @@ def test_redis_url_has_cel_redis_scheme_rule():
     empty-default escape hatch."""
     rules = _cel_rules(_spec_field("redisUrl"))
     assert any("redis://" in r["rule"] for r in rules), (
-        f"spec.redisUrl: no CEL rule asserting the redis:// scheme; got {rules!r}"
+        f"spec.redisUrl: no CEL rule asserting the redis:// scheme; got: {rules!r}"
     )
     assert any("issue #390" in r["message"].lower() for r in rules), (
-        f"spec.redisUrl: CEL rule message must reference 'issue #390'; got {rules!r}"
+        f"spec.redisUrl: CEL rule message must reference 'issue #390'; got: {rules!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #463: ``spec.redisUrl`` must REJECT embedded credentials — the CR
+# spec is stored plaintext in etcd, returned verbatim to any principal with
+# get/list on the CR, and typically committed to GitOps repos, so an inline
+# password leaks in three persistent places. Credentials move to a Secret
+# named by the new ``spec.redisCredentials.secretRef`` (full-URL semantics).
+# ---------------------------------------------------------------------------
+
+
+def test_redis_url_rejects_embedded_credentials_463():
+    """Issue #463 acceptance: the tightened pattern rejects every URL shape
+    carrying ``@``-userinfo — the empty-user helm-recipe form AND the
+    ``user:password`` form. A CR with an embedded credential fails CRD
+    validation at apply time (pattern applied here with ``re``, the same
+    ECMA-262-compatible subset the API server uses)."""
+    schema = _spec_field("redisUrl")
+    for bad in _REDIS_URL_EMBEDDED_CREDS:
+        assert not _matches_pattern(bad, schema), (
+            f"spec.redisUrl: {bad!r} carries embedded credentials and must be "
+            f"rejected by the pattern (issue #463)"
+        )
+
+
+def test_redis_url_has_cel_no_credentials_rule_463():
+    """Issue #463: a CEL rule rejects ``@`` with a readable apply-time
+    message pointing at the secretRef path (the raw pattern mismatch is
+    opaque about WHY credentialed URLs are now rejected)."""
+    rules = _cel_rules(_spec_field("redisUrl"))
+    assert any(
+        "@" in r["rule"] and "contains" in r["rule"] for r in rules
+    ), f"spec.redisUrl: no CEL rule rejecting '@' userinfo; got: {rules!r}"
+    assert any("issue #463" in r["message"].lower() for r in rules), (
+        f"spec.redisUrl: CEL rule message must reference 'issue #463'; got: {rules!r}"
+    )
+
+
+def test_redis_credentials_secret_ref_name_declares_convention_pattern():
+    """Issue #463 acceptance: ``spec.redisCredentials.secretRef.name`` is
+    pattern-locked to the ``openstudio-redis*`` convention — the #240-style
+    fence that keeps a CR-write principal from pointing the operator's one
+    Secret read at arbitrary Secrets (TLS, registry, operator-managed
+    credentials). ``openstudio-redis`` (deploy/redis-credentials-secret.yaml)
+    and suffixed rotations must pass; every other real Secret name must be
+    rejected."""
+    schema = (
+        SPEC_SCHEMA["properties"]["redisCredentials"]["properties"]["secretRef"]
+    )
+
+    name_schema = schema["properties"]["name"]
+    pattern = name_schema.get("pattern")
+    assert pattern == r"^openstudio-redis[a-z0-9-]*$", (
+        f"secretRef.name must declare the openstudio-redis* convention "
+        f"(issue #463); got {pattern!r}"
+    )
+    for good in ("openstudio-redis", "openstudio-redis-url", "openstudio-redis-2"):
+        assert _matches_pattern(good, name_schema), (
+            f"secretRef.name: {good!r} is a documented valid name and must be accepted"
+        )
+    for bad in ("tls-cert", "docker-pull-secret", "os-archive-creds", "WEB"):
+        assert not _matches_pattern(bad, name_schema), (
+            f"secretRef.name: {bad!r} must be rejected by the pattern (issue #463)"
+        )
+
+    rules = _cel_rules(name_schema)
+    assert any(
+        r["rule"] == "self.startsWith('openstudio-redis')" for r in rules
+    ), f"secretRef.name: no CEL rule asserting the openstudio-redis prefix; got: {rules!r}"
+    assert any("issue #463" in r["message"].lower() for r in rules), (
+        f"secretRef.name: CEL rule message must reference 'issue #463'; got: {rules!r}"
+    )
+
+
+def test_redis_credentials_secret_ref_requires_name_and_key():
+    """Issue #463: the secretRef object declares ``required: [name, key]`` —
+    a half-configured reference must fail apply-time validation instead of
+    surfacing as a runtime resolution error. The key field is a plain
+    Secret-key-shaped string (full-URL semantics: the key holds the whole
+    ``redis://...`` URL, e.g. ``redis-url``)."""
+    schema = (
+        SPEC_SCHEMA["properties"]["redisCredentials"]["properties"]["secretRef"]
+    )
+    assert schema.get("required") == ["name", "key"], (
+        f"secretRef must require both name and key (issue #463); "
+        f"got {schema.get('required')!r}"
+    )
+    key_schema = schema["properties"]["key"]
+    assert key_schema.get("pattern"), "secretRef.key is missing a `pattern` (issue #463)"
+    assert _matches_pattern("redis-url", key_schema)
+    assert _matches_pattern("password", key_schema)
 
 
 # ---------------------------------------------------------------------------
