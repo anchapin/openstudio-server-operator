@@ -39,7 +39,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 706 tests across 36 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 715 tests across 36 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -51,7 +51,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 
 ## Layout
 
-- `src/openstudio_operator/handlers/` — Kopf handlers, one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor`. `handlers/__init__.py` is the operator entrypoint: it starts the Prometheus `/metrics` server, installs the singleton guard, registers the warning-event sinks (Redis-URL guard, Resque key-layout guard, status-store cap), and boots the JSON-logging handler. **Add new handler modules to its import block** — see `docs/onboarding.md` for the 5-step pattern.
+- `src/openstudio_operator/handlers/` — Kopf handlers, one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor` (the four OSCM timers), plus `dry_run_audit` (a pure `@kopf.on.event` watch handler — NOT singleton-gated, NOT in the `_oscm_handlers` spawning registry — that emits the `DryRunToggled` audit Event on `spec.dryRun` transitions, #397). `handlers/__init__.py` is the operator entrypoint: it starts the Prometheus `/metrics` server, installs the singleton guard, registers the warning-event sinks (Redis-URL guard, Resque key-layout guard, status-store cap), and boots the JSON-logging handler. **Add new handler modules to its import block** — see `docs/onboarding.md` for the 5-step pattern.
 - Shared utility modules (single source of truth for the cross-handler surface):
   - `_constants.py` — operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace). Policy values do NOT belong here — cluster policy lives in the CRD `spec` / `config.py`.
   - `_time.py` — `parse_utc(...)`; tz-aware UTC, `None`-safe. Use this for any new timestamp parse — don't roll your own.

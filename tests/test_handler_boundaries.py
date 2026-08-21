@@ -324,3 +324,311 @@ def test_handler_wrapper_observe_tick_duration() -> None:
             f'openstudio_operator_handler_tick_duration_seconds_count{{module="{module}"}}'
             in exposition
         )
+
+
+# --- Issue #397 — DryRunToggled audit Event on spec.dryRun transitions ------------
+
+
+def _make_oscm_body(
+    dry_run: bool | None = False,
+    *,
+    namespace: str = "openstudio-server",
+    name: str = "oscm-a",
+    managed_fields: list[dict] | None = None,
+) -> dict:
+    """A minimal OSCM CR body in the shape kopf delivers to watch handlers.
+
+    ``dry_run=None`` omits the key entirely (the pre-toggle baseline shape
+    most existing CRs carry — ``config.py`` defaults it to False).
+    """
+    body: dict = {
+        "apiVersion": "energy.nrel.gov/v1alpha1",
+        "kind": "OpenStudioClusterManager",
+        "metadata": {"namespace": namespace, "name": name},
+        "spec": {"serverUrl": "http://web.openstudio-server.svc.cluster.local"},
+    }
+    if dry_run is not None:
+        body["spec"]["dryRun"] = dry_run
+    if managed_fields is not None:
+        body["metadata"]["managedFields"] = managed_fields
+    return body
+
+
+def _make_audit_sink() -> tuple[list[tuple[dict, str, str, str]], object]:
+    """Recorder sink in the repo's EventSink shape (mirrors test_singleton_guard)."""
+    events: list[tuple[dict, str, str, str]] = []
+
+    def emit(obj: dict, event_type: str, reason: str, message: str) -> None:
+        events.append((obj, event_type, reason, message))
+
+    return events, emit
+
+
+def _drain_dryruntoggled(events) -> list[tuple[dict, str, str, str]]:
+    return [e for e in events if e[2] == "DryRunToggled"]
+
+
+def test_dry_run_toggle_false_to_true_emits_exactly_one_event() -> None:
+    """Issue #397 acceptance: flipping ``dryRun`` false → true fires the
+    ``DryRunToggled`` Event reason exactly ONCE per transition — not per
+    reconcile. The first observation (operator start / initial listing) is a
+    baseline and emits nothing; the transition emits exactly one Normal
+    Event carrying the old and new value as ``"false"``/``"true"`` strings
+    in the message (kopf.event accepts no Event labels in 1.37–1.44).
+    """
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+
+    # First sight — baseline, no emission (operator boot / initial listing).
+    assert dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=False), logger=_SENTINEL_LOGGER, emit=emit
+    ) is False
+    # The patch: dryRun flipped on.
+    assert dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True), logger=_SENTINEL_LOGGER, emit=emit
+    ) is True
+    # Steady state after the flip — the operator's own .status RMW patches
+    # fire watch events; none of them may re-emit.
+    assert dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True), logger=_SENTINEL_LOGGER, emit=emit
+    ) is False
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 1, f"expected exactly one DryRunToggled, got {len(toggled)}"
+    obj, event_type, reason, message = toggled[0]
+    assert reason == "DryRunToggled"
+    assert event_type == "Normal"
+    assert obj["metadata"]["name"] == "oscm-a"
+    assert obj["metadata"]["namespace"] == "openstudio-server"
+    # The old/new values ride in the message as lowercase strings.
+    assert "false" in message and "true" in message
+    assert "false → true" in message
+    # The audit signal must NOT be routed through the D11 gate — it fires
+    # even though the NEW mode is dry-run (that's the whole point of #397):
+    assert "SUPPRESSED" in message
+
+
+def test_dry_run_unchanged_emits_no_events_on_reconcile_noise() -> None:
+    """Issue #397 scope guard: zero emissions when dryRun never transitions —
+    repeated observations (reconciles, resyncs, the operator's own status
+    patches) must stay silent. The diff is the gate."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+
+    for _ in range(5):
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=True), logger=_SENTINEL_LOGGER, emit=emit
+        )
+
+    assert events == [], f"unchanged dryRun must emit nothing, got {events}"
+
+
+def test_dry_run_toggles_back_and_forth_emit_once_per_transition() -> None:
+    """Every ACTUAL transition emits once — the sequence F,T,F,T,T,F,F carries
+    four edges (F→T, T→F, F→T, T→F) and four ``DryRunToggled`` Events; the
+    repeated levels (T,T and F,F tails) emit nothing."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+
+    for dry_run in (False, True, False, True, True, False, False):
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=dry_run), logger=_SENTINEL_LOGGER, emit=emit
+        )
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 4
+    # Edges in order.
+    assert "false → true" in toggled[0][3]
+    assert "true → false" in toggled[1][3]
+    assert "false → true" in toggled[2][3]
+    assert "true → false" in toggled[3][3]
+
+
+def test_dry_run_missing_field_defaults_false_and_first_toggle_emits() -> None:
+    """A CR created without ``spec.dryRun`` (the CRD-defaulted shape) baselines
+    as False — ``config.py`` applies the same default — so the first explicit
+    ``dryRun: true`` patch emits ``false → true``."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=None), logger=_SENTINEL_LOGGER, emit=emit
+    )
+    emitted = dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True), logger=_SENTINEL_LOGGER, emit=emit
+    )
+
+    assert emitted is True
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 1
+    assert "false → true" in toggled[0][3]
+
+
+def test_dry_run_toggle_tracks_crs_independently() -> None:
+    """The last-seen cache is per-CR: two OSCM CRs toggling independently each
+    emit on their own transitions (and a loser-CR toggle is just as audible —
+    the handler deliberately does not go through the singleton gate)."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+
+    bodies = [
+        _make_oscm_body(dry_run=False, name="alpha"),
+        _make_oscm_body(dry_run=False, name="beta"),
+    ]
+    for body in bodies:
+        dry_run_audit.record_dry_run_transition(body, logger=_SENTINEL_LOGGER, emit=emit)
+
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True, name="alpha"), logger=_SENTINEL_LOGGER, emit=emit
+    )
+    # beta unchanged → still silent.
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=False, name="beta"), logger=_SENTINEL_LOGGER, emit=emit
+    )
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True, name="beta"), logger=_SENTINEL_LOGGER, emit=emit
+    )
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 2
+    assert toggled[0][0]["metadata"]["name"] == "alpha"
+    assert toggled[1][0]["metadata"]["name"] == "beta"
+
+
+def test_dry_run_toggle_message_cites_managed_fields_writer() -> None:
+    """Best-effort acting-principal attribution: the message cites the latest
+    ``metadata.managedFields`` manager (the on-object last-writer hint) and
+    points at the apiserver audit log."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+    managed = [
+        {
+            "manager": "openstudio-operator",
+            "operation": "Update",
+            "time": "2026-08-19T10:00:00Z",
+        },
+        {
+            "manager": "kubectl-edit",
+            "operation": "Update",
+            "time": "2026-08-20T09:30:00Z",
+        },
+    ]
+
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=False), logger=_SENTINEL_LOGGER, emit=emit
+    )
+    dry_run_audit.record_dry_run_transition(
+        _make_oscm_body(dry_run=True, managed_fields=managed),
+        logger=_SENTINEL_LOGGER,
+        emit=emit,
+    )
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 1
+    assert "'kubectl-edit'" in toggled[0][3]
+    assert "audit log" in toggled[0][3]
+
+
+def test_dry_run_toggle_audit_handler_fires_once_per_kopf_event_transition(
+    monkeypatch,
+) -> None:
+    """Issue #397 acceptance, end-to-end shape: drive the REAL
+    ``@kopf.on.event`` handler fn with the kwargs kopf delivers; a dryRun
+    patch (old body false → new body true) produces exactly one Event; a
+    further reconcile with the same value produces none."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+    monkeypatch.setattr(dry_run_audit, "_emit_kopf_event", emit)
+
+    handler = dry_run_audit.dry_run_toggle_audit
+    handler(
+        body=_make_oscm_body(dry_run=False),
+        namespace="openstudio-server",
+        name="oscm-a",
+        logger=_SENTINEL_LOGGER,
+        type="MODIFIED",
+    )
+    handler(
+        body=_make_oscm_body(dry_run=True),
+        namespace="openstudio-server",
+        name="oscm-a",
+        logger=_SENTINEL_LOGGER,
+        type="MODIFIED",
+    )
+    handler(
+        body=_make_oscm_body(dry_run=True),
+        namespace="openstudio-server",
+        name="oscm-a",
+        logger=_SENTINEL_LOGGER,
+        type="MODIFIED",
+    )
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 1
+    assert toggled[0][1] == "Normal"
+    assert toggled[0][2] == "DryRunToggled"
+
+
+def test_dry_run_toggle_audit_handler_deleted_evicts_cache(monkeypatch) -> None:
+    """DELETED watch events evict the cache entry: a RECREATED same-name CR
+    starts a fresh baseline instead of diffing against the dead CR's value
+    (no false-positive DryRunToggled on the new CR's initial listing)."""
+    from openstudio_operator.handlers import dry_run_audit
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+    monkeypatch.setattr(dry_run_audit, "_emit_kopf_event", emit)
+
+    handler = dry_run_audit.dry_run_toggle_audit
+    common = {"namespace": "openstudio-server", "name": "oscm-a", "logger": _SENTINEL_LOGGER}
+    handler(body=_make_oscm_body(dry_run=False), type="ADDED", **common)
+    handler(body=_make_oscm_body(dry_run=True), type="MODIFIED", **common)  # 1 emit
+    handler(body=_make_oscm_body(dry_run=True), type="DELETED", **common)
+    # Recreated with dryRun still true... then toggled false: only the real
+    # transition (true→false) may emit, not the recreation baseline.
+    handler(body=_make_oscm_body(dry_run=True), type="ADDED", **common)
+    handler(body=_make_oscm_body(dry_run=False), type="MODIFIED", **common)
+
+    toggled = _drain_dryruntoggled(events)
+    assert len(toggled) == 2
+    assert "false → true" in toggled[0][3]
+    assert "true → false" in toggled[1][3]
+
+
+def test_dry_run_toggle_audit_is_a_watch_handler_never_gated() -> None:
+    """Wiring invariant for #397: ``dry_run_toggle_audit`` lives in kopf's
+    WATCHING registry (fires on events, not on a timer), is NOT wrapped by
+    the singleton ``_gated`` wrapper, and is NOT registered in the
+    Python-level spawning-handler registry (that registry exists to gate
+    timers/daemons only)."""
+    import kopf
+
+    import openstudio_operator.handlers  # noqa: F401 — populates the default registry
+    from openstudio_operator import singleton
+
+    registry = kopf.get_default_registry()
+    watching_ids = [getattr(h, "id", "?") for h in registry._watching._handlers]
+    assert "dry_run_toggle_audit" in watching_ids
+
+    for handler in registry._watching._handlers:
+        if getattr(handler, "id", "") == "dry_run_toggle_audit":
+            assert not getattr(handler.fn, singleton.GUARD_MARKER, False)
+            break
+
+    from openstudio_operator import _oscm_handlers
+
+    assert not _oscm_handlers.is_registered("dry_run_toggle_audit")
