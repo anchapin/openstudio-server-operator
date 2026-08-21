@@ -25,7 +25,10 @@ none of the four handler modules owns. Today it hosts:
   operator behavior established by issue #44 was preserved verbatim — see the
   function's docstring for the rationale),
 * :func:`rolling_restart_deployment` — perform a rolling restart of a
-  Deployment by patching the pod template's ``restartedAt`` annotation (issue #395).
+  Deployment by patching the pod template's ``restartedAt`` annotation,
+  plus the single-site constants :data:`RESTARTED_AT_ANNOTATION` and
+  :data:`DEFAULT_WORKER_DEPLOYMENT` the worker recycler and web_background
+  stall monitor both import (issue #395).
 * :func:`load_operator_kube_config` — the SINGLE public loader for the
   operator's kubeconfig (in-cluster first, ``kube_config`` fallback). The
   ``singleton.operator_*_api`` factories and
@@ -52,6 +55,8 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from kubernetes.client import AppsV1Api
+
+from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -151,23 +156,25 @@ def deployment_label_selector(
 
 
 # Shared rolling-restart helper (issue #395).
+#
 # Two handler modules (worker_recycler.py and web_background_monitor.py)
 # had byte-equivalent blocks that constructed the same patch_body dict,
 # called apps_api.patch_namespaced_deployment(...), appended the dry-run
 # suppression message, and emitted a counter increment. The constants
 # RESTARTED_AT_ANNOTATION and DEFAULT_WORKER_DEPLOYMENT were also
-# duplicated. This function centralizes that logic.
-#
-# Usage:
-#     from openstudio_operator._k8s import rolling_restart_deployment
-#     restart_value = rolling_restart_deployment(
-#         apps_api,
-#         deployment=config.target_worker_deployment or DEFAULT_WORKER_DEPLOYMENT,
-#         namespace=namespace,
-#         now=datetime.now(UTC),
-#         restart_annotation="kubectl.kubernetes.io/restartedAt",
-#         content_type=MERGE_PATCH_CONTENT_TYPE,
-#     )
+# duplicated. The constants below are now the single source of truth —
+# both handler modules import them from here (and re-export for their
+# test files' import compatibility).
+
+#: Pod-template annotation driving the rolling restart — same key/values as
+#: ``kubectl rollout restart``; only the value changing triggers a rollout.
+RESTARTED_AT_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
+
+#: Fallback when ``spec.targetWorkerDeployment`` is empty: the helm
+#: ``develop`` chart's fixed worker Deployment name (AGENTS.md identifiers).
+#: Also the liveness-corroboration fleet name for the web_background
+#: stall monitor's leg C.
+DEFAULT_WORKER_DEPLOYMENT = "worker"
 
 
 def rolling_restart_deployment(
@@ -176,21 +183,30 @@ def rolling_restart_deployment(
     deployment: str,
     namespace: str,
     now: datetime,
-    restart_annotation: str = "kubectl.kubernetes.io/restartedAt",
-    content_type: str = "application/merge-patch+json",
+    restart_annotation: str = RESTARTED_AT_ANNOTATION,
+    content_type: str = MERGE_PATCH_CONTENT_TYPE,
 ) -> str:
     """Perform a rolling restart of a Deployment by patching the pod template annotation.
 
+    The caller owns the D11 dry-run gate: suppress the call entirely when
+    ``spec.dryRun`` is set (the suppression message and Event/counter
+    emission stay at the handler call sites, where the Event text differs
+    per module). The explicit merge-patch content type (RFC 7386) is
+    applied here: the generated client's default selection for Deployment
+    patches is json-patch (ops array), which a dict body is not, and merge
+    preserves sibling annotations.
+
     Args:
-        apps_api: Kubernetes AppsV1Api client.
+        apps_api: Kubernetes AppsV1Api client (or a structural fake with
+            ``patch_namespaced_deployment``).
         deployment: Name of the Deployment to restart.
         namespace: Namespace of the Deployment.
         now: Timestamp to use for the restart annotation value (UTC).
         restart_annotation: Annotation key to patch (default is the kubectl
-            standard ``kubectl.kubernetes.io/restartedAt``).
+            standard :data:`RESTARTED_AT_ANNOTATION`).
         content_type: Content-Type header for the PATCH request; defaults
-            to ``application/merge-patch+json`` per RFC 7386 to preserve
-            sibling annotations.
+            to :data:`openstudio_operator.status_store.MERGE_PATCH_CONTENT_TYPE`
+            per RFC 7386 to preserve sibling annotations.
 
     Returns:
         The ISO-format restart timestamp that was written to the annotation.

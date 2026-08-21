@@ -60,12 +60,16 @@ recorded ones never re-fire.
 from __future__ import annotations
 
 import logging
-import time
 from datetime import UTC, datetime, timedelta
 
 import kopf
 
-from openstudio_operator._oscm_handlers import register_fn as _register_oscm_handler
+from openstudio_operator._oscm_handlers import (
+    observe_tick_duration,
+)
+from openstudio_operator._oscm_handlers import (
+    register_fn as _register_oscm_handler,
+)
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -73,7 +77,6 @@ from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
     DATAPOINTS_REQUEUED_TOTAL,
-    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
 )
 from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
@@ -207,6 +210,7 @@ def run_watchdog_tick(
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@observe_tick_duration(module="datapoint_watchdog")
 def zombie_datapoint_watchdog(
     body: dict,
     spec: dict,
@@ -215,36 +219,14 @@ def zombie_datapoint_watchdog(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer thin wrapper: wire config/client/store/events, run one tick."""
-    # Issue #308 — wall-clock observation of the wrapper invocation. The
-    # ``finally`` guarantees observation regardless of success or caught
-    # exception, so the slow-tick signal is independent of the failure
-    # counter and a sustained degradation between the healthy band and
-    # the eventual ``handler_tick_failures_total`` increment is visible.
-    _started = time.perf_counter()
-    try:
-        _zombie_datapoint_watchdog_impl(
-            body=body,
-            spec=spec,
-            namespace=namespace,
-            name=name,
-            logger=logger,
-        )
-    finally:
-        HANDLER_TICK_DURATION_SECONDS.labels(module="datapoint_watchdog").observe(
-            time.perf_counter() - _started
-        )
+    """Timer handler: wire config/client/store/events, run one tick.
 
-
-def _zombie_datapoint_watchdog_impl(
-    *,
-    body: dict,
-    spec: dict,
-    namespace: str,
-    name: str,
-    logger: kopf.Logger,
-) -> None:
-    """Inner body of :func:`zombie_datapoint_watchdog` (issue #308)."""
+    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395, replacing the per-module #308 wrapper) observes
+    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
+    (module="datapoint_watchdog")`` in a ``finally`` — regardless of success
+    or caught exception.
+    """
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — datapoint watchdog idle this tick")
@@ -253,8 +235,8 @@ def _zombie_datapoint_watchdog_impl(
     store = StatusStore(namespace, name, operator_custom_objects_api())
     # Issue #164 — single source of truth for Event emission; class wraps
     # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
-    # shim so the existing ``emit("Warning", REASON, message)`` call
-    # sites below keep working unchanged.
+    # shim so the existing ``emit("Warning", REASON, message)`` call sites
+    # below keep working unchanged.
     emit = EventEmitter(body=body, dry_run=config.dry_run)
 
     try:

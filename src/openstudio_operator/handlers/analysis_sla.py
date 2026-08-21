@@ -88,7 +88,6 @@ stop/escalation is re-attempted next poll, a recorded one never re-fires
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -96,7 +95,12 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException
 
-from openstudio_operator._oscm_handlers import register_fn as _register_oscm_handler
+from openstudio_operator._oscm_handlers import (
+    observe_tick_duration,
+)
+from openstudio_operator._oscm_handlers import (
+    register_fn as _register_oscm_handler,
+)
 from openstudio_operator.client_factory import (
     get_openstudio_client,
     get_read_only_redis_client,
@@ -105,7 +109,6 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
-    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     SOFT_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
@@ -593,6 +596,7 @@ def _escalate_analysis(
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@observe_tick_duration(module="analysis_sla")
 def analysis_sla_monitor(
     body: dict,
     spec: dict,
@@ -601,36 +605,14 @@ def analysis_sla_monitor(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer thin wrapper: wire config/client/store/kube/events/redis, run one tick."""
-    # Issue #308 — wall-clock observation of the wrapper invocation. The
-    # ``finally`` guarantees observation regardless of success or caught
-    # exception, so the slow-tick signal is independent of the failure
-    # counter and a sustained degradation between the healthy band and
-    # the eventual ``handler_tick_failures_total`` increment is visible.
-    _started = time.perf_counter()
-    try:
-        _analysis_sla_monitor_impl(
-            body=body,
-            spec=spec,
-            namespace=namespace,
-            name=name,
-            logger=logger,
-        )
-    finally:
-        HANDLER_TICK_DURATION_SECONDS.labels(module="analysis_sla").observe(
-            time.perf_counter() - _started
-        )
+    """Timer handler: wire config/client/store/kube/events/redis, run one tick.
 
-
-def _analysis_sla_monitor_impl(
-    *,
-    body: dict,
-    spec: dict,
-    namespace: str,
-    name: str,
-    logger: kopf.Logger,
-) -> None:
-    """Inner body of :func:`analysis_sla_monitor` (issue #308)."""
+    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395, replacing the per-module #308 wrapper) observes
+    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
+    (module="analysis_sla")`` in a ``finally`` — regardless of success or
+    caught exception.
+    """
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")
