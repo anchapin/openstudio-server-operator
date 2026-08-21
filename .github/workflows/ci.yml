@@ -48,7 +48,15 @@ jobs:
       - name: Verify :dev image provenance
         run: |
           set -euo pipefail
-          DIGEST=$(docker buildx imagetools inspect ghcr.io/anchapin/openstudio-server-operator:dev --raw | jq -r '.digest')
+          # Issue #459: `imagetools inspect --raw` prints the raw manifest
+          # (or image index) JSON, which has NO top-level `.digest` field —
+          # `jq -r '.digest'` was null by design and the job never passed.
+          # Read the digest from the descriptor instead.
+          DIGEST=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' ghcr.io/anchapin/openstudio-server-operator:dev)
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::could not resolve the :dev digest from GHCR (is the image published?)"
+            exit 1
+          fi
           cosign verify-attestation \
             --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
