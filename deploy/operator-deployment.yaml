@@ -84,13 +84,24 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             # Issue #242 — optional hook for clusters whose API server /
-            # inter-service traffic is fronted by a custom CA. Mount the CA
-            # bundle as a Secret volume and set this env var to its
-            # in-container path; when unset the client uses the system
-            # trust store (``verify=True`` is pinned explicitly regardless).
-            # Default empty (regression fence — see Working rules in AGENTS.md):
-            # operators MUST opt in per-cluster rather than inherit a baked-in
-            # bundle path that would mask a misconfigured in-cluster CA.
+            # inter-service traffic is fronted by a custom CA. When unset
+            # or empty the client uses the system trust store
+            # (``verify=True`` is pinned explicitly regardless). Default
+            # empty (regression fence — see Working rules in AGENTS.md):
+            # operators MUST opt in per-cluster rather than inherit a
+            # baked-in bundle path that would mask a misconfigured
+            # in-cluster CA.
+            # Issue #396 — the enablement recipe for corporate-PKI
+            # clusters (full runbook: docs/validation.md §Prerequisites):
+            #   1. kubectl -n openstudio-server create secret generic \
+            #        openstudio-tls-ca-bundle --from-file=ca-bundle.crt
+            #   2. uncomment the tls-ca-bundle volumeMount + volume below,
+            #   3. set this value to the in-pod path
+            #      /etc/openstudio/tls/ca-bundle.crt.
+            # openstudio_client._resolve_tls_ca_bundle (#296) then checks
+            # the path exists and carries a BEGIN CERTIFICATE PEM marker;
+            # a set-but-broken value aborts every tick with
+            # OperatorConfigError rather than degrading to an SSLError.
             - name: OPENSTUDIO_TLS_CA_BUNDLE
               value: ""
             # Issue #401 — optional bearer-token authN for /metrics. Default
@@ -173,6 +184,18 @@ spec:
             # - name: metrics-token
             #   mountPath: /var/run/openstudio-metrics
             #   readOnly: true
+            # Issue #396 — uncomment together with the tls-ca-bundle volume
+            # below AND the OPENSTUDIO_TLS_CA_BUNDLE env value above to
+            # trust a corporate-PKI CA bundle for the upstream
+            # spec.serverUrl REST traffic (NOT the operator's own
+            # kube-apiserver connection). Mirrors the commented #401
+            # metrics-token pair: the default Deployment ships WITHOUT this
+            # mount so it schedules on clusters where the Secret does not
+            # exist; a live secretName reference to a missing Secret would
+            # block pod scheduling (FailedMount).
+            # - name: tls-ca-bundle
+            #   mountPath: /etc/openstudio/tls
+            #   readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
@@ -184,3 +207,13 @@ spec:
         #     items:
         #       - key: token
         #         path: token
+        # Issue #396 — uncomment together with the tls-ca-bundle volumeMount
+        # above AND the OPENSTUDIO_TLS_CA_BUNDLE env value above. The
+        # key→path mapping puts the PEM at /etc/openstudio/tls/ca-bundle.crt
+        # — the in-pod path the env comment above tells the admin to set.
+        # - name: tls-ca-bundle
+        #   secret:
+        #     secretName: openstudio-tls-ca-bundle
+        #     items:
+        #       - key: ca-bundle.crt
+        #         path: ca-bundle.crt

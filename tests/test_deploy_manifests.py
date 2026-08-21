@@ -7,6 +7,7 @@ least-privilege Role), and the new Role must keep the house style —
 namespaced, enumerated verbs, no wildcards, no secrets/volume inspection.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -1060,6 +1061,143 @@ def test_operator_deployment_liveness_restarts_wedged_operator_within_90s():
     assert readiness["periodSeconds"] == 10, readiness
 
 
+# ---- Issue #396: optional tls-ca-bundle Secret volume + recipe ------
+#
+# OPENSTUDIO_TLS_CA_BUNDLE ships as `value: ""` (the #242 opt-in fence)
+# and openstudio_client._resolve_tls_ca_bundle (#296) validates any
+# non-empty value: path must exist and carry a BEGIN CERTIFICATE PEM
+# marker, else every tick aborts with OperatorConfigError. Pre-#396 the
+# manifest had NO matching volumeMount, no Secret recipe, and no
+# convention for where the bundle lives in the pod — a corporate-PKI
+# admin following the env-var comment had no documented path from Secret
+# to mount to env.
+#
+# Design tension: a LIVE `volumes[].secret.secretName` referencing a
+# Secret that does not exist blocks pod scheduling (FailedMount) — which
+# would break the default no-Secret deployment. (`optional: true` on the
+# secret volume would avoid that, but it changes the default manifest for
+# every cluster and diverges from the repo's established opt-in shape.)
+# The fix MIRRORS the #401 metrics-token pattern instead: the
+# volumeMount + secret volume ship commented-out with a
+# verified-parseable structure, and the default Deployment carries no
+# volume reference at all. The tests below pin BOTH states: the default
+# as-parsed manifest requires no Secret, and the commented enablement
+# stanzas parse back to the exact pinned conventions (mount name,
+# mountPath, secretName, key→path mapping).
+_OPERATOR_DEPLOYMENT_TEXT = (DEPLOY / "operator-deployment.yaml").read_text()
+
+
+def _commented_tls_ca_bundle_stanzas():
+    """Return the uncommented YAML text of every commented
+    ``- name: tls-ca-bundle`` stanza in the raw operator-deployment.yaml.
+
+    Each stanza starts at a ``# - name: tls-ca-bundle`` line and consumes
+    consecutive comment lines whose decommented content is indented (the
+    continuation keys of that list item). Prose comments (single space
+    after ``#``) and real manifest lines terminate the stanza."""
+    stanzas = []
+    lines = _OPERATOR_DEPLOYMENT_TEXT.splitlines()
+    i = 0
+    while i < len(lines):
+        if re.match(r"^\s*#\s+- name: tls-ca-bundle\s*$", lines[i]):
+            stanza = [re.sub(r"^\s*#\s?", "", lines[i])]
+            j = i + 1
+            while j < len(lines) and re.match(r"^\s*#\s{2,}\S", lines[j]):
+                stanza.append(re.sub(r"^\s*#\s?", "", lines[j]))
+                j += 1
+            stanzas.append("\n".join(stanza))
+            i = j
+        else:
+            i += 1
+    return stanzas
+
+
+def test_operator_deployment_default_applies_without_tls_ca_bundle_secret():
+    """Issue #396 acceptance: the DEFAULT deployment (as shipped, nothing
+    uncommented) references no tls-ca-bundle volume or mount, so it
+    schedules on clusters where the Secret does not exist. A live
+    ``volumes[].secret.secretName: openstudio-tls-ca-bundle`` without the
+    Secret would block pod scheduling (FailedMount) — the exact
+    default-breaks regression this test fences. The env var stays present
+    with ``value: ""`` (the #242 opt-in fence: system trust store unless
+    the cluster admin explicitly enables the bundle)."""
+    pod = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    mounts = container.get("volumeMounts") or []
+    assert all(m["name"] != "tls-ca-bundle" for m in mounts), (
+        "default operator-deployment must NOT declare an active tls-ca-bundle "
+        "volumeMount (issue #396): without the Secret the pod never schedules"
+    )
+    secret_names = [
+        (v.get("secret") or {}).get("secretName") for v in pod.get("volumes") or []
+    ]
+    assert "openstudio-tls-ca-bundle" not in secret_names, (
+        "default operator-deployment must NOT declare a live "
+        f"openstudio-tls-ca-bundle secret volume (issue #396); got {secret_names}"
+    )
+    env = {e["name"]: e.get("value") for e in container.get("env") or []}
+    assert env.get("OPENSTUDIO_TLS_CA_BUNDLE") == "", (
+        "OPENSTUDIO_TLS_CA_BUNDLE must ship as value: \"\" — the #242 opt-in "
+        "fence (system trust store) that #396 builds its recipe on top of"
+    )
+
+
+def test_operator_deployment_documents_tls_ca_bundle_enablement_recipe():
+    """Issue #396 acceptance: the manifest carries the documented
+    enablement path for corporate-PKI cluster admins — the kubectl
+    Secret-create command, the in-pod path the admin must set
+    OPENSTUDIO_TLS_CA_BUNDLE to, and BOTH commented stanzas
+    (volumeMount + secret volume), mirroring the #401 metrics-token
+    pattern."""
+    text = _OPERATOR_DEPLOYMENT_TEXT
+    assert "kubectl -n openstudio-server create secret generic" in text, (
+        "the env-var comment must carry the Secret-create command verbatim "
+        "(issue #396 acceptance criterion)"
+    )
+    assert "openstudio-tls-ca-bundle --from-file=ca-bundle.crt" in text, (
+        "the Secret-create command must name the pinned Secret + key "
+        "'openstudio-tls-ca-bundle --from-file=ca-bundle.crt' (issue #396)"
+    )
+    assert "/etc/openstudio/tls/ca-bundle.crt" in text, (
+        "the manifest must document the in-pod bundle path "
+        "/etc/openstudio/tls/ca-bundle.crt the admin sets the env var to"
+    )
+    assert len(_commented_tls_ca_bundle_stanzas()) == 2, (
+        "exactly two commented tls-ca-bundle stanzas must ship: the "
+        "volumeMount entry and the volumes[].secret entry (issue #396, "
+        "mirroring the #401 pair)"
+    )
+
+
+def test_operator_deployment_tls_ca_bundle_stanzas_parse_to_pinned_shape():
+    """Issue #396: the commented enablement stanzas must stay valid YAML —
+    a cluster admin uncommenting them blindly gets a parseable manifest
+    with the exact pinned conventions: mount name `tls-ca-bundle`
+    (linking the volumeMount to the volume), mountPath
+    /etc/openstudio/tls, readOnly, secretName
+    openstudio-tls-ca-bundle, and the key→path mapping that puts the PEM
+    at /etc/openstudio/tls/ca-bundle.crt — the same path the env-var
+    comment tells the admin to set."""
+    stanzas = _commented_tls_ca_bundle_stanzas()
+    items = [item for block in stanzas for item in yaml.safe_load(block)]
+    assert len(items) == 2, (
+        f"each commented stanza must parse as a one-item YAML list; got {items!r}"
+    )
+    mounts = [s for s in items if "mountPath" in s]
+    vols = [s for s in items if "secret" in s]
+    assert len(mounts) == 1 and len(vols) == 1, items
+    assert mounts[0] == {
+        "name": "tls-ca-bundle",
+        "mountPath": "/etc/openstudio/tls",
+        "readOnly": True,
+    }, mounts[0]
+    assert vols[0]["name"] == "tls-ca-bundle", vols[0]
+    assert vols[0]["secret"]["secretName"] == "openstudio-tls-ca-bundle", vols[0]
+    assert vols[0]["secret"]["items"] == [
+        {"key": "ca-bundle.crt", "path": "ca-bundle.crt"}
+    ], vols[0]
+
+
 # ---- Issue #112: namespace NetworkPolicy ----------------------------
 #
 # The operator surface (operator Deployment + storage-prune CronJob +
@@ -1872,8 +2010,6 @@ def test_prune_job_scope_vap_label_keys_match_archival_manifest():
 # string.startsWith() — and evaluates the MANIFEST'S OWN expression
 # text, not a re-implementation of its semantics (the
 # encode-the-bug-as-a-feature trap #315 audits for).
-
-import re
 
 _OSCM_ARCHIVE_NAME_PREFIX = "oscm-archive-"
 
