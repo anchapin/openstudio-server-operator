@@ -120,6 +120,17 @@ EXPECTED_COUNTER_FAMILIES = (
 #: server's FIRST bind attempt outcome (1.0 bound / 0.0 OSError),
 #: labelled by the configured ``(addr, port)``. ``== 0`` is the
 #: canonical "Prometheus scrape is down because of US" signal.
+#:
+#: Issue #469 — ``handler_last_tick_timestamp{module}`` Gauge is the
+#: scheduler heartbeat: Unix-epoch seconds of the most recent completed
+#: ``run_oscm_tick`` invocation, stamped in a ``finally`` on EVERY
+#: terminal path (success, idle return, caught skip-tuple failure,
+#: propagation). Generalizes the #312 freshness-pair idiom to the
+#: scheduler itself — every other registry signal is event-driven and
+#: reads green while ticks are silently unscheduled. The event-driven
+#: ``dry_run_audit`` watch handler is consciously excluded (no cadence).
+#: Alert: ``time() - handler_last_tick_timestamp{module=...} > 3 *
+#: <interval>`` (per-module intervals in ``_constants.py``).
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -129,6 +140,7 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_stall_window_fresh",
     "openstudio_operator_warnings_deferred_queue_depth",
     "openstudio_operator_metrics_server_bound",
+    "openstudio_operator_handler_last_tick_timestamp",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

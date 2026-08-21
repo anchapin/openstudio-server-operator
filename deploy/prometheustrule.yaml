@@ -33,8 +33,9 @@
 # gated by the `openstudio-operator-metrics-ingress` NetworkPolicy, issue
 # #166 — the scraper must run in the `prometheus` namespace or carry
 # `app.kubernetes.io/component: metrics-scraper`). The storage-prune
-# CronJob exposes the same families on its own pod; both targets surface the
-# `prune_tick_failures_total` alert below.
+# CronJob exposes the same families on its own pod; the prune group below
+# alerts on kube-state-metrics Job status (the durable signal — see the
+# group comment).
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -124,6 +125,36 @@ spec:
               read-modify-write cycles are losing the 409 race faster than the retry
               budget absorbs. Cross-check status_conflicts_total and the singleton guard:
               multiple writers on one CR is the usual cause (D05).
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py HANDLER_LAST_TICK_TIMESTAMP (#469) — the scheduler
+        # heartbeat: the ONLY signal that advances when the scheduler is
+        # merely invoking the timers. Every other family here is
+        # event-driven and reads green while ticks are silently
+        # unscheduled (kopf internals shift so install_singleton_guard
+        # returns 0 and the timers are unwrapped, the CR is deleted, the
+        # scheduling loop wedges). Thresholds are 3x each module's
+        # interval (per-module cadences in _constants.py: analysis_sla
+        # 30s, datapoint_watchdog 60s, worker_recycler 300s,
+        # web_background_monitor 60s).
+        - alert: OpenStudioOperatorHandlerHeartbeatStale
+          expr: time() - openstudio_operator_handler_last_tick_timestamp{module="analysis_sla"} > 90
+            or time() - openstudio_operator_handler_last_tick_timestamp{module="datapoint_watchdog"} > 180
+            or time() - openstudio_operator_handler_last_tick_timestamp{module="worker_recycler"} > 900
+            or time() - openstudio_operator_handler_last_tick_timestamp{module="web_background_monitor"} > 180
+          labels:
+            severity: critical
+          annotations:
+            summary: Handler scheduler heartbeat is stale ({{ $labels.module }})
+            description: >-
+              time() - openstudio_operator_handler_last_tick_timestamp > 3x the module's
+              interval for module {{ $labels.module }} — the timer has not completed an
+              invocation (success OR caught failure) in over three polls. The operator
+              may look healthy on every event-driven series while doing nothing: check
+              the pod is running, the OSCM CR still exists, and (after a kopf upgrade)
+              tests/test_singleton_registry_coverage.py against the deployed kopf
+              version — silently unwrapped timers are the documented kopf-pin failure
+              mode this alert exists to catch.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------
@@ -313,19 +344,39 @@ spec:
     # ---------------------------------------------------------------------
     - name: openstudio-operator.prune
       rules:
-        # metrics.py PRUNE_TICK_FAILURES_TOTAL (#306) — the three skip-tick
-        # branches (cr_list_failure | runtime_failure | redis_url_empty);
-        # the #392 exit-3 redisUrl wedge is covered by the same counter.
-        - alert: OpenStudioOperatorPruneTickFailures
-          expr: rate(openstudio_operator_prune_tick_failures_total[5m]) > 0
+        # Follow-up from #470 (landed with #469): the original alert keyed
+        # on rate(openstudio_operator_prune_tick_failures_total[5m]) —
+        # mathematically meaningless. The prune pod starts a metrics
+        # server, runs ONE tick, and exits within seconds, so the counter
+        # is per-pod-lifetime (resets to zero on every run) and a 30-60 s
+        # scrape samples it zero-to-one times — the README triage guidance
+        # (#470) says treat the counter as best-effort and alert on failed
+        # Jobs. Rekeyed onto kube-state-metrics Job status — the durable
+        # signal: the prune entrypoint exits nonzero on every failure
+        # branch (3 empty spec.redisUrl #392, 4 CR-list failure, 5 D12
+        # runtime failure; exit-code table in prune_entrypoint.py's module
+        # docstring), so K8s marks the Job Failed and failedJobsHistoryLimit
+        # (3) retains it for this alert to see. Requires kube-state-metrics
+        # (standard in kube-prometheus-stack). An absence-of-success
+        # variant (count(increase(kube_job_status_succeeded{...}[2h])) == 0)
+        # is the complementary signal for a suspended CronJob; not shipped
+        # to keep the alert count coherent with the #468 set.
+        - alert: OpenStudioOperatorPruneJobFailed
+          expr: kube_job_status_failed{namespace="openstudio-server", job_name=~"openstudio-storage-pruner-.+"} > 0
+          for: 15m
           labels:
             severity: warning
           annotations:
-            summary: Storage-prune CronJob ticks are failing ({{ $labels.reason }})
+            summary: Storage-prune CronJob Jobs are failing
             description: >-
-              Nonzero rate of openstudio_operator_prune_tick_failures_total for reason
-              {{ $labels.reason }} — the prune entrypoint is skipping ticks (K8s API CR
-              list failure, a caught D12 exception, or the empty-spec.redisUrl guard
-              #392). The storage-archival backlog grows while this fires; investigate
-              the upstream cause (RBAC, apiserver, NFS, redis-secret KeyRef).
+              kube_job_status_failed > 0 for a Job of the openstudio-storage-pruner
+              CronJob — the prune entrypoint exited nonzero (3 empty spec.redisUrl
+              #392, 4 CR-list failure, 5 D12 runtime failure). The storage-archival
+              backlog grows while this fires. The failed Job is retained by
+              failedJobsHistoryLimit so the alert persists until history GC (or manual
+              deletion) clears it. Triage: kubectl get jobs -n openstudio-server -l
+              app.kubernetes.io/component=storage-pruner, then read the Job pod logs;
+              the per-pod-lifetime
+              openstudio_operator_prune_tick_failures_total counter is best-effort
+              only (README #470).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics

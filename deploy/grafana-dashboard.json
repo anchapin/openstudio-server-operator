@@ -490,6 +490,49 @@
       ],
       "title": "web_background stall window + freshness (#254/#312)",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "time() - handler_last_tick_timestamp per module (#469) — the scheduler heartbeat. Every other panel on this dashboard is event-driven and reads green while ticks are silently unscheduled; a sustained lag above 3x a module's interval (90/180/900/180 s) means that timer is not being invoked at all.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "seconds since last completed tick",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "id": 13,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "time() - openstudio_operator_handler_last_tick_timestamp",
+          "legendFormat": "module={{module}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Handler heartbeat lag (#469)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

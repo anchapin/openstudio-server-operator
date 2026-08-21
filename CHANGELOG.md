@@ -33,6 +33,34 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#469`** — `openstudio_operator_handler_last_tick_timestamp{module}`:
+  the scheduler-heartbeat gauge. Every other runtime signal is
+  event-driven (tick-failure counters increment only when a tick runs and
+  fails; the duration histograms observe only when a tick executes;
+  `singleton_election_total` fires only when `enforce()` runs), so if
+  ticks stop being scheduled entirely — kopf registry internals shift so
+  `install_singleton_guard` returns 0 and the timers are silently
+  unwrapped (the documented kopf-pin failure mode), the CR is deleted, or
+  the scheduling loop wedges — every series goes flat and every dashboard
+  reads green while the operator does nothing. The gauge generalizes the
+  #312 freshness-pair idiom to the scheduler itself: set to `time.time()`
+  in a `finally` at the END of every `run_oscm_tick` invocation (the
+  single shared wrapper since #473) on every terminal path — success,
+  caught skip-tuple failure, idle return, even propagating exceptions.
+  Labelled by `module` (the four-timer vocabulary; 4 series); the
+  event-driven `dry_run_audit` watch handler is consciously excluded (no
+  cadence). Staleness alert
+  `time() - openstudio_operator_handler_last_tick_timestamp{module=...} > 3 * <interval>`
+  shipped as `OpenStudioOperatorHandlerHeartbeatStale`
+  (deploy/prometheusrule.yaml; per-module thresholds 90/180/900/180 s from
+  `_constants.py`) and a "Handler heartbeat lag" panel joined
+  deploy/grafana-dashboard.json (13 panels). Follow-up from #470 in the
+  same manifest: the mathematically-meaningless
+  `rate(openstudio_operator_prune_tick_failures_total[5m])` alert
+  (per-pod-lifetime counter, unscrapeable) was rekeyed onto
+  kube-state-metrics `kube_job_status_failed` as
+  `OpenStudioOperatorPruneJobFailed`. Registry now 20 counters + 9 gauges
+  + 3 histograms.
 - **`#463`** — `spec.redisCredentials.secretRef` (`{name, key}`): Redis
   credentials move out of the CR spec into a Secret holding the FULL
   `redis://:password@queue:6379` URL. `config.py` parses it,

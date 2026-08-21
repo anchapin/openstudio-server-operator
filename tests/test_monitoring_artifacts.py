@@ -157,8 +157,13 @@ def test_prometheustrule_covers_the_issue_468_minimum_alert_set():
 
     Handler tick failures, REST outcome=exception (via the histogram's
     _count series), singleton conflict, metrics-server bind, deferred-drop
-    rate, key-layout status, stall-window accumulation, prune tick
-    failures, and both #312 freshness gauges.
+    rate, key-layout status, stall-window accumulation, and both #312
+    freshness gauges. The #469 heartbeat gauge joins the minimum set (the
+    dead-scheduler alert); the #306 prune counter LEFT it — the #470
+    follow-up (landed with #469) rekeyed that alert onto kube-state-metrics
+    ``kube_job_status_failed`` because ``rate()`` over the prune pod's
+    per-pod-lifetime counter is mathematically meaningless (see the group
+    comment in the manifest).
     """
     alerts = _prometheusrule_alerts()
     referenced = _referenced_families(*(alert["expr"] for alert in alerts))
@@ -171,9 +176,11 @@ def test_prometheustrule_covers_the_issue_468_minimum_alert_set():
         "openstudio_operator_warnings_deferred_dropped_total",
         "openstudio_operator_redis_key_layout_status",
         "openstudio_operator_stall_window_elapsed_seconds",
-        "openstudio_operator_prune_tick_failures_total",
+        # NOT openstudio_operator_prune_tick_failures_total — the prune
+        # alert was rekeyed onto kube_job_status_failed (#470 follow-up).
         "openstudio_operator_resque_queue_depth_fresh",
         "openstudio_operator_stall_window_fresh",
+        "openstudio_operator_handler_last_tick_timestamp",
     }
     missing = required - referenced
     assert not missing, f"required #468 alert families not covered: {sorted(missing)}"
@@ -190,10 +197,13 @@ def test_prometheustrule_covers_the_issue_468_minimum_alert_set():
 
 
 def test_prometheusrule_freshness_alerts_use_time_minus_idiom():
-    """Both #312 staleness alerts use the canonical ``time() - fresh`` shape.
+    """Both #312 staleness alerts + the #469 heartbeat use ``time() - x``.
 
     The docstrings pin the idiom; a hand-rolled variant (e.g. ``abs(...)``)
     would pass the family check while alerting on the wrong arithmetic.
+    The #469 scheduler-heartbeat alert joins the same shape — per-module
+    thresholds (3x each module's interval) but identical staleness
+    arithmetic.
     """
     exprs = [alert["expr"] for alert in _prometheusrule_alerts()]
     assert any(
@@ -204,6 +214,10 @@ def test_prometheusrule_freshness_alerts_use_time_minus_idiom():
         expr.startswith("time() - openstudio_operator_stall_window_fresh")
         for expr in exprs
     ), "stall-window freshness alert must be `time() - stall_window_fresh > ...`"
+    assert any(
+        expr.startswith("time() - openstudio_operator_handler_last_tick_timestamp")
+        for expr in exprs
+    ), "heartbeat staleness alert must be `time() - handler_last_tick_timestamp ... > ...`"
 
 
 def test_grafana_dashboard_parses_with_templated_datasource():

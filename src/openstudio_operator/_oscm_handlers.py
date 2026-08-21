@@ -282,30 +282,56 @@ def run_oscm_tick(
     Returns the tick's return value, or ``None`` when the tick was
     skipped (idle CR or caught wiring/tick failure) — the D12 "retry
     next poll" posture.
+
+    Issue #469 — the scheduler heartbeat: EVERY invocation stamps
+    ``HANDLER_LAST_TICK_TIMESTAMP.labels(module=module)`` to
+    ``time.time()`` in the outer ``finally`` below, on ALL terminal
+    paths (successful tick, empty-``serverUrl`` idle return, caught
+    skip-tuple failure, and propagating uncaught exception). The
+    heartbeat answers whether the scheduler is invoking this module's
+    timer at all — a flat gauge is the only /metrics-visible signature
+    of a silently-dead scheduler (kopf internals shift so
+    install_singleton_guard returns 0 and the timers are unwrapped, the
+    CR is deleted, the kopf scheduling loop wedges); every other
+    registry signal is event-driven and reads green while nothing runs.
+    The ``dry_run_audit`` handler is CONSCIOUSLY EXCLUDED — it is an
+    ``@kopf.on.event`` watch handler, not a timer, so it ticks on CR
+    events with no cadence against which a staleness gap could be
+    thresholded.
     """
     config = OperatorConfig.from_spec(spec)
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — %s idle this tick", idle_label)
-        return None
-    store = StatusStore(namespace, name, custom_objects_api())
-    emit = EventEmitter(body=body, dry_run=config.dry_run)
-    deps = wire(config)
-    now = datetime.now(UTC)
     try:
-        return tick(config=config, store=store, emit=emit, deps=deps, now=now)
-    except SKIP_TICK_EXCEPTIONS as exc:
-        from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
+        if not config.server_url:
+            logger.warning("spec.serverUrl is empty — %s idle this tick", idle_label)
+            return None
+        store = StatusStore(namespace, name, custom_objects_api())
+        emit = EventEmitter(body=body, dry_run=config.dry_run)
+        deps = wire(config)
+        now = datetime.now(UTC)
+        try:
+            return tick(config=config, store=store, emit=emit, deps=deps, now=now)
+        except SKIP_TICK_EXCEPTIONS as exc:
+            from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
 
-        HANDLER_TICK_FAILURES_TOTAL.labels(
-            namespace=namespace,
-            name=name,
-            module=module,
-            error_type=type(exc).__name__,
-        ).inc()
-        logger.warning(
-            "%s tick skipped, retrying next poll (%s: %s)",
-            tick_label,
-            type(exc).__name__,
-            exc,
-        )
-        return None
+            HANDLER_TICK_FAILURES_TOTAL.labels(
+                namespace=namespace,
+                name=name,
+                module=module,
+                error_type=type(exc).__name__,
+            ).inc()
+            logger.warning(
+                "%s tick skipped, retrying next poll (%s: %s)",
+                tick_label,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+    finally:
+        # Issue #469 — scheduler heartbeat: stamped at the END of every
+        # invocation regardless of terminal path (the scheduler invoked
+        # the timer = alive, even if the tick itself failed or skipped).
+        # dry_run_audit is NOT stamped here: @kopf.on.event, event-driven,
+        # no cadence — consciously excluded (see docstring).
+        from openstudio_operator.metrics import HANDLER_LAST_TICK_TIMESTAMP
+
+        HANDLER_LAST_TICK_TIMESTAMP.labels(module=module).set(time.time())
