@@ -180,6 +180,11 @@ def test_metrics_http_server_serves_all_declared_counters():
     # guard); the
     # CronJob pod exposes the same exposition format on port 9090.
     metrics.PRUNE_TICK_FAILURES_TOTAL.labels(reason="__metrics_test_sentinel__").inc()
+    # Issue #471 — pre-touch the REST retry-attempt counter. Labelled by
+    # ``method`` only (GET | POST | DELETE — same vocabulary as the #308
+    # duration histogram; no CR-identity labels, the client is
+    # CR-agnostic).
+    metrics.REST_RETRIES_TOTAL.labels(method="GET").inc()
     # Issue #309 — pre-touch the four action counters that gained
     # outcome/trigger labels in this PR. Each call creates a labelled
     # series so the family-existence assertion below is self-contained
@@ -314,6 +319,11 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_analyses_deleted_total":
             assert (
                 'openstudio_operator_analyses_deleted_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_rest_retries_total":
+            assert (
+                'openstudio_operator_rest_retries_total{method="GET"}'
                 in response.text
             )
         else:

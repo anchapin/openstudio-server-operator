@@ -801,6 +801,69 @@ def test_rest_request_duration_observation_includes_retry_loop(client, sleeps):
     assert after > before
 
 
+def _counter_value(counter, **labels: str) -> float:
+    """Read a labelled Counter's cumulative value for the given label combo.
+
+    Counters expose their in-memory value on the labelled child's
+    ``_value.get()`` (the same direct-read seam the histogram helper
+    above approximates via ``_child_samples()``). Counters are module-
+    level singletons on the default REGISTRY, so values persist across
+    tests in a process — the #471 assertions below are DELTA-based
+    (``after - before``) for exactly that reason.
+    """
+    return float(counter.labels(**labels)._value.get())
+
+
+# --- Issue #471 — REST retry-attempt counter ---------------------------------
+
+
+@responses.activate
+def test_rest_retries_total_counts_exactly_two_retries(client, sleeps):
+    """Issue #471 acceptance: two 5xx then a 200 must record EXACTLY 2
+    retry increments on ``REST_RETRIES_TOTAL{method="GET"}`` — once per
+    re-attempt, not once per call. Without this counter the retry
+    amplification (the operator multiplying its own load up to 4x on
+    every poll during a v3.11.0 degrade) is invisible: the duration
+    histogram records the call as a mildly slow ``outcome="200"``
+    indistinguishable from a clean first-try success.
+    """
+    responses.get(f"{BASE}/analyses.json", status=503)
+    responses.get(f"{BASE}/analyses.json", status=502)
+    responses.get(f"{BASE}/analyses.json", json=[])
+    before = _counter_value(metrics.REST_RETRIES_TOTAL, method="GET")
+    docs = client.list_analyses()
+    after = _counter_value(metrics.REST_RETRIES_TOTAL, method="GET")
+    assert docs == []
+    assert len(responses.calls) == 3
+    assert len(sleeps) == 2
+    assert after - before == 2.0, (
+        f"REST_RETRIES_TOTAL recorded {after - before} increments for a "
+        "two-5xx-then-200 GET — expected exactly 2 (once per re-attempt, "
+        "issue #471)."
+    )
+    exposition = generate_latest().decode()
+    assert 'openstudio_operator_rest_retries_total{method="GET"}' in exposition
+
+
+@responses.activate
+def test_rest_retries_total_no_increments_on_clean_first_try(client):
+    """Issue #471: a clean first-try 200 must NOT touch the retry counter —
+    the counter's zero-noise contract is what makes ``rate(...[5m]) > 0``
+    a usable early-degrade alert (any increment means a re-attempt
+    actually happened, not a slow-but-successful poll).
+    """
+    responses.get(f"{BASE}/analyses.json", json=[])
+    before = _counter_value(metrics.REST_RETRIES_TOTAL, method="GET")
+    assert client.list_analyses() == []
+    after = _counter_value(metrics.REST_RETRIES_TOTAL, method="GET")
+    assert len(responses.calls) == 1
+    assert after - before == 0.0, (
+        f"REST_RETRIES_TOTAL recorded {after - before} increments for a "
+        "clean first-try GET — the counter must only advance on "
+        "re-attempts (issue #471)."
+    )
+
+
 def test_rest_request_duration_label_cardinality_pinned() -> None:
     """Issue #308 — pinned label vocabulary. ``method`` is the verbs the
     operator actually uses (GET | POST | DELETE); ``outcome`` is the
