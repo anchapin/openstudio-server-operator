@@ -120,7 +120,7 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
 
 ## Queue fabric (Module 5 / Phase 4)
 
-- Redis Service: `queue:6379` in ns `openstudio-server`; URL `redis://:openstudio@queue:6379` (password `openstudio` by default).
+- Redis Service: `queue:6379` in ns `openstudio-server`; URL `redis://:openstudio-rotated@queue:6379` (placeholder; was the publicly-known `openstudio` literal until #150; run `scripts/rotate_redis_password.sh` to install a per-cluster random password before applying — the operator refuses to operate when `redisUrl` arrives empty per #116).
 - Workers consume `QUEUES=requeued,simulations` (Resque).
 - Queue depth: `LLEN resque:queue:simulations` / `LLEN resque:queue:requeued` (Resque 2.x key layout — live-verified 2026-08-18, issue #67; the bare `LLEN simulations` form reads a non-existent key and returns 0 forever). Worker liveness: Resque worker registry/heartbeats keys.
 - Per-worker record: `GET resque:worker:{worker_id}` (STRING, JSON) — used by the Module 1 escalation path (issue #83 D2) to discover which Resque workers are currently processing a given analysis. The JSON's `payload.args` carries the job arguments (e.g. `[analysis_id, datapoint_id, ...]` for the OpenStudio Server `RunSimulateDataPoint` job class). Worker ids are `{hostname}:{pid}:{queues}` — the first colon-delimited segment is the K8s pod name (pods default `hostname` to the pod name), so the escalation can map a worker id to a pod for `kubectl delete pod`. **Pre-#83 escalation matched started-datapoint `ip_address` against worker pod `status.podIP`** — but on v3.11.0 datapoint `ip_address` is always null, so that path never matched (issue #83 D2: surgical pod eviction re-sourced to Resque worker identity).
@@ -136,6 +136,7 @@ machine-readably in `tests/fixtures/contract-shapes.json` under
 | Worker Deployment | `worker` | HPA `worker-hpa` (CPU, 2–20) — **DISABLED post-#77** via `--set worker.autoscaling.enabled=false` (or `kubectl delete hpa worker-hpa --ignore-not-found` on existing clusters); replaced by KEDA ScaledObject `keda-hpa-worker` driven by the Resque `simulations`+`requeued` queue depth — see `deploy/keda-scaledobject.yaml` and the KEDA prerequisite section in `docs/validation.md` |
 | web_background Deployment | `web-background` | 1 replica |
 | Redis Service | `queue` :6379 | |
+| Mongo Deployment | `db` | credentials via Secret `openstudio-mongo` (`MONGO_USER`/`MONGO_PASSWORD`; password placeholder `openstudio-rotated` — was the publicly-known `openstudio` literal until #219; run `scripts/rotate_mongo_password.sh` to install a per-cluster random password before applying) |
 | NFS PVC | `nfs-pvc` | RWX, storageClass `nfs`; mounted **only by web** at `/mnt/openstudio` |
 | Worker scratch | emptyDir | `/mnt/openstudio` is node-local in workers; restart = cleanup (Module 3 "temp clearing" is moot) |
 
