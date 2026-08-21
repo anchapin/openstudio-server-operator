@@ -642,6 +642,76 @@ def test_event_wrapper_url_guard_is_idempotent_per_cr(caplog, log, monkeypatch):
     )
 
 
+def test_url_guard_silent_when_secret_ref_present(caplog, log, monkeypatch):
+    """Issue #463: empty ``spec.redisUrl`` + populated
+    ``spec.redisCredentials.secretRef`` is the RECOMMENDED production shape
+    (the URL resolves from the Secret at client-construction time), so the
+    #116 ``RedisUrlEmpty`` Warning must NOT fire for it. The fence stays
+    armed for an empty URL with NO secretRef (the companion tests above)."""
+    secret_ref_spec = {
+        "serverUrl": "http://a.test",
+        "redisUrl": "",
+        "redisCredentials": {"secretRef": {"name": "openstudio-redis", "key": "redis-url"}},
+    }
+    guard = SingletonGuard(
+        FakeCustomObjectsApi(
+            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec=secret_ref_spec)]
+        )
+    )
+    monkeypatch.setattr(singleton, "_process_guard", guard)
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "_redis_url_warned", set())
+
+    singleton.singleton_guard_event(
+        body=make_cr("alpha", OLD_TS, spec=secret_ref_spec),
+        namespace=NAMESPACE,
+        name="alpha",
+        logger=log,
+        patch={},
+        type="ADDED",
+    )
+
+    url_events = [t for t in event_triples(events) if t[2] == "RedisUrlEmpty"]
+    assert url_events == [], (
+        f"RedisUrlEmpty must not fire when spec.redisCredentials.secretRef "
+        f"is populated (issue #463 — Secret-sourced URL is the recommended "
+        f"shape for an empty spec.redisUrl). Got: {url_events!r}."
+    )
+
+
+def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
+    """A secretRef missing name/key does NOT count as set (the tolerant
+    ``_has_redis_secret_ref`` shape check) — an empty redisUrl with a
+    half-configured secretRef still trips the #116 fence rather than
+    silently operating with no credential source at all."""
+    malformed_spec = {
+        "serverUrl": "http://a.test",
+        "redisUrl": "",
+        "redisCredentials": {"secretRef": {"name": "openstudio-redis"}},
+    }
+    guard = SingletonGuard(
+        FakeCustomObjectsApi(
+            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec=malformed_spec)]
+        )
+    )
+    monkeypatch.setattr(singleton, "_process_guard", guard)
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "_redis_url_warned", set())
+
+    singleton.singleton_guard_event(
+        body=make_cr("alpha", OLD_TS, spec=malformed_spec),
+        namespace=NAMESPACE,
+        name="alpha",
+        logger=log,
+        patch={},
+        type="ADDED",
+    )
+
+    assert ("alpha", "Warning", "RedisUrlEmpty") in event_triples(events)
+
+
 
     monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi([])))
     events, emit = make_sink()

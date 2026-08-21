@@ -69,6 +69,11 @@ wiring site), never hardcoded here (AGENTS.md).
 
 Credentials come ONLY from ``redis_url`` (``redis://:password@host:port`` is parsed by
 ``redis.Redis.from_url``); the client accepts no auth parameters of its own.
+Issue #463 adds the Secret-sourced twin: when the CR sets
+``spec.redisCredentials.secretRef`` the operator resolves the FULL
+``redis://...`` URL from that Secret key (see
+:func:`redis_url_from_secret_value` + ``client_factory``) and hands it to
+this client as ``redis_url`` — the client itself stays Secret-unaware.
 
 Error discipline: no in-client retry — Redis reads ride the same ~30s poll cadence as
 the REST client, so a failed tick is skipped and the next poll retries naturally.
@@ -81,6 +86,7 @@ subclass so existing callers that catch ``RedisClientError`` continue to handle 
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -166,6 +172,67 @@ class OperatorConfigError(RedisClientError):
     first stall-condition evaluation. Subclasses :class:`RedisClientError` so the
     existing ``except RedisClientError:`` call sites continue to handle it.
     """
+
+
+#: Issue #463 — the URL shape accepted for the SECRET-sourced Redis URL
+#: (``spec.redisCredentials.secretRef``). Same in-cluster ``redis://``
+#: Service constraint the CRD's ``spec.redisUrl`` pattern enforced in #390,
+#: EXCEPT credentials (``redis://:password@host`` / ``redis://user:pass@host``)
+#: are ALLOWED here — carrying the credential IS the point of the Secret.
+#: Applying the #390 host restriction at resolution time keeps the SSRF
+#: fence intact: moving the URL out of the CRD-validated spec into a Secret
+#: must not become a side door to off-cluster hosts.
+SECRET_REDIS_URL_PATTERN: re.Pattern[str] = re.compile(
+    r"^redis://([^@]+@)?"
+    r"[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+    r"(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?"
+    r"(\.svc(\.cluster\.local)?)?"
+    r"(:[0-9]{1,5})?(/[0-9]+)?$"
+)
+
+
+class RedisCredentialResolutionError(RedisClientError):
+    """Raised when ``spec.redisCredentials.secretRef`` cannot yield a usable URL (#463).
+
+    Covers every failure of the Secret-sourced credential path: the named
+    Secret does not exist / cannot be read, the key is missing, the value is
+    not valid base64/UTF-8, or the decoded value is not an in-cluster
+    ``redis://`` URL per :data:`SECRET_REDIS_URL_PATTERN`. Subclasses
+    :class:`RedisClientError` so existing ``except RedisClientError:`` call
+    sites degrade gracefully instead of crashing the tick (the D12 posture:
+    skip the tick, retry on the next poll).
+    """
+
+
+def redis_url_from_secret_value(
+    value: str, *, secret_name: str, secret_key: str
+) -> str:
+    """Validate a full ``redis://...`` URL read from one Secret key (#463).
+
+    The Secret key named by ``spec.redisCredentials.secretRef`` holds the
+    COMPLETE connection URL (``redis://:password@queue:6379``), not the bare
+    password — full-URL semantics avoid URL-reconstruction logic in the
+    operator and match the value the helm recipe already templates into the
+    web / worker ``REDIS_URL`` env vars.
+
+    Enforces :data:`SECRET_REDIS_URL_PATTERN` (in-cluster Service host,
+    credentials allowed — the #390 SSRF fence preserved on the Secret path).
+    Returns the validated value unchanged; raises
+    :class:`RedisCredentialResolutionError` naming the Secret/key on any
+    mismatch so the Warning log points the operator at the exact object to
+    fix. The error message deliberately carries only the offending URL's
+    scheme/host shape diagnostics, never the credential itself.
+    """
+    if not value or not SECRET_REDIS_URL_PATTERN.match(value):
+        target = _redis_target_for_diagnostics(value) if value else "<empty>"
+        raise RedisCredentialResolutionError(
+            f"Secret {secret_name!r} key {secret_key!r} does not hold a valid "
+            f"in-cluster redis:// URL (issue #463): got {target}. The key must "
+            f"carry the FULL URL (redis://[:password@]<service>[:port][/db]); "
+            f"off-cluster hosts and non-Redis schemes are rejected (issue #390 "
+            f"fence preserved on the Secret path)."
+        )
+    return value
 
 
 class WriteCommandForbidden(RuntimeError):

@@ -56,22 +56,28 @@ spec:
                   # URL to ``redis://`` against an in-cluster Service name: a bare
                   # Service label (`queue`), a namespaced form
                   # (`queue.openstudio-server`), or the ``.svc[.cluster.local]``
-                  # FQDN, with optional `:password@` auth, port, and ``/<db>``
-                  # selector. Multi-label public hostnames
-                  # (``attacker.example.com``) and non-Redis schemes
-                  # (``http://``, ``ftp://``) are rejected by the API server at
-                  # apply time. The trailing ``|^$`` branch preserves the
-                  # #116 empty-default escape hatch. The `[^@]+@` auth group
-                  # covers the helm-recipe ``redis://:openstudio-rotated@queue``
-                  # shape (empty user + password) and the standard
-                  # ``redis://user:password@host`` form. The issue's stated
-                  # pattern omitted the auth group and required ``.svc``
-                  # literally; both would reject the acceptance-criterion
-                  # good URL ``redis://:openstudio-rotated@queue:6379``.
-                  pattern: '^redis://([^@]+@)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
+                  # FQDN, with optional port and ``/<db>`` selector. Multi-label
+                  # public hostnames (``attacker.example.com``) and non-Redis
+                  # schemes (``http://``, ``ftp://``) are rejected by the API
+                  # server at apply time. The trailing ``|^$`` branch preserves
+                  # the #116 empty-default escape hatch.
+                  # Issue #463: the pre-#463 pattern allowed an optional
+                  # ``([^@]+@)?`` userinfo group, which let the queue-fabric
+                  # password ride inline in the CR spec — stored plaintext in
+                  # etcd, returned verbatim to every `get/list` principal, and
+                  # committed to GitOps repos. The auth group is REMOVED:
+                  # embedded credentials (``redis://:password@queue`` or
+                  # ``redis://user:pass@queue``) are now rejected at apply time.
+                  # Credentials belong in a Secret named by
+                  # ``spec.redisCredentials.secretRef`` (full-URL semantics);
+                  # ``redis://queue:6379`` (credential-free, for no-auth dev
+                  # clusters) remains accepted.
+                  pattern: '^redis://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
                   x-kubernetes-validations:
                     - rule: "self == '' || self.startsWith('redis://')"
                       message: "spec.redisUrl must be empty or an in-cluster redis:// Service URL (issue #390)."
+                    - rule: "self == '' || !self.contains('@')"
+                      message: "spec.redisUrl must not carry embedded credentials (issue #463); store the full URL in a Secret and reference it via spec.redisCredentials.secretRef."
                   description: |
                     Redis (Resque) URL for read-only queue-depth checks.
                     Issue #116: the default is intentionally EMPTY — the historical
@@ -79,13 +85,48 @@ spec:
                     password `openstudio` into every published CRD, so a fresh
                     deploy that did not override the field shipped a public-facing
                     password. The operator now refuses to start when this is
-                    empty (see handlers/__init__.py startup guard). Helm-chart
-                    users should derive the URL from the Redis-secret KeyRef
-                    and set `spec.redisUrl` explicitly. Issue #390 locks the
-                    value to an in-cluster ``redis://`` Service URL (or empty
-                    per #116); the API server rejects off-cluster hosts
-                    (``attacker.example.com``) and non-Redis schemes at apply
-                    time.
+                    empty AND spec.redisCredentials.secretRef is unset (see
+                    handlers/__init__.py startup guard). Issue #390 locks the
+                    value to an in-cluster `redis://` Service URL (or empty per
+                    #116). Issue #463 REJECTS embedded credentials (`@` userinfo):
+                    the CR spec is stored plaintext in etcd and mirrored into
+                    GitOps repos, so the password belongs in a Secret referenced
+                    via `spec.redisCredentials.secretRef` (recommended — see
+                    docs/onboarding.md) — `redis://queue:6379` without credentials
+                    stays valid for no-auth clusters.
+                redisCredentials:
+                  type: object
+                  description: "Secret-sourced Redis credentials (issue #463). Preferred over spec.redisUrl when both are set."
+                  required: [secretRef]
+                  properties:
+                    secretRef:
+                      type: object
+                      description: "Names the Secret key holding the FULL redis://... URL (redis://:password@queue:6379) — not the bare password. Resolved by the operator via a single namespaced CoreV1 get (the bounded 'never reads Secrets' exception, issue #463)."
+                      required: [name, key]
+                      properties:
+                        name:
+                          type: string
+                          # Issue #463 / #240-style fence: an unconstrained name
+                          # let a CR-write user point the operator's one Secret
+                          # read at ANY Secret in the namespace (TLS, registry,
+                          # operator-managed credentials). The pattern pins the
+                          # value to the documented `openstudio-redis*`
+                          # convention (deploy/redis-credentials-secret.yaml and
+                          # rotations of it); the CEL rule gives a readable
+                          # apply-time message for the same constraint.
+                          maxLength: 253
+                          pattern: '^openstudio-redis[a-z0-9-]*$'
+                          x-kubernetes-validations:
+                            - rule: "self.startsWith('openstudio-redis')"
+                              message: "spec.redisCredentials.secretRef.name must match '^openstudio-redis[a-z0-9-]*$' (issue #463)."
+                          description: "Name of a Secret in this namespace. Must match the openstudio-redis* naming convention (issue #463)."
+                        key:
+                          type: string
+                          # Secret keys are [-._a-zA-Z0-9] per the K8s API; this
+                          # pattern rejects empty values and embedded whitespace.
+                          maxLength: 253
+                          pattern: '^[A-Za-z0-9][-A-Za-z0-9._]*$'
+                          description: "Secret key holding the full redis:// URL (e.g. 'redis-url'). No default; always explicit."
                 dryRun:
                   type: boolean
                   default: false

@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-818 tests across 40 files (run `.venv/bin/pytest --collect-only` to
+840 tests across 40 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -266,11 +266,59 @@ test. Do not "fix" the silence by making the guard raise.
 `spec.redisUrl` defaults to **empty by design**. The historical default
 baked the kind-recipe password `openstudio` into every CRD; the operator
 now refuses to operate and emits a per-CR `Warning` event
-(`reason=RedisUrlEmpty`) when the field is empty. Helm-chart users must
-set it explicitly (or template it from the Redis Secret). **Do not "fix"
-the default** — it is the regression fence. See `handlers/__init__.py`
-for the drain-queue pattern kopf requires for events from non-event
-contexts.
+(`reason=RedisUrlEmpty`) when the field is empty AND no
+`spec.redisCredentials.secretRef` is set. Helm-chart users must configure
+one of the two paths below. **Do not "fix" the default** — it is the
+regression fence. See `handlers/__init__.py` for the drain-queue pattern
+kopf requires for events from non-event contexts.
+
+### Redis credentials via Secret reference (#463) — recommended
+
+`spec.redisUrl` is stored plaintext in etcd, returned verbatim to every
+principal with `get/list` on the OSCM CR, and typically committed to
+GitOps repos — an inline password leaked in three persistent places. The
+**recommended production shape** keeps the credential out of the CR spec
+entirely:
+
+```yaml
+spec:
+  redisUrl: ""                      # empty — the #116 fence stays silent
+  redisCredentials:
+    secretRef:
+      name: openstudio-redis        # must match ^openstudio-redis[a-z0-9-]*$
+      key: redis-url                # key holding the FULL redis:// URL
+```
+
+The named Secret key must hold the **complete** URL
+(`redis://:password@queue:6379`) — full-URL semantics, not the bare
+password; this avoids URL-reconstruction logic in the operator and matches
+the value the helm recipe already templates into the web / worker
+`REDIS_URL` env vars. Semantics:
+
+- **Preferred over inline** — when both `secretRef` and a (grandfathered)
+  inline `redisUrl` are present, the Secret wins.
+- **Resolution** happens in `client_factory.get_read_only_redis_client`:
+  one namespaced `CoreV1` get of exactly the named Secret (the operator's
+  single bounded "never reads Secrets" exception — documented in
+  `deploy/rbac.yaml`; the grant is `get`-only). The resolved URL is
+  fence-checked against the in-cluster `redis://` pattern (#390 SSRF fence
+  preserved; credentials allowed because carrying them is the point).
+- **Failures** (`RedisCredentialResolutionError`: Secret missing, key
+  missing, invalid value) are not cached — the next call re-resolves, so a
+  Secret created after the first attempt is picked up on the next tick.
+- **Cache key** — the `(redisUrl, secretRef, namespace)` tuple; changing
+  the secretRef name/key yields a fresh client. An in-place password
+  rotation keeps the cached client on the old URL until the operator
+  restarts (same runbook step the inline path needs — rotation also
+  touches every `REDIS_URL` env consumer; see
+  `scripts/rotate_redis_password.sh`).
+
+Since #463 the CRD pattern for `spec.redisUrl` **rejects embedded
+credentials** (`@` userinfo) at apply time; `redis://queue:6379`
+credential-free stays valid for no-auth dev clusters, and existing CRs
+with pre-#463 inline passwords are grandfathered (Kubernetes does not
+re-validate stored objects) — rotate them to the secretRef shape at the
+next spec edit.
 
 ### `spec.serverUrl` is the only server URL (`#3`)
 

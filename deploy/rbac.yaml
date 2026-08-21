@@ -48,6 +48,21 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch", "create", "patch"]
+  # Read ONE Secret by name for Redis connection info (issue #463).
+  #
+  # TENSION with the "operator never reads secrets" rule, documented here on
+  # purpose: `spec.redisCredentials.secretRef` names a Secret whose key holds
+  # the full redis:// URL, and the acceptance criterion requires the operator
+  # itself to resolve it (client_factory._resolve_redis_url — the rclone-style
+  # envFrom hand-off is not available for an in-process client constructor).
+  # This is the bounded exception: `get` only (no list/watch/create/update),
+  # and the CRD pins the Secret name to the `openstudio-redis*` convention
+  # (issue #463, #240-style fence) so a CR-write principal cannot redirect
+  # the read at arbitrary Secrets. RBAC has no per-object-name slot — the
+  # name constraint lives in the CRD schema, not here.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
   # NOTE (#77): the autoscaling/horizontalpodautoscalers rule is GONE.
   # The custom HPA-floor adjuster (#18) was removed; autoscaling is now
   # owned by KEDA (deploy/keda-scaledobject.yaml) which runs under its own
