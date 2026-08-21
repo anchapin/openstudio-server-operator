@@ -131,13 +131,16 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_metrics_server_bound",
 )
 
-#: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
-#: datapoint watchdog each observe the count off the OpenStudio REST analysis
-#: payload (or the equivalent summary endpoint) once per tick: the SLA records
-#: ``len(analyses)`` from ``/analyses.json``; the watchdog records
-#: ``len(started_ids)`` from ``/data_points/status?status=1&jobs=
-#: started``. No labels — one observation per tick, bounded-cardinality
-#: at the histogram level rather than per analysis.
+#: Issue #179 — per-tick count Histogram. The SLA monitor and the
+#: datapoint watchdog each observe a count off the OpenStudio REST payload
+#: once per tick: the SLA records ``len(analyses)`` from
+#: ``/analyses.json``; the watchdog records ``len(started_ids)`` from
+#: ``/data_points/status?status=1&jobs=started``. Issue #472 labels the
+#: family by ``view`` (``analyses_per_tick`` at the SLA site,
+#: ``started_datapoints_per_tick`` at the watchdog site) because the two
+#: populations have different units — the pre-#472 unlabelled merge made
+#: the percentiles meaningless. Two series total; bounded-cardinality at
+#: the histogram level rather than per analysis.
 #:
 #: Issue #308 — handler tick-duration Histogram. The four ``@kopf.timer``
 #: wrappers (analysis_sla, datapoint_watchdog, worker_recycler,

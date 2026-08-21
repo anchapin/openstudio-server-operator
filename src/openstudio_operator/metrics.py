@@ -643,23 +643,35 @@ EVENTS_EMITTED_TOTAL = Counter(
     labelnames=["namespace", "name", "reason"],
 )
 
-# Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
-# datapoint watchdog each iterate a count off the OpenStudio REST analysis
-# payload (or the equivalent summary endpoint) — the number of analyses per
-# tick for the SLA, the number of started datapoints per tick for the
-# watchdog — to decide whether to soft-stop, requeue, or escalate. The value
-# is a Counter-shaped integer that was never recorded, so an on-call SRE
-# investigating "why are SLA stops spiking?" had no way to correlate the
-# spike with a shift in analysis-size distribution. The Histogram is
-# bucket-capped at `[5, 10, 50, 100, 500, 1000, 5000]` so the
-# per-(analysis | datapoint) cardinality is bounded while still surfacing
-# the "we just started getting 5000-point analyses" shift (Goal 10, OSS
-# hardening). No labels: per-observation (one .observe() per observed count),
-# not per-CR — relabelling per analysis would multiply the series count by
-# the analysis count and defeat the bounded-cardinality design.
+# Issue #179 — per-tick count Histogram. The SLA monitor and the datapoint
+# watchdog each observe a count off the OpenStudio REST payload once per
+# tick — the number of analyses per tick for the SLA, the number of started
+# datapoints per tick for the watchdog — to decide whether to soft-stop,
+# requeue, or escalate. Issue #472 adds the ``view`` label because the two
+# populations have DIFFERENT units: analyses are typically an order of
+# magnitude fewer than in-flight datapoints, so the pre-#472 unlabelled
+# merge made the family's percentiles meaningless (p99 of the mixture
+# answers neither "how big are our analyses" nor "how many datapoints are
+# in flight") and a cadence change (e.g. the SLA timer moving to 30s vs
+# the watchdog's 60s) reweighted the mixture with no workload change.
+# ``view="analyses_per_tick"`` at the SLA site (``len(analyses)`` from
+# /analyses.json), ``view="started_datapoints_per_tick"`` at the watchdog
+# site (``len(started_ids)`` from the light started-datapoints view) — the
+# only two values. Still per-observation (one .observe() per observed
+# count, not per-CR) and still bounded-cardinality: relabelling per
+# analysis would multiply the series count by the analysis count and
+# defeat the design.
 ANALYSIS_DATAPOINT_COUNT = Histogram(
     "openstudio_operator_analysis_datapoint_count",
-    "Datapoints per analysis observed by SLA / watchdog modules",
+    "Per-tick counts observed by the SLA / watchdog modules, separated "
+    "by ``view`` (issue #472): ``analyses_per_tick`` — the number of "
+    "analyses returned by the SLA tick's ``/analyses.json`` poll; "
+    "``started_datapoints_per_tick`` — the number of started datapoints "
+    "seen by the watchdog tick's light view. The two populations have "
+    "different units and magnitudes, so dashboard queries MUST pin the "
+    "``view`` label — the merged percentiles the pre-#472 unlabelled "
+    "family served were meaningless.",
+    labelnames=["view"],
     buckets=[5, 10, 50, 100, 500, 1000, 5000],
 )
 

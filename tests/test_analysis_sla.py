@@ -36,7 +36,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import responses
-from prometheus_client import REGISTRY
+from prometheus_client import REGISTRY, generate_latest
 
 from openstudio_operator import metrics
 from openstudio_operator.config import OperatorConfig
@@ -392,41 +392,90 @@ def test_first_sight_writes_watching_anchor_without_soft_stop():
 # --- Issue #179 — per-CR datapoint-budget Histogram ---------------------------
 
 
-def _histogram_count(histogram) -> float:
-    """Sum of all sample counts in a Histogram (issue #179).
+def _histogram_count(histogram, **labels) -> float:
+    """Sum of all sample counts in a Histogram (issue #179), label-scoped.
 
-    An unlabelled Histogram (the shape ``ANALYSIS_DATAPOINT_COUNT`` is)
-    exposes a single bucket set; summing ``_sum`` of counts across the
-    buckets surfaces the total number of observations, which is what the
-    SLA tick produces per .observe() call.
+    Issue #472 makes ``ANALYSIS_DATAPOINT_COUNT`` a labelled Histogram
+    (``view``); pass label kwargs to scope the sum to one series — with
+    no kwargs the sum spans every series of the family (the pre-#472
+    unlabelled shape). Summing the ``_count`` samples surfaces the total
+    number of observations, which is what the SLA tick produces per
+    .observe() call.
     """
-    samples = list(REGISTRY.collect())
-    for fam in samples:
-        if fam.name == histogram._name:
-            return sum(sample.value for sample in fam.samples if sample.name.endswith("_count"))
-    return 0.0
+    total = 0.0
+    for fam in REGISTRY.collect():
+        if fam.name != histogram._name:
+            continue
+        for sample in fam.samples:
+            if not sample.name.endswith("_count"):
+                continue
+            if labels and any(sample.labels.get(k) != v for k, v in labels.items()):
+                continue
+            total += sample.value
+    return total
 
 
 @responses.activate
 def test_analysis_datapoint_count_observed_on_sla_poll():
-    """Issue #179 — the SLA tick records the per-CR datapoint budget via
-    ``ANALYSIS_DATAPOINT_COUNT.observe(len(analyses))`` after the initial
-    ``/analyses.json`` poll. Each tick is one observation; the value is
-    the count of analyses returned by the index endpoint. The
-    observation is recorded even when ``autoSoftStop`` is false (the
-    histogram is independent of the soft-stop decision — its purpose is
-    to surface the per-tick analysis-size distribution, not the
-    soft-stop rate)."""
+    """Issue #179 — the SLA tick records the per-tick analysis count via
+    ``ANALYSIS_DATAPOINT_COUNT.labels(view="analyses_per_tick")
+    .observe(len(analyses))`` after the initial ``/analyses.json`` poll.
+    Each tick is one observation; the value is the count of analyses
+    returned by the index endpoint. The observation is recorded even when
+    ``autoSoftStop`` is false (the histogram is independent of the
+    soft-stop decision — its purpose is to surface the per-tick
+    analysis-size distribution, not the soft-stop rate)."""
     api = FakeCustomObjectsApi(make_cr())
     register_analyses_index("a1", "a2", "a3")
     for aid in ("a1", "a2", "a3"):
         register_analysis_status(aid, status="na")  # not started → no anchor
-    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick")
 
     tick(api)
 
-    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick")
     assert after - before == 1.0  # exactly one observation per tick
+
+
+@responses.activate
+def test_analysis_datapoint_count_view_label_is_analyses_per_tick():
+    """Issue #472 — the SLA observe site must record on the
+    ``view="analyses_per_tick"`` series (``len(analyses)`` — a count of
+    ANALYSES) and never on the watchdog's
+    ``view="started_datapoints_per_tick"`` series: the two populations
+    have different units and magnitudes, and the pre-#472 unlabelled
+    merge made the family's percentiles meaningless. Pins the exact
+    exposition label value so a refactor that swaps the two sites' label
+    values (or drops the label) is caught at CI."""
+    api = FakeCustomObjectsApi(make_cr())
+    register_analyses_index("a1", "a2")
+    for aid in ("a1", "a2"):
+        register_analysis_status(aid, status="na")  # not started → no anchor writes
+    sla_before = _histogram_count(
+        metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick"
+    )
+    watchdog_before = _histogram_count(
+        metrics.ANALYSIS_DATAPOINT_COUNT, view="started_datapoints_per_tick"
+    )
+
+    tick(api)
+
+    sla_after = _histogram_count(
+        metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick"
+    )
+    watchdog_after = _histogram_count(
+        metrics.ANALYSIS_DATAPOINT_COUNT, view="started_datapoints_per_tick"
+    )
+    assert sla_after - sla_before == 1.0
+    # The SLA site never touches the watchdog's series — the two units
+    # must stay separable on the dashboard.
+    assert watchdog_after == watchdog_before
+    # And the exposition form carries the literal label value.
+    exposition = generate_latest().decode()
+    assert (
+        "openstudio_operator_analysis_datapoint_count_count"
+        '{view="analyses_per_tick"}' in exposition
+    )
 
 
 @responses.activate
@@ -440,14 +489,14 @@ def test_analysis_datapoint_count_not_observed_when_auto_soft_stop_disabled():
     spec = {**SPEC, "analysisPolicy": {"maxDurationMinutes": 180, "autoSoftStop": False}}
     api = FakeCustomObjectsApi(make_cr(spec))
     register_analyses_index("a1")
-    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    before = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick")
 
     result, events = tick(api, spec=spec)
 
     assert result.soft_stopped == [] and result.escalated == []
     assert events == []
     assert calls_to("/analyses.json") == 0  # no initial poll — disabled is a full stop
-    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT)
+    after = _histogram_count(metrics.ANALYSIS_DATAPOINT_COUNT, view="analyses_per_tick")
     assert after == before
 
 

@@ -175,6 +175,49 @@ def test_started_since_reset_on_re_entry():
     assert api.obj["status"]["startedSince"] == {"d1": later.isoformat()}
 
 
+# --- Issue #472 — ANALYSIS_DATAPOINT_COUNT view label ---------------------------
+
+
+def _view_count(view: str) -> float:
+    """Sample count of the ``view``-labelled ANALYSIS_DATAPOINT_COUNT series.
+
+    Issue #472 split the pre-existing unlabelled merge into two labelled
+    series; ``get_sample_value`` reads the ``_count`` sample of exactly one
+    series so the two observe sites can be asserted independently.
+    """
+    return (
+        REGISTRY.get_sample_value(
+            "openstudio_operator_analysis_datapoint_count_count", {"view": view}
+        )
+        or 0.0
+    )
+
+
+@responses.activate
+def test_analysis_datapoint_count_view_label_is_started_datapoints_per_tick():
+    """Issue #472 — the watchdog observe site must record on the
+    ``view="started_datapoints_per_tick"`` series (``len(started_ids)`` —
+    a count of DATAPOINTS) and never on the SLA monitor's
+    ``view="analyses_per_tick"`` series: the two populations have
+    different units and magnitudes, and the pre-#472 unlabelled merge
+    made the family's percentiles meaningless. Pins the exact exposition
+    label value so a refactor that swaps the two sites' label values (or
+    drops the label) is caught at CI."""
+    api = FakeCustomObjectsApi(make_cr())
+    register_started("d1", "d2")
+    watchdog_before = _view_count("started_datapoints_per_tick")
+    sla_before = _view_count("analyses_per_tick")
+
+    tick(api)
+
+    watchdog_after = _view_count("started_datapoints_per_tick")
+    sla_after = _view_count("analyses_per_tick")
+    assert watchdog_after - watchdog_before == 1.0  # exactly one observation per tick
+    # The watchdog site never touches the SLA's series — the two units
+    # must stay separable on the dashboard.
+    assert sla_after == sla_before
+
+
 # --- Requeue triggering ---------------------------------------------------------
 
 
