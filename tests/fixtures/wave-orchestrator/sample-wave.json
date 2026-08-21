@@ -1,0 +1,270 @@
+{
+  "meta": {
+    "name": "sample-wave",
+    "description": "Canonical 3-issue sample wave for the wave-orchestrator e2e replay (issue #381). Synthesized: no archived wave-state-archived-*.json exists in the repo. Encodes one clean wave (3 issues, no planner-level file/label conflicts), a count-line rebase episode (issues #401 and #402 both edit the AGENTS.md test-count line that the planner's issue-text extraction cannot see), and one mid-write corruption + resume episode (the 2026-08-20 failure mode).",
+    "repo": "anchapin/openstudio-server-operator",
+    "base_branch": "develop",
+    "first_pr_number": 501,
+    "started_at": "2026-08-20T09:00:00Z",
+    "last_updated": "2026-08-20T09:00:00Z"
+  },
+  "issues": [
+    {
+      "number": 401,
+      "title": "Add metrics histogram for soft-stop latency",
+      "state": "OPEN",
+      "labels": [{"name": "observability"}],
+      "body": "## Context\n\nThe soft-stop path emits no latency signal.\n\n## Fix\n\nAdd a Prometheus histogram in `src/openstudio_operator/metrics.py` and cover it in `tests/test_metrics_endpoint.py`.\n\n## Acceptance criterion\n\n- The histogram family appears in the /metrics inventory.\n- Tests pass: `tests/test_metrics_endpoint.py`"
+    },
+    {
+      "number": 402,
+      "title": "Document the worker recycle grace period",
+      "state": "OPEN",
+      "labels": [{"name": "documentation"}],
+      "body": "## Context\n\nThe recycle grace period is undocumented.\n\n## Fix\n\nAdd a runbook section to `docs/onboarding.md` describing the anchor semantics, with a smoke assertion against `tests/test_worker_recycler.py`.\n\n## Acceptance criterion\n\n- The runbook section exists and matches the handler behavior."
+    },
+    {
+      "number": 403,
+      "title": "Harden redis client against URL rewrite",
+      "state": "OPEN",
+      "labels": [{"name": "bugfix"}],
+      "body": "## Context\n\nA mutated `spec.redisUrl` can leak a stale connection.\n\n## Fix\n\nRebuild the connection on URL change in `src/openstudio_operator/redis_client.py` and extend `tests/test_redis_client.py`.\n\n## Acceptance criterion\n\n- A URL mutation invalidates the cached client."
+    }
+  ],
+  "sub_agents": {
+    "401": {
+      "commit_subject": "feat: resolve #401 — soft-stop latency histogram",
+      "affected_file": "tests/test_metrics_endpoint.py",
+      "files_changed": [
+        "src/openstudio_operator/metrics.py",
+        "tests/test_metrics_endpoint.py",
+        "AGENTS.md"
+      ]
+    },
+    "402": {
+      "commit_subject": "docs: resolve #402 — worker recycle grace period runbook",
+      "affected_file": "tests/test_worker_recycler.py",
+      "files_changed": [
+        "docs/onboarding.md",
+        "tests/test_worker_recycler.py",
+        "AGENTS.md"
+      ]
+    },
+    "403": {
+      "commit_subject": "fix: resolve #403 — redis client url rewrite guard",
+      "affected_file": "tests/test_redis_client.py",
+      "files_changed": [
+        "src/openstudio_operator/redis_client.py",
+        "tests/test_redis_client.py"
+      ]
+    }
+  },
+  "ci_checks": {
+    "output": "lint   pass  12s\ntest   pass  90s\n",
+    "returncode": 0
+  },
+  "expected": {
+    "wave_plan": {
+      "total_issues": 3,
+      "total_waves": 1,
+      "waves": [{"wave": 1, "issues": [401, 402, 403]}]
+    },
+    "pr_creation_sequence": [
+      {
+        "issue": 401,
+        "pr": 501,
+        "title": "feat: resolve #401 — soft-stop latency histogram",
+        "initial_body": "Closes #401",
+        "final_body": "Closes #401\n\nScope guard: Do NOT touch any other area of the codebase; #402 owns the follow-up area.",
+        "base": "develop"
+      },
+      {
+        "issue": 402,
+        "pr": 502,
+        "title": "docs: resolve #402 — worker recycle grace period runbook",
+        "initial_body": "Closes #402",
+        "final_body": "Closes #402\n\nScope guard: Do NOT touch any other area of the codebase; #403 owns the follow-up area.",
+        "base": "develop"
+      },
+      {
+        "issue": 403,
+        "pr": 503,
+        "title": "fix: resolve #403 — redis client url rewrite guard",
+        "initial_body": "Closes #403",
+        "final_body": "Closes #403\n\nScope guard: Do NOT touch any other area of the codebase; n/a owns the follow-up area.",
+        "base": "develop"
+      }
+    ],
+    "merge_order": [
+      {
+        "issue": 401,
+        "pr": 501,
+        "subject": "feat: resolve #401 — soft-stop latency histogram",
+        "body": "Closes #401",
+        "rebase": null
+      },
+      {
+        "issue": 402,
+        "pr": 502,
+        "subject": "docs: resolve #402 — worker recycle grace period runbook",
+        "body": "Closes #402",
+        "rebase": {
+          "triggered_by_merge_of": 401,
+          "conflicting_files": ["AGENTS.md"],
+          "conflict_type": "count-line",
+          "resolution": "re-count (accept develop's higher test/file counts)",
+          "retrigger": ["close", "reopen"]
+        }
+      },
+      {
+        "issue": 403,
+        "pr": 503,
+        "subject": "fix: resolve #403 — redis client url rewrite guard",
+        "body": "Closes #403",
+        "rebase": null
+      }
+    ],
+    "final_state": {
+      "repo": "anchapin/openstudio-server-operator",
+      "started_at": "2026-08-20T09:00:00Z",
+      "current_wave": 1,
+      "total_waves": 1,
+      "issues": {
+        "401": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 501,
+          "branch": "fix/issue-401-add-metrics-histogram",
+          "worktree": "../worktrees/issue-401-add-metrics-histogram",
+          "worktree_cleaned": true
+        },
+        "402": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 502,
+          "branch": "fix/issue-402-document-the-worker",
+          "worktree": "../worktrees/issue-402-document-the-worker",
+          "worktree_cleaned": true
+        },
+        "403": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 503,
+          "branch": "fix/issue-403-harden-redis-client",
+          "worktree": "../worktrees/issue-403-harden-redis-client",
+          "worktree_cleaned": true
+        }
+      },
+      "last_updated": "2026-08-20T09:00:00Z"
+    }
+  },
+  "crash_episode": {
+    "description": "Orchestrator crashed mid-write while recording issue #401's merge: wave-state.json is truncated mid-JSON and a stale .wave-state temp file lingers. At crash time PR #501 (issue 401) is MERGED but its worktree cleanup never ran; GitHub left issue #401 OPEN (the #289 comma-close gap); issue #402 is mid-implementation (worktree exists, branch unpushed); issue #403 has open PR #503.",
+    "truncated_state": "{\"repo\": \"anchapin/openstudio-server-operator\", \"started_at\": \"2026-08-20T09:00:00Z\", \"current_wave\": 1, \"total_waves\": 1, \"issues\": {\"401\": {\"wave\": 1, \"status\": \"me",
+    "stale_temp": ".wave-state.q7x1p9.json",
+    "disk": {
+      "worktrees": [
+        "../worktrees/issue-401-add-metrics-histogram",
+        "../worktrees/issue-402-document-the-worker",
+        "../worktrees/issue-403-harden-redis-client"
+      ],
+      "local_branches": [
+        "fix/issue-401-add-metrics-histogram",
+        "fix/issue-402-document-the-worker"
+      ],
+      "remote_branches": [
+        "fix/issue-401-add-metrics-histogram",
+        "fix/issue-403-harden-redis-client"
+      ],
+      "develop_files": [
+        "src/openstudio_operator/metrics.py",
+        "tests/test_metrics_endpoint.py",
+        "AGENTS.md"
+      ]
+    },
+    "gh_snapshot": {
+      "prs": [
+        {
+          "number": 501,
+          "title": "feat: resolve #401 — soft-stop latency histogram",
+          "body": "Closes #401\n\nScope guard: Do NOT touch any other area of the codebase; #402 owns the follow-up area.",
+          "baseRefName": "develop",
+          "headRefName": "fix/issue-401-add-metrics-histogram",
+          "state": "MERGED"
+        },
+        {
+          "number": 503,
+          "title": "fix: resolve #403 — redis client url rewrite guard",
+          "body": "Closes #403\n\nScope guard: Do NOT touch any other area of the codebase; n/a owns the follow-up area.",
+          "baseRefName": "develop",
+          "headRefName": "fix/issue-403-harden-redis-client",
+          "state": "OPEN"
+        }
+      ],
+      "issue_states": {"401": "OPEN", "402": "OPEN", "403": "OPEN"}
+    },
+    "expected_rebuilt_state": {
+      "repo": "anchapin/openstudio-server-operator",
+      "started_at": "2026-08-20T09:00:00Z",
+      "current_wave": 1,
+      "total_waves": 1,
+      "issues": {
+        "401": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 501,
+          "branch": "fix/issue-401-add-metrics-histogram",
+          "worktree": "../worktrees/issue-401-add-metrics-histogram",
+          "worktree_cleaned": false
+        },
+        "402": {
+          "wave": 1,
+          "status": "implementing",
+          "branch": "fix/issue-402-document-the-worker",
+          "worktree": "../worktrees/issue-402-document-the-worker"
+        },
+        "403": {
+          "wave": 1,
+          "status": "pr_created",
+          "pr": 503,
+          "branch": "fix/issue-403-harden-redis-client",
+          "worktree": "../worktrees/issue-403-harden-redis-client"
+        }
+      },
+      "last_updated": "2026-08-20T09:00:00Z"
+    },
+    "expected_final_state": {
+      "repo": "anchapin/openstudio-server-operator",
+      "started_at": "2026-08-20T09:00:00Z",
+      "current_wave": 1,
+      "total_waves": 1,
+      "issues": {
+        "401": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 501,
+          "branch": "fix/issue-401-add-metrics-histogram",
+          "worktree": "../worktrees/issue-401-add-metrics-histogram",
+          "worktree_cleaned": true
+        },
+        "402": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 504,
+          "branch": "fix/issue-402-document-the-worker",
+          "worktree": "../worktrees/issue-402-document-the-worker",
+          "worktree_cleaned": true
+        },
+        "403": {
+          "wave": 1,
+          "status": "merged",
+          "pr": 503,
+          "branch": "fix/issue-403-harden-redis-client",
+          "worktree": "../worktrees/issue-403-harden-redis-client",
+          "worktree_cleaned": true
+        }
+      },
+      "last_updated": "2026-08-20T09:00:00Z"
+    }
+  }
+}

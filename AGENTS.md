@@ -39,7 +39,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 756 tests across 38 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 789 tests across 39 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -71,7 +71,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
   - `retention.py` + `prune_entrypoint.py` — retention pipeline + Job entrypoint invoked by `deploy/storage-cronjob.yaml`. The operator process owns no storage polling loop.
   - `metrics.py` — Prometheus counters + `/metrics` HTTP server (port 9090). Full family inventory in `README.md#metrics`; the drift-invariant is `tests/_metrics_inventory.py` (`EXPECTED_COUNTER_FAMILIES` / `EXPECTED_GAUGE_FAMILIES` / `EXPECTED_HISTOGRAM_FAMILIES` — the shared canonical source both `test_metrics_endpoint.py` and `test_walk_metrics_registry.py` import from, issue #406). **Adding a counter/gauge/histogram without adding it there (or vice versa) fails CI loudly.**
 - `deploy/` — `crd.yaml` · `rbac.yaml` · `operator-deployment.yaml` (single-replica, `Recreate`) · `keda-scaledobject.yaml` · `redis-credentials-secret.yaml` · `mongo-credentials-secret.yaml` · `storage-cronjob.yaml` · `network-policy.yaml` · `pod-delete-admission-policy.yaml`. RBAC is namespaced **Role** only (verbs enumerated; no `horizontalpodautoscalers`, no `batch`). `pod-delete-admission-policy.yaml` (#293) is a cluster-scoped `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding` — see K8s 1.30+ rule below.
-- `tests/fixtures/` — `contract-shapes.json` + `samples/` (synthetic) + `live/` (captured from a real v3.11.0 cluster; live captures go through `scripts/capture_fixtures.sh` + `scripts/check_fixture_drift.py`).
+- `tests/fixtures/` — `contract-shapes.json` + `samples/` (synthetic) + `live/` (captured from a real v3.11.0 cluster; live captures go through `scripts/capture_fixtures.sh` + `scripts/check_fixture_drift.py`) + `wave-orchestrator/` (`sample-wave.json` — canonical 3-issue wave replayed by `tests/test_wave_orchestrator_e2e.py`, issue #381).
 - `tests/golden/` — snapshot tests for generated rclone Job manifests.
 
 ## Fixed identifiers (exact spelling matters)
