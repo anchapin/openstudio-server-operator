@@ -425,6 +425,44 @@ edge cases (`#246` `#247` `#248` `#249`).
   (typed array) added. `WARNINGS_DEFERRED_DROPPED_TOTAL{reason="queue_full"}`
   semantics and the `WARNINGS_DEFERRED_QUEUE_DEPTH` Gauge are unchanged.
 
+### Fixed
+- **`#462`** — the committed Redis/Mongo credential Secret manifests no
+  longer ship a usable password. `deploy/redis-credentials-secret.yaml` +
+  `deploy/mongo-credentials-secret.yaml` carried `openstudio-rotated`, a
+  publicly-known (git-committed) credential that plain `kubectl apply`
+  installs as a working password — the #150/#219 leak class renamed. Both
+  manifests now ship the unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT`;
+  the CI guards (`check_redis_password_unique.sh` /
+  `check_mongo_password_unique.sh`) were extended to fail the build if
+  either manifest's committed password is anything other than the sentinel
+  (legacy-literal rejection intact); the rotation scripts substitute both
+  tokens (sentinel in deploy Secrets, legacy in kind manifests) and reject
+  the sentinel as a user-chosen password. README prereqs + `install-keda.sh`
+  next-steps no longer offer the plain-apply path for those Secrets.
+  Regression test:
+  `test_credential_secret_manifests_ship_only_sentinel_placeholder`.
+
+### Added
+- **`#466`** — tick-level error-path coverage for `datapoint_watchdog`
+  (was 14 tests, zero error paths): sustained-503 through the real client
+  → retry exhaustion → 4-label `HANDLER_TICK_FAILURES_TOTAL` bump + clean
+  skip; single-409 on the requeue write → bounded retry resolves; sustained
+  409 → `StatusStoreConflictError` (pins the re-attempt-next-poll shape);
+  raw non-409 `ApiException` escapes the wrapper's 2-tuple uncounted
+  (pinned; `#493` owns the tuple standardization).
+- **`#467`** — tick-level error-path coverage for `worker_recycler`
+  (was 20 tests, zero error paths), mirroring the #466 pattern: sustained
+  503 on `/analyses.json` → counter + clean skip; 409-then-success on
+  `set_last_recycle_at`; `ApiException` from the deployment patch caught
+  by the 3-tuple (the inverse asymmetry vs `#466`, pinned for `#493`);
+  sustained 409 after a fired restart → unanchored restart + exactly one
+  re-fire on recovery (the documented benign delete-then-anchor race,
+  D12). Test count 797 → 806 across the four claim locations.
+
+### Docs
+- **`#465`** — AGENTS.md `deploy/` inventory lists all 11 manifests
+  (`priority-class.yaml` #414, `resource-quota.yaml` #400 were missing).
+
 ## [0.2.0] - 2026-08-19
 
 Auto-improvement-wave 10 consolidation: 32 issues closed in the recent
