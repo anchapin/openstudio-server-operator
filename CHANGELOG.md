@@ -33,6 +33,22 @@ edge cases (`#246` `#247` `#248` `#249`).
   on-call's Grafana board.
 
 ### Added
+- **`#383`** — `scripts/check_stale_worktrees.sh`: stale-worktree
+  pre-flight visibility check for wave orchestration. Lists every
+  `issue-*` directory under the worktrees dir (default
+  `../worktrees` resolved from the MAIN working tree) whose derived
+  branch name (`fix/`/`feat/`/`docs/`/`chore/` + dirname) matches no
+  local branch and which is not registered in `git worktree list` —
+  the leftover-directories-from-prior-sessions hazard `git worktree
+  prune` cannot see. Prints one `STALE worktree:` line per hit plus a
+  summary; a `WARNING` line when the count exceeds `--threshold`
+  (default 5) tells the orchestrator to surface a Warning event and
+  confirm with the user BEFORE creating new worktrees. List mode
+  always exits `0` and never deletes anything (visibility, not a CI
+  gate); deletion is opt-in via `--prune-stale-worktrees --yes
+  --min-age-days N` (default 30). Regression tests in
+  `tests/test_stale_worktree_check.py`; runbook section in
+  `docs/onboarding.md#stale-worktree-pre-flight-check-383`.
 - **`#393`** — `openstudio_operator_metrics_server_bound{addr,port}`:
   metrics-server bind-outcome gauge. `start_metrics_server()` catches
   `OSError` and only logged a WARNING — the operator continued with
