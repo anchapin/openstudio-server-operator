@@ -130,6 +130,63 @@ kubectl version --short   # the Server Version line must read v1.30 or newer
   and `batch/jobs` verbs (#293/#294), so those ServiceAccounts stay as
   wide as their RBAC Roles allow.
 
+### Corporate PKI: optional TLS CA bundle for the upstream server URL (issue #396)
+
+The operator's REST client pins `verify=True` and honors the
+`OPENSTUDIO_TLS_CA_BUNDLE` env var (`openstudio_client.py::
+_resolve_tls_ca_bundle`, issue #296). Default: the env var ships as an
+empty string and the client uses the system trust store —
+`deploy/operator-deployment.yaml` applies and runs with **no Secret
+present**. On a cluster whose `spec.serverUrl` traffic is fronted by a
+corporate CA, enable the bundle in this order (the volumeMount + secret
+volume ship commented-out in the manifest, mirroring the #401
+metrics-token pattern — a live `secretName` reference to a missing
+Secret would block pod scheduling):
+
+1. Create the Secret **before** applying the uncommented Deployment:
+
+   ```bash
+   kubectl -n openstudio-server create secret generic openstudio-tls-ca-bundle \
+     --from-file=ca-bundle.crt=/path/to/corporate-ca-bundle.pem
+   ```
+
+   The file must contain at least one `-----BEGIN CERTIFICATE-----` PEM
+   block; the client validates this on first tick and aborts every tick
+   with `OperatorConfigError` otherwise (the #296 fence).
+
+2. In `deploy/operator-deployment.yaml`, uncomment BOTH `tls-ca-bundle`
+   stanzas (the `volumeMounts` entry and the `volumes[].secret` entry)
+   and set the env override to the in-pod path the mount produces:
+
+   ```yaml
+   env:
+     - name: OPENSTUDIO_TLS_CA_BUNDLE
+       value: /etc/openstudio/tls/ca-bundle.crt
+   ```
+
+   The mount name, secret name, mount path, and key→path mapping are
+   pinned by `tests/test_deploy_manifests.py` (issue #396) — keep the
+   manifest, the env value, and this runbook in sync.
+
+3. Apply and verify the first tick reads the bundle:
+
+   ```bash
+   kubectl -n openstudio-server apply -f deploy/operator-deployment.yaml
+   kubectl -n openstudio-server rollout status deployment/openstudio-operator
+   kubectl -n openstudio-server logs deployment/openstudio-operator --tail=50
+   ```
+
+   A healthy first tick shows the usual timer-handler boot with **no**
+   `OperatorConfigError` / `OPENSTUDIO_TLS_CA_BUNDLE` line. A
+   set-but-broken value (Secret forgotten, stanza left commented, non-PEM
+   file) fails loud on every tick — that abort is the #296 fence working,
+   not a bug to work around; fix the offending step above.
+
+Scope guard (issue #396): this bundle governs the **upstream
+`spec.serverUrl` REST traffic only** — it does NOT change the operator's
+own kube-apiserver connection and does NOT touch the rclone archival
+credentials.
+
 ## Phase 0 — pre-flight: fixture drift on the work cluster
 
 Confirm the work cluster's REST surface still matches the contract the
