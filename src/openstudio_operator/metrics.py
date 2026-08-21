@@ -554,7 +554,7 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
 )
 
 # Issue #306 — observability surface for the storage-prune CronJob's
-# skip-tick branches. The CronJob runs as a separate process from the
+# failure branches. The CronJob runs as a separate process from the
 # operator (deploy/storage-cronjob.yaml invoking
 # ``openstudio_operator.prune_entrypoint.main()``); the two skip-tick
 # branches — ``prune_entrypoint.py:213-222`` (CR list failure) and
@@ -570,11 +570,14 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
 # operator Deployment, gated by the parallel
 # ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy), so a
 # Prometheus job can scrape both processes out of the same target list.
-# Labels mirror the two branch sites: ``cr_list_failure`` for the kube
-# API list path, ``runtime_failure`` for the D12 exception tuple. The
+# Labels mirror the three branch sites: ``cr_list_failure`` for the kube
+# API list path, ``runtime_failure`` for the D12 exception tuple, and
+# ``redis_url_empty`` for the exit-3 empty-``spec.redisUrl`` guard
+# (issue #392 — the loud Failed-pod signal, wired to the same counter so
+# the #306 dashboard alert covers a sustained redisUrl wedge too). The
 # exception class name is already in the WARNING log line via
 # ``type(exc).__name__`` — keeping the label vocabulary bounded to the
-# two branch names keeps cardinality trivial (2 series max) and matches
+# three branch names keeps cardinality trivial (3 series max) and matches
 # the regex of "one increment per tick the wrapper suppressed" that
 # #117 established for the handler wrappers.
 PRUNE_TICK_FAILURES_TOTAL = Counter(
@@ -586,9 +589,12 @@ PRUNE_TICK_FAILURES_TOTAL = Counter(
     "``run_retention_tick``) log at WARNING and return exit code 0, so "
     "without this counter a sustained degraded window (Redis unreachable, "
     "REST 5xx storm, StatusStoreConflictError) is invisible at "
-    "``/metrics``. Labelled by ``reason`` (cr_list_failure | "
-    "runtime_failure) — mirror of the two branch sites, bounded "
-    "cardinality (2 series total). Increment-by-1 per tick the entrypoint "
+    "``/metrics``. The exit-3 empty-``spec.redisUrl`` guard (issue #392) "
+    "is the third bump site — the loud Failed-pod signal, on the same "
+    "counter so the #306 dashboard alert covers a sustained redisUrl "
+    "wedge. Labelled by ``reason`` (cr_list_failure | runtime_failure | "
+    "redis_url_empty) — mirror of the three branch sites, bounded "
+    "cardinality (3 series total). Increment-by-1 per tick the entrypoint "
     "suppresses; the WARNING log line records the same event for log "
     "forwarding with the exception class name. Scraped from the "
     "CronJob pod's plaintext ``/metrics`` on port 9090 (gated by the "

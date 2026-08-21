@@ -327,7 +327,8 @@ metadata:
       same-namespace peer). Issue #306 — the CronJob now exposes
       ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL, and the new
       PRUNE_TICK_FAILURES_TOTAL{reason} counter (bumped by the two
-      skip-tick branches in prune_entrypoint.main()).
+      skip-tick branches and the exit-3 empty-redisUrl guard #392 in
+      prune_entrypoint.main()).
 spec:
   podSelector:
     matchLabels:

@@ -146,7 +146,7 @@ spec:
               # ANALYSES_DELETED_TOTAL (retention.py:316, 394, 441), and the
               # new PRUNE_TICK_FAILURES_TOTAL{reason} counter that the two
               # skip-tick branches (CR list failure + D12 exception tuple)
-              # bump. The endpoint is gated by the parallel
+              # and the exit-3 empty-redisUrl guard (#392) bump. The endpoint is gated by the parallel
               # ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy
               # in deploy/network-policy.yaml — same Prometheus-style
               # allow-list (namespace-matched scraper + same-namespace peer)
