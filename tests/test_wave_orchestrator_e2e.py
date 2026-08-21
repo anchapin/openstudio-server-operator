@@ -28,7 +28,11 @@ corruption+resume episode) and asserts:
 * (when node is available) the snapshot ``wave-planner.js`` produces the
   same plan as the Python harness, and
 * (when bash is available) the snapshot ``verify_issues_closed.sh``
-  passes/fails correctly through a fake ``gh`` executable on PATH.
+  passes/fails correctly through a fake ``gh`` executable on PATH, and
+* (issue #379) the wave-numbered skill-snapshot naming convention
+  (``SKILL.wave-<N>.md``) lets two concurrent skill-touching waves rebase
+  clean against real git while the legacy single-name pattern reproduces
+  the add/add conflict, plus the harness FakeGit model mirrors both.
 
 No network; every external command is doubled by the harness.
 """
@@ -626,3 +630,155 @@ class TestSnapshotScripts:
         assert payload["_meta"]["mode"] == "dry-run"
         assert payload["_meta"]["total_issues"] == 3
         assert "waves" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Skill-snapshot naming convention (issue #379): wave-numbered snapshot
+# names (SKILL.wave-<N>.md) make concurrent skill-touching waves
+# collision-free; the legacy single-name pattern (every wave adding
+# docs/skill-snapshot/SKILL.md) is the proven add/add failure mode.
+# ---------------------------------------------------------------------------
+
+HAS_GIT = shutil.which("git") is not None
+
+GIT_TEST_ENV = {
+    **os.environ,
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+}
+
+
+def _git(
+    repo: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=wave-orchestrator@test",
+            "-c",
+            "user.name=wave-orchestrator-test",
+            "-C",
+            str(repo),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=GIT_TEST_ENV,
+    )
+    if check and completed.returncode != 0:
+        raise AssertionError(f"git {args!r} failed:\n{completed.stderr}")
+    return completed
+
+
+def _snapshot_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A real git repo on branch ``develop`` with one base commit.
+
+    Returns ``(repo, base_sha)`` — the shared pre-merge point both wave
+    branches cut from, which is the 2026-08-20 cycle shape: wave 2's
+    worktree existed before wave 1's snapshot merged.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "checkout", "-b", "develop")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+    return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _commit_snapshot(repo: Path, name: str, content: str) -> None:
+    snapshot = repo / "docs" / "skill-snapshot" / name
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(content, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", f"snapshot {name}")
+
+
+class TestSkillSnapshotNumberedNames:
+    @pytest.mark.skipif(not HAS_GIT, reason="git not available")
+    def test_numbered_names_rebase_clean_across_waves(
+        self, tmp_path: Path
+    ) -> None:
+        """The #379 acceptance drill against real git: wave 1 adds
+        ``SKILL.wave-1.md`` and merges; wave 2 branched from the SAME
+        pre-merge base adds ``SKILL.wave-2.md`` and rebases onto develop —
+        zero conflicts, and both full snapshots coexist on develop."""
+        repo, base = _snapshot_repo(tmp_path)
+
+        _git(repo, "checkout", "-b", "fix/issue-401-wave1-skill")
+        _commit_snapshot(repo, "SKILL.wave-1.md", "# phase 3c v1\n")
+        _git(repo, "checkout", "develop")
+        _git(repo, "merge", "--no-ff", "fix/issue-401-wave1-skill")
+
+        _git(repo, "checkout", "-b", "fix/issue-402-wave2-skill", base)
+        _commit_snapshot(repo, "SKILL.wave-2.md", "# phase 3c v2\n")
+        rebase = _git(repo, "rebase", "develop", check=False)
+        assert rebase.returncode == 0, rebase.stderr
+        assert _git(repo, "ls-files", "-u").stdout == ""  # zero unmerged paths
+
+        _git(repo, "checkout", "develop")
+        _git(repo, "merge", "--no-ff", "fix/issue-402-wave2-skill")
+        for name in ("SKILL.wave-1.md", "SKILL.wave-2.md"):
+            assert (repo / "docs" / "skill-snapshot" / name).exists()
+
+    @pytest.mark.skipif(not HAS_GIT, reason="git not available")
+    def test_legacy_single_name_add_add_conflicts(self, tmp_path: Path) -> None:
+        """The failure mode #379 exists to kill: two waves adding the bare
+        ``SKILL.md`` (each carrying its own skill-home content) produce a
+        real add/add conflict at rebase — proving the regression test
+        above guards a real failure, not a hypothetical."""
+        repo, base = _snapshot_repo(tmp_path)
+
+        _git(repo, "checkout", "-b", "fix/issue-401-legacy-skill")
+        _commit_snapshot(repo, "SKILL.md", "# phase 3c v1\n")
+        _git(repo, "checkout", "develop")
+        _git(repo, "merge", "--no-ff", "fix/issue-401-legacy-skill")
+
+        _git(repo, "checkout", "-b", "fix/issue-402-legacy-skill", base)
+        _commit_snapshot(repo, "SKILL.md", "# phase 3c v2 (edited)\n")
+        rebase = _git(repo, "rebase", "develop", check=False)
+        assert rebase.returncode != 0
+        unmerged = _git(repo, "ls-files", "-u").stdout.splitlines()
+        assert unmerged, "expected an add/add conflict on the snapshot path"
+        assert {line.rsplit("/", 1)[-1] for line in unmerged} == {"SKILL.md"}
+        stages = {int(line.split()[2]) for line in unmerged}
+        assert {2, 3} <= stages  # ours + theirs → add/add, not a base edit
+        _git(repo, "rebase", "--abort")
+
+    def test_harness_model_legacy_names_collide(self) -> None:
+        """FakeGit's conflict model (branch files ∩ develop files) mirrors
+        the legacy collision: both waves snapshot the bare SKILL.md."""
+        git = harness_mod.FakeGit()
+        git.branch_files["fix/issue-401-legacy"] = {"docs/skill-snapshot/SKILL.md"}
+        git.branch_files["fix/issue-402-legacy"] = {"docs/skill-snapshot/SKILL.md"}
+        git.merge_into_develop("fix/issue-401-legacy")
+        assert git.conflicting_files("fix/issue-402-legacy") == [
+            "docs/skill-snapshot/SKILL.md"
+        ]
+
+    def test_harness_model_numbered_names_are_disjoint(self) -> None:
+        git = harness_mod.FakeGit()
+        git.branch_files["fix/issue-401-numbered"] = {
+            "docs/skill-snapshot/SKILL.wave-1.md"
+        }
+        git.branch_files["fix/issue-402-numbered"] = {
+            "docs/skill-snapshot/SKILL.wave-2.md"
+        }
+        git.merge_into_develop("fix/issue-401-numbered")
+        assert git.conflicting_files("fix/issue-402-numbered") == []
+
+    def test_committed_snapshots_follow_numbered_convention(self) -> None:
+        """The repo-side artifact of the convention: at least one
+        wave-numbered snapshot exists and the newest one carries the §3a
+        copy rule (skill-home SKILL.md Phase 3a, mirrored verbatim)."""
+        numbered = sorted(
+            harness_mod.SNAPSHOT_DIR.glob("SKILL.wave-*.md"),
+            key=lambda path: int(path.stem.removeprefix("SKILL.wave-")),
+        )
+        assert numbered, "no wave-numbered SKILL snapshot committed (issue #379)"
+        newest = numbered[-1].read_text(encoding="utf-8")
+        assert "SKILL.wave-${WAVE}.md" in newest
+        assert "issue #379" in newest.lower()
