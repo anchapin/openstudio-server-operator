@@ -66,10 +66,12 @@ def test_every_declared_gauge_family_in_registry_exposition():
 
 def test_every_declared_histogram_family_in_registry_exposition():
     # Issue #179 — Histogram, like a labelled Counter, only exposes its
-    # `# TYPE` family line after the first observation. The pre-touch
-    # below keeps the family-existence assertion self-contained
-    # (mirrors the labelled-counter pattern from #117).
-    metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    # `# TYPE` family line after the first observation. Issue #472 makes
+    # ANALYSIS_DATAPOINT_COUNT a labelled Histogram (``view``), so the
+    # pre-touch below carries the label — same pattern as the #308
+    # labelled histograms. Keeps the family-existence assertion
+    # self-contained (mirrors the labelled-counter pattern from #117).
+    metrics.ANALYSIS_DATAPOINT_COUNT.labels(view="analyses_per_tick").observe(1)
     # Issue #308 — labelled Histograms need at least one labelled
     # observation before the family line is exposed. Pre-touch each
     # labelled histogram so the family-existence assertion is
@@ -354,11 +356,12 @@ def test_metrics_http_server_serves_all_declared_counters():
         else:
             assert f"\n{name} " in response.text
     # Issue #179: histogram exposed alongside counters and the gauge. The
-    # pre-touch above creates the sentinel SERIES for the labelled counter;
-    # the histogram is unlabelled, but it ALSO only emits its `# TYPE` line
-    # after the first observation. Pre-touch it here so the family-existence
-    # assertion is self-contained (mirrors the labelled-counter pattern).
-    metrics.ANALYSIS_DATAPOINT_COUNT.observe(1)
+    # pre-touch above creates the sentinel SERIES for the labelled counter.
+    # Issue #472 makes this histogram labelled (``view``) — it also only
+    # emits its `# TYPE` line after the first labelled observation.
+    # Pre-touch it here so the family-existence assertion is self-contained
+    # (mirrors the labelled-counter pattern).
+    metrics.ANALYSIS_DATAPOINT_COUNT.labels(view="analyses_per_tick").observe(1)
     # Issue #308 — labelled Histograms (handler_tick_duration_seconds,
     # rest_request_duration_seconds) need at least one labelled observation
     # before the family line is exposed. Pre-touch each labelled histogram
@@ -380,6 +383,15 @@ def test_metrics_http_server_serves_all_declared_counters():
             # client-side change to label ordering is caught here.
             assert (
                 'openstudio_operator_handler_tick_duration_seconds_bucket{le="0.1",module="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_analysis_datapoint_count":
+            # Issue #472 — labelled by ``view``; prometheus_client emits
+            # labels alphabetically (``le`` < ``view``). The observe(1)
+            # pre-touch above lands in the le="5" bucket.
+            assert (
+                'openstudio_operator_analysis_datapoint_count_bucket'
+                '{le="5.0",view="analyses_per_tick"}'
                 in response.text
             )
         elif name == "openstudio_operator_rest_request_duration_seconds":

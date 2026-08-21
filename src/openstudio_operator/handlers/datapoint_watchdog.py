@@ -144,11 +144,14 @@ def run_watchdog_tick(
     max_runtime = timedelta(minutes=config.datapoint_policy.max_datapoint_runtime_minutes)
     max_requeues = config.datapoint_policy.max_auto_requeues
     started_ids = _datapoint_ids(client.list_started_datapoints())
-    # Issue #179 — observe the per-CR datapoint budget observed by the
-    # watchdog's initial poll. Recorded once per tick (per-observation), no
-    # labels — the SLA monitor records the same family for the analyses
-    # view, sharing one chart on the operator's dashboard.
-    ANALYSIS_DATAPOINT_COUNT.observe(len(started_ids))
+    # Issue #179 — observe the per-tick started-datapoint count from the
+    # watchdog's initial poll. Recorded once per tick (per-observation).
+    # Issue #472 — the ``view`` label separates this site's datapoints
+    # population from the SLA monitor's analyses population; the two
+    # units must never share a series.
+    ANALYSIS_DATAPOINT_COUNT.labels(view="started_datapoints_per_tick").observe(
+        len(started_ids)
+    )
     live = set(started_ids)
     started_since = store.get_started_since_map()
 
