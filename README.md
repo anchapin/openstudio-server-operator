@@ -60,21 +60,23 @@ restart. The scrape target is the operator Pod on port 9090 (matches the
 `containerPort` in `deploy/operator-deployment.yaml`).
 
 **Source of truth:** the family names below mirror
-`tests/test_metrics_endpoint.py::EXPECTED_COUNTER_FAMILIES`,
-`EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES` exactly —
-the test asserts `declared == expected` on every CI run, so adding a counter,
-gauge, or histogram here without adding it there (or vice versa) fails CI
-loudly. **Current shape: 19 counters + 7 gauges + 3 histograms (post-#171
-status-map defensive cap; post-#179 datapoint-budget distribution; post-#237
-EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue depth
-gauges; post-#239 singleton-guard election outcome counter; post-#253 Redis
-key-layout validation status gauge; post-#254 sustained-window elapsed
+`tests/_metrics_inventory.py` — the canonical `EXPECTED_COUNTER_FAMILIES`,
+`EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES` tuples shared by
+`tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
+(#406) — exactly; the tests assert `declared == expected` on every CI run, so
+adding a counter, gauge, or histogram here without adding it there (or vice
+versa) fails CI loudly. **Current shape: 19 counters + 8 gauges + 3 histograms
+(post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
+post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
+depth gauges; post-#239 singleton-guard election outcome counter; post-#253
+Redis key-layout validation status gauge; post-#254 sustained-window elapsed
 seconds gauge; post-#255 kopf.event emission failure counter; post-#306
 storage-prune CronJob skip-tick failure counter; post-#308 handler tick and
 REST round-trip duration histograms; post-#310 QueuedKopfEventSink
 backpressure drop counter + Queue depth gauge; post-#312 paired freshness
 timestamp gauges for `resque_queue_depth` and `stall_window_elapsed_seconds`;
-post-#403 singleton-guard loser per-tick skip counter).**
+post-#403 singleton-guard loser per-tick skip counter; post-#393 metrics-server
+bind-outcome gauge).**
 
 **Optional bearer-token authN (issue #401):** by default the endpoint is open
 plaintext behind the `openstudio-operator-metrics-ingress` NetworkPolicy
@@ -91,7 +93,7 @@ rotation takes effect without an operator restart, and a missing or empty
 file fails closed (every request 401s). No TLS is added — that is a separate
 concern requiring cert management.
 
-The seven metric families added since the 16+4+1 claim are signed off below
+The metric families added since the 16+4+1 claim are signed off below
 for the on-call's reference; the drift-integrity invariant that fails CI is
 the `N counters + M gauges + K histograms` count itself, not any one
 specific family:
@@ -112,6 +114,11 @@ specific family:
   per-`module` wall-clock duration of the four @kopf.timer wrappers.
 - `openstudio_operator_rest_request_duration_seconds` (histogram, #308) —
   per-`(method, outcome)` wall-clock duration of OpenStudioClient REST calls.
+- `openstudio_operator_singleton_loser_skips_total` (counter, #403) — per-tick
+  singleton-guard loser suppressions (per `(module, namespace, name)`).
+- `openstudio_operator_metrics_server_bound` (gauge, #393) — outcome of the
+  /metrics server's first bind attempt (per `(addr, port)`); `== 0` is the
+  canonical "Prometheus scrape is down because of US" signal.
 
 | Family | Type | Module / issue origin | Meaning for an on-call |
 |---|---|---|---|
@@ -144,6 +151,7 @@ specific family:
 | `openstudio_operator_resque_queue_depth_fresh` | gauge | `web_background_monitor` (`_stall_condition_holds` post-`queue_depths()`) · #312 | Last-successful-update Unix timestamp for the `resque_queue_depth` data gauge. Set to `time.time()` immediately after every successful `queue_depths()` Redis call — NOT touched on the exception path (Redis unreachable, ApiException, etc.). The data gauge advances on success but is a static stale value on failure; without this freshness pair, a prior tick's value masquerades as a live reading while the operator has in fact lost visibility. Dashboard query: `time() - openstudio_operator_resque_queue_depth_fresh` — alert on a sustained gap (e.g. > 5× the sensing tick cadence). |
 | `openstudio_operator_stall_window_fresh` | gauge | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) · #312 | Last-successful-update Unix timestamp for the `stall_window_elapsed_seconds` data gauge. Set to `time.time()` immediately after the `STALL_WINDOW_ELAPSED_SECONDS.set(...)` sequence on both the holding and broken paths. Unlabelled — one series (the reading site is unique, process-wide). Mirrors the `resque_queue_depth_fresh` round-trip pattern; the dashboard staleness computation `time() - fresh` works identically. Resetting only the freshness gauge (simulating "we lost visibility") leaves the data gauge holding its prior value — the exact failure mode #312 fixes. |
 | `openstudio_operator_warnings_deferred_queue_depth` | gauge | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) · #310 | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up — a companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000) so the drop path can be diagnosed before silent loss starts. |
+| `openstudio_operator_metrics_server_bound{addr,port}` | gauge (labelled) | `metrics` (`start_metrics_server` first bind attempt) · #393 | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address); never re-touched after the first attempt. Labelled by `addr` + `port` (the configured bind target — `0.0.0.0:9090` in the stock deployment, the same surface the `containerPort`, NetworkPolicy, and Prometheus scrape config reference). Covers the bind attempt in BOTH authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). **Alert on `== 0`: the canonical "Prometheus scrape is down because of US" signal** — it distinguishes "the metrics endpoint never bound" from "operator wedged / wrong scrape config" without log scraping for the `Cannot serve /metrics` WARNING. Self-referential edge: when the bind failed, this pod's `/metrics` is dead, so the `0.0` cannot be scraped from the pod itself — pair the alert with blackbox-exporter `up == 0` (the gauge is the durable record for post-mortems and confirms the operator-side cause). |
 
 The labelled counters emit one series per label combo; only the observed
 combos appear in the exposition (prometheus_client behaviour for labelled
@@ -160,7 +168,10 @@ by `reason` (same 7 vocabulary as `events_emitted_total`),
 vocabulary is the four handler names, same as `handler_tick_failures_total`;
 the namespace × name cross-product is bounded by the singleton guard's
 one-winner-per-namespace invariant, D05), and
-`resque_queue_depth` by `queue` (2 — the two managed queues). The labelled
+`resque_queue_depth` by `queue` (2 — the two managed queues). The one
+labelled gauge, `metrics_server_bound`, is labelled by `(addr, port)`
+(1 series — the single first bind attempt; cardinality is fixed by design,
+not bounded by an invariant). The labelled
 histograms (`handler_tick_duration_seconds`, `rest_request_duration_seconds`)
 follow the same convention — one labelled series per label combo. See each
 row for the vocabulary.
@@ -261,7 +272,7 @@ kubectl logs -n openstudio-server job/openstudio-prune-<timestamp> \
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (19+7+3)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (19+8+3)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

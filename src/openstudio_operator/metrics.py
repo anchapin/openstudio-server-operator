@@ -21,6 +21,13 @@ Unset/empty = the pre-#401 open-plaintext behavior (NetworkPolicy is then the
 only gate). The token file is re-read on EVERY request, so a kubelet-mounted
 Secret rotation (atomic symlink swap) takes effect without an operator restart;
 a missing/empty file at request time fails CLOSED (401 for everything).
+
+Issue #393 — bind-failure observability: ``start_metrics_server`` catches
+``OSError`` and logs a WARNING (losing metrics must never take the operator
+down), which historically left the failure invisible at ``/metrics`` itself.
+:data:`METRICS_SERVER_BOUND` records the FIRST bind attempt's outcome
+(``1.0`` bound, ``0.0`` OSError) as a labelled Gauge so the outage is a
+Prometheus signal, not a log line.
 """
 
 import hmac
@@ -734,9 +741,48 @@ DEFAULT_METRICS_PORT = METRICS_PORT
 #: ``OPENSTUDIO_TLS_CA_BUNDLE`` hook (#242).
 METRICS_TOKEN_FILE_ENV = "OPENSTUDIO_METRICS_TOKEN_FILE"
 
+# Issue #393 — metrics-server bind-outcome Gauge. ``start_metrics_server``
+# catches ``OSError`` and only logs a WARNING (the operator continues with
+# /metrics dead, ``_started`` stays False) — the bind failure was invisible
+# at ``/metrics`` itself: a blackbox-exporter ``up == 0`` could not
+# distinguish "operator wedged" from "metrics endpoint never bound", and
+# the only operator-side signal was a log line (logs are not alerts). This
+# Gauge records the FIRST bind attempt's outcome: ``1.0`` on a successful
+# bind, ``0.0`` on ``OSError`` (port already in use, unbindable addr) —
+# never re-touched after the first attempt (first-attempt semantics, per
+# the issue body; a later retry on a different port must not silently
+# rewrite history). Labelled by ``addr`` + ``port`` — the CONFIGURED bind
+# target (`0.0.0.0:9090` in the stock deployment), i.e. what the
+# deployment manifest / NetworkPolicy / Prometheus scrape config all
+# reference, so an SRE reading ``metrics_server_bound{addr="0.0.0.0",
+# port="9090"} == 0`` knows exactly which surface is dead. Covers THE
+# bind attempt regardless of authN mode: the plain
+# ``prometheus_client.start_http_server`` path and the #401
+# ``make_server`` path share the single ``except OSError`` branch. The
+# README metrics table documents the alert ``metrics_server_bound == 0``
+# as the canonical "Prometheus scrape is down because of US" signal.
+METRICS_SERVER_BOUND = Gauge(
+    "openstudio_operator_metrics_server_bound",
+    "Outcome of the /metrics server's first bind attempt (issue #393). "
+    "1.0 when the bind succeeded and /metrics is being served; 0.0 when "
+    "the bind raised OSError (port already in use, unbindable address) — "
+    "the WARNING log still fires, but the outage is also a Prometheus "
+    "signal. Labelled by ``addr`` and ``port`` (the configured bind "
+    "target). Never re-touched after the first attempt. Alert on "
+    "``openstudio_operator_metrics_server_bound == 0`` — the canonical "
+    "'Prometheus scrape is down because of US' signal (distinguishes an "
+    "unbound metrics endpoint from a wedged operator).",
+    labelnames=["addr", "port"],
+)
+
 _start_lock = threading.Lock()
 _started = False
 _active_port: int | None = None
+#: Issue #393 — latch so the bind gauge records the FIRST attempt only.
+#: Set (under ``_start_lock``) the first time the bind outcome — success OR
+#: failure — is recorded; every later ``start_metrics_server`` call (retries
+#: included) leaves the gauge untouched.
+_bind_gauge_latched = False
 
 
 def _read_bearer_token(token_file: str) -> str | None:
@@ -872,8 +918,14 @@ def start_metrics_server(
     plaintext server, unchanged. The wiring is checked once at start (a
     missing/empty token file logs a warning — every request then fails
     closed with 401 until the file appears).
+
+    Issue #393 — the first bind attempt's outcome is recorded on
+    :data:`METRICS_SERVER_BOUND` (``1.0`` bound / ``0.0`` OSError,
+    labelled by the configured ``addr``/``port``) and never re-touched
+    after that first attempt — the bind failure is a /metrics signal,
+    not just a WARNING log.
     """
-    global _started, _active_port
+    global _started, _active_port, _bind_gauge_latched
     with _start_lock:
         if _started:
             return _active_port
@@ -902,8 +954,23 @@ def start_metrics_server(
             else:
                 server, thread = prometheus_client.start_http_server(bound_port, addr=addr)
         except OSError as exc:
+            if not _bind_gauge_latched:
+                # Issue #393 — first-attempt latch: record the failure on the
+                # bind-outcome gauge. The WARNING log still fires below (logs
+                # are not alerts); the gauge makes the outage a /metrics
+                # signal. NOTE the self-referential edge: with the bind dead,
+                # THIS pod's /metrics is unscrapeable — the 0.0 is the durable
+                # record for post-mortems (and correlates the blackbox
+                # ``up == 0`` with "the endpoint never bound").
+                METRICS_SERVER_BOUND.labels(addr=addr, port=str(bound_port)).set(0.0)
+                _bind_gauge_latched = True
             logger.warning("Cannot serve /metrics on %s:%s: %s", addr, bound_port, exc)
             return None
+        if not _bind_gauge_latched:
+            # Issue #393 — same first-attempt latch on the success side: a
+            # successful bind advances the gauge to 1.0 exactly once.
+            METRICS_SERVER_BOUND.labels(addr=addr, port=str(bound_port)).set(1.0)
+            _bind_gauge_latched = True
         _started = True
         _active_port = server.server_address[1]
         logger.info(

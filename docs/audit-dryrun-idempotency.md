@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (717 tests across 36 files, current count)
+ruff check . && pytest                       # both green (720 tests across 36 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,8 +230,11 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **19 counters + 7 gauges + 3 histograms** — is asserted by `tests/test_metrics_endpoint.py`'s
-`EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and `EXPECTED_HISTOGRAM_FAMILIES`:
+local; the scrape is in-cluster). The exhaustive inventory — **19 counters + 8 gauges + 3 histograms** — is asserted by the canonical
+`EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
+`EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
+(#406; shared by `tests/test_metrics_endpoint.py` and
+`tests/test_walk_metrics_registry.py`):
 drift in either direction fails CI before it ships, so any new metric added to
 this codebase MUST be added to both the table below and the matching
 `EXPECTED_*` tuple in the same PR (the `hpa_floor_adjustments_total`
@@ -248,7 +251,10 @@ duration histograms, #310 QueuedKopfEventSink drop counter + queue depth
 gauge, #312 paired freshness timestamp gauges for `resque_queue_depth`
 and `stall_window_elapsed_seconds`). The post-#312 → 19+7+3 expansion is
 #403 (singleton-guard loser per-tick skip counter — the per-tick twin of
-the change-gated #239 election counter).
+the change-gated #239 election counter). The post-#403 → 19+8+3 expansion
+is #393 (metrics-server bind-outcome gauge — the first bind attempt's
+`1.0`/`0.0` record; D11-exempt like the rest of the registry, and set
+once at process start, before any dry-run-gated action could exist).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -309,6 +315,7 @@ unlabelled counter here is exactly the regression #181 guards against.
 | `openstudio_operator_resque_queue_depth_fresh` | `web_background_monitor` (`_stall_condition_holds` post-`queue_depths()`) (#312) | Last-successful-update Unix timestamp for the `resque_queue_depth` data gauge. Set to `time.time()` immediately after every successful `queue_depths()` Redis call — NOT touched on the exception path (Redis unreachable, ApiException, etc.). | n/a — staleness pair for `resque_queue_depth`; the data gauge advances on success but is a static stale value on failure, and without this freshness pair the operator has lost visibility silently. Dashboard query: `time() - openstudio_operator_resque_queue_depth_fresh` — alert on a sustained gap (e.g. > 5× the sensing tick cadence). |
 | `openstudio_operator_stall_window_fresh` | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) (#312) | Last-successful-update Unix timestamp for the `stall_window_elapsed_seconds` data gauge. Set to `time.time()` immediately after the `STALL_WINDOW_ELAPSED_SECONDS.set(...)` sequence on both the holding and broken paths. | n/a — staleness pair for `stall_window_elapsed_seconds`; mirrors the `resque_queue_depth_fresh` round-trip pattern. Resetting only the freshness gauge (simulating "we lost visibility") leaves the data gauge holding its prior value — the exact failure mode #312 fixes. |
 | `openstudio_operator_warnings_deferred_queue_depth` | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) (#310) | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. | n/a — observability for QueuedKopfEventSink backpressure. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up. Companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000). |
+| `openstudio_operator_metrics_server_bound` | `metrics` (`start_metrics_server` first bind attempt) (#393) | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address). Never re-touched after the first attempt. **Labelled by `(addr, port)`** (the configured bind target — `0.0.0.0:9090` in the stock deployment; 1 series, fixed cardinality). Covers both authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). | n/a — the canonical "Prometheus scrape is down because of US" signal (`== 0`). Self-referential edge: a failed bind means this pod's `/metrics` is unscrapeable, so the `0.0` is the durable post-mortem record and pairs with blackbox-exporter `up == 0`; the WARNING log still fires. Not a decision counter — does not follow the §2 anchor pairing convention. |
 
 ### Histograms
 

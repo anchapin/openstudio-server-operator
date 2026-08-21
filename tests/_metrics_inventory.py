@@ -106,6 +106,11 @@ EXPECTED_COUNTER_FAMILIES = (
 #: Events are piling up — a companion to the
 #: ``warnings_deferred_dropped_total`` Counter which fires when the
 #: cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded.
+#:
+#: Issue #393 — ``metrics_server_bound`` Gauge records the /metrics
+#: server's FIRST bind attempt outcome (1.0 bound / 0.0 OSError),
+#: labelled by the configured ``(addr, port)``. ``== 0`` is the
+#: canonical "Prometheus scrape is down because of US" signal.
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -114,6 +119,7 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_queue_depth_fresh",
     "openstudio_operator_stall_window_fresh",
     "openstudio_operator_warnings_deferred_queue_depth",
+    "openstudio_operator_metrics_server_bound",
 )
 
 #: Issue #179 — per-CR datapoint-budget Histogram. The SLA monitor and the
