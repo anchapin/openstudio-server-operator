@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green ( 728 tests across 37 files, current count)
+ruff check . && pytest                       # both green (730 tests across 37 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
