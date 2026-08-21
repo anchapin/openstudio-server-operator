@@ -685,26 +685,29 @@ def test_sustained_status_409_raises_out_of_tick_with_requeue_unrecorded(monkeyp
 
 
 @responses.activate
-def test_raw_api_exception_from_status_patch_propagates_uncounted(monkeypatch, caplog):
-    """Issue #466 (c) — pins CURRENT behavior; #493 owns any change.
+def test_raw_api_exception_from_status_patch_is_counted_by_shared_skip_tuple(monkeypatch, caplog):
+    """Issue #466 (c), post-#473 — the shared tuple widened the catch.
 
-    The wrapper's except tuple is ``(OpenStudioApiError, StatusStoreError)``
-    — narrower than the analysis_sla / worker_recycler / web_background_monitor
-    wrappers, which all additionally catch ApiException. StatusStore re-raises
-    non-409 ApiExceptions verbatim, so a raw kubernetes ApiException escapes
-    BOTH run_watchdog_tick and the wrapper: no counter bump, no skip-tick
-    warning — kopf logs it as an uncaught handler error. #493 owns
-    standardizing the skip-tick exception set; this test pins the behavior as
-    it ships today."""
+    StatusStore re-raises non-409 ApiExceptions verbatim. Pre-#473 the
+    watchdog wrapper's except tuple was ``(OpenStudioApiError,
+    StatusStoreError)`` — narrower than its siblings — so a raw
+    kubernetes ApiException escaped the wrapper uncounted. #473 unified
+    the four wrappers onto one canonical skip-tick tuple (the union of
+    the historical per-module tuples) in
+    ``_oscm_handlers.run_oscm_tick``, which includes ``ApiException``:
+    the exception is now swallowed, counted, logged, and the tick is
+    re-attempted next poll (D12) — same fail-soft posture the
+    analysis_sla / worker_recycler / web_background wrappers always had.
+    """
     api = ExplodingPatchFakeCustomObjectsApi(make_cr())
     register_started("d1")
 
     before = tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "ApiException")
-    with pytest.raises(ApiException):
-        call_wrapper(monkeypatch, api=api)
+    result = call_wrapper(monkeypatch, api=api)
 
-    assert tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "ApiException") == before
-    assert "tick skipped" not in caplog.text
+    assert result is None, "shared tuple must swallow ApiException and return None (D12)"
+    assert tick_failures_total(NAMESPACE, NAME, "datapoint_watchdog", "ApiException") - before == 1.0
+    assert "datapoint watchdog tick skipped, retrying next poll (ApiException" in caplog.text
     # The tick died at the very first status write (first observation clock).
     assert api.patch_calls == 0
     assert api.obj["status"] == {}

@@ -89,7 +89,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Protocol
 
 import kopf
@@ -97,6 +97,7 @@ from kubernetes.client import ApiException
 
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
+    run_oscm_tick,
 )
 from openstudio_operator._oscm_handlers import (
     register_fn as _register_oscm_handler,
@@ -109,12 +110,10 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
-    HANDLER_TICK_FAILURES_TOTAL,
     SOFT_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
 )
-from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
-from openstudio_operator.redis_client import RedisClientError
+from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_core_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
@@ -122,7 +121,6 @@ from openstudio_operator.status_store import (
     VERSION,
     SoftStopRecord,
     StatusStore,
-    StatusStoreError,
 )
 
 logger = logging.getLogger(__name__)
@@ -595,6 +593,15 @@ def _escalate_analysis(
     return outcome
 
 
+@dataclass(frozen=True)
+class _SlaTimerClients:
+    """Client bundle the SLA timer's ``wire`` closure builds each tick (#473)."""
+
+    client: OpenStudioClient
+    pod_api: WorkerPodApi
+    redis_client: RedisClientLike
+
+
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="analysis_sla")
 def analysis_sla_monitor(
@@ -605,55 +612,61 @@ def analysis_sla_monitor(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer handler: wire config/client/store/kube/events/redis, run one tick.
+    """Timer handler: delegate the wrapper wiring to the shared tick-runner.
 
-    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
-    decorator (issue #395, replacing the per-module #308 wrapper) observes
-    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
-    (module="analysis_sla")`` in a ``finally`` — regardless of success or
-    caught exception.
+    Issue #473: config parse, the empty-serverUrl idle check, store /
+    emitter / kube-API construction, the failure counter, and the skip log
+    all live in :func:`openstudio_operator._oscm_handlers.run_oscm_tick`;
+    this module contributes only its client wiring (REST + core + Redis)
+    and the :func:`run_sla_tick` call. The shared
+    :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395) still observes the wall-clock duration on
+    ``HANDLER_TICK_DURATION_SECONDS.labels(module="analysis_sla")`` in a
+    ``finally`` — regardless of success or caught exception.
     """
-    config = OperatorConfig.from_spec(spec)
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — analysis SLA monitor idle this tick")
-        return
-    client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, operator_custom_objects_api())
-    pod_api: WorkerPodApi = operator_core_api()
-    redis_client: RedisClientLike = get_read_only_redis_client(config.redis_url)
-    # Issue #164 — single source of truth for Event emission. The class
-    # encapsulates the dry-run gate (D11) and the suppressed counter; the
-    # ``__call__`` shim keeps the ``emit("Warning", REASON, message)``
-    # syntax alive for the handler call sites below.
-    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
-    try:
-        result = run_sla_tick(
-            client,
+    def wire(config: OperatorConfig) -> _SlaTimerClients:
+        return _SlaTimerClients(
+            client=get_openstudio_client(config.server_url),
+            pod_api=operator_core_api(),
+            redis_client=get_read_only_redis_client(config.redis_url),
+        )
+
+    def tick(
+        *,
+        config: OperatorConfig,
+        store: StatusStore,
+        emit: EventEmitter,
+        deps: _SlaTimerClients,
+        now: datetime,
+    ) -> SlaTickResult:
+        return run_sla_tick(
+            deps.client,
             store,
             config,
-            now=datetime.now(UTC),
+            now=now,
             emit=emit,
             namespace=namespace,
-            pod_api=pod_api,
-            redis_client=redis_client,
+            pod_api=deps.pod_api,
+            redis_client=deps.redis_client,
         )
-    except (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError) as exc:
-        HANDLER_TICK_FAILURES_TOTAL.labels(
-            namespace=namespace,
-            name=name,
-            module="analysis_sla",
-            error_type=type(exc).__name__,
-        ).inc()
-        logger.warning(
-            "analysis SLA tick skipped, retrying next poll (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-        return
-    if result.soft_stopped:
+
+    result = run_oscm_tick(
+        spec=spec,
+        body=body,
+        namespace=namespace,
+        name=name,
+        logger=logger,
+        module="analysis_sla",
+        tick_label="analysis SLA",
+        idle_label="analysis SLA monitor",
+        custom_objects_api=operator_custom_objects_api,
+        wire=wire,
+        tick=tick,
+    )
+    if result is not None and result.soft_stopped:
         logger.info("analysis SLA monitor soft-stopped %d analysis(es)", len(result.soft_stopped))
-    if result.escalated:
+    if result is not None and result.escalated:
         logger.warning(
             "analysis SLA monitor escalated %d analysis(es) to worker-pod eviction: %s",
             len(result.escalated),

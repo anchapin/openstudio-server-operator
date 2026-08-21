@@ -60,12 +60,13 @@ recorded ones never re-fire.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import kopf
 
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
+    run_oscm_tick,
 )
 from openstudio_operator._oscm_handlers import (
     register_fn as _register_oscm_handler,
@@ -77,9 +78,8 @@ from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
     DATAPOINTS_REQUEUED_TOTAL,
-    HANDLER_TICK_FAILURES_TOTAL,
 )
-from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
@@ -87,7 +87,6 @@ from openstudio_operator.status_store import (
     VERSION,
     RequeueRecord,
     StatusStore,
-    StatusStoreError,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,48 +221,52 @@ def zombie_datapoint_watchdog(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer handler: wire config/client/store/events, run one tick.
+    """Timer handler: delegate the wrapper wiring to the shared tick-runner.
 
-    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
-    decorator (issue #395, replacing the per-module #308 wrapper) observes
-    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
-    (module="datapoint_watchdog")`` in a ``finally`` — regardless of success
-    or caught exception.
+    Issue #473: config parse, the empty-serverUrl idle check, store /
+    emitter / kube-API construction, the failure counter, and the skip log
+    all live in :func:`openstudio_operator._oscm_handlers.run_oscm_tick`;
+    this module contributes only its REST client wiring and the
+    :func:`run_watchdog_tick` call. The shared
+    :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395) still observes the wall-clock duration on
+    ``HANDLER_TICK_DURATION_SECONDS.labels(module="datapoint_watchdog")``
+    in a ``finally`` — regardless of success or caught exception.
     """
-    config = OperatorConfig.from_spec(spec)
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — datapoint watchdog idle this tick")
-        return
-    client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, operator_custom_objects_api())
-    # Issue #164 — single source of truth for Event emission; class wraps
-    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
-    # shim so the existing ``emit("Warning", REASON, message)`` call sites
-    # below keep working unchanged.
-    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
-    try:
-        requeued = run_watchdog_tick(
-            client,
+    def wire(config: OperatorConfig) -> OpenStudioClient:
+        return get_openstudio_client(config.server_url)
+
+    def tick(
+        *,
+        config: OperatorConfig,
+        store: StatusStore,
+        emit: EventEmitter,
+        deps: OpenStudioClient,
+        now: datetime,
+    ) -> list[str]:
+        return run_watchdog_tick(
+            deps,
             store,
             config,
-            now=datetime.now(UTC),
+            now=now,
             emit=emit,
             exhausted_seen=_EXHAUSTED_WARNED,
         )
-    except (OpenStudioApiError, StatusStoreError) as exc:
-        HANDLER_TICK_FAILURES_TOTAL.labels(
-            namespace=namespace,
-            name=name,
-            module="datapoint_watchdog",
-            error_type=type(exc).__name__,
-        ).inc()
-        logger.warning(
-            "datapoint watchdog tick skipped, retrying next poll (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-        return
+
+    requeued = run_oscm_tick(
+        spec=spec,
+        body=body,
+        namespace=namespace,
+        name=name,
+        logger=logger,
+        module="datapoint_watchdog",
+        tick_label="datapoint watchdog",
+        idle_label="datapoint watchdog",
+        custom_objects_api=operator_custom_objects_api,
+        wire=wire,
+        tick=tick,
+    )
     if requeued:
         logger.info("datapoint watchdog requeued %d zombie datapoint(s)", len(requeued))
 

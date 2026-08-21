@@ -49,11 +49,11 @@ on); flipping ``spec.dryRun`` back to false changes only the mutation.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol
 
 import kopf
-from kubernetes.client import ApiException
 
 from openstudio_operator._k8s import (
     DEFAULT_WORKER_DEPLOYMENT,
@@ -62,6 +62,7 @@ from openstudio_operator._k8s import (
 )
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
+    run_oscm_tick,
 )
 from openstudio_operator._oscm_handlers import (
     register_fn as _register_oscm_handler,
@@ -69,11 +70,8 @@ from openstudio_operator._oscm_handlers import (
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
-from openstudio_operator.metrics import (
-    HANDLER_TICK_FAILURES_TOTAL,
-    WORKERS_RECYCLED_TOTAL,
-)
-from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.metrics import WORKERS_RECYCLED_TOTAL
+from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_apps_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
@@ -81,7 +79,6 @@ from openstudio_operator.status_store import (
     PLURAL,
     VERSION,
     StatusStore,
-    StatusStoreError,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,6 +187,14 @@ def run_recycler_tick(
     return trigger
 
 
+@dataclass(frozen=True)
+class _RecyclerTimerClients:
+    """Client bundle the recycler timer's ``wire`` closure builds each tick (#473)."""
+
+    client: OpenStudioClient
+    apps_api: DeploymentPatcher
+
+
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="worker_recycler")
 def worker_recycler(
@@ -200,50 +205,56 @@ def worker_recycler(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer handler: wire config/client/store/apps/events, run one tick.
+    """Timer handler: delegate the wrapper wiring to the shared tick-runner.
 
-    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
-    decorator (issue #395, replacing the per-module #308 wrapper) observes
-    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
-    (module="worker_recycler")`` in a ``finally`` — regardless of success or
-    caught exception.
+    Issue #473: config parse, the empty-serverUrl idle check, store /
+    emitter / kube-API construction, the failure counter, and the skip log
+    all live in :func:`openstudio_operator._oscm_handlers.run_oscm_tick`;
+    this module contributes only its client wiring (REST + apps) and the
+    :func:`run_recycler_tick` call. The shared
+    :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395) still observes the wall-clock duration on
+    ``HANDLER_TICK_DURATION_SECONDS.labels(module="worker_recycler")`` in
+    a ``finally`` — regardless of success or caught exception.
     """
-    config = OperatorConfig.from_spec(spec)
-    if not config.server_url:
-        logger.warning("spec.serverUrl is empty — worker recycler idle this tick")
-        return
-    client = get_openstudio_client(config.server_url)
-    store = StatusStore(namespace, name, operator_custom_objects_api())
-    apps_api = operator_apps_api()
-    # Issue #164 — single source of truth for Event emission; class wraps
-    # kopf.event with the dry-run gate (D11) and exposes a ``__call__``
-    # shim so the existing ``emit("Normal", REASON, message)`` call site
-    # below keeps working unchanged.
-    emit = EventEmitter(body=body, dry_run=config.dry_run)
 
-    try:
-        trigger = run_recycler_tick(
-            client,
+    def wire(config: OperatorConfig) -> _RecyclerTimerClients:
+        return _RecyclerTimerClients(
+            client=get_openstudio_client(config.server_url),
+            apps_api=operator_apps_api(),
+        )
+
+    def tick(
+        *,
+        config: OperatorConfig,
+        store: StatusStore,
+        emit: EventEmitter,
+        deps: _RecyclerTimerClients,
+        now: datetime,
+    ) -> str | None:
+        return run_recycler_tick(
+            deps.client,
             store,
             config,
-            apps_api,
+            deps.apps_api,
             namespace=namespace,
-            now=datetime.now(UTC),
+            now=now,
             emit=emit,
         )
-    except (OpenStudioApiError, StatusStoreError, ApiException) as exc:
-        HANDLER_TICK_FAILURES_TOTAL.labels(
-            namespace=namespace,
-            name=name,
-            module="worker_recycler",
-            error_type=type(exc).__name__,
-        ).inc()
-        logger.warning(
-            "worker recycler tick skipped, retrying next poll (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-        return
+
+    trigger = run_oscm_tick(
+        spec=spec,
+        body=body,
+        namespace=namespace,
+        name=name,
+        logger=logger,
+        module="worker_recycler",
+        tick_label="worker recycler",
+        idle_label="worker recycler",
+        custom_objects_api=operator_custom_objects_api,
+        wire=wire,
+        tick=tick,
+    )
     if trigger:
         logger.info("worker recycled (trigger=%s)", trigger)
 
