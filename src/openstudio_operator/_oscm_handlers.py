@@ -47,7 +47,7 @@ from typing import TypeVar
 
 from kubernetes.client import ApiException
 
-from openstudio_operator.config import OperatorConfig
+from openstudio_operator.config import OperatorConfig, OperatorConfigError
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.openstudio_client import OpenStudioApiError
 from openstudio_operator.redis_client import RedisClientError
@@ -225,11 +225,23 @@ def observe_tick_duration(*, module: str):
 #: the next poll (D12); anything outside this tuple propagates to kopf as
 #: an uncaught handler error (fail-closed, pinned by the issue #249
 #: negative tests in ``tests/test_timer_wrapper_failures.py``).
+#:
+#: Issue #475 added ``OperatorConfigError`` as an EXPLICIT member. Pre-#475
+#: it subclassed ``RedisClientError``, so the historical wrappers'
+#: ``except RedisClientError`` catches already caught it at runtime — the
+#: runtime-EFFECTIVE historical union always included it, and the literal
+#: #473 union silently dropped it when #475 severed the parentage. Explicit
+#: membership preserves the D12 posture: a config/wiring failure (TLS
+#: CA-bundle misconfiguration, Resque key-layout drift) skips the tick,
+#: bumps the failure counter, and retries on the next poll — where a fixed
+#: Secret, CR spec, or re-mounted bundle is picked up live — instead of
+#: propagating as an uncaught kopf handler error.
 SKIP_TICK_EXCEPTIONS: tuple[type[Exception], ...] = (
     OpenStudioApiError,
     StatusStoreError,
     ApiException,
     RedisClientError,
+    OperatorConfigError,
 )
 
 _DepsT = TypeVar("_DepsT")

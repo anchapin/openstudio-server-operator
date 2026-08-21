@@ -24,6 +24,7 @@ from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
 from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS, run_oscm_tick
+from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.openstudio_client import OpenStudioApiError
 from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import StatusStoreError
@@ -101,14 +102,21 @@ def test_run_oscm_tick_owns_failure_counter_and_skip_log(
     the error type, and (c) return ``None`` (D12: retry next poll). The
     canonical tuple is pinned as the UNION of the four historical
     per-wrapper tuples, so no handler silently lost a catch in the
-    unification.
+    unification — evaluated at RUNTIME: issue #475 made the
+    ``OperatorConfigError`` membership explicit because it used to ride
+    into the historical wrappers' ``except RedisClientError`` catches via
+    subclassing.
     """
     assert SKIP_TICK_EXCEPTIONS == (
         OpenStudioApiError,
         StatusStoreError,
         ApiException,
         RedisClientError,
-    ), "the canonical tuple must stay the union of the four historical wrapper tuples"
+        OperatorConfigError,
+    ), (
+        "the canonical tuple must stay the runtime-effective union of the four "
+        "historical wrapper tuples (OperatorConfigError explicitly, per #475)"
+    )
 
     def wire(config: object) -> object:
         return object()  # client wiring is per-module; the runner only forwards it
@@ -210,3 +218,49 @@ def test_run_oscm_tick_stamps_heartbeat_on_idle() -> None:
     assert before - 1.0 <= stamped <= after + 1.0, (
         "heartbeat must be set on the idle return (timer invoked = scheduler alive)"
     )
+
+
+def test_run_oscm_tick_skips_on_operator_config_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #475: ``OperatorConfigError`` (TLS / key-layout misconfiguration)
+    is an explicit ``SKIP_TICK_EXCEPTIONS`` member.
+
+    Pre-#475 the class subclassed ``RedisClientError`` and was caught inside
+    the historical wrappers via that parentage; the move to config.py severs
+    the link, so the tuple carries it explicitly to preserve the D12 posture:
+    a wiring/config failure skips the tick (counter bumped with
+    ``error_type=OperatorConfigError``, single skip log) and retries on the
+    next poll — where a fixed Secret, CR spec, or re-mounted CA bundle is
+    picked up live — instead of propagating as an uncaught kopf error.
+    """
+    def wire(config: object) -> object:
+        return object()  # client wiring is per-module; the runner only forwards it
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise OperatorConfigError("synthetic TLS CA-bundle misconfiguration (#475)")
+
+    before = _counter("OperatorConfigError")
+    with caplog.at_level(logging.WARNING):
+        result = run_oscm_tick(
+            spec=SPEC,
+            body={"metadata": {"name": NAME, "namespace": NAMESPACE}},
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+            module="tick_runner_probe",
+            tick_label="tick runner probe",
+            idle_label="tick runner probe",
+            custom_objects_api=lambda: object(),
+            wire=wire,
+            tick=tick,
+        )
+
+    assert result is None, "runner must skip the tick on OperatorConfigError (D12)"
+    assert _counter("OperatorConfigError") - before == 1.0, (
+        "HANDLER_TICK_FAILURES_TOTAL{module=tick_runner_probe, "
+        "error_type=OperatorConfigError} must increment by exactly 1"
+    )
+    assert (
+        "tick runner probe tick skipped, retrying next poll (OperatorConfigError" in caplog.text
+    ), "the shared site must log the OperatorConfigError skip-tick warning"

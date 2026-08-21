@@ -28,6 +28,41 @@ DEFAULT_REDIS_URL = ""
 DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0
 
 
+class OperatorConfigError(Exception):
+    """Raised when operator-facing configuration is invalid (issue #475).
+
+    Neutral home for the operator's config-validation failure type. Born in
+    ``redis_client.py`` (issue #44) as a ``RedisClientError`` subclass for the
+    Resque key-layout drift probe; the REST client then borrowed it for
+    ``OPENSTUDIO_TLS_CA_BUNDLE`` validation (issue #296), which made the REST
+    client depend on the Redis module for an unrelated symbol AND made
+    ``except RedisClientError`` blocks accidentally swallow REST TLS-config
+    failures. Issue #475 moved it here — beside the other config validation —
+    and severed the Redis parentage; ``redis_client`` re-exports it for
+    compatibility (the #305 kubeconfig-loader pattern) so existing
+    ``redis_client.OperatorConfigError`` importers keep working, but new code
+    imports it from here.
+
+    Raise sites today:
+
+    * :meth:`openstudio_operator.redis_client.ReadOnlyRedisClient.validate_key_layout`
+      — the centralized Resque key constants (``WORKER_REGISTRY_KEY`` etc.,
+      issue #44) do not match the live v3.11.0 layout (wrong logical DB or
+      prefix); raised at operator boot so a misconfiguration fails LOUD, not
+      silently at the first stall-condition evaluation.
+    * :func:`openstudio_operator.openstudio_client._resolve_tls_ca_bundle`
+      — ``OPENSTUDIO_TLS_CA_BUNDLE`` does not name a readable PEM bundle
+      (issue #296); raised at REST-client construction so the operator
+      refuses to start the tick rather than degrading TLS verification.
+
+    Callers that need to handle it must catch it explicitly — it is no
+    longer reachable via ``except RedisClientError`` (the shared OSCM tick
+    tuple ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` carries it as an explicit
+    member so a wiring/config failure still skips the tick and retries on
+    the next poll, D12).
+    """
+
+
 @dataclass(frozen=True)
 class RedisSecretRef:
     """Names the Secret key holding the FULL ``redis://...`` URL (issue #463).
