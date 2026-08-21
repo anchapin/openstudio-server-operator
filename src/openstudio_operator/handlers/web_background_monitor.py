@@ -96,7 +96,6 @@ from openstudio_operator.config import (
 )
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
-    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     RESQUE_QUEUE_DEPTH,
     RESQUE_QUEUE_DEPTH_FRESH,
@@ -113,7 +112,7 @@ from openstudio_operator.singleton import (
 )
 from openstudio_operator.status_store import (
     GROUP,
-    MERGE_PATCH_CONTENT_TYPE,
+    MERGE_PATCH_CONTENT_TYPE,  # noqa: F401 — re-export: tests import it from this module
     PLURAL,
     VERSION,
     StatusStore,
@@ -131,8 +130,18 @@ from openstudio_operator._constants import (
     LAYOUT_WARNING_GRACE_SECONDS,
     WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
 )
-from openstudio_operator._k8s import deployment_label_selector
-from openstudio_operator._oscm_handlers import register_fn as _register_oscm_handler
+from openstudio_operator._k8s import (
+    DEFAULT_WORKER_DEPLOYMENT,
+    RESTARTED_AT_ANNOTATION,
+    deployment_label_selector,
+    rolling_restart_deployment,
+)
+from openstudio_operator._oscm_handlers import (
+    observe_tick_duration,
+)
+from openstudio_operator._oscm_handlers import (
+    register_fn as _register_oscm_handler,
+)
 
 POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 
@@ -140,13 +149,10 @@ POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 #: ``develop`` chart's fixed web_background Deployment name (AGENTS.md).
 DEFAULT_WEB_BACKGROUND_DEPLOYMENT = "web-background"
 
-#: Fallback when ``spec.targetWorkerDeployment`` is empty: the helm chart's
-#: fixed worker Deployment name, whose pods are the liveness corroboration.
-DEFAULT_WORKER_DEPLOYMENT = "worker"
-
-#: Pod-template annotation driving the rolling restart — same key/values as
-#: ``kubectl rollout restart``; only the value changing triggers a rollout.
-RESTARTED_AT_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
+# Issue #395 — DEFAULT_WORKER_DEPLOYMENT and RESTARTED_AT_ANNOTATION were
+# declared here AND in worker_recycler.py; both now live once in
+# :mod:`openstudio_operator._k8s` (imported above) and are re-exported by
+# this module so existing test imports keep resolving.
 
 WEB_BACKGROUND_RESTARTED_EVENT = "WebBackgroundRestarted"
 
@@ -565,23 +571,12 @@ def run_stall_tick(
         return False
 
     deployment = config.target_web_background_deployment or DEFAULT_WEB_BACKGROUND_DEPLOYMENT
-    restart_value = now.astimezone(UTC).isoformat()
-    patch_body = {
-        "spec": {
-            "template": {"metadata": {"annotations": {RESTARTED_AT_ANNOTATION: restart_value}}}
-        }
-    }
     dry_run = config.dry_run
     if not dry_run:
-        # Explicit merge-patch content type: the generated client's default
-        # selection for Deployment patches is json-patch (ops array), which a
-        # dict body is not. RFC 7386 merge preserves sibling annotations.
-        apps_api.patch_namespaced_deployment(
-            deployment,
-            namespace,
-            body=patch_body,
-            _content_type=MERGE_PATCH_CONTENT_TYPE,
-        )
+        # Issue #395 — shared rolling-restart patch (explicit RFC 7386
+        # merge-patch content type applied inside the helper; preserves
+        # sibling annotations).
+        rolling_restart_deployment(apps_api, deployment=deployment, namespace=namespace, now=now)
     message = (
         f"Queue stall sustained {int(window // timedelta(minutes=1))}m (work queued on "
         f"simulations/requeued, no fresh Resque worker heartbeat in "
@@ -602,6 +597,7 @@ def run_stall_tick(
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@observe_tick_duration(module="web_background_monitor")
 def web_background_monitor(
     body: dict,
     spec: dict,
@@ -610,36 +606,14 @@ def web_background_monitor(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer thin wrapper: wire config/redis/store/apis/events, run one tick."""
-    # Issue #308 — wall-clock observation of the wrapper invocation. The
-    # ``finally`` guarantees observation regardless of success or caught
-    # exception, so the slow-tick signal is independent of the failure
-    # counter and a sustained degradation between the healthy band and
-    # the eventual ``handler_tick_failures_total`` increment is visible.
-    _started = time.perf_counter()
-    try:
-        _web_background_monitor_impl(
-            body=body,
-            spec=spec,
-            namespace=namespace,
-            name=name,
-            logger=logger,
-        )
-    finally:
-        HANDLER_TICK_DURATION_SECONDS.labels(module="web_background_monitor").observe(
-            time.perf_counter() - _started
-        )
+    """Timer handler: wire config/redis/store/apis/events, run one tick.
 
-
-def _web_background_monitor_impl(
-    *,
-    body: dict,
-    spec: dict,
-    namespace: str,
-    name: str,
-    logger: kopf.Logger,
-) -> None:
-    """Inner body of :func:`web_background_monitor` (issue #308)."""
+    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395, replacing the per-module #308 wrapper) observes
+    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
+    (module="web_background_monitor")`` in a ``finally`` — regardless of
+    success or caught exception.
+    """
     config = OperatorConfig.from_spec(spec)
     # Same idle posture as every sibling handler: an OSCM without serverUrl
     # is an incomplete CR, even though this monitor senses Redis + K8s only.

@@ -49,19 +49,27 @@ on); flipping ``spec.dryRun`` back to false changes only the mutation.
 from __future__ import annotations
 
 import logging
-import time
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import kopf
 from kubernetes.client import ApiException
 
-from openstudio_operator._oscm_handlers import register_fn as _register_oscm_handler
+from openstudio_operator._k8s import (
+    DEFAULT_WORKER_DEPLOYMENT,
+    RESTARTED_AT_ANNOTATION,
+    rolling_restart_deployment,
+)
+from openstudio_operator._oscm_handlers import (
+    observe_tick_duration,
+)
+from openstudio_operator._oscm_handlers import (
+    register_fn as _register_oscm_handler,
+)
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
-    HANDLER_TICK_DURATION_SECONDS,
     HANDLER_TICK_FAILURES_TOTAL,
     WORKERS_RECYCLED_TOTAL,
 )
@@ -69,7 +77,7 @@ from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudio
 from openstudio_operator.singleton import operator_apps_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
     GROUP,
-    MERGE_PATCH_CONTENT_TYPE,
+    MERGE_PATCH_CONTENT_TYPE,  # noqa: F401 — re-export: tests import it from this module
     PLURAL,
     VERSION,
     StatusStore,
@@ -87,13 +95,10 @@ from openstudio_operator._constants import WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 
 POLL_INTERVAL_SECONDS = WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 
-#: Fallback when ``spec.targetWorkerDeployment`` is empty: the helm
-#: ``develop`` chart's fixed worker Deployment name (AGENTS.md identifiers).
-DEFAULT_WORKER_DEPLOYMENT = "worker"
-
-#: Pod-template annotation driving the rolling restart — same key/values as
-#: ``kubectl rollout restart``; only the value changing triggers a rollout.
-RESTARTED_AT_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
+# Issue #395 — DEFAULT_WORKER_DEPLOYMENT and RESTARTED_AT_ANNOTATION were
+# declared here AND in web_background_monitor.py; both now live once in
+# :mod:`openstudio_operator._k8s` (imported above) and are re-exported by
+# this module so existing test imports keep resolving.
 
 WORKER_RECYCLED_EVENT = "WorkerRecycled"
 
@@ -166,23 +171,12 @@ def run_recycler_tick(
         return None
 
     deployment = config.target_worker_deployment or DEFAULT_WORKER_DEPLOYMENT
-    restart_value = now.astimezone(UTC).isoformat()
-    patch_body = {
-        "spec": {
-            "template": {"metadata": {"annotations": {RESTARTED_AT_ANNOTATION: restart_value}}}
-        }
-    }
     dry_run = config.dry_run
     if not dry_run:
-        # Explicit merge-patch content type: the generated client's default
-        # selection for Deployment patches is json-patch (ops array), which a
-        # dict body is not. RFC 7386 merge preserves sibling annotations.
-        apps_api.patch_namespaced_deployment(
-            deployment,
-            namespace,
-            body=patch_body,
-            _content_type=MERGE_PATCH_CONTENT_TYPE,
-        )
+        # Issue #395 — shared rolling-restart patch (explicit RFC 7386
+        # merge-patch content type applied inside the helper; preserves
+        # sibling annotations).
+        rolling_restart_deployment(apps_api, deployment=deployment, namespace=namespace, now=now)
     message = (
         f"Recycled worker Deployment {namespace}/{deployment} (trigger: {trigger}) "
         f"— rolling restart via {RESTARTED_AT_ANNOTATION} patch"
@@ -197,6 +191,7 @@ def run_recycler_tick(
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@observe_tick_duration(module="worker_recycler")
 def worker_recycler(
     body: dict,
     spec: dict,
@@ -205,36 +200,14 @@ def worker_recycler(
     logger: kopf.Logger,
     **_: object,
 ) -> None:
-    """Timer thin wrapper: wire config/client/store/apps/events, run one tick."""
-    # Issue #308 — wall-clock observation of the wrapper invocation. The
-    # ``finally`` guarantees observation regardless of success or caught
-    # exception, so the slow-tick signal is independent of the failure
-    # counter and a sustained degradation between the healthy band and
-    # the eventual ``handler_tick_failures_total`` increment is visible.
-    _started = time.perf_counter()
-    try:
-        _worker_recycler_impl(
-            body=body,
-            spec=spec,
-            namespace=namespace,
-            name=name,
-            logger=logger,
-        )
-    finally:
-        HANDLER_TICK_DURATION_SECONDS.labels(module="worker_recycler").observe(
-            time.perf_counter() - _started
-        )
+    """Timer handler: wire config/client/store/apps/events, run one tick.
 
-
-def _worker_recycler_impl(
-    *,
-    body: dict,
-    spec: dict,
-    namespace: str,
-    name: str,
-    logger: kopf.Logger,
-) -> None:
-    """Inner body of :func:`worker_recycler` (issue #308)."""
+    The shared :func:`openstudio_operator._oscm_handlers.observe_tick_duration`
+    decorator (issue #395, replacing the per-module #308 wrapper) observes
+    the wall-clock duration on ``HANDLER_TICK_DURATION_SECONDS.labels
+    (module="worker_recycler")`` in a ``finally`` — regardless of success or
+    caught exception.
+    """
     config = OperatorConfig.from_spec(spec)
     if not config.server_url:
         logger.warning("spec.serverUrl is empty — worker recycler idle this tick")
