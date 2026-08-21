@@ -100,7 +100,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-797 tests across 39 files (run `.venv/bin/pytest --collect-only` to
+798 tests across 39 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -328,9 +328,11 @@ Full ground truth: [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./contra
 
 The kind recipe (`scripts/manifests/02-redis.yaml`) and
 `deploy/redis-credentials-secret.yaml` no longer ship the
-publicly-known `openstudio` literal (rotated to the placeholder
-`openstudio-rotated`). The matching `REDIS_URL` env vars in the
-manifests for `web`, `web_background`, and `worker` were rotated in
+publicly-known `openstudio` literal. Since #462 the deploy/ Secret ships
+only the unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` (never a
+working credential); the kind-recipe manifests keep the rotated
+placeholder `openstudio-rotated`. The matching `REDIS_URL` env vars in
+the manifests for `web`, `web_background`, and `worker` were rotated in
 lockstep.
 
 Fresh installs MUST run `scripts/rotate_redis_password.sh` first —
@@ -341,7 +343,13 @@ it into the five manifests at apply time, and updates the live
 `scripts/check_redis_password_unique.sh` fails the build if the
 legacy `openstudio` literal re-appears as a Redis password in any of
 the five manifest files (#150 was a real incident; this is the
-regression fence).
+regression fence), and — since #462 — if
+`deploy/redis-credentials-secret.yaml` ships anything other than the
+unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` as its committed
+password (the renamed `openstudio-rotated` placeholder was itself a
+publicly-known credential). The same rules hold for Mongo via
+`scripts/rotate_mongo_password.sh` +
+`scripts/check_mongo_password_unique.sh` (#219/#462).
 
 ### `/metrics` ingress is namespace-scoped (#166)
 

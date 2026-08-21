@@ -36,9 +36,12 @@
 # If you change the Redis password, update the `openstudio-redis` Secret in
 # the `openstudio-server` namespace and the TriggerAuthentication will
 # pick it up on the next poll. (Issue #150: the committed default was rotated
-# from the legacy `openstudio` literal to `openstudio-rotated`. For a fresh
-# cluster, run `scripts/rotate_redis_password.sh` to install a per-cluster
-# random password.)
+# from the legacy `openstudio` literal to a placeholder; issue #462 replaced
+# that real-looking placeholder with the unusable sentinel
+# `CHANGE_ME_RUN_ROTATE_SCRIPT`. For a fresh cluster, run
+# `scripts/rotate_redis_password.sh` to install a per-cluster random
+# password — plain apply of the Secret manifest alone installs the
+# sentinel.)
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
