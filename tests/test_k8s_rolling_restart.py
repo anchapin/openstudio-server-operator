@@ -19,21 +19,21 @@ handlers at once, so this module pins its contracts directly:
 * the loader's incluster-first / kubeconfig-fallback order, and that the
   SECOND exception propagates when both sources fail (fail closed).
 
-The fake applies the exact RFC 7386 merge-patch mirror from ``tests/_fakes.py``
-(``_merge_patch``) onto an in-memory Deployment, so annotation-preservation is
-asserted against real merge semantics, not just the outgoing body dict.
+The shared ``FakeAppsV1Api`` from ``tests/_fakes.py`` (#531) applies the RFC
+7386 merge-patch mirror (``_merge_patch``) onto an in-memory Deployment, so
+annotation-preservation is asserted against real merge semantics, not just the
+outgoing body dict.
 """
 
 from __future__ import annotations
 
-import copy
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from kubernetes.client import ApiException
 from kubernetes.config import ConfigException
 
-from _fakes import _merge_patch
+from _fakes import FakeAppsV1Api
 from openstudio_operator._k8s import (
     RESTARTED_AT_ANNOTATION,
     load_operator_kube_config,
@@ -44,32 +44,6 @@ from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 NAMESPACE = "openstudio-server"
 DEPLOYMENT = "worker"
-
-
-class FakeAppsV1Api:
-    """In-memory AppsV1Api stand-in applying real RFC 7386 merge-patch semantics.
-
-    Mirrors the ``FakeCustomObjectsApi`` approach in ``tests/_fakes.py``: the
-    Deployment body is stored server-side, ``patch_namespaced_deployment``
-    applies the patch via the shared merge-patch mirror, and every attempt
-    (including raising ones) is recorded in ``patches``. ``fail_with`` makes
-    the NEXT patch call raise before touching the stored object.
-    """
-
-    def __init__(self, deployment_obj: dict | None = None) -> None:
-        self.obj = copy.deepcopy(deployment_obj or {})
-        self.patches: list[dict] = []
-        self.fail_with: ApiException | None = None
-
-    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
-        self.patches.append(
-            {"name": name, "namespace": namespace, "body": copy.deepcopy(body), "kwargs": kwargs}
-        )
-        if self.fail_with is not None:
-            exc, self.fail_with = self.fail_with, None
-            raise exc
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
 
 
 def make_deployment_obj() -> dict:

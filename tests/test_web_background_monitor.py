@@ -10,7 +10,6 @@ test_worker_recycler.py), the Deployment read/patch with a
 cluster, no dependencies beyond the ``[dev]`` extra.
 """
 
-import copy
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -19,7 +18,7 @@ import fakeredis
 import pytest
 from prometheus_client import REGISTRY
 
-from _fakes import FakeCustomObjectsApi, make_emit
+from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -53,7 +52,9 @@ SPEC = {
     "webBackgroundPolicy": {"stallWindowMinutes": 10},
 }
 
-WORKER_SELECTOR = {"app.kubernetes.io/name": "openstudio-server", "component": "worker"}
+# Worker-selector string the fake AppsV1Api's default match_labels produce —
+# the shared ``FakeAppsV1Api`` (#531) serves the same helm-chart selector the
+# old module-local fake did.
 SELECTOR_STRING = "app.kubernetes.io/name=openstudio-server,component=worker"
 
 # Shared-fake binding (issue #474): this module's make_cr default spec.
@@ -62,27 +63,6 @@ make_cr = partial(_shared_make_cr, default_spec=SPEC)
 
 def minute(n: int) -> timedelta:
     return timedelta(minutes=n)
-
-
-class FakeAppsV1Api:
-    """Records Deployment patches; serves the worker selector for pod discovery."""
-
-    def __init__(self, selector: dict | None = None) -> None:
-        self.selector = dict(selector if selector is not None else WORKER_SELECTOR)
-        self.patches: list[dict] = []
-        self.reads: list[tuple[str, str]] = []
-
-    def read_namespaced_deployment(self, name, namespace, **kwargs):
-        self.reads.append((name, namespace))
-        return SimpleNamespace(
-            spec=SimpleNamespace(selector=SimpleNamespace(match_labels=dict(self.selector)))
-        )
-
-    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
-        self.patches.append(
-            {"name": name, "namespace": namespace, "body": copy.deepcopy(body), "kwargs": kwargs}
-        )
-        return {"metadata": {"name": name}}
 
 
 def make_pod(phase: str = "Running", ready: bool = True) -> SimpleNamespace:

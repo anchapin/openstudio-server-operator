@@ -38,7 +38,7 @@ from types import SimpleNamespace
 import responses
 from prometheus_client import REGISTRY, generate_latest
 
-from _fakes import FakeCustomObjectsApi, calls_to, make_emit
+from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, calls_to, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import metrics
 from openstudio_operator.config import OperatorConfig
@@ -234,39 +234,6 @@ class FakeCoreV1Api:
     def delete_namespaced_pod(self, name, namespace, **kwargs):
         self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
         return {}
-
-
-class FakeAppsV1Api:
-    """AppsV1Api stand-in serving one Deployment's pod-template selector.
-
-    Issue #83 D2: ``apps_api`` is no longer used for pod discovery in
-    escalation (Resque does that), but the worker Deployment's selector
-    is still useful for the R3 protection shape — kept for compatibility
-    with the existing tests for the helper itself.
-    """
-
-    def __init__(
-        self,
-        match_labels: dict | None = None,
-        *,
-        match_expressions: list[SimpleNamespace] | None = None,
-        name: str = "worker",
-    ) -> None:
-        self.match_labels = dict(match_labels if match_labels is not None else WORKER_LABELS)
-        self.match_expressions = list(match_expressions if match_expressions is not None else [])
-        self.reads: list[dict] = []
-        self.name = name
-
-    def read_namespaced_deployment(self, name, namespace, **kwargs):
-        self.reads.append({"name": name, "namespace": namespace, "kwargs": kwargs})
-        return SimpleNamespace(
-            spec=SimpleNamespace(
-                selector=SimpleNamespace(
-                    match_labels=self.match_labels,
-                    match_expressions=self.match_expressions,
-                )
-            )
-        )
 
 
 class FakeRedisClient:
