@@ -57,6 +57,7 @@ existing handler module as a template, and start editing.
 | Python | **3.12** | `Dockerfile` pins `python:3.12-slim` by digest (`#113`); local dev should match. `pyproject.toml` allows `>=3.11` but 3.12 is what CI and the container image use. |
 | `pip` | latest | used to install from `requirements.lock` (hash-pinned, `--require-hashes`) and then the editable package. |
 | `requirements.lock` | pinned | the source of truth for runtime deps (`#173`) AND dev deps (`#298`). Every package is pinned to an exact version with `--hash=sha256:...` annotations. Generated with `pip-compile --extra=dev --generate-hashes --output-file=requirements.lock pyproject.toml` (requires `pip-tools`); see `requirements.lock` header for the exact invocation. The `tests/test_dependency_drift.py` CI gate fails the build if any `[project.optional-dependencies].dev` entry is missing its `--hash` line. Never edit by hand. |
+| `requirements.txt` | pinned | the runtime-only lockfile (`#479`) the Dockerfile installs from — same `pip-compile` invocation as above but WITHOUT `--extra=dev`, so no dev tools ship in the production image. Refresh it in the same commit as `requirements.lock`. |
 | `ruff` | **`>=0.16`** | pinned in `pyproject.toml` `[project.optional-dependencies].dev`. Local floor must match CI's floor — the `#68` incident (TRY004 + RUF059) was caused by an old local ruff that activated new CI rules. If `ruff --version` reports `<0.16`, upgrade before committing. |
 | `pytest` | `>=8.0` | installed by `pip install -e '.[dev]'`. **Use the venv pytest, not the system one** — the system pytest cannot resolve the `openstudio_operator` package import and reports `ModuleNotFoundError` for almost every test. |
 | `kubectl` + a cluster | for live validation only | `kopf run --module openstudio_operator.handlers` needs the CRD applied and the namespace `openstudio-server` reachable. The unit-test loop does NOT require a cluster. |
@@ -100,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-858 tests across 42 files (run `.venv/bin/pytest --collect-only` to
+862 tests across 42 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.

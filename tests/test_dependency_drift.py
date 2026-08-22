@@ -31,6 +31,24 @@ when:
 * something in ``requirements.lock`` slipped in without a hash (the lockfile
   contract is broken more broadly).
 
+Runtime-only lockfile (issue #479)
+----------------------------------
+The production image installs from ``requirements.txt`` — a second
+pip-compile output generated WITHOUT ``--extra=dev`` — so pytest /
+hypothesis / responses / fakeredis / ruff and their dev-only transitives
+never enter the runtime container. The mirror tests below fail when:
+
+* a runtime dep declared in ``[project].dependencies`` is missing (or
+  unhashed) in ``requirements.txt`` (the maintainer edited pyproject and
+  re-ran only the ``--extra=dev`` compile), OR
+* any dev-extra package appears by name in ``requirements.txt`` (the
+  runtime lockfile was regenerated with the dev extra by mistake — the
+  regression fence for the #479 attack-surface fix).
+
+Both lockfiles are refreshed together by the commands documented in
+``AGENTS.md`` (one ``pip-compile --extra=dev`` → ``requirements.lock``, one
+without → ``requirements.txt``).
+
 When the test fires, the failure message tells the maintainer exactly which
 package is missing and the canonical remediation command (``pip-compile
 --extra=dev --generate-hashes --output-file=requirements.lock pyproject.toml``),
@@ -60,6 +78,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 REQUIREMENTS_LOCK = REPO_ROOT / "requirements.lock"
+REQUIREMENTS_TXT = REPO_ROOT / "requirements.txt"
 
 # PEP 503: normalize name by lowercasing and replacing runs of [-_.] with -.
 _NORMALIZE_RE = re.compile(r"[-_.]+")
@@ -70,18 +89,16 @@ def _normalize(name: str) -> str:
     return _NORMALIZE_RE.sub("-", name).lower()
 
 
-def _dev_dep_names(pyproject_text: str) -> list[str]:
-    """Extract the PEP 503-normalized names of every ``[project.optional-dependencies].dev`` entry.
+def _dep_names(entries: list[str]) -> list[str]:
+    """Normalize a list of PEP 508 requirement strings to PEP 503 names.
 
     Strips inline comments (everything after ``#``) and version specifiers
     (``>=``, ``==``, ``<``, ``>``, ``~=``, ``!=``) so we end up with a clean
     list of package names. Extras markers (e.g. ``package[extra]``) are also
-    stripped — the lockfile pins only the base package.
+    stripped — the lockfiles pin only the base package.
     """
-    data = tomllib.loads(pyproject_text)
-    dev = data["project"]["optional-dependencies"]["dev"]
     names: list[str] = []
-    for raw in dev:
+    for raw in entries:
         # Strip inline comments and surrounding whitespace
         cleaned = raw.split("#", 1)[0].strip()
         if not cleaned:
@@ -92,6 +109,19 @@ def _dev_dep_names(pyproject_text: str) -> list[str]:
         name = re.split(r"[<>=!~]", cleaned, 1)[0].strip()
         names.append(_normalize(name))
     return names
+
+
+def _dev_dep_names(pyproject_text: str) -> list[str]:
+    """Extract the PEP 503-normalized names of every ``[project.optional-dependencies].dev`` entry."""
+    data = tomllib.loads(pyproject_text)
+    dev = data["project"]["optional-dependencies"]["dev"]
+    return _dep_names(dev)
+
+
+def _runtime_dep_names(pyproject_text: str) -> list[str]:
+    """Extract the PEP 503-normalized names of every ``[project].dependencies`` entry."""
+    data = tomllib.loads(pyproject_text)
+    return _dep_names(data["project"]["dependencies"])
 
 
 def _parse_lockfile(lockfile_text: str) -> dict[str, bool]:
@@ -217,5 +247,108 @@ def test_lockfile_every_entry_has_a_hash() -> None:
     unhashed = sorted(name for name, has in blocks.items() if not has)
     assert not unhashed, (
         f"requirements.lock entries missing --hash=sha256:... lines: {unhashed}. "
+        "Re-run `pip-compile --generate-hashes` to re-assert the hash pins."
+    )
+
+
+def test_runtime_lockfile_exists() -> None:
+    """``requirements.txt`` (the runtime-only lockfile) is present at the repo root.
+
+    Issue #479: the Dockerfile installs from ``requirements.txt`` — compiled
+    WITHOUT ``--extra=dev`` — so dev tools never enter the production image.
+    A missing file means the Docker build would fail (or worse, someone
+    pointed it back at ``requirements.lock``).
+    """
+    assert REQUIREMENTS_TXT.exists(), (
+        f"requirements.txt not found at {REQUIREMENTS_TXT}. "
+        "Run `pip-compile --generate-hashes --no-strip-extras "
+        "--output-file=requirements.txt pyproject.toml` to generate it "
+        "(issue #479 — refresh it together with requirements.lock)."
+    )
+
+
+def test_every_runtime_dep_is_hash_pinned_in_runtime_lockfile() -> None:
+    """Every ``[project].dependencies`` dep has a hash-pinned entry in ``requirements.txt``.
+
+    Mirror of the dev-dep gate for the runtime lockfile: the maintainer who
+    adds a runtime dep to ``pyproject.toml`` must re-run BOTH pip-compile
+    commands. A runtime dep missing from ``requirements.txt`` would make the
+    Docker image build install an unpinned (or absent) package.
+    """
+    pyproject_text = PYPROJECT.read_text()
+    runtime_dep_names = _runtime_dep_names(pyproject_text)
+    assert runtime_dep_names, (
+        "No runtime deps found in pyproject.toml [project].dependencies — "
+        "the operator has no dependencies, which cannot be right."
+    )
+
+    runtime_lockfile_text = REQUIREMENTS_TXT.read_text()
+    blocks = _parse_lockfile(runtime_lockfile_text)
+
+    missing = [name for name in runtime_dep_names if name not in blocks]
+    unhashed = [name for name in runtime_dep_names if name in blocks and not blocks[name]]
+
+    if missing or unhashed:
+        problems: list[str] = []
+        if missing:
+            problems.append(f"Runtime deps missing from requirements.txt entirely: {missing}")
+        if unhashed:
+            problems.append(
+                f"Runtime deps present in requirements.txt but without "
+                f"--hash=sha256:... lines: {unhashed}"
+            )
+        pytest.fail(
+            "pyproject.toml [project].dependencies drift detected vs "
+            "requirements.txt (#479):\n  - "
+            + "\n  - ".join(problems)
+            + "\nRemediation: regenerate BOTH lockfiles together:\n"
+            "  pip-compile --extra=dev --generate-hashes --no-strip-extras \\\n"
+            "      --output-file=requirements.lock pyproject.toml\n"
+            "  pip-compile --generate-hashes --no-strip-extras \\\n"
+            "      --output-file=requirements.txt pyproject.toml"
+        )
+
+
+def test_no_dev_deps_in_runtime_lockfile() -> None:
+    """No ``[project.optional-dependencies].dev`` package appears in ``requirements.txt``.
+
+    The #479 regression fence: the runtime lockfile must be compiled WITHOUT
+    the dev extra. A direct-dev-name blacklist is sufficient here — dev-only
+    transitives (pluggy, iniconfig, ...) ride along with pytest, and the
+    release-workflow ``docker run`` find_spec assert covers the built-image
+    transitive story end to end.
+    """
+    pyproject_text = PYPROJECT.read_text()
+    dev_dep_names = _dev_dep_names(pyproject_text)
+
+    runtime_lockfile_text = REQUIREMENTS_TXT.read_text()
+    blocks = _parse_lockfile(runtime_lockfile_text)
+
+    leaked = sorted(name for name in dev_dep_names if name in blocks)
+    assert not leaked, (
+        f"Dev deps leaked into requirements.txt (the runtime-only lockfile, #479): "
+        f"{leaked}. requirements.txt must be compiled WITHOUT --extra=dev:\n"
+        "  pip-compile --generate-hashes --no-strip-extras \\\n"
+        "      --output-file=requirements.txt pyproject.toml"
+    )
+
+
+def test_runtime_lockfile_every_entry_has_a_hash() -> None:
+    """Every package entry in ``requirements.txt`` carries at least one ``--hash=sha256:...`` line.
+
+    The Dockerfile runs ``pip install --require-hashes -r requirements.txt``;
+    an unhashed entry breaks the release image build. Mirrors the broader
+    ``requirements.lock`` hash-everywhere check.
+    """
+    runtime_lockfile_text = REQUIREMENTS_TXT.read_text()
+    blocks = _parse_lockfile(runtime_lockfile_text)
+    if not blocks:
+        pytest.skip(
+            "requirements.txt contains no package entries; "
+            "the broader hash-everywhere check is vacuously true"
+        )
+    unhashed = sorted(name for name, has in blocks.items() if not has)
+    assert not unhashed, (
+        f"requirements.txt entries missing --hash=sha256:... lines: {unhashed}. "
         "Re-run `pip-compile --generate-hashes` to re-assert the hash pins."
     )

@@ -56,6 +56,18 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:dev
           provenance: mode=max
           sbom: true
+      # Issue #479: assert the production image carries no dev dependencies.
+      # The Dockerfile installs from requirements.txt (runtime-only lockfile);
+      # this docker-run check is the release-time backstop for the PR-time
+      # tests/test_dependency_drift.py guard (which inspects the lockfile
+      # text, not the built image). Runs BEFORE the digest-pin commit so a
+      # leaked dev dep can never be pinned into deploy/ manifests.
+      - name: Assert no dev deps in the runtime image (issue #479)
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          docker run --rm --entrypoint python "${IMAGE_NAME}@${DIGEST}" -c \
+            "import importlib.util as u; assert not any(u.find_spec(m) for m in ['pytest','hypothesis','responses','fakeredis','ruff']), 'dev deps leaked into runtime image'"
       # Issue #149: after the build step resolves the digest, pin
       # deploy/operator-deployment.yaml AND deploy/storage-cronjob.yaml
       # to `@sha256:<digest>` and commit back to develop. The standard
@@ -204,6 +216,15 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           provenance: mode=max
           sbom: true
+      # Issue #479: same dev-dep absence assert as publish-dev — the
+      # versioned image must be identical in shape to :dev (no pytest /
+      # hypothesis / responses / fakeredis / ruff anywhere in it).
+      - name: Assert no dev deps in the runtime image (issue #479)
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          docker run --rm --entrypoint python "${IMAGE_NAME}@${DIGEST}" -c \
+            "import importlib.util as u; assert not any(u.find_spec(m) for m in ['pytest','hypothesis','responses','fakeredis','ruff']), 'dev deps leaked into runtime image'"
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign + attest the versioned image
