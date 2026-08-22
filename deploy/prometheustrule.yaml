@@ -447,10 +447,10 @@ spec:
         # runtime failure; exit-code table in prune_entrypoint.py's module
         # docstring), so K8s marks the Job Failed and failedJobsHistoryLimit
         # (3) retains it for this alert to see. Requires kube-state-metrics
-        # (standard in kube-prometheus-stack). An absence-of-success
-        # variant (count(increase(kube_job_status_succeeded{...}[2h])) == 0)
-        # is the complementary signal for a suspended CronJob; not shipped
-        # to keep the alert count coherent with the #468 set.
+        # (standard in kube-prometheus-stack). The complementary
+        # absence-of-success variant the #468 set deferred is shipped
+        # below since #569 — the failed-Job alert is event-driven and
+        # cannot see a suspended CronJob or a starved schedule.
         - alert: OpenStudioOperatorPruneJobFailed
           expr: kube_job_status_failed{namespace="openstudio-server", job_name=~"openstudio-storage-pruner-.+"} > 0
           for: 15m
@@ -469,4 +469,46 @@ spec:
               the per-pod-lifetime
               openstudio_operator_prune_tick_failures_total counter is best-effort
               only (README #470).
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # Issue #569 — the absence-of-success complement the #468 set
+        # deferred (see the comment on the failed-Job alert above). Every
+        # signal in this manifest's other groups belongs to the OPERATOR
+        # process (heartbeat, tick counters, event counters); the failed-Job
+        # alert is event-driven (it needs a Job to reach Failed — since
+        # #569 the activeDeadlineSeconds on the prune Job template makes a
+        # hung pod do exactly that), but the no-event modes — CronJob
+        # suspended (spec.suspend), schedule mutated wrong, controller
+        # outage, Jobs never scheduled — produce nothing for it to key on
+        # while the archival backlog grows toward an NFS-full outage
+        # (#470). Expression shape is load-bearing: max_over_time, NOT
+        # increase()/changes() — the prune tick runs seconds, so a Job can
+        # appear, succeed and be scraped for the first time already at
+        # succeeded=1 with no observed 0->1 transition for increase() to
+        # count; and ``sum(...) or vector(0)`` keeps the expression
+        # non-empty when successfulJobsHistoryLimit (3) has GC'd every
+        # matching series — TRUE absence must evaluate to 0 and fire, not
+        # vacuously match nothing. 1h window = 6 missed */10 schedules.
+        # Requires kube-state-metrics like the sibling failed-Job alert.
+        - alert: OpenStudioOperatorPruneJobNoSuccess
+          expr: (sum(max_over_time(kube_job_status_succeeded{namespace="openstudio-server", job_name=~"openstudio-storage-pruner-.+"}[1h])) or vector(0)) < 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: No successful storage-prune Job in over an hour
+            description: >-
+              No kube_job_status_succeeded=1 for an openstudio-storage-pruner-*
+              Job in the last hour (6 missed */10 schedules) — the retention
+              pipeline has not completed a tick. Either the CronJob is
+              suspended / mis-scheduled, Jobs are never created, or (pre-#569
+              manifests) a hung pod is pinning the Running Job under
+              concurrencyPolicy: Forbid — post-#569 that pod is
+              DeadlineExceeded-killed at 1800s and surfaces as
+              OpenStudioOperatorPruneJobFailed, so cross-check that alert.
+              The archival backlog grows while this fires; NFS fill (#470) is
+              the end state. Triage: kubectl get cronjob
+              openstudio-storage-pruner -n openstudio-server (suspend flag?
+              lastScheduleTime?), kubectl get jobs -n openstudio-server -l
+              app.kubernetes.io/component=storage-pruner, then the Job pod logs.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics

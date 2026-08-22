@@ -95,6 +95,35 @@ spec:
       # The entrypoint already implements skip-and-retry-next-schedule (D12);
       # in-place pod retries add nothing.
       backoffLimit: 0
+      # Issue #569 — upper bound on one tick's wall-clock time: the #394
+      # archival-Job pattern (archival.py::
+      # ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS) applied to the prune side,
+      # sized off a reference cadence instead of waiting forever. #394
+      # used 6x the chart's worker terminationGracePeriodSeconds (5200s)
+      # because a healthy multi-GB rclone upload runs for hours; here the
+      # reference is the schedule itself (600s, matched above) because a
+      # tick is orchestration-only — retention NEVER blocks on archival
+      # Job completion (in-flight Jobs are observed tick-spaced, see
+      # retention.py "still running — keep watching"), so this deadline
+      # cannot race a legitimate upload (those carry their own 31200s
+      # #394 deadline inside the rclone pod). A worst-case healthy tick —
+      # 3x REST retry budget with jittered backoff + the once-per-tick
+      # heavy data_points poll + archival Job spawns — finishes in
+      # single-digit minutes; 1800s = 3 full schedule intervals absorbs
+      # that with room to spare. The hang this bounds: the kubernetes
+      # python client sets NO read timeout, so an apiserver/Redis stall
+      # or a black-holed TCP connection pins the pod in Running forever;
+      # with concurrencyPolicy: Forbid every subsequent */10 schedule is
+      # then skipped and retention dies silently (the Job never reaches
+      # Failed, so OpenStudioOperatorPruneJobFailed never fires —
+      # kube_job_status_failed stays 0 by construction). The kubelet
+      # hard-kills the pod at the deadline and marks the Job Failed
+      # (DeadlineExceeded) — at most two skipped schedules — which the
+      # failed-Job alert then pages on. The complementary
+      # absence-of-success alert (deploy/prometheustrule.yaml, also
+      # #569) covers the no-event modes a deadline cannot reach
+      # (suspended CronJob, Jobs never scheduled).
+      activeDeadlineSeconds: 1800
       template:
         metadata:
           labels:
