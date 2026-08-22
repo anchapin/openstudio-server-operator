@@ -21,6 +21,7 @@ any batch permissions.
 
 import copy
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,8 @@ import responses
 from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
+from _fakes import FakeCustomObjectsApi, calls_to, make_emit
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.archival import archival_job_name, build_archival_job
 from openstudio_operator.config import OperatorConfig, StoragePolicy
 from openstudio_operator.openstudio_client import OpenStudioClient
@@ -55,15 +58,8 @@ STORAGE = {
 }
 SPEC = {"serverUrl": BASE, "storagePolicy": dict(STORAGE)}
 
-
-def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {"name": NAME, "namespace": NAMESPACE},
-        "spec": copy.deepcopy(spec if spec is not None else SPEC),
-        "status": copy.deepcopy(status if status is not None else {}),
-    }
+# Shared-fake binding (issue #474): this module's make_cr default spec.
+make_cr = partial(_shared_make_cr, default_spec=SPEC)
 
 
 def archiving_status(analysis_id: str, job_name: str) -> dict:
@@ -105,47 +101,6 @@ def verified_status(analysis_id: str, job_name: str) -> dict:
             }
         }
     }
-
-
-class FakeCustomObjectsApi:
-    """In-memory CustomObjectsApi stand-in with RFC 7386 merge-patch."""
-
-    def __init__(self, obj: dict) -> None:
-        self.obj = copy.deepcopy(obj)
-        self.patch_calls = 0
-
-    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
-        return copy.deepcopy(self.obj)
-
-    def patch_namespaced_custom_object_status(
-        self, group, version, namespace, plural, name, body, _content_type=None
-    ):
-        self.patch_calls += 1
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
-def make_emit():
-    events: list[tuple[str, str, str]] = []
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        events.append((event_type, reason, message))
-
-    return events, emit
-
-
-def calls_to(suffix: str) -> int:
-    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
 
 
 def archived_total() -> float:

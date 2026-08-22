@@ -8,15 +8,17 @@ and test_analysis_sla.py). All assertions target ``run_watchdog_tick``
 directly; the kopf timer wrapper is thin wiring.
 """
 
-import copy
 import logging
 from datetime import UTC, datetime, timedelta
+from functools import partial
 
 import pytest
 import responses
 from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
+from _fakes import FakeCustomObjectsApi, calls_to, make_emit, tick_failures_total
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.datapoint_watchdog import (
@@ -38,56 +40,8 @@ SPEC = {
     "datapointPolicy": {"maxDatapointRuntimeMinutes": 45, "maxAutoRequeues": 2},
 }
 
-
-def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {"name": NAME, "namespace": NAMESPACE},
-        "spec": copy.deepcopy(spec if spec is not None else SPEC),
-        "status": copy.deepcopy(status if status is not None else {}),
-    }
-
-
-class FakeCustomObjectsApi:
-    """In-memory CustomObjectsApi stand-in with RFC 7386 merge-patch."""
-
-    def __init__(self, obj: dict) -> None:
-        self.obj = copy.deepcopy(obj)
-        self.patch_calls = 0
-
-    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
-        return copy.deepcopy(self.obj)
-
-    def patch_namespaced_custom_object_status(
-        self, group, version, namespace, plural, name, body, _content_type=None
-    ):
-        self.patch_calls += 1
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
-def make_emit():
-    events: list[tuple[str, str, str]] = []
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        events.append((event_type, reason, message))
-
-    return events, emit
-
-
-def calls_to(suffix: str) -> int:
-    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
+# Shared-fake binding (issue #474): this module's make_cr default spec.
+make_cr = partial(_shared_make_cr, default_spec=SPEC)
 
 
 def requeued_total() -> float:
@@ -562,17 +516,6 @@ class ExplodingPatchFakeCustomObjectsApi(FakeCustomObjectsApi):
         self, group, version, namespace, plural, name, body, _content_type=None
     ):
         raise ApiException(status=500, reason="Internal Server Error")
-
-
-def tick_failures_total(namespace: str, name: str, module: str, error_type: str) -> float:
-    """Read the labelled HANDLER_TICK_FAILURES_TOTAL sample (issue #117 shape)."""
-    return (
-        REGISTRY.get_sample_value(
-            "openstudio_operator_handler_tick_failures_total",
-            {"namespace": namespace, "name": name, "module": module, "error_type": error_type},
-        )
-        or 0.0
-    )
 
 
 def started_view_calls() -> int:

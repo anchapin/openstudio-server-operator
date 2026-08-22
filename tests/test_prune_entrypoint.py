@@ -19,6 +19,7 @@ import pytest
 import responses
 from kubernetes.client import ApiException
 
+from _fakes import FakeCustomObjectsApi, calls_to
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.prune_entrypoint import (
@@ -74,41 +75,6 @@ def completed_doc(analysis_id: str, *, age_days: float = 10.0) -> dict:
     }
 
 
-class FakeCustomObjectsApi:
-    """CR list + status get/patch with RFC 7386 merge-patch (list is what the
-    entrypoint adds over test_retention.py's fake — singleton resolution)."""
-
-    def __init__(self, crs: list[dict], active: dict) -> None:
-        self.crs = crs
-        self.obj = copy.deepcopy(active)  # the CR the StatusStore reads/writes
-        self.patch_calls = 0
-
-    def list_namespaced_custom_object(self, group, version, namespace, plural, **_kw):
-        return {"items": copy.deepcopy(self.crs)}
-
-    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
-        return copy.deepcopy(self.obj)
-
-    def patch_namespaced_custom_object_status(
-        self, group, version, namespace, plural, name, body, _content_type=None
-    ):
-        import copy
-
-        self.patch_calls += 1
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
 class FakeCoreV1Api:
     def __init__(self) -> None:
         self.events: list[dict] = []
@@ -161,7 +127,7 @@ def run_main(custom_api, *, spec=None, batch=None, now=NOW):
 
 
 def test_zero_crs_idle_exit_zero():
-    code, batch, core = run_main(FakeCustomObjectsApi([], make_cr()))
+    code, batch, core = run_main(FakeCustomObjectsApi(make_cr(), items=[]))
     assert code == 0
     assert batch.creates == [] and core.events == []
 
@@ -178,7 +144,7 @@ def test_oldest_cr_is_served_not_the_newest():
     ]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     responses.get(f"{BASE}/data_points.json", json=[])
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, batch, _core = run_main(api, spec=old_spec)
 
@@ -191,7 +157,7 @@ def test_oldest_cr_is_served_not_the_newest():
 
 def test_empty_server_url_idles():
     crs = [make_cr(spec={"serverUrl": ""})]
-    code, batch, core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+    code, batch, core = run_main(FakeCustomObjectsApi(crs[0], items=crs))
     assert code == 0
     assert batch.creates == [] and core.events == []
 
@@ -204,7 +170,7 @@ def test_empty_redis_url_emits_warning_event_and_returns_nonzero():
     """
     spec = {"serverUrl": BASE, "redisUrl": ""}
     crs = [make_cr(spec=spec)]
-    code, batch, core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+    code, batch, core = run_main(FakeCustomObjectsApi(crs[0], items=crs))
 
     assert code == 3
     assert batch.creates == []
@@ -227,7 +193,7 @@ def test_empty_redis_url_emits_warning_event_and_returns_nonzero():
 
 def test_missing_namespace_is_a_wiring_error(monkeypatch):
     monkeypatch.delenv("POD_NAMESPACE", raising=False)
-    assert main(None, custom_api=FakeCustomObjectsApi([], make_cr())) == 2
+    assert main(None, custom_api=FakeCustomObjectsApi(make_cr(), items=[])) == 2
 
 
 # --- D11: the dryRun gate flows from the ACTIVE CR spec ---------------------------
@@ -240,7 +206,7 @@ def test_dry_run_suppresses_job_spawn_and_deletes_but_records_events():
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     responses.get(f"{BASE}/data_points.json", json=[])
     responses.delete(f"{BASE}/analyses/a1", status=204)
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, batch, core = run_main(api)
 
@@ -267,7 +233,7 @@ def test_real_run_spawns_the_archival_job():
     crs = [make_cr(spec=spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
     responses.get(f"{BASE}/data_points.json", json=[])
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, batch, core = run_main(api)
 
@@ -291,7 +257,7 @@ def test_transient_api_failure_exits_five_and_retries_next_schedule():
     spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": dict(STORAGE)}
     crs = [make_cr(spec=spec)]
     responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, batch, core = run_main(api)
 
@@ -306,7 +272,7 @@ def test_invalid_storage_policy_exits_five():
     bad_spec = {"serverUrl": BASE, "redisUrl": "redis://queue:6379", "storagePolicy": {**STORAGE, "backend": "ftp"}}
     crs = [make_cr(spec=bad_spec)]
     responses.get(f"{BASE}/analyses.json", json=[completed_doc("a1")])
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, batch, _ = run_main(api)
 
@@ -325,10 +291,6 @@ def test_cr_list_failure_exits_four():
     code, batch, core = run_main(FailingApi())
     assert code == 4
     assert batch.creates == [] and core.events == []
-
-
-def calls_to(suffix: str) -> int:
-    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
 
 
 # --- Issue #306: prune-tick failures observability surface --------------------
@@ -410,7 +372,7 @@ def test_prune_skip_tick_runtime_failure_increments_prune_tick_failures_counter(
     # 500 on the REST GET — same exception the D12 tuple catches
     # (OpenStudioApiError) — so the runtime branch fires.
     responses.get(f"{BASE}/analyses.json", json={"error": "boom"}, status=500)
-    api = FakeCustomObjectsApi(crs, crs[0])
+    api = FakeCustomObjectsApi(crs[0], items=crs)
 
     code, _batch, _core = run_main(api)
     assert code == 5  # issue #470: loud runtime failure (Failed Job signal)
@@ -450,7 +412,7 @@ def test_prune_exit3_redis_url_empty_increments_prune_tick_failures_counter():
 
     spec = {"serverUrl": BASE, "redisUrl": ""}
     crs = [make_cr(spec=spec)]
-    code, _batch, _core = run_main(FakeCustomObjectsApi(crs, crs[0]))
+    code, _batch, _core = run_main(FakeCustomObjectsApi(crs[0], items=crs))
 
     assert code == 3  # exit-code contract unchanged (issues #116, #180)
 
@@ -550,7 +512,7 @@ def test_entrypoint_serves_every_cloud_backend_spec(backend):
     crs = [make_cr(spec=spec)]
     with responses.RequestsMock() as rsps:
         rsps.get(f"{BASE}/analyses.json", json=[])
-        api = FakeCustomObjectsApi(crs, crs[0])
+        api = FakeCustomObjectsApi(crs[0], items=crs)
         code, _batch, _ = run_main(api)
 
     assert code == 0  # empty analyses: nothing due, clean exit per backend

@@ -49,8 +49,15 @@ def make_cr(name: str, created: str, uid: str | None = None, spec: dict | None =
     }
 
 
-class FakeCustomObjectsApi:
-    """In-memory list-only CustomObjectsApi stand-in (the guard never mutates)."""
+class ListOnlyFakeCustomObjectsApi:
+    """In-memory list-only CustomObjectsApi stand-in (the guard never mutates).
+
+    Kept local and deliberately NOT the shared ``_fakes.FakeCustomObjectsApi``
+    (issue #474): this fake must carry NO patch/get surface at all —
+    ``test_guard_never_mutates_losing_crs`` proves the guard's read-only
+    contract via ``assert not hasattr(api, "patch_calls")``, which the
+    shared union fake (eager patch counters) cannot satisfy.
+    """
 
     def __init__(self, items: list[dict]) -> None:
         self.items = copy.deepcopy(items)
@@ -63,7 +70,7 @@ class FakeCustomObjectsApi:
         return {"items": copy.deepcopy(self.items)}
 
 
-class ExplodingCustomObjectsApi(FakeCustomObjectsApi):
+class ExplodingCustomObjectsApi(ListOnlyFakeCustomObjectsApi):
     def list_namespaced_custom_object(self, group, version, namespace, plural):
         raise ApiException(status=500, reason="boom")
 
@@ -85,8 +92,8 @@ def event_triples(events):
 def guard_two_crs():
     """Oldest CR 'alpha' (spec A) + newer CR 'beta' (spec B)."""
     return SingletonGuard(
-        FakeCustomObjectsApi(
-            [
+        ListOnlyFakeCustomObjectsApi(
+            items=[
                 make_cr("alpha", OLD_TS, uid="uid-alpha", spec={"serverUrl": "http://a.test"}),
                 make_cr("beta", NEW_TS, uid="uid-beta", spec={"serverUrl": "http://b.test"}),
             ]
@@ -150,7 +157,7 @@ def test_is_active_true_for_oldest_false_for_newer(guard_two_crs):
 
 
 def test_is_active_zero_crs_is_false():
-    guard = SingletonGuard(FakeCustomObjectsApi([]))
+    guard = SingletonGuard(ListOnlyFakeCustomObjectsApi(items=[]))
     assert guard.is_active(make_cr("anyone", OLD_TS), NAMESPACE) is False
 
 
@@ -190,7 +197,7 @@ def test_enforce_is_silent_when_state_unchanged(caplog, log, guard_two_crs):
 
 
 def test_enforce_single_cr_one_info_log_no_events(caplog, log):
-    guard = SingletonGuard(FakeCustomObjectsApi([make_cr("solo", OLD_TS)]))
+    guard = SingletonGuard(ListOnlyFakeCustomObjectsApi(items=[make_cr("solo", OLD_TS)]))
     events, emit = make_sink()
     guard.enforce(guard.list_crs(NAMESPACE), logger=log, emit=emit)
     guard.enforce(guard.list_crs(NAMESPACE), logger=log, emit=emit)
@@ -201,7 +208,7 @@ def test_enforce_single_cr_one_info_log_no_events(caplog, log):
 
 
 def test_enforce_zero_crs_single_idle_log_no_events(caplog, log):
-    guard = SingletonGuard(FakeCustomObjectsApi([]))
+    guard = SingletonGuard(ListOnlyFakeCustomObjectsApi(items=[]))
     events, emit = make_sink()
     guard.enforce([], logger=log, emit=emit)
     guard.enforce([], logger=log, emit=emit)
@@ -212,7 +219,7 @@ def test_enforce_zero_crs_single_idle_log_no_events(caplog, log):
 
 
 def test_enforce_newer_cr_appears_winner_unchanged(caplog, log):
-    api = FakeCustomObjectsApi([make_cr("alpha", OLD_TS, uid="uid-alpha")])
+    api = ListOnlyFakeCustomObjectsApi(items=[make_cr("alpha", OLD_TS, uid="uid-alpha")])
     guard = SingletonGuard(api)
     events, emit = make_sink()
     guard.enforce(guard.list_crs(NAMESPACE), logger=log, emit=emit)
@@ -230,7 +237,7 @@ def test_enforce_newer_cr_appears_winner_unchanged(caplog, log):
 
 
 def test_enforce_older_cr_appears_and_usurps_winner(caplog, log):
-    api = FakeCustomObjectsApi([make_cr("beta", NEW_TS, uid="uid-beta")])
+    api = ListOnlyFakeCustomObjectsApi(items=[make_cr("beta", NEW_TS, uid="uid-beta")])
     guard = SingletonGuard(api)
     events, emit = make_sink()
     guard.enforce(guard.list_crs(NAMESPACE), logger=log, emit=emit)
@@ -249,7 +256,7 @@ def test_enforce_older_cr_appears_and_usurps_winner(caplog, log):
 
 
 def test_enforce_transition_to_zero_after_deletion(caplog, log):
-    api = FakeCustomObjectsApi([make_cr("alpha", OLD_TS)])
+    api = ListOnlyFakeCustomObjectsApi(items=[make_cr("alpha", OLD_TS)])
     guard = SingletonGuard(api)
     events, emit = make_sink()
     guard.enforce(guard.list_crs(NAMESPACE), logger=log, emit=emit)
@@ -395,7 +402,7 @@ def test_gated_wrapper_fails_closed_on_api_error(caplog, log, monkeypatch):
     registry = make_registry_with_handlers()
     install_singleton_guard(registry=registry)
     gated = oscm_handlers(registry)[0].fn
-    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi([])))
+    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi(items=[])))
 
     result = gated(
         body=make_cr("alpha", OLD_TS), spec={}, namespace=NAMESPACE, name="alpha", logger=log
@@ -407,7 +414,7 @@ def test_gated_wrapper_fails_closed_on_api_error(caplog, log, monkeypatch):
 # --- Issue #307 — singleton guard wrapper must bump HANDLER_TICK_FAILURES_TOTAL on API errors ---
 
 
-class _ServiceUnavailableApi(FakeCustomObjectsApi):
+class _ServiceUnavailableApi(ListOnlyFakeCustomObjectsApi):
     """list_namespaced_custom_object raises ApiException(503).
 
     The acceptance criterion for issue #307 — a sustained apiserver outage
@@ -487,8 +494,8 @@ def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_
     # test. The companion ``test_event_wrapper_url_guard_fires_directly``
     # below exercises the direct URL-guard path explicitly.
     populated_guard = SingletonGuard(
-        FakeCustomObjectsApi(
-            [
+        ListOnlyFakeCustomObjectsApi(
+            items=[
                 make_cr(
                     "alpha", OLD_TS, uid="uid-alpha",
                     spec={"serverUrl": "http://a.test", "redisUrl": "redis://queue.test:6379"},
@@ -544,8 +551,8 @@ def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
     the conflict branch.
     """
     guard = SingletonGuard(
-        FakeCustomObjectsApi(
-            [
+        ListOnlyFakeCustomObjectsApi(
+            items=[
                 make_cr(
                     "alpha", OLD_TS, uid="uid-alpha",
                     spec={"serverUrl": "http://a.test"},
@@ -597,8 +604,8 @@ def test_event_wrapper_url_guard_is_idempotent_per_cr(caplog, log, monkeypatch):
     for the ``RedisUrlEmpty`` reason.
     """
     guard = SingletonGuard(
-        FakeCustomObjectsApi(
-            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec={"serverUrl": "http://a.test"})]
+        ListOnlyFakeCustomObjectsApi(
+            items=[make_cr("alpha", OLD_TS, uid="uid-alpha", spec={"serverUrl": "http://a.test"})]
         )
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
@@ -654,8 +661,8 @@ def test_url_guard_silent_when_secret_ref_present(caplog, log, monkeypatch):
         "redisCredentials": {"secretRef": {"name": "openstudio-redis", "key": "redis-url"}},
     }
     guard = SingletonGuard(
-        FakeCustomObjectsApi(
-            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec=secret_ref_spec)]
+        ListOnlyFakeCustomObjectsApi(
+            items=[make_cr("alpha", OLD_TS, uid="uid-alpha", spec=secret_ref_spec)]
         )
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
@@ -691,8 +698,8 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
         "redisCredentials": {"secretRef": {"name": "openstudio-redis"}},
     }
     guard = SingletonGuard(
-        FakeCustomObjectsApi(
-            [make_cr("alpha", OLD_TS, uid="uid-alpha", spec=malformed_spec)]
+        ListOnlyFakeCustomObjectsApi(
+            items=[make_cr("alpha", OLD_TS, uid="uid-alpha", spec=malformed_spec)]
         )
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
@@ -713,7 +720,7 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
 
 
 
-    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi([])))
+    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi(items=[])))
     events, emit = make_sink()
     monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
 
@@ -730,7 +737,7 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
 
 
 def test_startup_wrapper_zero_crs_logs_idle_once(caplog, log, monkeypatch):
-    guard = SingletonGuard(FakeCustomObjectsApi([]))
+    guard = SingletonGuard(ListOnlyFakeCustomObjectsApi(items=[]))
     monkeypatch.setattr(singleton, "_process_guard", guard)
     monkeypatch.setenv("POD_NAMESPACE", NAMESPACE)
     events, emit = make_sink()
@@ -744,7 +751,7 @@ def test_startup_wrapper_zero_crs_logs_idle_once(caplog, log, monkeypatch):
 
 
 def test_startup_wrapper_without_pod_namespace_skips(monkeypatch):
-    guard = SingletonGuard(FakeCustomObjectsApi([]))
+    guard = SingletonGuard(ListOnlyFakeCustomObjectsApi(items=[]))
     monkeypatch.setattr(singleton, "_process_guard", guard)
     monkeypatch.delenv("POD_NAMESPACE", raising=False)
 

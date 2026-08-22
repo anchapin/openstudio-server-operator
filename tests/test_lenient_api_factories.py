@@ -53,7 +53,6 @@ tests.
 
 from __future__ import annotations
 
-import copy
 import logging
 
 import kopf
@@ -64,6 +63,7 @@ from kubernetes.client import ApiException, CoreV1Api
 from kubernetes.config import ConfigException
 from prometheus_client import REGISTRY
 
+from _fakes import FakeCustomObjectsApi
 from openstudio_operator import singleton
 from openstudio_operator.handlers import analysis_sla
 from openstudio_operator.singleton import SingletonGuard
@@ -96,24 +96,6 @@ def make_cr(name: str, created: str, uid: str | None = None) -> dict:
         "metadata": meta,
         "spec": {"serverUrl": "http://web.test"},
     }
-
-
-class FakeCustomObjectsApi:
-    """List-only :class:`CustomObjectsApi` stand-in — the guard never mutates.
-
-    Symmetric to :class:`tests.test_singleton_guard.FakeCustomObjectsApi`
-    (duplicated here to keep this module hermetic against fixture imports).
-    """
-
-    def __init__(self, items: list[dict]) -> None:
-        self.items = copy.deepcopy(items)
-
-    def list_namespaced_custom_object(self, group, version, namespace, plural):
-        from openstudio_operator.status_store import GROUP, PLURAL
-
-        assert (group, version, plural) == (GROUP, "v1alpha1", PLURAL)
-        assert namespace == NAMESPACE
-        return {"items": copy.deepcopy(self.items)}
 
 
 def _counter(module: str, error_type: str) -> float:
@@ -490,7 +472,7 @@ def test_handler_with_lenient_api_call_increments_tick_failures(
     # inner analysis_sla_monitor body. Without this guard, the gate's
     # strict ``operator_custom_objects_api`` call raises ConfigException
     # and the wrapper returns None before any ``run_sla_tick`` is called.
-    guard = SingletonGuard(FakeCustomObjectsApi([make_cr(NAME, OLD_TS, uid=UID)]))
+    guard = SingletonGuard(FakeCustomObjectsApi(items=[make_cr(NAME, OLD_TS, uid=UID)]))
     monkeypatch.setattr(singleton, "_process_guard", guard)
 
     # Simulate the "lenient placeholder fails at the call site" scenario:

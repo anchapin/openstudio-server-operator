@@ -35,6 +35,7 @@ import fakeredis
 import responses
 from prometheus_client import REGISTRY
 
+from _fakes import _merge_patch, calls_to, make_cr, make_emit
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import (
     OperatorConfig,
@@ -97,39 +98,6 @@ class FakeCO:
         self.patch_calls += 1
         _merge_patch(self.obj, body)
         return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
-def make_cr(spec: dict, status: dict | None = None) -> dict:
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {"name": NAME, "namespace": NAMESPACE},
-        "spec": copy.deepcopy(spec),
-        "status": copy.deepcopy(status if status is not None else {}),
-    }
-
-
-def make_emit():
-    events: list[tuple[str, str, str]] = []
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        events.append((event_type, reason, message))
-
-    return events, emit
-
-
-def calls_to(suffix: str) -> int:
-    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
 
 
 def metric(name: str) -> float:
