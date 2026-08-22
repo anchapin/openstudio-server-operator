@@ -77,6 +77,17 @@ dry-run-marked — but ``lastWebBackgroundRestart`` still advances. Same
 deliberate choice as #11: a dry-run simulation paces exactly like a real
 run (cooldown cadence observable, Event not re-emitted every tick), and
 flipping ``spec.dryRun`` back to false changes only the mutation.
+
+Issue #490 — this timer is also the carrier for the periodic Redis
+key-layout revalidation: every tick first offers
+:func:`_maybe_revalidate_redis_key_layout` the chance to re-run
+``handlers._check_redis_key_layout_for_cr`` (once per 5-minute
+:data:`REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`), because a steady-state
+cluster generates no OSCM watch events and the #163 boot-time check would
+otherwise never re-fire. The rider runs BEFORE the stall evaluation
+(independent of the cooldown gate) and never raises, so the stall
+semantics above are unchanged; its gauges/log/Warning-deferral are the
+existing key-layout surface, now stamped on a cadence.
 """
 
 from __future__ import annotations
@@ -130,6 +141,7 @@ _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 #: spec/config (AGENTS.md).
 from openstudio_operator._constants import (
     LAYOUT_WARNING_GRACE_SECONDS,
+    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL,
     WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
 )
 from openstudio_operator._k8s import (
@@ -209,6 +221,68 @@ def reset_leg2_safeguard_state() -> None:
     _empty_registry_since = None
     _resque_layout_warning_emitted = False
     RESQUE_WORKERS_SEEN_MAX.set(0)
+
+
+#: Issue #490 — when this module last re-ran the Redis key-layout
+#: validation (``handlers._check_redis_key_layout_for_cr``) from the stall
+#: tick. Process-lifetime state, deliberately UN-keyed (the same #497
+#: census rationale as the leg-2 flags above: the Resque key layout is a
+#: Redis-server property, not a CR property, and the D05 singleton guard
+#: means at most one CR's tick drives the cadence anyway).
+#: :func:`reset_key_layout_revalidation_state` is the test seam.
+_last_key_layout_revalidation: datetime | None = None
+
+
+def reset_key_layout_revalidation_state() -> None:
+    """Test-only: clear the process-level key-layout revalidation clock (#490).
+
+    The next ``_maybe_revalidate_redis_key_layout`` invocation runs the
+    check unconditionally (``None`` clock = never validated this process),
+    which is also the fresh-operator-start posture.
+    """
+    global _last_key_layout_revalidation
+    _last_key_layout_revalidation = None
+
+
+def _maybe_revalidate_redis_key_layout(
+    body: dict, *, logger: logging.Logger, now: datetime
+) -> None:
+    """Issue #490 — re-run the Redis key-layout check when the cadence elapses.
+
+    The #163 ``@kopf.on.event`` watch only fires on OSCM watch events (boot
+    listing + CR edits); a steady-state cluster generates none, so without
+    this rider the key-layout status gauge holds its boot value forever and
+    a mid-flight Resque layout drift (helm chart upgrade to a different
+    prefix, queue backend swap) is both unreported AND undetected. This
+    rider re-invokes ``handlers._check_redis_key_layout_for_cr`` — the
+    single validation code path, so the status gauge, its #490 freshness
+    pair, the structured log line, and the ``RedisKeyLayoutDrift`` Warning
+    deferral all behave exactly as at boot — at most once per
+    :data:`REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL` (5 min, half the default
+    ``stallWindowMinutes`` so drift surfaces before the first vacuous
+    restart window can complete).
+
+    Never raises: the underlying check is total (fully wrapped), so a
+    failing validation degrades to the ``unreachable``/``error`` gauges
+    and logs — the stall tick that carries it is unaffected. The deferred
+    import breaks the handlers↔module cycle (``handlers/__init__``
+    imports this module at package load; the check symbol only exists
+    after that import block runs).
+    """
+    global _last_key_layout_revalidation
+    if (
+        _last_key_layout_revalidation is not None
+        and now - _last_key_layout_revalidation < REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL
+    ):
+        return
+    # Stamp BEFORE the call: the check is total (never raises), so this
+    # records "attempted at" == "ran at" without a post-call line — and a
+    # hypothetical future raising variant would retry next tick rather
+    # than hot-looping.
+    _last_key_layout_revalidation = now
+    from openstudio_operator.handlers import _check_redis_key_layout_for_cr
+
+    _check_redis_key_layout_for_cr(body, logger=logger)
 
 
 _RUNNING = "Running"
@@ -689,6 +763,14 @@ def web_background_monitor(
     ``HANDLER_TICK_DURATION_SECONDS.labels
     (module="web_background_monitor")`` in a ``finally`` — regardless of
     success or caught exception.
+
+    Issue #490 — the tick closure ALSO carries the periodic Redis
+    key-layout revalidation (:func:`_maybe_revalidate_redis_key_layout`,
+    before the stall evaluation and independent of its cooldown gate): a
+    steady-state cluster generates no OSCM watch events, so this rider is
+    what bounds the ``redis_key_layout_status_fresh`` staleness gap. It
+    runs at most once per ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` (5
+    min) and never raises, so the stall semantics below are unchanged.
     """
 
     def wire(config: OperatorConfig) -> _StallTimerClients:
@@ -707,6 +789,12 @@ def web_background_monitor(
         deps: _StallTimerClients,
         now: datetime,
     ) -> bool:
+        # Issue #490 — periodic key-layout revalidation rides this tick
+        # BEFORE the stall evaluation (and therefore before the cooldown
+        # gate inside run_stall_tick): the revalidation cadence must not
+        # stall for a full stall window after every restart the monitor
+        # itself issues.
+        _maybe_revalidate_redis_key_layout(body, logger=logger, now=now)
         return run_stall_tick(
             deps.redis_client,
             store,

@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (956 tests across 44 files, current count)
+ruff check . && pytest                       # both green (965 tests across 44 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 16 gauges + 5 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 17 gauges + 5 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
@@ -300,7 +300,18 @@ BOTH success and failure paths, so an inflated
 Redis vs REST vs kube during an incident; the label vocabularies are
 issue-pinned — `llen|smembers|scan` and `get|patch|delete|list` — and
 both families share the #308 bucket set so the three dependency
-histograms render on one dashboard axis).
+histograms render on one dashboard axis). The post-#488 expansion to
+20+17+5 is #490 (`redis_key_layout_status_fresh` — the #312
+freshness-pair idiom applied to the #253 key-layout status gauge,
+which was set only by the `@kopf.on.event` watch and therefore held
+its boot value indefinitely on a steady-state cluster; every
+`_check_redis_key_layout_for_cr` run now stamps the pair in lockstep
+through `handlers/_set_redis_key_layout_status`, and the
+`web_background_monitor` timer re-runs the check at most once per
+`REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL` (5 min) so a mid-flight
+Resque layout drift is revalidated-and-surfaced before the first
+vacuous restart window can complete; alert
+`time() - redis_key_layout_status_fresh > 600` = 2× the interval).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -357,6 +368,7 @@ unlabelled counter here is exactly the regression #181 guards against.
 | `openstudio_operator_resque_workers_seen_max` | `web_background_monitor` (#44/#87) | Monotonic max of distinct Resque worker ids ever observed in process lifetime (`SMEMBERS resque:workers`, emitted every poll regardless of queue depth) | #44 — Resque key-layout leg-2 non-vacuity safeguard; #87 dropped the original `AND queue depth > 0` alert conjunction so the gauge populates on a healthy idle fleet. `0` with a reachable Redis unambiguously means no workers are registered — alert on `== 0`. Not a decision counter — does not follow the §2 anchor pairing convention. |
 | `openstudio_operator_resque_queue_depth` | `web_background_monitor` (`_stall_condition_holds` leg-A read) (#238) | LLEN of the two managed Resque queues (`resque:queue:simulations` and `resque:queue:requeued`) on **every** sensing tick (same path the stall-condition leg-A reads, no separate cost). **Labelled by `queue`** (cardinality bounded to the two managed queues — 2 total). | n/a — surfaces the operator's authoritative reading as a cross-check against KEDA's external metrics view (a centralized-constants / live v3.11.0 layout drift (#44/#66/#67) shows up as the operator's depths disagreeing with KEDA's). Alert on `simulations` > 0 sustained while `resque_workers_seen_max == 0` (the dangerous silent misbehavior signature). |
 | `openstudio_operator_redis_key_layout_status` | `handlers` (`_check_redis_key_layout_for_cr` per-CR check) (#253) | Cluster-wide latest observation of the boot-time Redis key-layout validator (#163). `1.0` when the most recent `validate_key_layout()` call returned `ok`; `0.0` for every other terminal status (`degraded` \| `unreachable` \| `error` \| `skipped`). One series for the cluster-wide validator state (no per-CR labels — cardinality stays bounded regardless of CR count). | n/a — observability for the post-#44 failure mode (a v3.11.0 layout drift takes `resque_workers_seen_max` silent, the stall condition fires vacuously, and the operator periodic-restarts `web_background` while everything looks healthy). Alert on `== 0` without log scraping. |
+| `openstudio_operator_redis_key_layout_status_fresh` | `handlers` (`_set_redis_key_layout_status`, in lockstep with the status gauge at every `_check_redis_key_layout_for_cr` run — the `@kopf.on.event` watch plus the #490 revalidation riding the `web_background_monitor` stall tick) (#490) | Last-run Unix timestamp for the `redis_key_layout_status` data gauge. Set to `time.time()` on EVERY terminal path (`ok` \| `degraded` \| `unreachable` \| `error` \| `skipped` — fresh means recently validated; the status gauge carries the result). | n/a — staleness pair for `redis_key_layout_status`. Pre-#490 the status gauge was watch-event-only (boot listing + CR edits), so a steady-state cluster held its boot value indefinitely and a mid-flight Resque layout drift was both unreported and undetected. Since #490 the web_background timer re-runs the check at most once per `REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL` (5 min, `_constants.py`; half the default `stallWindowMinutes` so drift surfaces before the first vacuous restart window completes). Alert: `time() - openstudio_operator_redis_key_layout_status_fresh > 600` (2× the interval). |
 | `openstudio_operator_stall_window_elapsed_seconds` | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) (#254) | Sustained-window elapsed seconds for the web_background stall. Set after `tracker.observe()` to the elapsed seconds when the stall condition held this tick, or `0` when it broke (the tracker resets). | n/a — heads-up display between the first sustained observation and the eventual `web_background_restarts_total` increment. Without this gauge, three or more Redis/K8s-leg ticks can accumulate toward a restart with nothing on the dashboard until the gate trips. Rate > 0 means the window is accumulating; exact value shows how close to action (the action fires at `stallWindowMinutes`). |
 | `openstudio_operator_resque_queue_depth_fresh` | `web_background_monitor` (`_stall_condition_holds` post-`queue_depths()`) (#312) | Last-successful-update Unix timestamp for the `resque_queue_depth` data gauge. Set to `time.time()` immediately after every successful `queue_depths()` Redis call — NOT touched on the exception path (Redis unreachable, ApiException, etc.). | n/a — staleness pair for `resque_queue_depth`; the data gauge advances on success but is a static stale value on failure, and without this freshness pair the operator has lost visibility silently. Dashboard query: `time() - openstudio_operator_resque_queue_depth_fresh` — alert on a sustained gap (e.g. > 5× the sensing tick cadence). |
 | `openstudio_operator_stall_window_fresh` | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) (#312) | Last-successful-update Unix timestamp for the `stall_window_elapsed_seconds` data gauge. Set to `time.time()` immediately after the `STALL_WINDOW_ELAPSED_SECONDS.set(...)` sequence on both the holding and broken paths. | n/a — staleness pair for `stall_window_elapsed_seconds`; mirrors the `resque_queue_depth_fresh` round-trip pattern. Resetting only the freshness gauge (simulating "we lost visibility") leaves the data gauge holding its prior value — the exact failure mode #312 fixes. |

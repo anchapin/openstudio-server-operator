@@ -131,6 +131,25 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   census.
 
 ### Added
+- **`#490`** — `openstudio_operator_redis_key_layout_status_fresh`: the
+  #312 freshness-pair idiom applied to the #253 key-layout status gauge.
+  The status gauge was set only by the `@kopf.on.event` watch (boot
+  listing + CR edits), so a steady-state cluster generated no watch
+  events, the gauge held its boot value indefinitely, and a mid-flight
+  Resque layout drift (helm chart upgrade to a different prefix, queue
+  backend swap) was both unreported and undetected — validation itself
+  was one-shot. Every `_check_redis_key_layout_for_cr` run now stamps
+  the pair in lockstep (new `handlers/_set_redis_key_layout_status`
+  helper, on every terminal path: fresh means recently validated; the
+  status gauge carries the result), and the `web_background_monitor`
+  timer re-runs the check at most once per the new
+  `_constants.REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL` (5 min — half the
+  default `stallWindowMinutes`, so drift is revalidated-and-surfaced
+  before the first vacuous restart window can complete; the rider runs
+  before the stall evaluation, independent of the restart cooldown, and
+  never raises). Alert: `time() - openstudio_operator_redis_key_layout_
+  status_fresh > 600` (2× the interval). Registry now 20 counters + 17
+  gauges + 5 histograms.
 - **`#488`** — `openstudio_operator_redis_request_duration_seconds{operation}`
   + `openstudio_operator_kube_api_request_duration_seconds{verb}`: the two
   dependencies the #308 REST histogram left uninstrumented got the same

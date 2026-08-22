@@ -93,6 +93,15 @@ EXPECTED_COUNTER_FAMILIES = (
 #: surfaces the boot-time validator outcome as a cluster-wide latest-
 #: observation signal so an SRE can alert on `== 0` without log scraping.
 #:
+#: Issue #490 — ``redis_key_layout_status_fresh`` is the freshness pair
+#: for that gauge: set to ``time.time()`` in lockstep with the status
+#: value at EVERY ``_check_redis_key_layout_for_cr`` invocation (all
+#: terminal paths — fresh means recently validated; the status gauge
+#: carries the result), and kept cadenced by the periodic revalidation
+#: riding the web_background stall tick
+#: (``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``, 5 min). Alert on
+#: ``time() - redis_key_layout_status_fresh > 600`` (2× the interval).
+#:
 #: Issue #254 — ``stall_window_elapsed_seconds`` Gauge tracks the
 #: ``StallWindowTracker`` state between the first sustained observation
 #: and the eventual ``web_background_restarts_total`` increment — a heads-
@@ -181,6 +190,10 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
     "openstudio_operator_redis_key_layout_status",
+    # Issue #490 — freshness pair for redis_key_layout_status: stamped in
+    # lockstep at every _check_redis_key_layout_for_cr run; cadenced by the
+    # 5-minute revalidation riding the web_background stall tick.
+    "openstudio_operator_redis_key_layout_status_fresh",
     "openstudio_operator_stall_window_elapsed_seconds",
     "openstudio_operator_resque_queue_depth_fresh",
     "openstudio_operator_stall_window_fresh",

@@ -1021,6 +1021,122 @@ def test_consolidated_drain_handler_emits_redis_key_layout_drift_event(
     )
 
 
+# --- Issue #490 — key-layout freshness gauge stamped on every run --------------
+#
+# The #253 status gauge carries the validator RESULT; the #490 freshness
+# pair carries WHEN the validator last ran. Both are set in lockstep by
+# ``handlers/_set_redis_key_layout_status`` at every terminal path of
+# ``_check_redis_key_layout_for_cr`` — the tests below pin the lockstep
+# on the success path and on representative failure/skip paths, so a
+# future branch added without the helper fails CI instead of silently
+# reintroducing the blind-holds-value risk #490 fixed.
+from prometheus_client import REGISTRY
+
+from openstudio_operator import metrics as _metrics_module
+
+_FRESH_SAMPLE = "openstudio_operator_redis_key_layout_status_fresh"
+_STATUS_SAMPLE = "openstudio_operator_redis_key_layout_status"
+
+
+def _freshness_value() -> float:
+    return REGISTRY.get_sample_value(_FRESH_SAMPLE) or 0.0
+
+
+def test_redis_key_layout_check_stamps_freshness_gauge_on_ok(
+    fake, client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #490: the ``ok`` path stamps the freshness gauge, not just the status.
+
+    Pre-sets the freshness gauge to a pre-epoch sentinel so the assertion
+    proves THIS call re-stamped it (an untouched gauge would keep the
+    sentinel), then runs the seeded-valid-layout check and asserts the
+    stamp advanced to a plausible wall-clock epoch.
+    """
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    _patched_client_factory(fake, monkeypatch)
+
+    _metrics_module.REDIS_KEY_LAYOUT_STATUS_FRESH.set(1.0)  # pre-epoch sentinel
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+    status = _check_redis_key_layout_for_cr(
+        item, logger=logging.getLogger("openstudio_operator.handlers")
+    )
+
+    assert status == "ok"
+    assert REGISTRY.get_sample_value(_STATUS_SAMPLE) == 1.0
+    fresh = _freshness_value()
+    assert fresh > 1_000_000_000.0, (
+        f"Freshness gauge not re-stamped by the ok run: {fresh!r}. The #490 "
+        f"pair must advance on EVERY validation run — see "
+        f"handlers/_set_redis_key_layout_status."
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["degraded", "unreachable", "skipped"],
+)
+def test_redis_key_layout_check_stamps_freshness_gauge_on_non_ok_paths(
+    fake, client, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Issue #490: every non-``ok`` terminal path stamps freshness in lockstep.
+
+    Fresh means "recently validated" — the STATUS gauge carries the result
+    (0.0 on all three paths), the FRESH gauge carries that a run happened
+    at all. Without the stamp on these paths, a cluster whose validation
+    persistently fails would read as "stale validation" (the ``time() -
+    fresh`` alert firing) when the real problem is the carried 0.0 — two
+    alerts telling one story confusingly.
+    """
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+    if scenario == "skipped":
+        item = {
+            "metadata": {"namespace": "test-ns", "name": "test-osc"},
+            "spec": {"redisUrl": ""},
+        }
+    elif scenario == "unreachable":
+        import redis as _redis
+
+        def _factory(redis_url: str, **_kwargs: object) -> ReadOnlyRedisClient:
+            probe_client = ReadOnlyRedisClient(
+                redis_url, connection=fake, now_fn=lambda: NOW
+            )
+
+            def _boom(*_args: object, **_kwargs: object) -> None:
+                raise _redis.exceptions.ConnectionError("Connection refused")
+
+            monkeypatch.setattr(fake, "scan", _boom)
+            return probe_client
+
+        monkeypatch.setattr(
+            "openstudio_operator.handlers.get_read_only_redis_client", _factory
+        )
+    else:  # degraded — empty fakeredis (no Resque keys) drifts the layout.
+        _patched_client_factory(fake, monkeypatch)
+        handlers_pkg._sink.clear()
+
+    _metrics_module.REDIS_KEY_LAYOUT_STATUS_FRESH.set(1.0)  # pre-epoch sentinel
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == scenario, f"scenario setup drift: got {status!r}"
+    assert REGISTRY.get_sample_value(_STATUS_SAMPLE) == 0.0
+    fresh = _freshness_value()
+    assert fresh > 1_000_000_000.0, (
+        f"Freshness gauge not re-stamped by the {scenario} run: {fresh!r}. "
+        f"The #490 pair must advance on EVERY validation run (fresh means "
+        f"recently validated; the status gauge carries the result)."
+    )
+
+
 # --- Issue #488 — Redis request-duration histogram -------------------------
 
 

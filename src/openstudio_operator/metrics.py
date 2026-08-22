@@ -336,6 +336,44 @@ REDIS_KEY_LAYOUT_STATUS = Gauge(
     "the validator outcome is process-wide).",
 )
 
+# Issue #490 — paired freshness timestamp gauge for REDIS_KEY_LAYOUT_STATUS
+# (above). The #253 status gauge is set only where a validation RUNS: the
+# #163 ``@kopf.on.event`` watch (boot listing + CR edits) and, since #490,
+# the periodic revalidation riding the web_background stall tick
+# (REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL in _constants.py). A steady-state
+# cluster generates no watch events, so pre-#490 the gauge held its boot
+# value indefinitely — a mid-flight Resque layout drift left it reading ok
+# while web_background_monitor's leg-A/leg-2 evaluation ran against a
+# stale layout. The #312 freshness-pair idiom applied to
+# resque_queue_depth / stall_window_elapsed_seconds closes that blind
+# holds-value risk here too: this stamp is set to ``time.time()`` in
+# LOCKSTEP with the status gauge at every
+# ``handlers/_check_redis_key_layout_for_cr`` invocation, on EVERY
+# terminal path (ok | degraded | unreachable | error | skipped — fresh
+# means "recently validated"; the status gauge carries the result).
+# Unlabelled like its data gauge: the validator outcome is process-wide,
+# one series. Alert on the staleness gap: ``time() -
+# openstudio_operator_redis_key_layout_status_fresh > 600`` — 2× the
+# 5-minute revalidation interval (see _constants.py).
+REDIS_KEY_LAYOUT_STATUS_FRESH = Gauge(
+    "openstudio_operator_redis_key_layout_status_fresh",
+    "Unix-epoch seconds of the most recent "
+    "``REDIS_KEY_LAYOUT_STATUS`` update (issue #490). Set to "
+    "``time.time()`` in lockstep with the status gauge at every "
+    "``handlers/_check_redis_key_layout_for_cr`` invocation, on every "
+    "terminal path (``ok`` | ``degraded`` | ``unreachable`` | ``error`` "
+    "| ``skipped`` — fresh means recently validated; the status gauge "
+    "carries the result). Without this pair the status gauge holds its "
+    "boot value indefinitely on a steady-state cluster (no OSCM watch "
+    "events → no revalidation), so a mid-flight Resque layout drift "
+    "reads ``ok`` while the operator has lost its key-layout footing. "
+    "Dashboards should compute staleness as ``time() - "
+    "openstudio_operator_redis_key_layout_status_fresh`` and alert on "
+    "``> 600`` (2× the 5-minute revalidation interval — see "
+    "``_constants.REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``; the "
+    "revalidation rides the web_background stall tick).",
+)
+
 # Issue #254 — sustained-window elapsed seconds for the web_background
 # stall. ``StallWindowTracker`` records the first tick the stall condition
 # was observed and counts elapsed seconds against
