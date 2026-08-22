@@ -1416,3 +1416,195 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
     # Dry-run gate still records exactly the one restart Warning Event.
     assert emitter.suppressed_count == 1
     assert emitter.dry_run is True
+
+
+# --- Issue #490 — periodic key-layout revalidation riding the stall tick -------
+#
+# The #163 key-layout check behind the @kopf.on.event watch only re-runs on
+# OSCM watch events (boot listing + CR edits); a steady-state cluster
+# generates none. The #490 rider re-runs the check from this module's timer
+# tick at most once per REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL (5 min,
+# _constants.py), stamping the paired freshness gauge through the existing
+# handlers code path. The tests below pin: the first-tick fire, the
+# interval gate (skip within, fire at/after), the reset seam, and the
+# wiring — the kopf handler's tick closure carries the rider BEFORE the
+# stall evaluation so the restart cooldown cannot stall revalidation.
+import logging as _logging
+
+from openstudio_operator.handlers import web_background_monitor as _wbm
+from openstudio_operator.handlers.web_background_monitor import (
+    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL as _REVALIDATION_INTERVAL,
+)
+from openstudio_operator.handlers.web_background_monitor import (
+    _maybe_revalidate_redis_key_layout as _revalidate,
+)
+from openstudio_operator.handlers.web_background_monitor import (
+    reset_key_layout_revalidation_state as _reset_revalidation,
+)
+
+
+class _CheckRecorder:
+    """Stand-in for ``handlers._check_redis_key_layout_for_cr`` (#490 tests)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    def __call__(self, item, *, logger):  # test-double signature: mirrors the check
+        self.calls.append((item, logger.name))
+        return "ok"
+
+
+def _record_check(monkeypatch: pytest.MonkeyPatch) -> _CheckRecorder:
+    recorder = _CheckRecorder()
+    monkeypatch.setattr(
+        "openstudio_operator.handlers._check_redis_key_layout_for_cr", recorder
+    )
+    return recorder
+
+
+def test_key_layout_revalidation_fires_on_first_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh process (``None`` clock) revalidates on the very first tick.
+
+    That first fire initializes the freshness gauge promptly after boot and
+    bounds the drift window from process start — the boot-time watch check
+    and this rider agree within one timer interval.
+    """
+    _reset_revalidation()
+    recorder = _record_check(monkeypatch)
+    body = make_cr()
+
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW)
+
+    assert len(recorder.calls) == 1, (
+        f"Expected the first tick to run the key-layout check; got "
+        f"{len(recorder.calls)} calls. See issue #490."
+    )
+    assert recorder.calls[0][0] is body, "the check must receive the CR body"
+    assert _wbm._last_key_layout_revalidation == NOW
+
+
+def test_key_layout_revalidation_skips_within_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticks inside REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL do not re-run the check.
+
+    The rider must not turn the 60 s stall cadence into a 60 s SCAN cadence
+    — the interval gate is the cost bound (per-run cost capped by
+    VALIDATE_SCAN_KEY_BUDGET, but still a Redis round-trip set).
+    """
+    _reset_revalidation()
+    recorder = _record_check(monkeypatch)
+    body = make_cr()
+
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW)
+    assert len(recorder.calls) == 1
+
+    # 4 minutes later — inside the 5-minute interval: no second run.
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW + minute(4))
+    assert len(recorder.calls) == 1, (
+        "Revalidation fired inside the interval — the cadence gate is "
+        "broken (a SCAN storm against Redis). See issue #490."
+    )
+
+
+def test_key_layout_revalidation_fires_again_at_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At exactly the interval elapsed the gate re-opens (boundary is >=).
+
+    The staleness alert thresholds at ``2 * interval``, so an exact-interval
+    re-fire keeps the alert arithmetic honest: the gap can never reach 2x
+    while the rider is alive.
+    """
+    _reset_revalidation()
+    recorder = _record_check(monkeypatch)
+    body = make_cr()
+
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW - _REVALIDATION_INTERVAL)
+    assert len(recorder.calls) == 1
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW)
+    assert len(recorder.calls) == 2, (
+        "Revalidation did not re-fire at exactly the interval elapsed — "
+        "the gate must be `< interval` (fire on >=). See issue #490."
+    )
+
+
+def test_reset_key_layout_revalidation_state_clears_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test seam restores the fresh-process posture (clock ``None``)."""
+    _reset_revalidation()
+    recorder = _record_check(monkeypatch)
+    body = make_cr()
+
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW)
+    assert _wbm._last_key_layout_revalidation == NOW
+    _reset_revalidation()
+    assert _wbm._last_key_layout_revalidation is None
+
+    # And the next invocation runs unconditionally again.
+    _revalidate(body, logger=_logging.getLogger("test"), now=NOW + timedelta(seconds=1))
+    assert len(recorder.calls) == 2
+
+
+def test_web_background_timer_tick_carries_key_layout_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kopf handler's tick closure runs the rider BEFORE the stall tick.
+
+    Wiring-level acceptance for #490: invoking the real
+    ``web_background_monitor`` timer (run_stall_tick stubbed to a no-op so
+    only the wrapper + rider execute) runs the key-layout check on the
+    first tick, skips it on an immediate second tick (interval gate), and
+    re-runs it once the clock is rewound past the interval. The rider also
+    precedes the stall evaluation, so the restart cooldown inside
+    run_stall_tick cannot stall revalidation.
+    """
+    _reset_revalidation()
+    recorder = _record_check(monkeypatch)
+    stall_calls: list[dict] = []
+    monkeypatch.setattr(
+        _wbm, "run_stall_tick", lambda *args, **kwargs: stall_calls.append(kwargs) or False
+    )
+    # StatusStore construction needs a CustomObjectsApi; the stall tick is
+    # stubbed so a sentinel never gets used (the test_timer_wrapper_failures
+    # pattern).
+    monkeypatch.setattr(_wbm, "operator_custom_objects_api", lambda: object())
+    monkeypatch.setattr(
+        _wbm, "get_read_only_redis_client", lambda redis_url: object()
+    )
+
+    spec = {**SPEC, "dryRun": True}
+    body = make_cr(spec)
+
+    def invoke() -> None:
+        _wbm.web_background_monitor(
+            body=body,
+            spec=spec,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=_logging.getLogger("test"),
+        )
+
+    invoke()
+    assert len(recorder.calls) == 1, (
+        "The timer tick did not run the key-layout revalidation — the #490 "
+        "rider is not wired into the tick closure."
+    )
+    assert len(stall_calls) == 1, "the stall evaluation must still run after the rider"
+
+    # Immediate second tick: interval gate holds.
+    invoke()
+    assert len(recorder.calls) == 1
+
+    # Rewind the clock past the interval (against the REAL wall clock the
+    # wrapper stamps — run_oscm_tick uses datetime.now(UTC), not this
+    # module's pinned NOW): the rider fires again.
+    _wbm._last_key_layout_revalidation = (
+        datetime.now(UTC) - _REVALIDATION_INTERVAL - timedelta(seconds=1)
+    )
+    invoke()
+    assert len(recorder.calls) == 2
+    assert len(stall_calls) == 3

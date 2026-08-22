@@ -14,6 +14,7 @@ Warning Event reasons (``RedisUrlEmpty``, ``RedisKeyLayoutDrift``,
 """
 
 import logging
+import time
 
 import kopf
 
@@ -29,7 +30,11 @@ from openstudio_operator.handlers import (  # noqa: F401
     worker_recycler,
 )
 from openstudio_operator.logging_setup import install_json_logging
-from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS, start_metrics_server
+from openstudio_operator.metrics import (
+    REDIS_KEY_LAYOUT_STATUS,
+    REDIS_KEY_LAYOUT_STATUS_FRESH,
+    start_metrics_server,
+)
 from openstudio_operator.redis_client import RedisClientError
 
 logger = logging.getLogger(__name__)
@@ -93,6 +98,14 @@ def _emit_redis_warning_event(*, namespace: str, name: str, message: str) -> Non
 # try/except so a Redis connectivity failure degrades gracefully (operator
 # continues to boot, retries on the next CR tick) — never crashes the
 # process. The drain path is the consolidated :func:`_drain_queued_warning_events`.
+#
+# Issue #490 — validation is no longer boot-only: the web_background stall
+# tick re-runs this check every
+# ``_constants.REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` (5 min) via
+# ``web_background_monitor._maybe_revalidate_redis_key_layout``, so a
+# mid-flight layout drift is caught within a bounded window instead of
+# waiting for a CR edit to happen to coincide. Every run stamps the paired
+# freshness gauge through :func:`_set_redis_key_layout_status` above.
 
 
 def _emit_redis_key_layout_event(
@@ -109,6 +122,22 @@ def _emit_redis_key_layout_event(
     _sink.defer_to_next_tick(
         namespace=namespace, name=name, reason=reason, message=message,
     )
+
+
+def _set_redis_key_layout_status(value: float) -> None:
+    """Set the #253 status gauge + its #490 freshness stamp in lockstep.
+
+    Issue #490 — the status gauge alone is a blind-holds-value signal on
+    a steady-state cluster (no OSCM watch events → no revalidation), so
+    every terminal path of
+    :func:`_check_redis_key_layout_for_cr` goes through THIS helper: the
+    freshness timestamp proves the validator ran recently while the
+    status value carries the result. Centralizing the pair here keeps
+    the two gauges from drifting apart the way a hand-maintained second
+    ``.set(...)`` line at each of the eight branches eventually would.
+    """
+    REDIS_KEY_LAYOUT_STATUS.set(value)
+    REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
 
 
 def _check_redis_key_layout_for_cr(
@@ -134,18 +163,28 @@ def _check_redis_key_layout_for_cr(
     ``error`` | ``skipped``). The gauge is a cluster-wide latest-observation
     signal — no per-CR labels, so cardinality stays bounded regardless of
     CR count.
+
+    Issue #490 — every return path ALSO stamps the paired
+    ``openstudio_operator_redis_key_layout_status_fresh`` timestamp gauge
+    (via :func:`_set_redis_key_layout_status`, in lockstep with the
+    status value). Callers besides the ``@kopf.on.event`` watch: the
+    periodic revalidation riding the web_background stall tick
+    (``web_background_monitor._maybe_revalidate_redis_key_layout`` on
+    ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``) — that cadence is what
+    bounds the freshness gap a dashboard's ``time() - fresh`` computation
+    alerts on.
     """
     if not isinstance(item, dict):
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "skipped"
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
     if not isinstance(meta, dict):
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "skipped"
     ns = str(meta.get("namespace") or "")
     nm = str(meta.get("name") or "")
     if not ns or not nm:
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "skipped"
     spec = item.get("spec") or {}
     redis_url = str(spec.get("redisUrl") or "")
@@ -157,7 +196,7 @@ def _check_redis_key_layout_for_cr(
             ns,
             nm,
         )
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "skipped"
     try:
         get_read_only_redis_client(redis_url).validate_key_layout()
@@ -188,7 +227,7 @@ def _check_redis_key_layout_for_cr(
                 "the constants (see issue #44 / docs/kind-validation.md)."
             ),
         )
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "degraded"
     except (RedisClientError, OSError) as exc:
         # Redis connectivity failure (refused, DNS, timeout) — wire-level,
@@ -201,7 +240,7 @@ def _check_redis_key_layout_for_cr(
             nm,
             exc,
         )
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "unreachable"
     except Exception as exc:  # noqa: BLE001 — defensive last-resort (see web_background_monitor.py)
         logger.warning(
@@ -211,14 +250,14 @@ def _check_redis_key_layout_for_cr(
             type(exc).__name__,
             exc,
         )
-        REDIS_KEY_LAYOUT_STATUS.set(0.0)
+        _set_redis_key_layout_status(0.0)
         return "error"
     logger.info(
         "redis_key_layout=ok namespace=%s name=%s",
         ns,
         nm,
     )
-    REDIS_KEY_LAYOUT_STATUS.set(1.0)
+    _set_redis_key_layout_status(1.0)
     return "ok"
 
 

@@ -64,6 +64,21 @@ WEB_BACKGROUND_POLL_INTERVAL_SECONDS: float = 60.0
 #: within the first stall window.
 LAYOUT_WARNING_GRACE_SECONDS: timedelta = timedelta(seconds=60)
 
+#: Issue #490 — periodic Redis key-layout revalidation cadence. The #163
+#: boot-time check (``handlers/_check_redis_key_layout_for_cr`` behind the
+#: ``@kopf.on.event`` watch) only re-runs on OSCM watch events — the boot
+#: listing and CR edits — so a steady-state cluster generates none and a
+#: mid-flight Resque layout drift (helm chart upgrade to a different
+#: prefix, queue backend swap) leaves the key-layout status gauge holding
+#: its boot value indefinitely. The web_background stall tick re-runs the
+#: check on this cadence (``web_background_monitor``'s #490 rider). 5
+#: minutes — half the default ``stallWindowMinutes`` (10), so drift is
+#: revalidated and surfaced on ``redis_key_layout_status{,_fresh}``
+#: before the FIRST vacuous restart window can complete; matches the
+#: worker-recycler 300 s precedent for a low-frequency Redis-side scan
+#: cadence (per-run cost bounded by ``VALIDATE_SCAN_KEY_BUDGET``).
+REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL: timedelta = timedelta(minutes=5)
+
 # -----------------------------------------------------------------------------
 # Metrics HTTP server
 # -----------------------------------------------------------------------------
