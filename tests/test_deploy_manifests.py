@@ -716,10 +716,12 @@ def test_cronjob_image_digest_matches_operator_deployment():
 # conventional Prometheus port (METRICS_PORT=9090). The endpoint is gated
 # by the parallel ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy
 # in deploy/network-policy.yaml — same Prometheus-style allow-list (namespace-
-# matched scraper + same-namespace peer) used for the operator's /metrics
-# (#166). The two targets are intentionally distinct policy objects because
-# the pod labels differ (the operator carries ``app: openstudio-operator`` and
-# the CronJob carries ``app.kubernetes.io/component: storage-pruner``);
+# matched scraper + label-scoped same-namespace peer, hardened to the #295
+# bar by #478) used for the operator's /metrics (#166), plus the same
+# empty-by-default OPENSTUDIO_METRICS_TOKEN_FILE bearer opt-in (#401 parity,
+# #478). The two targets are intentionally distinct policy objects because
+# the pod labels differ (the operator carries ``app: openstudio-operator``
+# and the CronJob carries ``app.kubernetes.io/component: storage-pruner``);
 # widening the operator's policy with an OR selector would silently broaden
 # the surface, so the two-policy split is the regression fence.
 
@@ -815,27 +817,83 @@ def test_storage_pruner_metrics_ingress_restricts_to_port_9090():
 
 def test_storage_pruner_metrics_ingress_has_prometheus_and_peer_allow():
     """Same Prometheus-style allow-list as the operator's policy (#166 /
-    AGENTS.md "Working rules"): a namespace-matched scraper + a same-
-    namespace peer. Cluster admins running a different scraper namespace
-    MUST edit the label match — the test is the regression fence that
-    prompts the rename."""
+    #295 / AGENTS.md "Working rules"): a namespace-matched scraper + a
+    same-namespace peer only when that peer opts in via the project label
+    ``app.kubernetes.io/component: metrics-scraper``. An empty
+    ``podSelector: {}`` is a regression (issue #478 — the pruner policy's
+    original shape): every helm-chart pod in openstudio-server carries
+    some ``app.kubernetes.io/component`` value (web / web-background /
+    worker / db / redis / queue / nfs), but none of them is
+    ``metrics-scraper``, so the unscoped allow let them scrape the
+    pruner's plaintext /metrics (``analyses_archived_total``,
+    ``analyses_deleted_total``, ``prune_tick_failures_total{reason}``) —
+    useful reconnaissance for timing retention deletes against conflict
+    storms. Cluster admins running a different scraper namespace MUST
+    edit the label match — the test is the regression fence that prompts
+    the rename."""
     policy = _storage_pruner_metrics_ingress_policy()
     rule = policy["spec"]["ingress"][0]
     from_selectors = rule["from"]
     has_namespace_selector = any(
         "namespaceSelector" in peer for peer in from_selectors
     )
-    has_same_ns_peer = any(
-        peer.get("podSelector") == {} for peer in from_selectors
+    same_ns_peers = [
+        peer for peer in from_selectors if "podSelector" in peer
+    ]
+    has_label_scoped_peer = any(
+        peer["podSelector"].get("matchLabels", {}).get(
+            "app.kubernetes.io/component"
+        )
+        == "metrics-scraper"
+        for peer in same_ns_peers
+    )
+    has_empty_podselector = any(
+        peer.get("podSelector") == {} for peer in same_ns_peers
     )
     assert has_namespace_selector, (
         "storage-pruner-metrics-ingress must include a namespaceSelector "
         "pointing at the cluster's scraper namespace (default `prometheus`); "
         "see AGENTS.md Working rules for the cluster-admin opt-in."
     )
-    assert has_same_ns_peer, (
-        "storage-pruner-metrics-ingress must include an empty podSelector "
-        "to allow co-located scrapers (e.g. sidecar) in openstudio-server"
+    assert has_label_scoped_peer, (
+        "storage-pruner-metrics-ingress must include a podSelector matching "
+        "{app.kubernetes.io/component: metrics-scraper} so the same-"
+        "namespace peer allow is opt-in only. See AGENTS.md /metrics "
+        "ingress rule (issues #295 / #478)."
+    )
+    assert not has_empty_podselector, (
+        "storage-pruner-metrics-ingress must NOT use `podSelector: {}` — "
+        "that selector matches every pod in openstudio-server (web, "
+        "web-background, worker, db, redis, queue, nfs) and would re-open "
+        "the plaintext /metrics endpoint to every helm-chart pod "
+        "(issue #478 — same regression as #295 fixed for the operator)."
+    )
+
+
+def test_storage_cronjob_carries_metrics_token_file_env():
+    """Issue #478 acceptance: the prune CronJob container carries the same
+    (empty-by-default) ``OPENSTUDIO_METRICS_TOKEN_FILE`` opt-in as the
+    operator Deployment's #401 hook. ``prune_entrypoint.main()`` calls the
+    shared ``metrics.start_metrics_server()`` with no explicit token_file,
+    so this env var is the pruner's ONLY config surface for the
+    fail-closed bearer gate — without the manifest entry the CronJob pod
+    could never enable authN even though the code supports it. Empty value
+    = the documented open-plaintext default (the NetworkPolicy is then
+    the only gate); a non-empty default would silently require a Secret
+    mount the stock install does not ship."""
+    container = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in container.get("env") or []}
+    assert "OPENSTUDIO_METRICS_TOKEN_FILE" in env, (
+        "storage-cronjob.yaml must ship the OPENSTUDIO_METRICS_TOKEN_FILE "
+        "env var (empty-by-default opt-in, mirroring "
+        "deploy/operator-deployment.yaml's #401 hook) — the pruner's "
+        "/metrics bearer-token gate is unreachable without it (#478)"
+    )
+    assert env["OPENSTUDIO_METRICS_TOKEN_FILE"] == "", (
+        "OPENSTUDIO_METRICS_TOKEN_FILE must default to empty (open "
+        "plaintext gated only by the metrics-ingress NetworkPolicy); a "
+        "non-empty default would require a Secret mount the stock install "
+        "does not ship (#401 / #478 opt-in shape)"
     )
 
 

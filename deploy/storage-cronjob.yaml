@@ -140,6 +140,29 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # Issue #478 — optional bearer-token authN for the prune
+                # CronJob's /metrics endpoint, at parity with the operator
+                # Deployment's #401 hook (deploy/operator-deployment.yaml):
+                # the same env var, the same fail-closed 401 semantics.
+                # prune_entrypoint.main() calls the shared
+                # metrics.start_metrics_server(), which reads this env var
+                # — set to a readable token file, the endpoint demands
+                # ``Authorization: Bearer <token>`` and 401s otherwise.
+                # Default empty = open plaintext gated only by the
+                # ``openstudio-storage-pruner-metrics-ingress``
+                # NetworkPolicy (also #478-hardened to the #295 label-
+                # scoped selector); do NOT make the token mandatory. To
+                # enable per-cluster:
+                #   1. kubectl -n openstudio-server create secret generic \
+                #        openstudio-pruner-metrics-token --from-literal=token=<secret>
+                #   2. uncomment the metrics-token volumeMount + volume below,
+                #   3. set this value to /var/run/openstudio-pruner-metrics/token.
+                # The server re-reads the token file on every request, so
+                # Secret rotation takes effect without waiting for the next
+                # tick; a missing or empty file fails CLOSED (every
+                # /metrics request 401s).
+                - name: OPENSTUDIO_METRICS_TOKEN_FILE
+                  value: ""
               # Issue #306 — expose the plaintext Prometheus endpoint on the
               # conventional /metrics port (METRICS_PORT=9090). The prune
               # entrypoint calls start_metrics_server() at the top of main()
@@ -181,9 +204,29 @@ spec:
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+                # Issue #478 — uncomment together with the metrics-token
+                # volume below AND the OPENSTUDIO_METRICS_TOKEN_FILE env
+                # value above to enable bearer-token authN on the pruner's
+                # /metrics (same opt-in shape as the operator Deployment's
+                # #401 pair — the default ships WITHOUT this mount so the
+                # CronJob schedules on clusters where the Secret does not
+                # exist; a live secretName reference to a missing Secret
+                # would block pod scheduling (FailedMount)):
+                # - name: metrics-token
+                #   mountPath: /var/run/openstudio-pruner-metrics
+                #   readOnly: true
           volumes:
             - name: tmp
               emptyDir: {}
+            # Issue #478 — uncomment together with the metrics-token
+            # volumeMount above AND the OPENSTUDIO_METRICS_TOKEN_FILE env
+            # value above:
+            # - name: metrics-token
+            #   secret:
+            #     secretName: openstudio-pruner-metrics-token
+            #     items:
+            #       - key: token
+            #         path: token
 ---
 # Issue #294 — ValidatingAdmissionPolicy that constrains the prune SA's
 # `batch/jobs create|delete` verbs to Jobs that carry the archival labels.

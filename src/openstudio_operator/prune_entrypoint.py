@@ -207,6 +207,14 @@ def main(
     # failure is the only signal if a sibling process is already on it.
     # Placement: right after the JSON log formatter is installed so any
     # failure-to-bind warning is itself JSON-structured for Loki/CloudWatch.
+    # Issue #478 — bearer-token parity with the operator (#401): this
+    # calls the SAME shared ``metrics.start_metrics_server`` with no
+    # explicit ``token_file``, so the ``OPENSTUDIO_METRICS_TOKEN_FILE``
+    # env var (shipped empty-by-default on the CronJob manifest) is the
+    # config surface: when it names a readable file the endpoint demands
+    # ``Authorization: Bearer <token>`` and 401s otherwise (fail-closed
+    # on a missing/empty file); unset = open plaintext gated only by the
+    # ``openstudio-storage-pruner-metrics-ingress`` NetworkPolicy.
     start_metrics_server()
     if namespace is None:
         namespace = os.environ.get("POD_NAMESPACE")

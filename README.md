@@ -121,6 +121,16 @@ rotation takes effect without an operator restart, and a missing or empty
 file fails closed (every request 401s). No TLS is added — that is a separate
 concern requiring cert management.
 
+**Pruner-endpoint parity (issue #478):** the storage-prune CronJob's
+`/metrics` endpoint (same port 9090) is hardened to the same bar — its
+`openstudio-storage-pruner-metrics-ingress` NetworkPolicy uses the same
+label-scoped `app.kubernetes.io/component: metrics-scraper` same-namespace
+peer (no bare `podSelector: {}`, #295 parity) and the CronJob manifest
+ships the same empty-by-default `OPENSTUDIO_METRICS_TOKEN_FILE` opt-in
+(Secret `openstudio-pruner-metrics-token`; `prune_entrypoint.main()` calls
+the shared `metrics.start_metrics_server()`, so the fail-closed 401
+semantics are identical to the operator's).
+
 The metric families added since the 16+4+1 claim are signed off below
 for the on-call's reference; the drift-integrity invariant that fails CI is
 the `N counters + M gauges + K histograms` count itself, not any one
