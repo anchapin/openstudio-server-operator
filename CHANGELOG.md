@@ -34,6 +34,16 @@ parsing, `#483` rolling-restart paths, `#485` deploy-inventory gate,
 audit-policy index, `#487` ADR index, `#486` snapshot-cruft prune,
 `#503` CONTRIBUTING setup) — alongside the earlier iteration's
 NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
+The `#571` backfill restores the closures the doc-sync passes
+under-selected: the security/cluster-posture headliners (`#388` PSS
+recipe labels, `#392` prune silent-wedge counter, `#394` archival
+deadline + wedged-pipeline alert, `#396` TLS CA-bundle mount recipe,
+`#398` VAP name-pattern second factor, `#400` ResourceQuota/LimitRange,
+`#401` /metrics bearer authN, `#414` PriorityClass), the supply-chain
+CI repair (`#456` SLSA predicate shape, `#459` cosign digest
+extraction, `#564` base-image CVE refresh, `#565` VAP schemas, `#567`
+secretRef tick wiring), and the earlier iteration's test/refactor/docs
+wave (`#286`–`#316`, `#381`, `#382`).
 
 ### Changed
 - **`#497`** — one per-CR cache keying + reset convention for the
@@ -909,6 +919,208 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   finally (wiring-failing-but-scheduled reads ALIVE + climbing, the
   signature SREs need). Non-tuple wiring errors (e.g. `RuntimeError`)
   still propagate fail-closed.
+
+### Added
+- **`#394`** — `ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS` (6× the chart's
+  worker `terminationGracePeriodSeconds`, 31200 s) is emitted as
+  `activeDeadlineSeconds` on every generated archival Job manifest —
+  the kubelet hard-kills a hung rclone pod past it, so the
+  verified-upload gate can no longer wedge the retention pipeline
+  indefinitely. Companion wedged-pipeline alert (README metrics
+  table): archival rate at zero while an in-flight Job outlives the
+  deadline bound.
+- **`#396`** — corporate-PKI TLS support is completed end-to-end in
+  `deploy/operator-deployment.yaml`: `OPENSTUDIO_TLS_CA_BUNDLE` ships
+  with the documented `kubectl create secret ... --from-file=ca-bundle.crt`
+  recipe and the commented `tls-ca-bundle` volume/volumeMount pair
+  landing it at `/etc/openstudio/tls/ca-bundle.crt`, where
+  `openstudio_client._resolve_tls_ca_bundle` (`#296`) already looks —
+  previously the env var could be set but the mount it implies did
+  not exist, so a configured CA bundle was never actually read.
+- **`#397`** — `spec.dryRun` toggle audits: the `dry_run_audit`
+  handler module (a pure `@kopf.on.event` watch — NOT singleton-gated,
+  NOT in the `_oscm_handlers` spawning registry) emits a
+  `DryRunToggled` audit Event on every `spec.dryRun` transition. A
+  stealth-disable (live → dry-run, actions silently suppressed per
+  D11) now leaves an Event trail instead of being invisible.
+- **`#400`** — `deploy/resource-quota.yaml`: ResourceQuota +
+  LimitRange bounding the namespace's aggregate (pods / requests /
+  limits) and per-container resource surface — caps the blast radius
+  of a runaway worker scale-out or a hostile CR write.
+- **`#401`** — optional bearer-token authN on the plaintext `/metrics`
+  endpoint: `OPENSTUDIO_METRICS_TOKEN_FILE` (empty by default = the
+  historical no-auth behavior; fail-closed 401 on every scrape when
+  set), with the create-secret + uncomment-mount recipe commented
+  into `deploy/operator-deployment.yaml`. The pruner CronJob carries
+  the same opt-in (`#478` parity).
+- **`#414`** — `deploy/priority-class.yaml`: the
+  `openstudio-operator-critical` PriorityClass, wired into the
+  operator Deployment and the prune CronJob — under node-pressure
+  eviction the scheduler now evicts workload pods before the
+  operator or the retention pruner.
+- **`#306`** — the prune CronJob serves its own `/metrics` surface:
+  `prune_entrypoint.main()` calls the shared
+  `metrics.start_metrics_server()` and every skip-tick / terminal
+  failure path increments
+  `openstudio_operator_prune_tick_failures_total{reason}` — the
+  prune actor's failures were previously log-only and effectively
+  unobservable.
+- **`#308`** — `openstudio_operator_handler_tick_duration_seconds{module}`
+  + `openstudio_operator_rest_request_duration_seconds` histograms:
+  per-tick wall-clock and per-REST-round-trip latency distributions
+  (the dependency-latency view `#488` later extended to Redis and the
+  kube API).
+- **`#286`** — `tests/test_lenient_api_factories.py`: fail-closed
+  regression tests for the lenient `operator_*_api` factory path
+  (`#251`) — placeholder-on-`ConfigException` behavior is pinned,
+  not assumed.
+- **`#287`** — `tests/test_walk_metrics_registry.py`: walks the
+  registry and asserts every family `metrics.py` defines appears in
+  the `EXPECTED_*_FAMILIES` tuples (re-sourced through the shared
+  `tests/_metrics_inventory.py` fixture by `#406`).
+- **`#297`** — Hypothesis property tests for the archival Job-name
+  derivation + manifest generator (`tests/test_archival.py`).
+- **`#299`** — `EventEmitter.emit`'s `kopf.event` failure path is
+  directly tested (`tests/test_events.py`, tracks `#255`) — the
+  emit-failure counter bump is pinned, not incidental.
+- **`#300`** — DST spring-forward / fall-back boundary strings for
+  `parse_iso_utc` (`tests/test_time_parsing.py`) — the three boundary
+  instants a fixed-offset fake cannot generate.
+- **`#316`** — the CronJob-entrypoint image test reads the pinned
+  digest out of `deploy/storage-cronjob.yaml` instead of a hard-coded
+  literal — `release.yml` digest re-pins no longer break the suite.
+- **`#381`** — `tests/test_wave_orchestrator_e2e.py`: end-to-end
+  wave-orchestrator replay over
+  `tests/fixtures/wave-orchestrator/sample-wave.json`.
+- **`#415`** — `tests/test_deploy_manifests.py` asserts
+  `automountServiceAccountToken: false` is NOT set on the operator
+  Deployment or the prune CronJob (both need their SA tokens, unlike
+  the `#241` archival Jobs) — fences a copy-paste of the archival
+  hardening onto the wrong pods.
+
+### Changed
+- **`#388`** — Pod Security Standards arrive in the kind recipe:
+  `scripts/manifests/00-namespace.yaml` labels the namespace
+  `enforce`/`audit: restricted` (`enforce-version: latest`) and the
+  chart-overlay pod manifests (`04-web`, `05-web-background`,
+  `06-worker`) carry the `securityContext` the labels demand.
+  `deploy/namespace-labels.yaml` (`#498`) mirrors the label set for
+  production installs.
+- **`#311`** — the tick-failure and status-store counters gain
+  `namespace`/`name` labels (CR identity, bounded by D05) —
+  `handler_tick_failures_total` and `status_map_caps_total` series
+  attribute to a CR instead of pooling the namespace.
+- **`#292`** — the `kubernetes` client dependency is bounded
+  (`>=29.3.0,<37`) in `pyproject.toml` — a major-version bump of the
+  client can no longer ride in silently via a lockfile refresh.
+- **`#404`** — the byte-identical `_noop_event_sink` shadow is
+  removed; `set_event_sink(None)` restores the original default
+  sink.
+- **`#405`** — the redundant `singleton._load_k8s_config` /
+  `prune_entrypoint._load_kube_config` wrappers are removed
+  (completes `#305`): the singleton factories and
+  `prune_entrypoint.main()` call `_k8s.load_operator_kube_config()`
+  directly.
+- **`#406`** — the `EXPECTED_*_FAMILIES` tuples live in the single
+  shared fixture `tests/_metrics_inventory.py`; both
+  `test_metrics_endpoint.py` and `test_walk_metrics_registry.py`
+  (`#287`) import from it — the inventory has one definition site.
+- **`#407`** — the four-fold duplicated `_register_oscm_handler`
+  import-and-call collapses into `register_fn(fn)` (the
+  `__name__`-introspecting convenience in `_oscm_handlers.py`) — one
+  less step in the "add a new OSCM timer handler" pattern.
+- **`#416`** — the duplicated `_sleep` test-seams in
+  `openstudio_client.py` and `status_store.py` collapse into
+  `src/openstudio_operator/_retry.py` — one monkeypatch site for
+  retry/backoff tests.
+
+### Fixed
+- **`#289`** (skill, `docs/skill-snapshot/`) — `auto_close_issues.py`
+  parses comma-separated `Closes #N, #M` reference lists after a
+  squash merge (previously only single-reference subjects
+  auto-closed).
+- **`#291`** — the storage CronJob no longer runs the mutable `:dev`
+  tag with `imagePullPolicy: IfNotPresent`: the image reference is
+  digest-pinned with pull policy `Always`, so a node holding a cached
+  stale `:dev` layer set can no longer run the wrong pruner.
+- **`#295`** — the `/metrics` ingress NetworkPolicy's same-namespace
+  peer allow is scoped to the `app.kubernetes.io/component:
+  metrics-scraper` label (was `podSelector: {}` — every helm-chart
+  pod could scrape the plaintext endpoint). The label convention is
+  the documented opt-in contract; the pruner's parallel policy was
+  hardened to the same bar by `#478`.
+- **`#304`** — `singleton.py` no longer imports FROM
+  `openstudio_operator.handlers` (the inverted dependency): the
+  redis-URL guard Warning fires via `_emit_kopf_event` directly, and
+  an AST gate keeps the inversion from returning.
+- **`#307`** — the singleton guard's `_gated` wrapper increments
+  `HANDLER_TICK_FAILURES_TOTAL` on API errors instead of silently
+  swallowing them — guard-internal failures are scrapeable.
+- **`#382`** (skill, `docs/skill-snapshot/`) — the orchestrator's
+  placeholder substitution (`{N}`, `{affected_file}`, `#M`,
+  `NEXT_ISSUE`) has a documented resolver contract.
+- **`#392`** — the prune exit-3 empty-`spec.redisUrl` path increments
+  `prune_tick_failures_total{reason="redis_url_empty"}` before
+  exiting — the silent-wedge mode (CronJob pod restarts forever, no
+  metric moves) is scrapeable; the exit-code contract is unchanged.
+- **`#398`** — the archival-Job VAP gains its second factor: the CEL
+  match now also requires
+  `metadata.name.startsWith("oscm-archive-")` (checked on object and
+  oldObject) alongside the archival labels — labels alone are
+  spoofable by the very SA the policy constrains; the deterministic
+  name from `archival_job_name` is not.
+- **`#456`** — `release.yml` emits the SLSA predicate as the bare
+  v0.2 `ProvenancePredicate` (cosign's `--type slsaprovenance`
+  unmarshals the file into the v0.2 struct and constructs the
+  Statement envelope itself). The previously-emitted v1-shaped
+  statement failed `required field builder missing` — every
+  `cosign attest` since `#155` was broken.
+- **`#459`** — the ci.yml cosign-verify job reads the `:dev` digest
+  from the registry descriptor instead of
+  `imagetools inspect --raw | jq .digest` (the raw manifest has no
+  top-level `.digest`; the extraction was null by design and the job
+  had never passed).
+- **`#564`** — base-image CVE refresh: the `python:3.12-slim` digest
+  is bumped past the stale digest's 3 CRITICAL + 50 HIGH, clearing
+  the 16 time-boxed `.trivyignore` exceptions the `#481` gate's
+  first run carried.
+- **`#565`** — the four admission docs (both VAPs + both Bindings)
+  are schema-valid `admissionregistration.k8s.io/v1`
+  (`validationActions`, `matchResources`, prune-SA `userInfo`
+  carve-out) — the API server previously rejected all four at apply
+  time, so the `#293`/`#294`/`#398` narrow-scope enforcement never
+  actually applied. Passing server-side dry-run on kind v1.31,
+  fenced by CI tests globbing every VAP/Binding under `deploy/`.
+- **`#567`** — the `#463` `redisCredentials.secretRef` resolution is
+  wired into the Redis-consuming surfaces: the boot-time redis-URL
+  guard and the `analysis_sla` fallback factory path resolve the
+  effective URL from the secretRef (+ CR namespace) — a
+  secretRef-only CR (empty `spec.redisUrl`, the preferred production
+  shape) no longer trips the empty-URL Warning and gets a working
+  client.
+
+### Docs
+- **`#288`** — this `[Unreleased]` section gained its `### Changed` /
+  `### Removed` subsections (post-`#257` structure).
+- **`#301`** — the PR-body `Scope guard:` requirement is documented
+  (AGENTS.md + onboarding.md + PR template) and enforced by
+  `scripts/check_pr_body_scope.sh` in the `lint` job.
+- **`#302`** — `CONTRIBUTING.md` created as the canonical branch /
+  PR / merge-subject home (previously scattered across AGENTS.md and
+  onboarding.md).
+- **`#303`** — the merge-subject hygiene paragraph is de-duplicated
+  between AGENTS.md and onboarding.md (onboarding.md is the source of
+  truth; AGENTS.md carries the quick-reference pointer).
+- **`#408`** — README Repository layout lists every `deploy/`
+  manifest (three were missing).
+- **`#409` / `#410`** — the REST-contract doc and the kind-validation
+  snippets no longer cite the legacy `openstudio` Redis password
+  (stale post-`#150` rotation).
+- **`#411` / `#413`** — docs/validation.md documents the
+  `#293`/`#294` VAPs and the K8s 1.30+ requirement, in both the
+  runbook and the module-status table.
+- **`#412`** — docs/onboarding.md "Working rules that bite" gains the
+  `#295` `metrics-scraper` label rule and the VAP narrowing rules.
 
 ## [0.2.0] - 2026-08-19
 
