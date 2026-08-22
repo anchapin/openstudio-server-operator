@@ -32,7 +32,9 @@ every handler tick share one connection pool per Redis URL. The
 Cache semantics (D04: cache-only, never operator state)
 -------------------------------------------------------
 Each cache is a :func:`functools.lru_cache` keyed by its URL alone
-(``server_url`` for the REST client, ``redis_url`` for the Redis client):
+(``server_url`` for the REST client, the EFFECTIVE Redis URL — inline
+``spec.redisUrl`` or the Secret-resolved value (#463/#568) — for the Redis
+client):
 
 * **Cache hit** — repeated calls with the same URL return the *same* client
   object, so the underlying ``requests.Session`` / ``redis.Redis`` connection
@@ -79,15 +81,24 @@ the URL as a constructor argument). The grant is namespaced ``get``-only in
 ``openstudio-redis*`` convention (#240-style fence) so a CR-write principal
 cannot point the operator at arbitrary Secrets.
 
-Cache semantics on the Secret path: the cache key is
-``(redis_url, secret_ref, namespace)`` — mutating the secretRef name/key in
-the spec is a different key and therefore a fresh client (same
-invalidation-by-key property as a mutated URL). The Secret's CONTENT is not
-part of the key, so an in-place password rotation leaves the cached client
-on the old URL until the operator restarts or the spec's secretRef changes
-— the same runbook step the inline path needs (rotating the password also
-requires updating every REDIS_URL env consumer); see
-``scripts/rotate_redis_password.sh``.
+Cache semantics on the Secret path (issues #463, #568): the Secret is
+re-resolved on EVERY call — one bounded ``secrets: get`` per secret-path
+call, zero on the inline path — and the client LRU is keyed by the
+EFFECTIVE resolved URL. Rotating the Secret in place therefore lands
+in-band: the rotated password changes the URL, the URL is a new cache key,
+and the next tick builds a fresh client — no operator restart and no
+eviction hook. (Pre-#568 the key was ``(redis_url, secret_ref,
+namespace)``: Secret CONTENT was not part of the key, so
+``scripts/rotate_redis_password.sh`` left the cached client authenticating
+with the OLD password — WRONGPASS on every Resque read, counted skip-ticks,
+Resque-dependent features dark — until someone bounced the operator pod.
+That is the gap #568 closed.) Keying on the resolved URL rather than the
+Secret's bare ``resourceVersion`` is deliberate: any credential rotation
+changes the URL, while a ``resourceVersion`` bump that leaves the URL
+untouched keeps the cached client, so the connection pool only churns when
+the credential actually changes. Mutating the secretRef name/key in the
+spec resolves a different Secret and therefore (usually) a different URL —
+the same invalidation-by-key property as a mutated inline URL.
 
 Tests call :func:`get_openstudio_client.cache_clear` /
 :func:`get_read_only_redis_client.cache_clear` to get a clean process.
@@ -133,6 +144,20 @@ def get_openstudio_client(server_url: str) -> OpenStudioClient:
 
 
 @lru_cache(maxsize=REDIS_CLIENT_CACHE_MAXSIZE)
+def _redis_client_for_url(resolved_url: str) -> ReadOnlyRedisClient:
+    """The ONE :class:`ReadOnlyRedisClient` construction site (issue #235),
+    keyed by the EFFECTIVE URL — the inline ``spec.redisUrl`` or the
+    Secret-resolved value, whichever :func:`get_read_only_redis_client`
+    settled on (#463).
+
+    Keying on the effective URL is what makes Secret rotation an
+    invalidation (#568): a rotated password is a different URL and
+    therefore a different client, while an unchanged URL keeps one
+    connection pool no matter which Secret it came from.
+    """
+    return ReadOnlyRedisClient(resolved_url)
+
+
 def get_read_only_redis_client(
     redis_url: str,
     secret_ref: RedisSecretRef | None = None,
@@ -162,12 +187,26 @@ def get_read_only_redis_client(
     Issue #463 — when ``secret_ref`` is set, the URL is resolved from that
     Secret key (full-URL semantics; validated against the in-cluster
     pattern with credentials allowed) and PREFERRED over ``redis_url``.
-    The cache key is ``(redis_url, secret_ref, namespace)``, so a mutated
-    secretRef is a different key and therefore a fresh client; resolution
-    failures raise :class:`RedisCredentialResolutionError` and are not
-    cached (a Secret created later is picked up on the next call).
+
+    Issue #568 — the Secret is re-resolved on EVERY call and the client
+    cache (:func:`_redis_client_for_url`) is keyed by the resolved URL, so
+    an in-place password rotation is picked up within one tick: the new URL
+    is a new cache key, the stale client is never handed back out, and no
+    operator restart is needed. Resolution failures raise
+    :class:`RedisCredentialResolutionError` outside the LRU, so they are
+    never cached (a Secret created later is picked up on the next call).
     """
-    return ReadOnlyRedisClient(_resolve_redis_url(redis_url, secret_ref, namespace))
+    if secret_ref is None:
+        return _redis_client_for_url(redis_url)
+    return _redis_client_for_url(_resolve_redis_url(redis_url, secret_ref, namespace))
+
+
+# Issue #568 moved the LRU inward — the key is now the resolved URL, which
+# only the uncached wrapper above can compute (it takes a Secret read).
+# The ``lru_cache`` seam the test suite and teardown rely on stays on the
+# public function.
+get_read_only_redis_client.cache_clear = _redis_client_for_url.cache_clear
+get_read_only_redis_client.cache_info = _redis_client_for_url.cache_info
 
 
 def _resolve_redis_url(
@@ -194,6 +233,9 @@ def _resolve_redis_url(
     is namespaced ``get``-only on Secrets (``deploy/rbac.yaml``), and the
     CRD pins the Secret name to the ``openstudio-redis*`` convention so a
     CR-write principal cannot make the operator read arbitrary Secrets.
+    Since #568 this resolution runs on every secret-path call (the rotation
+    probe): this one ``get`` is the whole added cost, and the client LRU
+    keyed on its result absorbs it whenever nothing rotated.
     """
     if secret_ref is None:
         return redis_url

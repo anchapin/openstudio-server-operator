@@ -224,18 +224,44 @@ class FakeSecretsCoreV1Api:
     ``(name, namespace)`` tuple in ``.calls`` so tests can assert the
     factory asked for exactly the referenced Secret in the CR's
     namespace.
+
+    Issue #568 adds the rotation surface: reads serve
+    ``metadata.resource_version`` (tracked in ``.versions_read``), and
+    :meth:`rotate` models an in-place Secret update — new content plus a
+    resourceVersion bump — so tests can pin the factory's re-resolution
+    behaviour without a live API server.
     """
 
-    def __init__(self, data: dict[str, str] | None = None, exc: Exception | None = None):
+    def __init__(
+        self,
+        data: dict[str, str] | None = None,
+        exc: Exception | None = None,
+        resource_version: str = "1000",
+    ):
         self._data = dict(data or {})
         self._exc = exc
+        self._resource_version = resource_version
         self.calls: list[tuple[str, str]] = []
+        self.versions_read: list[str] = []
+
+    def rotate(
+        self,
+        data: dict[str, str],
+        resource_version: str | None = None,
+    ) -> None:
+        """Model an in-place Secret update (#568): swap content, bump rv."""
+        self._data = dict(data)
+        self._resource_version = resource_version or str(int(self._resource_version) + 1)
 
     def read_namespaced_secret(self, name: str, namespace: str):
         self.calls.append((name, namespace))
         if self._exc is not None:
             raise self._exc
-        return SimpleNamespace(data=dict(self._data))
+        self.versions_read.append(self._resource_version)
+        return SimpleNamespace(
+            data=dict(self._data),
+            metadata=SimpleNamespace(resource_version=self._resource_version),
+        )
 
 
 def calls_to(suffix: str) -> int:

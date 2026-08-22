@@ -237,3 +237,9 @@ echo "Password retained at: $OUT_FILE (0600) — delete it once recorded."
 echo
 echo "Next step:"
 echo "  scripts/deploy-openstudio-stack.sh   # apply the rest of the kind stack"
+echo
+echo "Operator note (#568): the operator re-resolves the openstudio-redis"
+echo "Secret on every tick, so the rotated password is picked up in-band"
+echo "within one poll — no operator restart required. To drop the old"
+echo "client's connection pool immediately anyway:"
+echo "  kubectl rollout restart deployment/openstudio-operator -n $NAMESPACE"
