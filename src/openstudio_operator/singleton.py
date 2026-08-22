@@ -58,7 +58,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import kopf
 from kubernetes.client import (
@@ -71,7 +71,7 @@ from kubernetes.client import (
 from kubernetes.config import ConfigException
 
 from openstudio_operator._k8s import load_operator_kube_config
-from openstudio_operator._time import parse_iso_utc
+from openstudio_operator._time import utc_parser
 from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
@@ -96,23 +96,11 @@ class SingletonGuardError(Exception):
     """Singleton-guard failure: unparseable CR metadata."""
 
 
-def _parse_utc(value: Any, context: str) -> datetime:
-    """Parse an ISO-8601 timestamp at the API boundary; always tz-aware UTC.
-
-    Thin wrapper over :func:`openstudio_operator._time.parse_iso_utc` (D12
-    boundary, issue #174) that re-raises ``ValueError`` as
-    :class:`SingletonGuardError` with the caller's ``context`` prefix so the
-    domain-specific exception type stays in this module's public contract.
-    ``None`` is not a valid input here — the call sites guard for it — so we
-    reject it explicitly with the same shape the legacy ``expected
-    ISO-8601 string`` error used.
-    """
-    if value is None:
-        raise SingletonGuardError(f"{context}: expected ISO-8601 string, got NoneType")
-    try:
-        return parse_iso_utc(value)
-    except ValueError as exc:
-        raise SingletonGuardError(f"{context}: {exc}") from exc
+#: Domain-flavored parse seam (issue #506): the ``_time.utc_parser`` closure
+#: rejects ``None`` and re-raises parse failures as
+#: :class:`SingletonGuardError` with the caller's ``context`` prefix — this
+#: module's public exception contract.
+_parse_utc = utc_parser(SingletonGuardError)
 
 
 def _meta(obj: object) -> Mapping:

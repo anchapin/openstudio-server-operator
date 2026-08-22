@@ -6,8 +6,9 @@ modules today (``openstudio_client._parse_timestamp``, ``status_store._parse_utc
 ``singleton._parse_utc``) with byte-equivalent bodies — a fix to one is silently
 missed in the others. This module is the single source of truth; the three
 callers each keep a one-line alias that delegates here (status_store and
-singleton re-raise as their own exception type to preserve the existing public
-contracts).
+singleton bind theirs from :func:`utc_parser` — issue #506 — so the
+None-rejection / re-raise wrapper body also exists exactly once, while each
+module keeps its own exception type in its public contract).
 
 Accepted inputs:
 
@@ -33,7 +34,9 @@ re-raise with their own context.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 
 def parse_iso_utc(value: str | None) -> datetime | None:
@@ -60,3 +63,27 @@ def parse_iso_utc(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def utc_parser(error_cls: type[Exception]) -> Callable[[Any, str], datetime]:
+    """Build a domain-flavored ``_parse_utc(value, context)`` closure (issue #506).
+
+    ``singleton`` and ``status_store`` used to carry byte-identical wrappers
+    over :func:`parse_iso_utc` — ``None`` rejection plus a ``ValueError``
+    re-raise — differing only in the exception class they raised. This factory
+    declares that seam once: the returned closure rejects ``None`` with the
+    legacy ``expected ISO-8601 string`` shape (call sites guard for it, so it
+    never arrives as a valid input) and re-raises parse failures as
+    ``error_cls`` prefixed with the caller's ``context``, preserving each
+    module's public exception contract. Per D12 the underlying parse still
+    normalizes to tz-aware UTC at the API boundary.
+    """
+    def _parse_utc(value: Any, context: str) -> datetime:
+        if value is None:
+            raise error_cls(f"{context}: expected ISO-8601 string, got NoneType")
+        try:
+            return parse_iso_utc(value)
+        except ValueError as exc:
+            raise error_cls(f"{context}: {exc}") from exc
+
+    return _parse_utc

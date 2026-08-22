@@ -22,7 +22,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from openstudio_operator._time import parse_iso_utc
+from openstudio_operator._time import parse_iso_utc, utc_parser
 
 # --- None passthrough -----------------------------------------------------
 
@@ -427,3 +427,23 @@ def test_hypothesis_idempotency_with_offset(value: datetime) -> None:
     assert once.utcoffset() == timedelta(0)
     twice = parse_iso_utc(once.isoformat())
     assert twice == once
+
+
+# --- utc_parser factory (issue #506) ---------------------------------------
+
+
+class _FlavorError(Exception):
+    """Stand-in domain exception pinning the factory's error-class plumbing."""
+
+
+def test_utc_parser_preserves_error_class_and_context_prefix():
+    parse = utc_parser(_FlavorError)
+    # Good input: tz-aware UTC via the underlying parse_iso_utc.
+    parsed = parse("2024-01-02T03:04:05", "ctx")
+    assert parsed == datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+    # None is rejected with the legacy message shape (call sites guard for it).
+    with pytest.raises(_FlavorError, match=r"ctx: expected ISO-8601 string, got NoneType"):
+        parse(None, "ctx")
+    # Parse failures re-raise as the domain class with the context prefix.
+    with pytest.raises(_FlavorError, match=r"ctx: unparseable timestamp"):
+        parse("not-a-timestamp", "ctx")
