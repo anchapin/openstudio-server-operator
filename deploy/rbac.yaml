@@ -26,7 +26,12 @@ rules:
   - apiGroups: ["energy.nrel.gov"]
     resources: ["openstudioclustermanagers/status"]
     verbs: ["get", "list", "watch", "patch", "update"]
-  # Manage Worker Deployments & Pod Restarts
+  # Manage Worker Deployments & Pod Restarts. Issue #573: the grant is
+  # namespace-wide (RBAC has no workable per-name slot for a
+  # CR-configurable target); the admission-layer companion narrowing
+  # this SA's Deployment patch/update surface to the `worker` and
+  # `web-background` names lives in
+  # deploy/deployment-patch-admission-policy.yaml.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "update"]

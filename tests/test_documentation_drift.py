@@ -345,6 +345,7 @@ DEPLOY_INTRODUCING_ISSUES = {
     "network-policy.yaml": "#112",
     "pod-delete-admission-policy.yaml": "#293",
     "secret-read-admission-policy.yaml": "#572",
+    "deployment-patch-admission-policy.yaml": "#573",
     "priority-class.yaml": "#414",
     "resource-quota.yaml": "#400",
 }

@@ -1,0 +1,115 @@
+# Issue #573 — admission-layer fence for the operator ServiceAccount's
+# Deployment mutating surface: `apps/deployments` patch/update is
+# narrowed to exactly the two managed names, `worker` and
+# `web-background`.
+#
+# Threat model (the same namespace-compromise shape as #293/#294/#572):
+# deploy/rbac.yaml grants the operator SA
+# `deployments: [get, list, watch, patch, update]` with NO resourceNames
+# — namespace-wide. The documented mutating surface is exactly two
+# Deployments: `worker` (worker_recycler's scale-down/restore) and
+# `web-background` (web_background_monitor's restartedAt rolling
+# restart). Nothing constrains a COMPROMISED operator pod: with the SA
+# token it can patch the `web` Deployment instead — inject a command or
+# env into the Rails pod that holds the Mongo credentials and the
+# read-write NFS mount — pivoting from operator compromise to full
+# application compromise without touching pods/delete (#293 already
+# narrows that) or Secrets (#572 narrows those). It can equally tamper
+# with the `db` Deployment or any future workload in the namespace.
+# Native RBAC cannot close that itself: the operator's target is
+# CR-configurable (`spec.targetWorkerDeployment` — which the CRD
+# already pins to exactly 'worker' or 'web-background', issue #160),
+# and pinning exact names in RBAC resourceNames would break every CR
+# that overrides the default — the same RBAC-shape reasoning
+# deploy/rbac.yaml documents for #463 and the #293 policy documents
+# for label selectors. The admission layer keeps the RBAC grant
+# generic while fencing the operator SA to the same two names the CRD
+# schema admits — the CEL literals and the CRD enum below name the
+# same pair (cross-fenced in tests/test_deploy_manifests.py).
+#
+# WHY `operations: ["UPDATE"]` AND NOT `["PATCH", "UPDATE"]` — the
+# admission chain presents every HTTP PATCH (strategic-merge, merge,
+# json-patch) as operation UPDATE, with `object` = post-patch state and
+# `oldObject` = pre-patch state; the NamedRuleWithOperations enum has
+# NO `PATCH` literal ("the current admission policy version does not
+# support PATCH"). A literal "PATCH" is an Invalid reject at apply
+# time — a dead manifest, the exact failure mode #565 closed for the
+# first two policies. `UPDATE` alone therefore covers 100% of the
+# operator's real Deployment mutating surface (both handler modules
+# call patch_namespaced_deployment) and any PUT-shaped update besides.
+#
+# The CEL short-circuit `request.userInfo.username != '<operator SA>'
+# || request.name == 'worker' || request.name == 'web-background'`
+# leaves every other actor untouched — humans via kubectl, the prune
+# CronJob SA, helm — exactly the #293 carve-out shape. `request.name`
+# is always populated for PATCH/UPDATE (the name is in the request
+# path), and under `failurePolicy: Fail` an empty/odd name REJECTS —
+# the safe direction.
+#
+# Requires K8s 1.30+ (admissionregistration.k8s.io/v1 GA) — the same
+# prerequisite as the #293/#398/#572 policies; pre-1.30 clusters must
+# skip all VAPs (see AGENTS.md). Apply alongside the rest of the
+# operator manifests (docs/kind-validation.md Phase A ordering).
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openstudio-operator-deployment-patch-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        # UPDATE only — admission presents HTTP PATCH as UPDATE (there
+        # is no PATCH literal in the operations enum; naming one is an
+        # apply-time Invalid reject per #565). This is the operator's
+        # complete Deployment mutating surface: worker_recycler and
+        # web_background_monitor both go through
+        # patch_namespaced_deployment.
+        operations: ["UPDATE"]
+        resources: ["deployments"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
+  validations:
+    - expression: >
+        request.userInfo.username !=
+        'system:serviceaccount:openstudio-server:openstudio-operator-sa'
+        ||
+        request.name == 'worker'
+        ||
+        request.name == 'web-background'
+      # Issue #565: the message MUST be a single line — the API server
+      # rejects any validation message containing "\n" ("message must
+      # not contain line breaks"). The folded `>-` scalar (strip-
+      # chomped) yields exactly one line with no trailing newline.
+      message: >-
+        openstudio-operator-sa may only PATCH/UPDATE the Deployments
+        named worker and web-background (the worker-recycler and
+        web-background-restart surfaces). All other Deployment
+        mutations from this ServiceAccount are rejected at admission
+        time (issue #573) — the web Deployment holds the Mongo
+        credentials and the read-write NFS mount. Humans via kubectl
+        and other ServiceAccounts are unaffected.
+---
+# ValidatingAdmissionPolicyBinding scopes the cluster-scoped policy
+# to the `openstudio-server` namespace via namespaceSelector (which
+# is additive with the policy's own matchConstraints.namespaceSelector
+# — both must match for the policy to evaluate a request).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openstudio-operator-deployment-patch-scope
+spec:
+  policyName: openstudio-operator-deployment-patch-scope
+  # Issue #565: `validationActions` is REQUIRED on a v1
+  # ValidatingAdmissionPolicyBinding — the API server rejects an
+  # omitted/empty list ("at least one validation action is
+  # required"). `Deny` is the only action that actually blocks the
+  # request; `Warn`/`Audit` alone would leave the #573 fence dormant.
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
