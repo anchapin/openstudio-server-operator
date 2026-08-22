@@ -74,6 +74,13 @@ Issue #463 adds the Secret-sourced twin: when the CR sets
 ``redis://...`` URL from that Secret key (see
 :func:`redis_url_from_secret_value` + ``client_factory``) and hands it to
 this client as ``redis_url`` — the client itself stays Secret-unaware.
+Issue #476 adds TLS: a ``rediss://`` URL (TLS-only Azure Cache / Memorystore /
+ElastiCache shapes) is accepted everywhere ``redis://`` is — the CRD pattern,
+the #463 Secret fence, and this constructor. ``redis.Redis.from_url`` handles
+the scheme natively (SSL connection class, ``ssl_cert_reqs='required'``,
+hostname check on, system trust store by default); the only operator-side
+knob is the optional ``REDIS_TLS_CA_BUNDLE`` env var
+(:func:`_resolve_redis_tls_ca_bundle`) pinning an explicit PEM bundle.
 
 Error discipline: no in-client retry — Redis reads ride the same ~30s poll cadence as
 the REST client, so a failed tick is skipped and the next poll retries naturally.
@@ -89,6 +96,7 @@ compatibility with existing importers.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable
@@ -184,6 +192,62 @@ class RedisClientError(RuntimeError):
 # explicitly — it is no longer reachable via ``except RedisClientError``.
 
 
+_PEM_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
+
+#: Issue #476 — env var naming an explicit PEM CA bundle for ``rediss://``
+#: TLS connections. Unset/empty means the system trust store (redis-py's
+#: ``ssl.create_default_context()`` default). Mirrors the REST client's
+#: ``OPENSTUDIO_TLS_CA_BUNDLE`` (issue #296) shape for shape, including the
+#: ``OperatorConfigError`` refusal on a bad value.
+_REDIS_TLS_CA_BUNDLE_ENV = "REDIS_TLS_CA_BUNDLE"
+
+
+def _resolve_redis_tls_ca_bundle() -> str | None:
+    """Validate ``REDIS_TLS_CA_BUNDLE`` and return the ``ssl_ca_certs`` path (issue #476).
+
+    Mirrors :func:`openstudio_operator.openstudio_client._resolve_tls_ca_bundle`
+    (issue #296) shape for shape: the truthy-string fallthrough would silently
+    accept arbitrary non-empty env values, and an attacker (or a misconfigured
+    helm chart) who controls the operator pod env could substitute a CA bundle
+    of their choosing and MITM the TLS Redis traffic — so the value must name
+    a readable file carrying a real PEM marker.
+
+    Returns ``None`` when the env var is unset or empty (system trust store —
+    the TLS default redis-py already provides via
+    ``ssl.create_default_context()``). Returns the bundle path on success.
+    Raises :class:`OperatorConfigError` (the #475 neutral home in
+    :mod:`openstudio_operator.config` — NOT a ``RedisClientError``) on any
+    validation failure so the operator refuses to build the client rather
+    than degrading TLS verification into an obscure handshake error at the
+    first read.
+    """
+    ca_bundle = os.environ.get(_REDIS_TLS_CA_BUNDLE_ENV)
+    if not ca_bundle:
+        return None
+    if not os.path.isfile(ca_bundle):
+        raise OperatorConfigError(
+            f"{_REDIS_TLS_CA_BUNDLE_ENV}={ca_bundle!r} does not name an existing "
+            f"file; refusing to build the TLS Redis client with an unverifiable "
+            f"CA bundle (issue #476). Mount the PEM bundle as a Secret volume "
+            f"and set the env var to its in-pod path."
+        )
+    try:
+        with open(ca_bundle, encoding="utf-8") as bundle_file:
+            head = bundle_file.read(4096)
+    except OSError as exc:
+        raise OperatorConfigError(
+            f"{_REDIS_TLS_CA_BUNDLE_ENV}={ca_bundle!r} is not readable: {exc}; "
+            f"refusing to build the TLS Redis client (issue #476)."
+        ) from exc
+    if _PEM_BEGIN_MARKER not in head:
+        raise OperatorConfigError(
+            f"{_REDIS_TLS_CA_BUNDLE_ENV}={ca_bundle!r} does not contain a "
+            f"{_PEM_BEGIN_MARKER!r} PEM marker in the first 4 KiB; refusing to "
+            f"treat it as a CA bundle (issue #476)."
+        )
+    return ca_bundle
+
+
 #: Issue #463 — the URL shape accepted for the SECRET-sourced Redis URL
 #: (``spec.redisCredentials.secretRef``). Same in-cluster ``redis://``
 #: Service constraint the CRD's ``spec.redisUrl`` pattern enforced in #390,
@@ -192,8 +256,11 @@ class RedisClientError(RuntimeError):
 #: Applying the #390 host restriction at resolution time keeps the SSRF
 #: fence intact: moving the URL out of the CRD-validated spec into a Secret
 #: must not become a side door to off-cluster hosts.
+#: Issue #476: the ``rediss?`` scheme alternation accepts the TLS
+#: (``rediss://``) twin everywhere the plaintext scheme is accepted —
+#: same in-cluster host fence, credentials still allowed.
 SECRET_REDIS_URL_PATTERN: re.Pattern[str] = re.compile(
-    r"^redis://([^@]+@)?"
+    r"^rediss?://([^@]+@)?"
     r"[a-z0-9]([-a-z0-9]*[a-z0-9])?"
     r"(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?"
     r"(\.svc(\.cluster\.local)?)?"
@@ -237,10 +304,11 @@ def redis_url_from_secret_value(
         target = _redis_target_for_diagnostics(value) if value else "<empty>"
         raise RedisCredentialResolutionError(
             f"Secret {secret_name!r} key {secret_key!r} does not hold a valid "
-            f"in-cluster redis:// URL (issue #463): got {target}. The key must "
-            f"carry the FULL URL (redis://[:password@]<service>[:port][/db]); "
-            f"off-cluster hosts and non-Redis schemes are rejected (issue #390 "
-            f"fence preserved on the Secret path)."
+            f"in-cluster redis:// or rediss:// URL (issue #463): got {target}. "
+            f"The key must carry the FULL URL "
+            f"(redis://[:password@]<service>[:port][/db], or the rediss:// "
+            f"TLS twin — issue #476); off-cluster hosts and non-Redis schemes "
+            f"are rejected (issue #390 fence preserved on the Secret path)."
         )
     return value
 
@@ -257,6 +325,12 @@ class ReadOnlyRedisClient:
     """Read-only view of the Resque/Redis queue fabric.
 
     ``redis_url`` is the only credential source (parsed by ``redis.Redis.from_url``).
+    A ``rediss://`` scheme (issue #476) connects with TLS — certificate
+    verification REQUIRED against the system trust store by default; set the
+    ``REDIS_TLS_CA_BUNDLE`` env var to pin an explicit PEM bundle (validated
+    by :func:`_resolve_redis_tls_ca_bundle`, which raises
+    :class:`OperatorConfigError` on a bad path — mirroring the REST client's
+    ``OPENSTUDIO_TLS_CA_BUNDLE`` handling from issue #296).
     ``connection`` injects a pre-built client (fakeredis in tests); it MUST be created
     with ``decode_responses=True`` like the URL path. ``now_fn`` supplies the epoch
     clock for staleness judgment (injected for deterministic tests).
@@ -272,11 +346,25 @@ class ReadOnlyRedisClient:
     ) -> None:
         self._redis_url = redis_url
         self._redis_target = _redis_target_for_diagnostics(redis_url)
+        # Issue #476: ``redis.Redis.from_url`` handles ``rediss://`` natively —
+        # it selects the SSL connection class with ``ssl_cert_reqs='required'``,
+        # hostname checking on, and the system trust store (via
+        # ``ssl.create_default_context()``) when no explicit bundle is given.
+        # The only operator-side knob is the optional CA bundle; resolving it
+        # ONLY on the TLS path keeps the plaintext path byte-for-byte intact
+        # (fakeredis-injected tests and no-auth dev clusters never read the
+        # env var).
+        tls_kwargs: dict[str, str] = {}
+        if urlparse(redis_url).scheme == "rediss":
+            ca_bundle = _resolve_redis_tls_ca_bundle()
+            if ca_bundle is not None:
+                tls_kwargs["ssl_ca_certs"] = ca_bundle
         self._redis = connection or redis.Redis.from_url(
             redis_url,
             decode_responses=True,
             socket_timeout=socket_timeout_seconds,
             socket_connect_timeout=socket_timeout_seconds,
+            **tls_kwargs,
         )
         self._now = now_fn
 

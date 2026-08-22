@@ -449,3 +449,21 @@ def test_no_secret_ref_keeps_inline_path_byte_for_byte(monkeypatch):
 
     assert client._redis_url == INLINE_CRED_FREE
     assert fake.calls == []
+
+
+def test_secret_ref_resolves_rediss_tls_url_end_to_end_476(monkeypatch):
+    """Issue #476: a Secret holding a ``rediss://`` (TLS) URL resolves
+    through the SAME factory path — fence-checked by
+    ``redis_url_from_secret_value`` and built as a TLS connection (SSL
+    connection class from ``redis.Redis.from_url``). Proves the cache key /
+    secretRef resolution pass the scheme through untouched."""
+    from redis.connection import SSLConnection
+
+    tls_url = "rediss://:rotated-pw@queue.openstudio-server.svc.cluster.local:6379"
+    fake = FakeCoreV1Api({"redis-url": _encoded(tls_url)})
+    _install_secret_api(monkeypatch, fake)
+
+    client = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    assert client._redis_url == tls_url
+    assert client._redis.connection_pool.connection_class is SSLConnection

@@ -72,10 +72,15 @@ spec:
                   # ``spec.redisCredentials.secretRef`` (full-URL semantics);
                   # ``redis://queue:6379`` (credential-free, for no-auth dev
                   # clusters) remains accepted.
-                  pattern: '^redis://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
+                  # Issue #476: the ``rediss?://`` scheme alternation accepts
+                  # the TLS twin (``rediss://queue:6379`` — TLS-only Azure
+                  # Cache / Memorystore / ElastiCache shapes) everywhere the
+                  # plaintext scheme is accepted; the in-cluster host fence
+                  # and the #463 no-credentials rule are unchanged.
+                  pattern: '^rediss?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
                   x-kubernetes-validations:
-                    - rule: "self == '' || self.startsWith('redis://')"
-                      message: "spec.redisUrl must be empty or an in-cluster redis:// Service URL (issue #390)."
+                    - rule: "self == '' || self.startsWith('redis://') || self.startsWith('rediss://')"
+                      message: "spec.redisUrl must be empty or an in-cluster redis:// or rediss:// (TLS) Service URL (issue #390, #476)."
                     - rule: "self == '' || !self.contains('@')"
                       message: "spec.redisUrl must not carry embedded credentials (issue #463); store the full URL in a Secret and reference it via spec.redisCredentials.secretRef."
                   description: |
@@ -93,7 +98,10 @@ spec:
                     GitOps repos, so the password belongs in a Secret referenced
                     via `spec.redisCredentials.secretRef` (recommended — see
                     docs/onboarding.md) — `redis://queue:6379` without credentials
-                    stays valid for no-auth clusters.
+                    stays valid for no-auth clusters. Issue #476: `rediss://`
+                    connects with TLS (certificate verification against the
+                    system trust store by default; optional explicit CA bundle
+                    via the REDIS_TLS_CA_BUNDLE env var on the operator).
                 redisCredentials:
                   type: object
                   description: "Secret-sourced Redis credentials (issue #463). Preferred over spec.redisUrl when both are set."

@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-870 tests across 43 files (run `.venv/bin/pytest --collect-only` to
+882 tests across 43 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -304,7 +304,12 @@ The named Secret key must hold the **complete** URL
 (`redis://:password@queue:6379`) — full-URL semantics, not the bare
 password; this avoids URL-reconstruction logic in the operator and matches
 the value the helm recipe already templates into the web / worker
-`REDIS_URL` env vars. Semantics:
+`REDIS_URL` env vars. TLS-enabled Redis works with the `rediss://` scheme
+(Azure Cache / Memorystore / TLS-only ElastiCache): accepted by the same
+CRD and Secret patterns, connected with certificate verification against
+the system trust store by default — an explicit CA bundle can be pinned
+via the `REDIS_TLS_CA_BUNDLE` env var on the operator (issue #476).
+Semantics:
 
 - **Preferred over inline** — when both `secretRef` and a (grandfathered)
   inline `redisUrl` are present, the Secret wins.
