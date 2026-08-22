@@ -185,6 +185,15 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
+        # IPv6 / dual-stack caveat (issue #477): an `0.0.0.0/0` ipBlock
+        # rule does NOT constrain IPv6 egress on dual-stack CNIs — a pod
+        # with an IPv6 address could still egress anywhere via ::. The
+        # equivalent hardening for IPv6 clusters is an `::/0` ipBlock
+        # rule with excepts for the private/link-local IPv6 ranges
+        # (e.g. fe80::/10). Not emitted here because this policy has no
+        # IPv6 pattern to mirror and the default install (kind recipe)
+        # is IPv4-only; documented as a known limitation for dual-stack
+        # operators.
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
@@ -192,6 +201,20 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              # Link-local 169.254.0.0/16 — hosts the AWS/GCP/Azure
+              # instance metadata service (IMDS). Archival pods carry
+              # live S3/GCS/Azure credentials via envFrom; a compromised
+              # rclone (or the pod's sh entrypoint) reaching IMDS could
+              # steal node IAM credentials / the kubelet identity and
+              # pivot from namespace compromise to node/cluster
+              # compromise. Blocking IMDS via NetworkPolicy except-lists
+              # is the standard cloud hardening control (AWS's own
+              # guidance recommends exactly this shape). (issue #477)
+              - 169.254.0.0/16
+              # CGNAT 100.64.0.0/10 — carrier-grade NAT space, never a
+              # legitimate storage endpoint; excluded alongside RFC1918
+              # so the "public HTTPS only" posture holds. (issue #477)
+              - 100.64.0.0/10
       ports:
         - protocol: TCP
           port: 443
