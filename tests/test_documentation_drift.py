@@ -27,6 +27,14 @@ into a pre-#150 cluster silently re-introduces the literal the shell guard
 exists to keep out of source. The contract doc (the REST ground truth per
 AGENTS.md) had the same defect in prose (issue #409).
 
+Issue #485 extends the #408 README layout gate to the full inventory drift
+shape: every file under ``deploy/`` must be named in AGENTS.md's hand-written
+``deploy/`` Layout bullet (the inventory #465 rebuilt) AND in README.md's
+Repository-layout ``deploy/`` subtree — in BOTH directions. An undocumented
+manifest (added to ``deploy/`` but missing from a doc) and a phantom entry
+(doc names a manifest that no longer exists) both fail the build, with the
+offending file(s) and doc named in the failure message.
+
 Historical capture logs are the one legitimate home for the literal: a capture
 transcribed before #150 is authentic evidence and may keep it — but only when
 the block is explicitly introduced by a leading ``PRE-#150`` marker line so no
@@ -44,6 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 KIND_VALIDATION_DOC = REPO_ROOT / "docs" / "kind-validation.md"
 CONTRACTS_DOC = REPO_ROOT / "docs" / "contracts" / "openstudio-server-v3.11.0-rest.md"
 README_DOC = REPO_ROOT / "README.md"
+AGENTS_DOC = REPO_ROOT / "AGENTS.md"
 DEPLOY_DIR = REPO_ROOT / "deploy"
 README_LAYOUT_HEADING = "## Repository layout"
 AUDIT_POLICY_DOC = REPO_ROOT / "docs" / "audit-policy.md"
@@ -179,22 +188,149 @@ def readme_layout_section_lines() -> list[str]:
 
 
 def test_readme_layout_lists_every_deploy_file() -> None:
-    """Issue #408: the README layout tree must enumerate every file under
-    ``deploy/`` so load-bearing manifests (the cluster-scoped admission
+    """Issues #408 / #485: the README layout tree must enumerate every file
+    under ``deploy/`` so load-bearing manifests (the cluster-scoped admission
     policy, the network policy, the credential Secrets, the quota and priority
     classes) are not invisible to first-time contributors. The directory is
     globbed at test time, so a future manifest that ships undocumented fails
-    here until the README catches up.
+    here until the README catches up. Since #485 the gate is exact and
+    bidirectional: the ``deploy/`` subtree must list each manifest by name
+    (all files, not just ``*.yaml``), and every name it lists must exist on
+    disk — a phantom entry pointing at a deleted manifest fails too.
     """
-    layout = "\n".join(readme_layout_section_lines())
-    missing = sorted(
-        path.name for path in DEPLOY_DIR.glob("*.yaml") if path.name not in layout
+    assert_deploy_inventory_matches(
+        readme_deploy_subtree_entry_names(
+            README_DOC.read_text(encoding="utf-8").splitlines()
+        ),
+        "README.md",
     )
-    assert not missing, (
-        "README.md §Repository layout does not mention every deploy/ manifest "
-        f"(issue #408). Undocumented files: {missing}. Add each one to the "
-        "layout tree with a per-file comment citing the introducing issue."
+
+
+# Issue #485 — the deploy/ inventory drift gate. AGENTS.md's ``deploy/``
+# Layout bullet is maintained by hand (rebuilt in #465); nothing else keeps it
+# honest. A backticked token inside that bullet counts as a listed manifest
+# only when it is manifest-shaped: a bare ``*.yaml``/``*.json`` filename with
+# no directory component. That excludes the bullet's cross-references
+# (``tests/test_monitoring_artifacts.py`` — has a slash) and inline literals
+# (``Recreate``, ``secrets: [get]``, ``spec.redisCredentials.secretRef``) while
+# still catching a manifest-shaped name that is not a real ``deploy/`` file.
+AGENTS_DEPLOY_BULLET_PREFIX = "- `deploy/`"
+MANIFEST_NAME = re.compile(r"[\w.-]+\.(?:yaml|json)")
+README_DEPLOY_DIR_LINE = "├── deploy/"
+README_SUBTREE_ENTRY = re.compile(r"^│\s*[├└]──\s*(\S+)")
+
+
+def deploy_dir_file_names() -> set[str]:
+    """Every file currently shipping under ``deploy/``, globbed at test time
+    (issue #485) — the inventory is derived from disk, never hardcoded."""
+    return {path.name for path in DEPLOY_DIR.iterdir() if path.is_file()}
+
+
+def agents_deploy_inventory_names(bullet: str) -> set[str]:
+    """Return the manifest-shaped backticked names in one AGENTS.md-style
+    ``deploy/`` Layout bullet (issue #485). Pure over the bullet line."""
+    tokens = re.findall(r"`([^`]+)`", bullet)
+    return {token for token in tokens if MANIFEST_NAME.fullmatch(token)}
+
+
+def agents_deploy_inventory_bullet() -> str:
+    """Return AGENTS.md's single ``deploy/`` Layout bullet line (issue #485)."""
+    bullets = [
+        line
+        for line in AGENTS_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith(AGENTS_DEPLOY_BULLET_PREFIX)
+    ]
+    assert len(bullets) == 1, (
+        "AGENTS.md must have exactly one Layout bullet starting "
+        f"`{AGENTS_DEPLOY_BULLET_PREFIX}` — the deploy/ inventory #465 rebuilt "
+        f"and #485 gates (found {len(bullets)})."
     )
+    return bullets[0]
+
+
+def readme_deploy_subtree_entry_names(lines: list[str]) -> set[str]:
+    """Return the per-file entry names in a Repository-layout tree's
+    ``deploy/`` subtree (issue #485). Pure over the tree lines.
+
+    Scoping to the subtree — the ``├── deploy/`` line down to the next
+    top-level ``├──``/``└──`` entry — means a manifest mentioned elsewhere in
+    the README cannot mask inventory drift, and a non-deploy file named
+    elsewhere in the tree cannot raise a phantom alarm.
+    """
+    start = next(
+        (i for i, line in enumerate(lines) if README_DEPLOY_DIR_LINE in line), None
+    )
+    assert start is not None, (
+        "README.md's Repository-layout tree must contain a "
+        f"`{README_DEPLOY_DIR_LINE}` directory line (issue #408)."
+    )
+    names: set[str] = set()
+    for line in lines[start + 1 :]:
+        if line.startswith(("├──", "└──")):
+            break
+        match = README_SUBTREE_ENTRY.match(line)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def assert_deploy_inventory_matches(documented: set[str], doc: str) -> None:
+    """Issue #485 acceptance: the names a doc lists for ``deploy/`` must equal
+    the directory contents exactly — both directions, with the offending
+    file(s) and the doc named in the failure message."""
+    on_disk = deploy_dir_file_names()
+    undocumented = sorted(on_disk - documented)
+    phantom = sorted(documented - on_disk)
+    assert not undocumented and not phantom, (
+        f"{doc} deploy/ inventory drifted from deploy/ on disk (issue #485). "
+        f"Manifest(s) missing from {doc}: {undocumented}. "
+        f"Phantom entrie(s) in {doc} naming no on-disk file: {phantom}. "
+        "Update the doc inventory and the manifest together — the inventory "
+        "is derived from `ls deploy/`, never hardcoded here."
+    )
+
+
+def test_agents_deploy_inventory_matches_deploy_dir() -> None:
+    """Issue #485: AGENTS.md's hand-written ``deploy/`` Layout bullet (the
+    inventory #465 rebuilt) must name every file under ``deploy/`` — and no
+    manifest-shaped name it lists may be missing from disk. Without this gate
+    a new manifest lands undocumented and the inventory silently rots again.
+    """
+    assert_deploy_inventory_matches(
+        agents_deploy_inventory_names(agents_deploy_inventory_bullet()), "AGENTS.md"
+    )
+
+
+def test_agents_inventory_names_from_synthetic_bullet() -> None:
+    bullet = (
+        "- `deploy/` — `crd.yaml` · `operator-deployment.yaml` (single-replica, "
+        "`Recreate`) · `release: prometheus` · `tests/test_monitoring_artifacts.py` "
+        "· `spec.redisCredentials.secretRef` · `grafana-dashboard.json`"
+    )
+    assert agents_deploy_inventory_names(bullet) == {
+        "crd.yaml",
+        "operator-deployment.yaml",
+        "grafana-dashboard.json",
+    }
+
+
+def test_readme_deploy_subtree_names_from_synthetic_tree() -> None:
+    lines = [
+        "```",
+        "├── deploy/                     # CRD, RBAC, alerting",
+        "│   ├── crd.yaml                # OpenStudioClusterManager CRD",
+        "│   ├── phantom-manifest.yaml   # listed but never shipped",
+        "│   └── grafana-dashboard.json  # dashboard (#468)",
+        "├── docs/                       # runbooks",
+        "│   └── nested-doc.md",
+        "└── pyproject.toml",
+        "```",
+    ]
+    assert readme_deploy_subtree_entry_names(lines) == {
+        "crd.yaml",
+        "phantom-manifest.yaml",
+        "grafana-dashboard.json",
+    }
 
 
 # Primary introducing issue per manifest (from AGENTS.md §Layout and the
