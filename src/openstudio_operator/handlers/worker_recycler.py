@@ -54,6 +54,7 @@ from datetime import datetime, timedelta
 
 import kopf
 
+from openstudio_operator._constants import CRD_SPEC, WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 from openstudio_operator._k8s import (
     DEFAULT_WORKER_DEPLOYMENT,
     RESTARTED_AT_ANNOTATION,
@@ -83,14 +84,12 @@ logger = logging.getLogger(__name__)
 #: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WORKER_RECYCLE_POLL_INTERVAL_SECONDS`
 #: — operator behavior, not cluster policy; policy values live in the CRD
 #: spec/config (AGENTS.md).
-from openstudio_operator._constants import WORKER_RECYCLE_POLL_INTERVAL_SECONDS
-
 POLL_INTERVAL_SECONDS = WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 
 # Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
-# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# object (``**CRD_SPEC`` from ``_constants``, imported at the top of this module
+# with the rest of the dependency surface) instead of a per-module ``_SPEC``
 # dict reassembled from the raw constants.
-from openstudio_operator._constants import CRD_SPEC
 
 # Issue #395 — DEFAULT_WORKER_DEPLOYMENT and RESTARTED_AT_ANNOTATION were
 # declared here AND in web_background_monitor.py; both now live once in

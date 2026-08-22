@@ -101,6 +101,27 @@ import kopf
 from kubernetes.client import ApiException
 
 from openstudio_operator import _cr_cache as cr_cache
+from openstudio_operator._constants import (
+    CRD_SPEC,
+    LAYOUT_WARNING_GRACE_SECONDS,
+    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL,
+    WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
+)
+from openstudio_operator._k8s import (
+    DEFAULT_WORKER_DEPLOYMENT,
+    RESTARTED_AT_ANNOTATION,
+    DeploymentManager,
+    PodLister,
+    deployment_label_selector,
+    rolling_restart_deployment,
+)
+from openstudio_operator._oscm_handlers import (
+    observe_tick_duration,
+    run_oscm_tick,
+)
+from openstudio_operator._oscm_handlers import (
+    register_fn as _register_oscm_handler,
+)
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
@@ -133,28 +154,6 @@ logger = logging.getLogger(__name__)
 #: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WEB_BACKGROUND_POLL_INTERVAL_SECONDS`
 #: — operator behavior, not cluster policy; policy values live in the CRD
 #: spec/config (AGENTS.md).
-from openstudio_operator._constants import (
-    CRD_SPEC,
-    LAYOUT_WARNING_GRACE_SECONDS,
-    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL,
-    WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
-)
-from openstudio_operator._k8s import (
-    DEFAULT_WORKER_DEPLOYMENT,
-    RESTARTED_AT_ANNOTATION,
-    DeploymentManager,
-    PodLister,
-    deployment_label_selector,
-    rolling_restart_deployment,
-)
-from openstudio_operator._oscm_handlers import (
-    observe_tick_duration,
-    run_oscm_tick,
-)
-from openstudio_operator._oscm_handlers import (
-    register_fn as _register_oscm_handler,
-)
-
 POLL_INTERVAL_SECONDS = WEB_BACKGROUND_POLL_INTERVAL_SECONDS
 
 #: Fallback when ``spec.targetWebBackgroundDeployment`` is empty: the helm

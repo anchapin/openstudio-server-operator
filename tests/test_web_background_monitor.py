@@ -10,6 +10,9 @@ test_worker_recycler.py), the Deployment read/patch with a
 cluster, no dependencies beyond the ``[dev]`` extra.
 """
 
+import logging as _logging
+import time as _time
+import types
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -22,13 +25,25 @@ from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.handlers import web_background_monitor as _wbm
+from openstudio_operator.handlers import web_background_monitor as wbm_module
 from openstudio_operator.handlers.web_background_monitor import (
     DEFAULT_WEB_BACKGROUND_DEPLOYMENT,
     MERGE_PATCH_CONTENT_TYPE,
+    RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
     RESTARTED_AT_ANNOTATION,
     WEB_BACKGROUND_RESTARTED_EVENT,
     StallWindowTracker,
     run_stall_tick,
+)
+from openstudio_operator.handlers.web_background_monitor import (
+    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL as _REVALIDATION_INTERVAL,
+)
+from openstudio_operator.handlers.web_background_monitor import (
+    _maybe_revalidate_redis_key_layout as _revalidate,
+)
+from openstudio_operator.handlers.web_background_monitor import (
+    reset_key_layout_revalidation_state as _reset_revalidation,
 )
 from openstudio_operator.redis_client import (
     REQUEUED_QUEUE,
@@ -607,9 +622,6 @@ def test_sensing_failure_raises_resets_tracker_and_is_retried():
 # --- Issue #312 — freshness timestamp gauges detect stale data ------------------
 
 
-import time as _time
-
-
 def queue_depth_fresh() -> float:
     return REGISTRY.get_sample_value("openstudio_operator_resque_queue_depth_fresh") or 0.0
 
@@ -1013,12 +1025,6 @@ def test_reset_per_cr_caches_seam_drops_scoped_and_all() -> None:
 # --- Issue #44 leg-2 non-vacuity safeguard -------------------------------------
 
 
-from openstudio_operator.handlers import web_background_monitor as wbm_module
-from openstudio_operator.handlers.web_background_monitor import (
-    RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
-)
-
-
 def workers_seen_max() -> float:
     return REGISTRY.get_sample_value("openstudio_operator_resque_workers_seen_max") or 0.0
 
@@ -1343,9 +1349,6 @@ def test_warning_does_not_fire_when_idle_no_queue_work():
 # --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
 
 
-import types
-
-
 def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
     """Issue #232 — MappingView (types.MappingProxyType) body end-to-end.
 
@@ -1429,18 +1432,6 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
 # interval gate (skip within, fire at/after), the reset seam, and the
 # wiring — the kopf handler's tick closure carries the rider BEFORE the
 # stall evaluation so the restart cooldown cannot stall revalidation.
-import logging as _logging
-
-from openstudio_operator.handlers import web_background_monitor as _wbm
-from openstudio_operator.handlers.web_background_monitor import (
-    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL as _REVALIDATION_INTERVAL,
-)
-from openstudio_operator.handlers.web_background_monitor import (
-    _maybe_revalidate_redis_key_layout as _revalidate,
-)
-from openstudio_operator.handlers.web_background_monitor import (
-    reset_key_layout_revalidation_state as _reset_revalidation,
-)
 
 
 class _CheckRecorder:

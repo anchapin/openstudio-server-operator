@@ -210,12 +210,22 @@ def test_handler_modules_import_from_constants():
     src_root = project_root / "src" / "openstudio_operator"
 
     expected_imports = {
-        "handlers/analysis_sla.py": r"from openstudio_operator\._constants import\s+SLA_POLL_INTERVAL_SECONDS",
+        # Issue #507 — the imports are hoisted to each module's top block and
+        # may share one ``_constants`` statement with CRD_SPEC (ruff's isort
+        # merges same-module imports), so each pattern allows the poll name
+        # to sit anywhere inside the import statement — same shape the
+        # web_background_monitor pattern below has always used.
+        "handlers/analysis_sla.py": (
+            r"from openstudio_operator\._constants import\s+"
+            r"\(?[\s\S]*?SLA_POLL_INTERVAL_SECONDS"
+        ),
         "handlers/datapoint_watchdog.py": (
-            r"from openstudio_operator\._constants import\s+DATAPOINT_POLL_INTERVAL_SECONDS"
+            r"from openstudio_operator\._constants import\s+"
+            r"\(?[\s\S]*?DATAPOINT_POLL_INTERVAL_SECONDS"
         ),
         "handlers/worker_recycler.py": (
-            r"from openstudio_operator\._constants import\s+WORKER_RECYCLE_POLL_INTERVAL_SECONDS"
+            r"from openstudio_operator\._constants import\s+"
+            r"\(?[\s\S]*?WORKER_RECYCLE_POLL_INTERVAL_SECONDS"
         ),
         "handlers/web_background_monitor.py": (
             r"from openstudio_operator\._constants import\s+"

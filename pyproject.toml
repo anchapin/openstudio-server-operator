@@ -53,6 +53,15 @@ packages = ["src/openstudio_operator"]
 line-length = 100
 src = ["src", "tests"]
 
+# Issue #507 — E402 (module-level import not at top of file) is enforced on
+# top of ruff's default rule set (E4/E7/E9 + F): mid-file imports had crept
+# in via later refactors (#165, #395, #495, #505) and the default set is
+# blind to them. Deliberate cycle-breaking deferrals live inside functions
+# (function-scope imports are invisible to E402); a genuine module-level
+# deferral would carry a targeted ``# noqa: E402`` with the cycle rationale.
+[tool.ruff.lint]
+extend-select = ["E402"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Issue #257 — print the slowest 10 tests in CI (any >1 s is visible by

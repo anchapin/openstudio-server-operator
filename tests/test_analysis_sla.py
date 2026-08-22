@@ -31,16 +31,19 @@ Issue #83 — contract drift against the verified v3.11.0 REST + Resque layout:
   the candidate pods exist in the namespace.
 """
 
+import types
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
 
+import pytest
 import responses
 from prometheus_client import REGISTRY, generate_latest
 
 from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, calls_to, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import metrics
+from openstudio_operator._k8s import deployment_label_selector
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.analysis_sla import (
@@ -50,6 +53,7 @@ from openstudio_operator.handlers.analysis_sla import (
     _status_is_started,
     run_sla_tick,
 )
+from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.status_store import StatusStore
 
@@ -1352,12 +1356,6 @@ def handler_tick_failures_total(module: str, error_type: str) -> float:
 # --- Issue #44: pod discovery with matchExpressions -------------------------
 
 
-import pytest
-
-from openstudio_operator._k8s import deployment_label_selector
-from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
-
-
 def _exp(key, operator, values=None):
     """Helper: build a matchExpressions entry as the generated client does."""
     return SimpleNamespace(key=key, operator=operator, values=values or [])
@@ -1517,9 +1515,6 @@ def test_escalate_analysis_uses_redis_resolved_pod_set():
 
 
 # --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
-
-
-import types
 
 
 @responses.activate

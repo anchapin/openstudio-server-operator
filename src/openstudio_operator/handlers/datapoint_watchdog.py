@@ -67,6 +67,7 @@ from datetime import datetime, timedelta
 import kopf
 
 from openstudio_operator import _cr_cache as cr_cache
+from openstudio_operator._constants import CRD_SPEC, DATAPOINT_POLL_INTERVAL_SECONDS
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
     run_oscm_tick,
@@ -94,14 +95,12 @@ logger = logging.getLogger(__name__)
 #: Poll cadence (issue #165). See :data:`openstudio_operator._constants.DATAPOINT_POLL_INTERVAL_SECONDS`
 #: — not a CRD field, it is operator behavior, not cluster policy (policy values
 #: live in the CRD spec/config).
-from openstudio_operator._constants import DATAPOINT_POLL_INTERVAL_SECONDS
-
 POLL_INTERVAL_SECONDS = DATAPOINT_POLL_INTERVAL_SECONDS
 
 # Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
-# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# object (``**CRD_SPEC`` from ``_constants``, imported at the top of this module
+# with the rest of the dependency surface) instead of a per-module ``_SPEC``
 # dict reassembled from the raw constants.
-from openstudio_operator._constants import CRD_SPEC
 
 DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
