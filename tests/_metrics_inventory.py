@@ -164,6 +164,19 @@ EXPECTED_COUNTER_FAMILIES = (
 #: redeploy mixes old/new pod series with identical labels — this series
 #: makes the emitting release a scrapeable fact. One series, fixed
 #: cardinality.
+#:
+#: Issue #491 — ``singleton_wrapped_handlers`` Gauge is the RUNTIME half
+#: of the kopf-pin fence: the count of OSCM spawning handlers whose fn
+#: carries the singleton-gate marker after ``install_singleton_guard``
+#: ran at boot. ``0`` on a booted operator that expects timers is the
+#: silent-unwrap failure mode (a kopf upgrade moved the private
+#: ``registry._spawning._handlers`` layout; D05 enforcement silently
+#: disabled while every timer still fires ungated) — the CI-time fence
+#: is ``tests/test_singleton_registry_coverage.py``, this gauge is what
+#: Prometheus can alert on. Complementary to the #469 heartbeat: the
+#: heartbeat proves scheduling, the wrap count proves guarding.
+#: Unlabelled; one series per process; set once at boot (D11-exempt —
+#: before any dry-run-gated action could exist).
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -186,6 +199,9 @@ EXPECTED_GAUGE_FAMILIES = (
     # row; constant 1 set at metrics import time from the installed
     # distribution metadata, ``unknown`` fallback when absent).
     "openstudio_operator_build_info",
+    # Issue #491 — boot-time singleton-guard wrap count (0 on a booted
+    # operator with timers expected = the silent-unwrap failure mode).
+    "openstudio_operator_singleton_wrapped_handlers",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

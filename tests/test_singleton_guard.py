@@ -338,6 +338,102 @@ def test_install_does_not_touch_watching_handlers():
     assert registry._watching._handlers[0].fn is evt
 
 
+# --- Issue #491 — singleton_wrapped_handlers boot gauge -------------------------
+
+
+def _wrapped_handlers_gauge_value() -> float:
+    """Current value of ``SINGLETON_WRAPPED_HANDLERS`` (module-global gauge)."""
+    return float(singleton.SINGLETON_WRAPPED_HANDLERS._value.get())
+
+
+def make_registry_with_n_oscm_timers(count: int) -> kopf.OperatorRegistry:
+    """Registry with ``count`` OSCM timers (all #250-registered) + one
+    non-OSCM deployment timer (never gated, never counted)."""
+    registry = kopf.OperatorRegistry()
+    from openstudio_operator import _oscm_handlers
+
+    fns = []
+    for _ in range(count):
+
+        @kopf.timer(GROUP, "v1alpha1", PLURAL, interval=30.0, registry=registry)
+        def oscm_timer_n(body: dict, **_: object):
+            return "served"
+
+        fns.append(oscm_timer_n)
+
+    # Same identity-based id lookup as make_registry_with_handlers: kopf
+    # dedupes colliding handler ids (identical qualnames from this loop)
+    # with suffixes, so the id must be read back per fn, not assumed.
+    for fn in fns:
+        kopf_id = next(h.id for h in registry._spawning._handlers if h.fn is fn)
+        _oscm_handlers.register(kopf_id, fn)
+
+    @kopf.timer("apps", "v1", "deployments", interval=30.0, registry=registry)
+    def deployment_timer(body: dict, **_: object):
+        return "deployments-are-not-gated"
+
+    return registry
+
+
+def test_install_sets_wrapped_handlers_gauge_to_wrap_count():
+    """Issue #491: after installing the guard over a registry with OSCM
+    timers, ``SINGLETON_WRAPPED_HANDLERS`` equals the number of wrapped
+    handlers. The idempotent re-install (0 NEW wraps) must NOT clobber
+    the gauge to 0 — the gauge counts handlers CARRYING the gate marker,
+    and 0 is precisely the silent-unwrap alert value."""
+    registry = make_registry_with_handlers()
+    assert install_singleton_guard(registry=registry) == 1
+    assert _wrapped_handlers_gauge_value() == 1.0
+    # idempotent re-install: returns 0 newly-wrapped, gauge keeps the
+    # actual gated population.
+    assert install_singleton_guard(registry=registry) == 0
+    assert _wrapped_handlers_gauge_value() == 1.0
+
+
+def test_wrapped_handlers_gauge_counts_every_oscm_timer():
+    """Issue #491: the gauge tracks N, not just the 1-handler shape — a
+    future handler module added to the import block moves the healthy
+    reading, and the non-OSCM deployment timer is never counted."""
+    registry = make_registry_with_n_oscm_timers(3)
+    assert install_singleton_guard(registry=registry) == 3
+    assert _wrapped_handlers_gauge_value() == 3.0
+
+
+def test_wrapped_handlers_gauge_zero_when_no_oscm_timers():
+    """Issue #491: a registry with no matching handlers leaves the gauge
+    at 0 — a legitimate 0 (nothing to gate), distinct from the alert
+    semantics only when the cluster EXPECTS timers (the alert's
+    ``for: 5m`` + expectation context carries that distinction)."""
+    registry = kopf.OperatorRegistry()
+
+    @kopf.timer("apps", "v1", "deployments", interval=30.0, registry=registry)
+    def deployment_timer(body: dict, **_: object):
+        return "deployments-are-not-gated"
+
+    assert install_singleton_guard(registry=registry) == 0
+    assert _wrapped_handlers_gauge_value() == 0.0
+
+
+def test_wrapped_handlers_gauge_zero_when_internals_not_as_expected(caplog):
+    """Issue #491 — the silent-unwrap shape, made scrapeable: a kopf
+    upgrade that moves ``registry._spawning._handlers`` (the private
+    layout the gate walks — the documented kopf-pin failure mode) sends
+    the gate down its internals-mismatch branch. Pre-#491 that outcome
+    was a WARNING log only; the gauge must now read 0.0 so
+    ``openstudio_operator_singleton_wrapped_handlers == 0`` fires."""
+
+    class _InternalsShiftedRegistry:
+        # _spawning carries no _handlers list — the post-upgrade shape
+        # the gate's isinstance(handlers, list) check rejects.
+        _spawning = object()
+
+    assert install_singleton_guard(registry=_InternalsShiftedRegistry()) == 0
+    assert _wrapped_handlers_gauge_value() == 0.0
+    assert any(
+        "registry internals not as expected" in r.getMessage() for r in caplog.records
+    )
+
+
 def test_gated_wrapper_serves_only_oldest(monkeypatch, log, guard_two_crs):
     registry = make_registry_with_handlers()
     assert install_singleton_guard(registry=registry) == 1

@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (898 tests across 43 files, current count)
+ruff check . && pytest                       # both green (903 tests across 43 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 15 gauges + 3 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 16 gauges + 3 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
@@ -275,7 +275,20 @@ fixed-cardinality series, D11-exempt by construction like #393 — set
 at import, before any dry-run-gated action could exist). It costs one
 series and makes every other series interpretable against a release
 during single-replica Recreate redeploys, where a rolling-window scrape
-mixes old/new pod series with identical labels.
+mixes old/new pod series with identical labels. The post-#504 expansion
+to 20+16+3 is #491 (`singleton_wrapped_handlers` — the boot-time
+singleton-guard wrap count, set at the end of
+`singleton.install_singleton_guard` to the number of OSCM spawning
+handlers whose fn carries the gate marker; `0` on a booted operator
+that expects timers is the silent-unwrap failure mode the kopf pin
+documents — a kopf upgrade moved the private
+`registry._spawning._handlers` layout, D05 enforcement silently
+disabled while every timer still fires ungated. The runtime complement
+of the CI-time `tests/test_singleton_registry_coverage.py` fence and of
+the #469 heartbeat — heartbeat proves scheduling, wrap count proves
+guarding; shipped with the `OpenStudioOperatorSingletonGuardUnwrapped`
+alert). D11-exempt like #393/#504 — set at boot wiring time, before any
+dry-run-gated action could exist).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -344,6 +357,7 @@ unlabelled counter here is exactly the regression #181 guards against.
 | `openstudio_operator_auto_soft_stop_enabled` | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) (#492) | 1.0 when `analysisPolicy.autoSoftStop` is true (the CRD default) — the SLA monitor is armed; 0.0 = the SLA monitor is fully passive (a full stop — no soft-stop, no escalation, no anchors written). **Labelled by `(namespace, name)`** (#311; bounded by D05). | n/a — previously the debug log line was the only record of a passive SLA monitor. Alert on an unexpected 0 on production. |
 | `openstudio_operator_status_map_entries` | `status_store` (`_read_status` — the single read site every RMW cycle and typed getter lands on) (#489) | `len(map)` for each of the four capped `.status` maps, stamped on every read (RMW fresh GETs and plain getters alike; a 409 burst re-stamps per attempt — idempotent `.set()`). **Labelled by `(namespace, name, map_name)`** — `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`} (the exact `.status` map keys, same vocabulary as `status_map_caps_total`); cardinality bounded by D05, one series per CR-map pair. The stamp is read-time: a write's own RMW stamps the pre-write map, the next read stamps the post-write length (every tick reads before deciding, so the gauge is fresh within one poll). | n/a — the LEAD-TIME companion to `status_map_caps_total` (#171): the cap counter + `StatusMapCapped` Warning Event fire only AFTER `STATUS_MAP_MAX_ENTRIES` (10000) is hit and the oldest D04 idempotency anchors are already being dropped (an evicted `softStops`/`startedSince` anchor for a still-relevant analysis silently re-arms the double-soft-stop / double-requeue paths the anchors exist to prevent). Alert on `> 8000` (0.8 × 10000) sustained 30m — shipped as `OpenStudioOperatorStatusMapNearCap`; the 2000-entry headroom is days of runway at typical fill rates, with `archivedAnalyses`' monotonic growth the canonical long-lived-cluster case. In-process metric — D11-exempt; read-path only, forces no write. |
 | `openstudio_operator_build_info` | `metrics` (import-time constant stamp, `importlib.metadata`) (#504) | Fleet-identity row: constant `1` recording which operator release is emitting the exposition. Set ONCE at metrics import time — before any handler, config parse, or server bind runs. **Labelled by `(version, python_version)`**: `version` = the installed `openstudio-server-operator` distribution version (`unknown` when the distribution is absent, so a bare-venv import stays alive), `python_version` = `sys.version.split()[0]`. One series, fixed cardinality by construction. | n/a — identity, not health; no alert. During an upgrade the operator is a single-replica Recreate Deployment, so a rolling-window scrape after redeploy mixes series from the old and the new pod with identical labels — previously the only post-hoc correlation was pod-start timestamps against the deployment history. D11-exempt by construction (set at import, before any dry-run-gated action could exist — same shape as the #393 bind gauge); not a decision counter — does not follow the §2 anchor pairing convention. |
+| `openstudio_operator_singleton_wrapped_handlers` | `singleton` (`install_singleton_guard` end-of-install stamp) (#491) | Boot-time count of OSCM spawning handlers the singleton guard actually wrapped — set at the END of `install_singleton_guard` to the number of registry entries whose fn carries the gate marker (an idempotent re-install wraps nothing new but keeps reporting the gated population; the internals-mismatch branch sets `0`). Unlabelled — one series, process-wide. | n/a — the RUNTIME half of the kopf-pin fence. `0` on a booted operator that expects timers is the silent-unwrap failure mode (a kopf upgrade moved the private `registry._spawning._handlers` layout — D05 enforcement silently disabled while every timer still fires ungated); the CI-time fence is `tests/test_singleton_registry_coverage.py`. Alert on `== 0` sustained (`OpenStudioOperatorSingletonGuardUnwrapped`, `for: 5m`) — complementary to the #469 heartbeat (`handler_last_tick_timestamp` proves scheduling, this gauge proves guarding). D11-exempt (set at boot wiring time, before any dry-run-gated action could exist); not a decision counter — does not follow the §2 anchor pairing convention. |
 
 ### Histograms
 

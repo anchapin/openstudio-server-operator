@@ -77,6 +77,7 @@ from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     SINGLETON_ELECTION_TOTAL,
     SINGLETON_LOSER_SKIPS_TOTAL,
+    SINGLETON_WRAPPED_HANDLERS,
 )
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
@@ -564,6 +565,16 @@ def install_singleton_guard(registry: object | None = None) -> int:
     un-gated handler. Issue #285 retired the legacy-id whitelist that
     grandfathered the four pre-#250 timers — every OSCM handler must
     now register explicitly, so this cross-check has no exemptions.
+
+    Issue #491 — the wrap count is recorded at boot on
+    :data:`openstudio_operator.metrics.SINGLETON_WRAPPED_HANDLERS` (set
+    at the end of this function, and to ``0`` on the registry-internals
+    mismatch branch below): ``0`` on a booted operator that expects
+    timers is the silent-unwrap failure mode the kopf pin documents,
+    made scrapeable. The gauge counts handlers CARRYING the gate marker
+    (not newly-wrapped ones), so an idempotent re-install — which wraps
+    nothing new — keeps reporting the actual gated population instead
+    of clobbering the reading to 0.
     """
     # Local import: avoiding a top-level dependency on the Python-level
     # registry so the gate's import graph stays shallow (the registry is
@@ -578,6 +589,11 @@ def install_singleton_guard(registry: object | None = None) -> int:
             "singleton guard: kopf registry internals not as expected — "
             "OSCM handlers NOT gated (D05 enforcement disabled)"
         )
+        # Issue #491 — the silent-unwrap shape, made scrapeable: whatever
+        # the reason the gate could not run (kopf upgrade moved the
+        # private _spawning._handlers layout), the boot gauge must record
+        # ZERO wrapped handlers so the == 0 alert fires.
+        SINGLETON_WRAPPED_HANDLERS.set(0)
         return 0
 
     wrapped = 0
@@ -634,6 +650,21 @@ def install_singleton_guard(registry: object | None = None) -> int:
             "tests/test_singleton_registry_coverage.py.",
             skipped_unregistered,
         )
+    # Issue #491 — boot-time wrap-count gauge. Counted as the OSCM
+    # spawning handlers CARRYING the gate marker after this pass (not the
+    # newly-wrapped ``wrapped``): a fresh boot equals ``wrapped`` (every
+    # previously-unmarked handler was just wrapped), and an idempotent
+    # re-install (0 new wraps) keeps reporting the actual gated
+    # population — a re-invocation must not clobber the gauge to 0, the
+    # value that IS the silent-unwrap alert expression. Handlers skipped
+    # for missing registration carry no marker and are correctly absent.
+    gated = sum(
+        1
+        for h in handlers
+        if _selector_matches_oscms(h)
+        and getattr(getattr(h, "fn", None), GUARD_MARKER, False)
+    )
+    SINGLETON_WRAPPED_HANDLERS.set(gated)
     return wrapped
 
 

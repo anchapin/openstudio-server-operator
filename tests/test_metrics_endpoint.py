@@ -1340,3 +1340,27 @@ def test_build_info_gauge_version_label_non_empty_when_installed():
         f'{{python_version="{sys.version.split()[0]}",version="{installed}"}} 1.0'
         in exposition
     )
+
+
+# --- Issue #491 — singleton-guard wrap-count Gauge --------------------------------
+
+
+def test_singleton_wrapped_handlers_gauge_round_trip():
+    """Issue #491 acceptance: ``openstudio_operator_singleton_wrapped_
+    handlers`` Gauge accepts arbitrary values (the real set site is the
+    end of ``singleton.install_singleton_guard``, asserted end-to-end in
+    ``tests/test_singleton_guard.py`` — this test pins the exposition
+    shape). Unlabelled Gauge — one series, no cardinality growth; the
+    bare ``<name> <value>`` line with no ``{label}`` suffix, mirroring
+    the #253 / #254 / #312 unlabelled-gauge conventions. The 0.0 reset
+    is the alert semantics: ``== 0`` on a booted operator that expects
+    timers is the silent-unwrap failure mode (kopf internals shifted so
+    the gate wrapped nothing — D05 enforcement disabled while the
+    operator appears healthy)."""
+    metrics.SINGLETON_WRAPPED_HANDLERS.set(4.0)
+    assert metrics.SINGLETON_WRAPPED_HANDLERS._value.get() == 4.0
+    metrics.SINGLETON_WRAPPED_HANDLERS.set(0.0)
+    assert metrics.SINGLETON_WRAPPED_HANDLERS._value.get() == 0.0
+    exposition = generate_latest().decode()
+    assert "# TYPE openstudio_operator_singleton_wrapped_handlers gauge" in exposition
+    assert "\nopenstudio_operator_singleton_wrapped_handlers 0.0" in exposition
