@@ -54,7 +54,7 @@ existing handler module as a template, and start editing.
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Python | **3.12** | `Dockerfile` pins `python:3.12-slim` by digest (`#113`); local dev should match. `pyproject.toml` allows `>=3.11` but 3.12 is what CI and the container image use. |
+| Python | **3.12** | `Dockerfile` pins `python:3.12-slim-bookworm` by digest (`#113`, bookworm since `#564`); local dev should match. `pyproject.toml` allows `>=3.11` but 3.12 is what CI and the container image use. |
 | `pip` | latest | used to install from `requirements.lock` (hash-pinned, `--require-hashes`) and then the editable package. |
 | `requirements.lock` | pinned | the source of truth for runtime deps (`#173`) AND dev deps (`#298`). Every package is pinned to an exact version with `--hash=sha256:...` annotations. Generated with `pip-compile --extra=dev --generate-hashes --output-file=requirements.lock pyproject.toml` (requires `pip-tools`); see `requirements.lock` header for the exact invocation. The `tests/test_dependency_drift.py` CI gate fails the build if any `[project.optional-dependencies].dev` entry is missing its `--hash` line. Never edit by hand. |
 | `requirements.txt` | pinned | the runtime-only lockfile (`#479`) the Dockerfile installs from — same `pip-compile` invocation as above but WITHOUT `--extra=dev`, so no dev tools ship in the production image. Refresh it in the same commit as `requirements.lock`. |

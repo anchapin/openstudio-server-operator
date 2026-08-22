@@ -1,29 +1,21 @@
 # Trivy triage list — see the header rules below.
 #
-# ISSUE #564 TIME-BOXED EXCEPTIONS: every entry below is a CURRENT
-# finding in the stale python:3.12-slim base digest (3 CRITICAL +
-# 50 HIGH across 16 unique CVEs, first observed by the #481 gate's
-# first run). The durable fix is the base-image refresh tracked in
-# #564 (dependabot #551 or a within-3.12-slim digest refresh).
-# When that lands: EMPTY this file back to comments-only and verify
-# the gate stays green without triage. Do not delete the gate.
+# ISSUE #564 RESOLVED (2026-08): the time-boxed exceptions that lived
+# here were the stale python:3.12-slim (trixie) digest findings from
+# the #481 gate's first run (3 CRITICAL + 50 HIGH across 16 unique
+# CVEs). The durable fix landed: the base moved to
+# python:3.12-slim-bookworm @ sha256:a116514e…, which scans clean at
+# the gate floor (CRITICAL,HIGH with --ignore-unfixed — the exact
+# .github/workflows/ci.yml audit-job flags) with this file EMPTY, and
+# all 16 entries were removed.
+#
+# Bookworm's remaining CRITICAL/HIGH CVEs (e.g. perl-base
+# CVE-2026-13221, zlib1g CVE-2023-45853, libsqlite3-0 CVE-2025-7458)
+# are all UNFIXED upstream — the gate's `ignore-unfixed: true` excludes
+# them by design. They are enumerated for awareness in issue #564's
+# decision comment, not triaged here; re-opening triage would just hide
+# them from non-CI scans without making anyone safer.
 #
 # Rules: one CVE/GHSA per line; a justification comment + follow-up
 # issue are required for any NEW entry; re-review on dependabot
 # base-image bumps.
-CVE-2025-69720  # triaged via #564 (stale base digest)
-CVE-2026-13221  # triaged via #564 (stale base digest)
-CVE-2026-14456  # triaged via #564 (stale base digest)
-CVE-2026-41992  # triaged via #564 (stale base digest)
-CVE-2026-42496  # triaged via #564 (stale base digest)
-CVE-2026-42497  # triaged via #564 (stale base digest)
-CVE-2026-48962  # triaged via #564 (stale base digest)
-CVE-2026-53612  # triaged via #564 (stale base digest)
-CVE-2026-53613  # triaged via #564 (stale base digest)
-CVE-2026-53614  # triaged via #564 (stale base digest)
-CVE-2026-53615  # triaged via #564 (stale base digest)
-CVE-2026-54369  # triaged via #564 (stale base digest)
-CVE-2026-57432  # triaged via #564 (stale base digest)
-CVE-2026-57433  # triaged via #564 (stale base digest)
-CVE-2026-8376  # triaged via #564 (stale base digest)
-CVE-2026-9538  # triaged via #564 (stale base digest)
