@@ -562,6 +562,81 @@ def test_cronjob_schedule_and_single_flight():
     assert CRONJOB["metadata"]["namespace"] == "openstudio-server"
 
 
+def test_cronjob_job_template_has_active_deadline_seconds():
+    """Issue #569 — the prune Job template bounds one tick's wall-clock.
+
+    A hung prune pod (the kubernetes python client sets NO read timeout —
+    an apiserver/Redis stall or a black-holed TCP connection pins it in
+    Running forever) wedges the whole retention pipeline under
+    ``concurrencyPolicy: Forbid``: every subsequent */10 schedule is
+    skipped and the Job never reaches Failed, so
+    ``OpenStudioOperatorPruneJobFailed`` (keyed on kube_job_status_failed)
+    never fires. ``activeDeadlineSeconds`` is the #394 archival-Job
+    pattern (``archival.py::ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS``)
+    applied to the prune side, sized off the schedule cadence (600 s)
+    instead of the #394 worker grace period: 1800 s = 3 full intervals —
+    generous for a worst-case healthy tick (3x REST retry budget + the
+    once-per-tick heavy data_points poll; the tick never blocks on
+    archival Job completion, so this cannot race a legitimate upload —
+    those carry their own 31200 s #394 deadline) yet bounded so the
+    kubelet DeadlineExceeded-kills a wedged pod within two skipped
+    schedules, transitioning the Job to Failed for the sibling alert.
+    """
+    job_spec = CRONJOB["spec"]["jobTemplate"]["spec"]
+    assert job_spec["activeDeadlineSeconds"] == 1800, (
+        "prune Job template must bound one tick's wall-clock at 1800s "
+        "(3x the 600s schedule — the #394 multiple-of-a-reference-cadence "
+        "pattern; issue #569): a hung pod otherwise pins the Job in "
+        "Running forever and retention dies silently under Forbid"
+    )
+
+
+def test_prometheusrule_prune_group_pins_failure_and_absence_of_success():
+    """Issue #569 — the prune alert pair: failed Jobs AND no success in ~1h.
+
+    The failed-Job alert is event-driven (it needs a Job to reach Failed
+    — the activeDeadlineSeconds from
+    ``test_cronjob_job_template_has_active_deadline_seconds`` now makes a
+    hung pod do exactly that); the absence-of-success complement catches
+    the modes that produce no events at all — suspended CronJob, schedule
+    mutated wrong, Jobs never scheduled — where every operator-process
+    signal stays green (the heartbeat and tick counters belong to the
+    operator, not the pruner). The expression shape is load-bearing:
+    ``max_over_time`` (NOT increase()/changes() — a seconds-long tick can
+    first appear scraped already at succeeded=1 with no observed 0->1
+    transition for increase() to count) and ``or vector(0)`` (an empty
+    selector after successfulJobsHistoryLimit GC must evaluate to 0 and
+    fire, not vacuously match nothing).
+    """
+    docs = list(yaml.safe_load_all((DEPLOY / "prometheustrule.yaml").read_text()))
+    rule = next(d for d in docs if d and d["kind"] == "PrometheusRule")
+    prune_group = next(
+        g for g in rule["spec"]["groups"] if g["name"] == "openstudio-operator.prune"
+    )
+    alerts = {entry["alert"]: entry for entry in prune_group["rules"]}
+    failed = alerts.get("OpenStudioOperatorPruneJobFailed")
+    assert failed is not None, "prune failed-Job alert must stay (the #470 rekey)"
+    assert 'kube_job_status_failed{' in failed["expr"]
+    no_success = alerts.get("OpenStudioOperatorPruneJobNoSuccess")
+    assert no_success is not None, (
+        "prune absence-of-success alert missing (issue #569) — the "
+        "event-driven failed alert cannot see a suspended/starved CronJob"
+    )
+    expr = no_success["expr"]
+    assert "kube_job_status_succeeded" in expr
+    assert "max_over_time" in expr and "[1h]" in expr, (
+        "absence-of-success must be max_over_time over a 1h window (~6 "
+        "missed */10 schedules, issue #569), not increase()/changes() — a "
+        "seconds-long tick can first appear scraped at succeeded=1"
+    )
+    assert "or vector(0)" in expr, (
+        "absence-of-success must keep firing on an empty selector (job "
+        "history GC'd) — TRUE absence evaluates to 0, it must not "
+        "vacuously match nothing"
+    )
+    assert no_success["labels"]["severity"] == "warning"
+
+
 def test_cronjob_runs_entrypoint_from_pinned_operator_image():
     """The prune CronJob must (a) be wired to the least-privilege
     ``openstudio-storage-pruner-sa`` ServiceAccount and the
