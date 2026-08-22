@@ -1158,6 +1158,225 @@ def test_install_singleton_guard_skips_unregistered_oscm_handler(
         _oscm_handlers.REGISTRY.update(saved_registry)
 
 
+# --- Issue #570 — expected-count gauge + wrapped<expected partial-unwrap gap -----
+#
+# Issue #570: the two ``continue`` skip paths inside
+# ``install_singleton_guard`` (a handler missing from the Python-level
+# registry, #250; a ``dataclasses.replace`` TypeError) leave a
+# kopf-registered OSCM timer running UN-GATED. Pre-#570 the only runtime
+# signal was the boot-time ERROR log: ``SINGLETON_WRAPPED_HANDLERS``
+# exported just the gated count (a plausible "3 of 4") and
+# ``OpenStudioOperatorSingletonGuardUnwrapped`` fired only on ``== 0`` —
+# a partial unwrap was invisible at /metrics and to alerting. The fix
+# exports the expected count too
+# (``SINGLETON_EXPECTED_HANDLERS``, sized from the same kopf-registry
+# scan this file performs) and rekeys the alert onto a strict
+# ``wrapped < expected``. These tests pin the partial-skip acceptance
+# criterion (loud log + both gauges), the healthy parity (no false
+# alert), and the internals-mismatch fallback (the Python-level registry
+# population stands in so a total unwrap keeps firing under strict ``<``).
+
+
+def _gauge_value_570(gauge) -> float:
+    """Current value of an unlabelled module-global Gauge (#491 idiom)."""
+    return float(gauge._value.get())
+
+
+def test_install_partial_skip_exports_wrapped_lt_expected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #570 acceptance: one registered + one unregistered OSCM timer.
+
+    The #570 partial-skip shape — two OSCM timers in the kopf registry,
+    only one of them in the Python-level registry (#250) — must export
+    the gap as a metric PAIR: ``SINGLETON_WRAPPED_HANDLERS == 1`` (the
+    gated half) against ``SINGLETON_EXPECTED_HANDLERS == 2`` (the
+    population kopf reports), so the rekeyed
+    ``wrapped < expected`` alert fires where the historical ``== 0``
+    expression read a plausible "1" and stayed silent. The loud ERROR
+    log from the #250 cross-check is asserted alongside — the log names
+    the orphan id, the gauge pair makes it scrapeable.
+    """
+    from openstudio_operator import _oscm_handlers
+    from openstudio_operator.metrics import (
+        SINGLETON_EXPECTED_HANDLERS,
+        SINGLETON_WRAPPED_HANDLERS,
+    )
+
+    registry = kopf.OperatorRegistry()
+
+    @kopf.timer(GROUP, "v1alpha1", PLURAL, interval=30.0, registry=registry)
+    def oscm_timer_registered(body: dict, **_: object):
+        return "served"
+
+    @kopf.timer(GROUP, "v1alpha1", PLURAL, interval=60.0, registry=registry)
+    def oscm_timer_orphan(body: dict, **_: object):
+        return "ungated"
+
+    # Identity-based id lookup (kopf dedupes colliding ids with
+    # suffixes) — the same pattern as _make_gated_oscm_timer_403.
+    registered_id = next(
+        h.id for h in registry._spawning._handlers if h.fn is oscm_timer_registered
+    )
+    orphan_id = next(
+        h.id for h in registry._spawning._handlers if h.fn is oscm_timer_orphan
+    )
+
+    saved_registry = dict(_oscm_handlers.REGISTRY)
+    try:
+        _oscm_handlers.REGISTRY.clear()
+        # Register ONLY the first timer — the second is the #250
+        # partial-skip shape (a handler module that forgot register()).
+        _oscm_handlers.register(registered_id, oscm_timer_registered)
+
+        with caplog.at_level(logging.ERROR, logger=singleton.logger.name):
+            wrapped = singleton.install_singleton_guard(registry=registry)
+
+        # The registered half wrapped; the orphan skipped.
+        assert wrapped == 1, (
+            f"Expected exactly 1 wrap (registered timer) with 1 orphan "
+            f"skip; got {wrapped}. The #250 cross-check fence broke."
+        )
+
+        # Loud log: the per-handler ERROR names the orphan handler id.
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR
+            and "Python-level registry" in r.getMessage()
+        ]
+        assert any(orphan_id in r.getMessage() for r in error_records), (
+            f"Expected the #250 cross-check ERROR to name the orphan id "
+            f"{orphan_id!r}; captured: "
+            f"{[r.getMessage() for r in caplog.records]!r}."
+        )
+
+        # The metric pair: expected counts BOTH kopf-reported timers,
+        # wrapped counts only the gated one — 1 < 2 is the partial
+        # unwrap made scrapeable (the == 0 alert could not see it).
+        assert _gauge_value_570(SINGLETON_WRAPPED_HANDLERS) == 1.0, (
+            "SINGLETON_WRAPPED_HANDLERS must read 1.0 (the gated half)."
+        )
+        assert _gauge_value_570(SINGLETON_EXPECTED_HANDLERS) == 2.0, (
+            "SINGLETON_EXPECTED_HANDLERS must read 2.0 (the OSCM "
+            "population kopf reports, counted before wrapping)."
+        )
+
+        # The orphan's kopf-side fn stays un-gated (the #250 fence's
+        # existing contract, restated: the gap is real, not just visual).
+        orphan_fn = next(
+            h.fn
+            for h in registry._spawning._handlers
+            if getattr(h, "id", None) == orphan_id
+        )
+        assert not getattr(orphan_fn, singleton.GUARD_MARKER, False), (
+            "The orphan timer's fn must NOT carry the gate marker."
+        )
+    finally:
+        _oscm_handlers.REGISTRY.clear()
+        _oscm_handlers.REGISTRY.update(saved_registry)
+
+
+def test_install_exports_expected_equal_to_wrapped_on_healthy_registry() -> None:
+    """Issue #570: a fully-registered registry reads expected == wrapped.
+
+    No false alert: on the healthy path (every OSCM timer registered,
+    every wrap succeeds) the pair must agree. The idempotent re-install
+    must keep them equal too — the expected pre-pass counts handlers
+    ALREADY carrying the marker, so a re-invocation reports the same
+    population instead of collapsing the expectation to 0.
+    """
+    from openstudio_operator import _oscm_handlers
+    from openstudio_operator.metrics import (
+        SINGLETON_EXPECTED_HANDLERS,
+        SINGLETON_WRAPPED_HANDLERS,
+    )
+
+    registry = kopf.OperatorRegistry()
+    fns = []
+    for _ in range(2):
+
+        @kopf.timer(GROUP, "v1alpha1", PLURAL, interval=30.0, registry=registry)
+        def oscm_timer_healthy(body: dict, **_: object):
+            return "served"
+
+        fns.append(oscm_timer_healthy)
+
+    saved_registry = dict(_oscm_handlers.REGISTRY)
+    try:
+        _oscm_handlers.REGISTRY.clear()
+        for fn in fns:
+            kopf_id = next(h.id for h in registry._spawning._handlers if h.fn is fn)
+            _oscm_handlers.register(kopf_id, fn)
+
+        assert singleton.install_singleton_guard(registry=registry) == 2
+        assert _gauge_value_570(SINGLETON_WRAPPED_HANDLERS) == 2.0
+        assert _gauge_value_570(SINGLETON_EXPECTED_HANDLERS) == 2.0
+
+        # Idempotent re-install: 0 NEW wraps, but the pair stays equal —
+        # expected counts marker-carrying handlers on the re-scan.
+        assert singleton.install_singleton_guard(registry=registry) == 0
+        assert _gauge_value_570(SINGLETON_WRAPPED_HANDLERS) == 2.0
+        assert _gauge_value_570(SINGLETON_EXPECTED_HANDLERS) == 2.0
+    finally:
+        _oscm_handlers.REGISTRY.clear()
+        _oscm_handlers.REGISTRY.update(saved_registry)
+
+
+def test_install_internals_mismatch_expected_falls_back_to_python_registry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #570: the mismatch branch sizes the expectation from REGISTRY.
+
+    When the kopf layout is unreadable (the kopf-upgrade shape — the
+    gate cannot scan kopf at all), the expected gauge must fall back to
+    the Python-level ``_oscm_handlers.REGISTRY`` population so the
+    rekeyed strict-``<`` alert keeps firing on the TOTAL unwrap
+    (``0 < N``). Sizing the expectation from the unreadable kopf side
+    would read ``0 < 0`` and silently re-open the exact gap #491's
+    ``== 0`` clause used to cover.
+    """
+    from openstudio_operator import _oscm_handlers
+    from openstudio_operator.metrics import (
+        SINGLETON_EXPECTED_HANDLERS,
+        SINGLETON_WRAPPED_HANDLERS,
+    )
+
+    class _InternalsShiftedRegistry:
+        # _spawning carries no _handlers list — the post-upgrade shape
+        # the gate's isinstance(handlers, list) check rejects.
+        _spawning = object()
+
+    saved_registry = dict(_oscm_handlers.REGISTRY)
+    try:
+        _oscm_handlers.REGISTRY.clear()
+        # A known Python-registry population (two declared OSCM timers).
+        _oscm_handlers.register("_fake_oscm_a", lambda *a, **k: None)
+        _oscm_handlers.register("_fake_oscm_b", lambda *a, **k: None)
+
+        with caplog.at_level(logging.WARNING, logger=singleton.logger.name):
+            assert (
+                singleton.install_singleton_guard(
+                    registry=_InternalsShiftedRegistry()
+                )
+                == 0
+            )
+
+        assert _gauge_value_570(SINGLETON_WRAPPED_HANDLERS) == 0.0
+        assert _gauge_value_570(SINGLETON_EXPECTED_HANDLERS) == 2.0, (
+            "The internals-mismatch branch must size the expectation "
+            "from len(_oscm_handlers.REGISTRY) so 0 < expected keeps "
+            "the total-unwrap alert firing under strict <."
+        )
+        assert any(
+            "registry internals not as expected" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        _oscm_handlers.REGISTRY.clear()
+        _oscm_handlers.REGISTRY.update(saved_registry)
+
+
 # --- Issue #285 — Python-level registry is the sole source of truth ------------
 #
 # Issue #285: ``_oscm_handlers.KNOWN_LEGACY_OSCM_HANDLER_IDS`` was a

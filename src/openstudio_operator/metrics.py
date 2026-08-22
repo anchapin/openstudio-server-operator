@@ -306,6 +306,54 @@ SINGLETON_WRAPPED_HANDLERS = Gauge(
     "process (the wrap count is process-wide).",
 )
 
+# Issue #570 — expected-count Gauge, the denominator of the #491 wrap-count
+# fence. ``SINGLETON_WRAPPED_HANDLERS`` (above) exports only the gated count;
+# nothing correlates it against how many OSCM spawning handlers the operator
+# SHOULD have, so a PARTIAL unwrap was invisible: ``install_singleton_guard``
+# has two ``continue`` skip paths (a handler missing from the Python-level
+# registry, #250; a ``dataclasses.replace`` TypeError) that leave a
+# kopf-registered OSCM timer running UN-GATED while the wrap gauge reads a
+# plausible-looking ``3 of 4`` and the ``== 0`` alert stays silent. In a
+# multi-CR namespace the ungated timer would double-soft-stop, double-requeue,
+# and double-restart on the loser CR — precisely what D05 exists to prevent.
+# This gauge is set at install time, from the OSCM spawning-handler
+# population kopf actually reports (the same scan the coverage test
+# performs — every ``registry._spawning._handlers`` entry whose selector
+# matches the OSCM resource and whose fn is not None, counted BEFORE
+# wrapping). On the registry-internals-mismatch branch (kopf moved the
+# private layout — the gate cannot scan kopf at all) the Python-level
+# ``_oscm_handlers.REGISTRY`` population stands in as the expectation, so
+# ``wrapped == 0 < expected`` still fires. Alert on
+# ``openstudio_operator_singleton_wrapped_handlers <
+# openstudio_operator_singleton_expected_handlers`` (shipped as the
+# rekeyed ``OpenStudioOperatorSingletonGuardUnwrapped``) — strict ``<``
+# covers the historical ``== 0`` clause because a total unwrap is always
+# ``0 < N`` for any nonzero expectation. Unlabelled — one series per
+# process; set at boot wiring time like the #491 gauge (D11-exempt).
+SINGLETON_EXPECTED_HANDLERS = Gauge(
+    "openstudio_operator_singleton_expected_handlers",
+    "Number of OSCM spawning (timer/daemon) handlers the singleton guard "
+    "EXPECTED to wrap at boot (issue #570) — the denominator of "
+    "``singleton_wrapped_handlers``. Set at install time from the OSCM "
+    "spawning-handler population kopf actually reports (the same scan "
+    "``tests/test_singleton_registry_coverage.py`` performs: every "
+    "``registry._spawning._handlers`` entry whose selector matches the "
+    "OSCM resource and whose fn is not None, counted BEFORE wrapping). On "
+    "the registry-internals-mismatch branch the Python-level "
+    "``_oscm_handlers.REGISTRY`` population stands in. A partial unwrap "
+    "— one handler skipped for missing #250 registration, or a "
+    "``dataclasses.replace`` TypeError — reads ``wrapped < expected`` "
+    "while the historical ``== 0`` alert stayed silent; in a multi-CR "
+    "namespace the ungated timer double-serves the loser CR (the exact "
+    "D05 violation). Alert on "
+    "``openstudio_operator_singleton_wrapped_handlers < "
+    "openstudio_operator_singleton_expected_handlers`` sustained "
+    "(``OpenStudioOperatorSingletonGuardUnwrapped``) — strict ``<`` "
+    "subsumes the old ``== 0`` clause. Unlabelled — one series, "
+    "process-wide; D11-exempt (boot wiring, before any dry-run-gated "
+    "action could exist).",
+)
+
 # Issue #253 — Redis key-layout validation status as a Gauge. The boot-time
 # validator (#163) returns one of ``ok | degraded | unreachable | error |
 # skipped`` and emits a structured log line per CR; the Warning Event on the

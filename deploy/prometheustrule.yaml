@@ -230,35 +230,55 @@ spec:
               being suppressed by the singleton guard. Delete the loser CR.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
-        # metrics.py SINGLETON_WRAPPED_HANDLERS (#491) — the RUNTIME half of
-        # the kopf-pin fence: install_singleton_guard wraps the OSCM timers
+        # metrics.py SINGLETON_WRAPPED_HANDLERS (#491) +
+        # SINGLETON_EXPECTED_HANDLERS (#570) — the RUNTIME half of the
+        # kopf-pin fence: install_singleton_guard wraps the OSCM timers
         # at boot by walking kopf's private registry._spawning._handlers.
         # Zero wrapped on a booted operator that expects timers is the
-        # silent-unwrap failure mode — D05 enforcement disabled while every
-        # timer still fires ungated and the operator appears healthy. The
-        # CI-time fence is tests/test_singleton_registry_coverage.py; this
-        # alert is what catches a deployed kopf whose internals shifted
-        # anyway. Complementary to OpenStudioOperatorHandlerHeartbeatStale
-        # (#469): the heartbeat proves the scheduler is invoking the timers,
-        # the wrap count proves those invocations are guarded.
+        # silent-unwrap failure mode — D05 enforcement disabled while
+        # every timer still fires ungated and the operator appears
+        # healthy. Issue #570 rekeys the expression from == 0 to a
+        # strict wrapped < expected: a PARTIAL unwrap (one timer skipped
+        # for missing #250 registration, or a dataclasses.replace
+        # TypeError) leaves the wrap gauge at a plausible "3 of 4" while
+        # the ungated timer double-serves a loser CR — exactly the D05
+        # violation the == 0 clause could not see. Strict < subsumes the
+        # old clause: a total unwrap is always 0 < N for any nonzero
+        # expectation (the expected gauge falls back to the Python-level
+        # registry population on the internals-mismatch branch, so the
+        # kopf-upgrade shape keeps firing too). The CI-time fence is
+        # tests/test_singleton_registry_coverage.py; this alert is what
+        # catches a deployed kopf whose internals shifted anyway.
+        # Complementary to OpenStudioOperatorHandlerHeartbeatStale
+        # (#469): the heartbeat proves the scheduler is invoking the
+        # timers, the wrap pair proves those invocations are guarded.
         - alert: OpenStudioOperatorSingletonGuardUnwrapped
-          expr: openstudio_operator_singleton_wrapped_handlers == 0
+          expr: openstudio_operator_singleton_wrapped_handlers < openstudio_operator_singleton_expected_handlers
           for: 5m
           labels:
             severity: critical
           annotations:
-            summary: Singleton guard wrapped zero OSCM handlers at boot
+            summary: Singleton guard left OSCM handlers ungated at boot ({{ $value }} behind expectation)
             description: >-
-              openstudio_operator_singleton_wrapped_handlers == 0 — the singleton
-              gate found no OSCM spawning handlers to wrap at boot, so D05
-              enforcement is silently disabled while every timer still fires
-              ungated. The usual cause is a kopf upgrade that moved or renamed
-              the private registry._spawning._handlers layout the gate walks
-              (the documented kopf-pin failure mode). Cross-check the #469
-              heartbeat (handler_last_tick_timestamp proves scheduling, not
-              guarding) and run tests/test_singleton_registry_coverage.py
-              against the deployed kopf version; pin kopf back into the
-              >=1.37,<1.45 band or adjust the gate before re-deploying.
+              openstudio_operator_singleton_wrapped_handlers <
+              openstudio_operator_singleton_expected_handlers — the singleton
+              gate left one or more OSCM spawning handlers running UN-GATED:
+              every timer still fires, but the ones the gate could not wrap
+              serve EVERY CR in the namespace (in a multi-CR namespace they
+              would double-soft-stop, double-requeue, and double-restart on
+              the loser CR — the exact D05 violation). A PARTIAL gap (wrapped
+              = 3 of expected 4) means a handler was skipped for missing
+              #250 Python-registry registration or a dataclasses.replace
+              TypeError; a TOTAL gap (wrapped = 0) means a kopf upgrade moved
+              or renamed the private registry._spawning._handlers layout the
+              gate walks (the documented kopf-pin failure mode — the expected
+              gauge then reads the Python-level registry population).
+              Cross-check the #469 heartbeat
+              (handler_last_tick_timestamp proves scheduling, not guarding)
+              and run tests/test_singleton_registry_coverage.py against the
+              deployed kopf version; pin kopf back into the >=1.37,<1.45
+              band or add the missing _oscm_handlers.register() call before
+              re-deploying.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------
