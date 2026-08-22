@@ -40,7 +40,7 @@ apiserver. Tests and metrics can read the counter to distinguish
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import kopf
 
@@ -110,13 +110,18 @@ class EventEmitter:
     """
 
     __slots__ = ("_body", "_dry_run", "_name", "_namespace", "_suppressed_count")
-
-    def __init__(self, body: dict, *, dry_run: bool = False) -> None:
+    def __init__(self, body: Mapping, *, dry_run: bool = False) -> None:
         """Bind the OSCM body and the dry-run gate for one tick.
 
         ``body`` is the OSCM CR body kopf hands to every timer/event
         callback — it's what :func:`kopf.event` attaches the Event to.
-        ``dry_run`` mirrors :attr:`openstudio_operator.config.OperatorConfig.dry_run`
+        Accepted as a :class:`collections.abc.Mapping`, not a ``dict``:
+        kopf >=1.4x delivers the ``body`` kwarg as
+        ``kopf._cogs.structs.bodies.Body`` (a MappingView, not a dict
+        subclass) — the pre-#544 ``isinstance(body, dict)`` guard made
+        every counter series degrade to ``<unknown>``/``<unknown>``
+        labels in production. ``dry_run`` mirrors
+        :attr:`openstudio_operator.config.OperatorConfig.dry_run`
         and decides whether :meth:`emit` posts the Event or just
         increments the suppressed counter.
 
@@ -132,8 +137,12 @@ class EventEmitter:
         self._body = body
         self._dry_run = dry_run
         self._suppressed_count = 0
-        metadata = body.get("metadata") if isinstance(body, dict) else None
-        if isinstance(metadata, dict):
+        # Mapping, not dict: kopf >=1.4x delivers `body` as Body (a
+        # MappingView, not a dict subclass) — issue #544 widens both
+        # guards so a live kopf body extracts its real metadata instead
+        # of falling through to the <unknown> placeholders.
+        metadata = body.get("metadata") if isinstance(body, Mapping) else None
+        if isinstance(metadata, Mapping):
             self._namespace = str(metadata.get("namespace") or "<unknown>")
             self._name = str(metadata.get("name") or "<unknown>")
         else:

@@ -384,29 +384,29 @@ def test_missing_metadata_body_shapes_pin_unknown_labels(body_shape, expected_na
     assert suppressed_after - suppressed_before == 1.0
 
 
-def test_mappingview_body_pins_unknown_labels_but_emit_still_flows(body):
-    """Issue #501 / #232 — kopf 1.4x MappingView body: labels are ``<unknown>``.
+def test_mappingview_body_extracts_real_labels_and_emit_flows(body):
+    """Issue #544 / #232 / #501 — kopf 1.4x MappingView body: REAL labels.
 
     kopf >=1.4x delivers ``body`` as ``kopf._cogs.structs.bodies.Body``
-    — a MappingView subclass, NOT a ``dict`` subclass. The extraction
-    in ``__init__`` (#311) guards with ``isinstance(body, dict)``, so a
-    MappingView body — even one carrying full metadata — resolves to
-    ``("<unknown>", "<unknown>")`` labels. This is CURRENT pinned
-    behavior (flagged in #501 as a surprise, not fixed there): the
-    #232 end-to-end tests already drive MappingProxyType bodies through
-    the handlers' suppressed paths, so those series are already
-    labelled ``<unknown>`` in practice.
+    — a MappingView subclass, NOT a ``dict`` subclass (verified against
+    the pinned kopf 1.44.6: ``Body`` is a registered
+    ``collections.abc.Mapping``). Pre-#544 the extraction in
+    ``__init__`` (#311) guarded with ``isinstance(body, dict)``, so a
+    MappingView body — even one carrying full metadata — resolved to
+    ``("<unknown>", "<unknown>")`` labels (the #501 pin). Since #544
+    the guard is Mapping-aware and the SAME body extracts its REAL
+    ``(namespace, name)`` pair.
 
-    The emit path itself is unaffected: with ``dry_run=False`` the
+    The emit path is unchanged by the fix: with ``dry_run=False`` the
     proxy body flows to ``kopf.event`` unchanged (``kopf.event`` reads
     the mapping, it does not require a dict), and the emitted counter
-    is bumped once on the ``<unknown>``-labelled series.
+    is bumped once — now on the real-labelled series.
     """
     proxy_body = types.MappingProxyType(body)
     assert not isinstance(proxy_body, dict)  # the shape this pin exists for
 
     emitted_before = EVENTS_EMITTED_TOTAL.labels(
-        namespace="<unknown>", name="<unknown>", reason="Reason"
+        namespace="openstudio-server", name="test-oscm", reason="Reason"
     )._value.get()
 
     emitter = EventEmitter(body=proxy_body, dry_run=False)
@@ -419,28 +419,35 @@ def test_mappingview_body_pins_unknown_labels_but_emit_still_flows(body):
     assert emitter.suppressed_count == 0
 
     emitted_after = EVENTS_EMITTED_TOTAL.labels(
-        namespace="<unknown>", name="<unknown>", reason="Reason"
+        namespace="openstudio-server", name="test-oscm", reason="Reason"
     )._value.get()
     assert emitted_after - emitted_before == 1.0
 
 
-def test_plain_dict_and_mappingview_extraction_asymmetry(body):
-    """Issue #501 — plain dict and MappingView bodies are NOT extraction-equivalent.
+def test_plain_dict_and_mappingview_extraction_equivalence(body):
+    """Issue #544 — plain dict and MappingView bodies extract the SAME labels.
 
-    The issue asked for "kopf MappingView vs plain dict equivalence";
-    the pinned reality is an asymmetry: the SAME underlying data
-    extracts real (namespace, name) labels when delivered as a plain
-    dict, and ``("<unknown>", "<unknown>")`` when delivered as a
-    MappingView (the ``isinstance(body, dict)`` guard). Both emitters
-    still gate identically (one suppressed emit each, same D11
-    behavior) — only the counter labels differ. If a future change
-    makes extraction MappingView-aware, this test flips and the
-    #232 end-to-end pins keep the emit path honest.
+    #501 pinned the asymmetry (dict → real labels, MappingView →
+    ``("<unknown>", "<unknown>")`` via the ``isinstance(body, dict)``
+    guard) with a note that the test would flip once extraction became
+    Mapping-aware; #544 is that change. The SAME underlying data now
+    extracts the real ``(namespace, name)`` labels whether delivered as
+    a plain dict or as a MappingView. Both emitters still gate
+    identically (one suppressed emit each, same D11 behavior) — and
+    the suppressed series they bump is the same real-labelled one.
     """
     proxy_body = types.MappingProxyType(body)
 
     dict_emitter = EventEmitter(body=body, dry_run=True)
     proxy_emitter = EventEmitter(body=proxy_body, dry_run=True)
+
+    def _suppressed(namespace: str, name: str) -> float:
+        return EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
+            namespace=namespace, name=name, reason="Reason"
+        )._value.get()
+
+    before_real = _suppressed("openstudio-server", "test-oscm")
+    before_unknown = _suppressed("<unknown>", "<unknown>")
 
     with patch.object(events_module, "kopf") as mock_kopf:
         dict_emitter.emit("Warning", "Reason", "message")
@@ -448,15 +455,77 @@ def test_plain_dict_and_mappingview_extraction_asymmetry(body):
 
     mock_kopf.event.assert_not_called()
 
-    def _suppressed(namespace: str, name: str) -> float:
-        return EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
-            namespace=namespace, name=name, reason="Reason"
-        )._value.get()
-
-    before_dict = _suppressed("openstudio-server", "test-oscm")
-    assert before_dict >= 1.0  # the dict emitter's series moved (sanity)
-    before_proxy = _suppressed("<unknown>", "<unknown>")
-    assert before_proxy >= 1.0  # the proxy emitter's series moved (sanity)
+    # BOTH emitters' suppressions landed on the REAL-labelled series —
+    # exactly two increments, none on the <unknown> fallback series.
+    assert _suppressed("openstudio-server", "test-oscm") - before_real == 2.0
+    assert _suppressed("<unknown>", "<unknown>") == before_unknown
 
     assert dict_emitter.suppressed_count == 1
     assert proxy_emitter.suppressed_count == 1
+
+
+#: Issue #544 — the ``<unknown>`` fallbacks survive the Mapping
+#: widening. Same shapes as ``_MISSING_METADATA_CASES`` above (the
+#: plain-dict authority), delivered as ``types.MappingProxyType`` —
+#: the standard-library stand-in for kopf >=1.4x ``Body``. A Mapping
+#: body whose metadata is absent / empty / non-mapping still resolves
+#: to the ``<unknown>`` placeholders; the widening only makes
+#: FULL-metadata views extract real labels, it must not invent labels
+#: where none exist.
+_MAPPINGVIEW_MISSING_METADATA_CASES = (
+    ({}, "<unknown>", "<unknown>"),
+    ({"spec": {}}, "<unknown>", "<unknown>"),
+    ({"metadata": None}, "<unknown>", "<unknown>"),
+    ({"metadata": {}}, "<unknown>", "<unknown>"),
+    ({"metadata": "not-a-mapping"}, "<unknown>", "<unknown>"),
+    ({"metadata": {"name": "only-name"}}, "<unknown>", "only-name"),
+    ({"metadata": {"namespace": "only-ns"}}, "only-ns", "<unknown>"),
+    ({"metadata": {"namespace": "", "name": ""}}, "<unknown>", "<unknown>"),
+)
+
+_MAPPINGVIEW_MISSING_METADATA_IDS = (
+    "proxy-empty-body",
+    "proxy-no-metadata-key",
+    "proxy-metadata-none",
+    "proxy-metadata-empty-dict",
+    "proxy-metadata-non-mapping",
+    "proxy-name-only",
+    "proxy-namespace-only",
+    "proxy-falsy-strings",
+)
+
+
+@pytest.mark.parametrize(
+    ("body_shape", "expected_namespace", "expected_name"),
+    _MAPPINGVIEW_MISSING_METADATA_CASES,
+    ids=_MAPPINGVIEW_MISSING_METADATA_IDS,
+)
+def test_mappingview_missing_metadata_body_shapes_pin_unknown_labels(
+    body_shape, expected_namespace, expected_name
+):
+    """Issue #544 — MappingView-delivered missing metadata stays ``<unknown>``.
+
+    Mirrors ``test_missing_metadata_body_shapes_pin_unknown_labels``
+    (#501) for the kopf 1.4x body shape: each shape is wrapped in
+    ``types.MappingProxyType`` (a Mapping, not a dict) before reaching
+    ``EventEmitter.__init__``, and the suppressed series that moves is
+    the ``<unknown>``-labelled one — never a fabricated label.
+    """
+    proxy_body = types.MappingProxyType(body_shape)
+    assert not isinstance(proxy_body, dict)  # the shape this pin exists for
+
+    suppressed_before = EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
+        namespace=expected_namespace, name=expected_name, reason="Reason"
+    )._value.get()
+
+    emitter = EventEmitter(body=proxy_body, dry_run=True)
+    with patch.object(events_module, "kopf") as mock_kopf:
+        emitter("Warning", "Reason", "message")
+
+    mock_kopf.event.assert_not_called()
+    assert emitter.suppressed_count == 1
+
+    suppressed_after = EVENTS_DRY_RUN_SUPPRESSED_TOTAL.labels(
+        namespace=expected_namespace, name=expected_name, reason="Reason"
+    )._value.get()
+    assert suppressed_after - suppressed_before == 1.0

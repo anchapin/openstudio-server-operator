@@ -707,3 +707,57 @@ def test_dry_run_toggle_flips_posture_gauge_immediately() -> None:
         "the gauge flip must not change the Event cadence — exactly one "
         "DryRunToggled per real transition, as #397 pinned"
     )
+
+
+# --- Issue #544 — MappingView body keeps counter labels real end-to-end --------
+
+
+def test_mappingview_body_end_to_end_labels_emitted_counter_with_real_identity() -> None:
+    """Issue #544 acceptance — kopf 1.4x MappingView body end-to-end: REAL labels.
+
+    The #232 end-to-end tests in the four handler files drive
+    ``types.MappingProxyType`` bodies through the handlers' suppressed
+    paths (the D11 gate); this gate closes the label half of that
+    story: the production :class:`~openstudio_operator.events.EventEmitter`
+    constructed over a full-metadata MappingView body — the shape
+    kopf >=1.4x delivers to every timer callback
+    (``kopf._cogs.structs.bodies.Body`` is a MappingView, a registered
+    ``collections.abc.Mapping``, verified against the pinned kopf
+    1.44.6) — must label ``EVENTS_EMITTED_TOTAL`` with the CR's REAL
+    ``(namespace, name)``, not the ``<unknown>``/``<unknown>``
+    fallbacks. Pre-#544 the ``isinstance(body, dict)`` extraction guard
+    silently degraded every event-driven series on the dashboards and
+    alerts keyed on CR identity.
+    """
+    import types
+    from unittest.mock import patch
+
+    from openstudio_operator import events as events_module
+    from openstudio_operator.events import EventEmitter
+
+    cr_body = _make_oscm_body(dry_run=False)
+    proxy_body = types.MappingProxyType(cr_body)
+    assert not isinstance(proxy_body, dict)  # the shape kopf 1.4x delivers
+
+    counter = metrics.EVENTS_EMITTED_TOTAL
+
+    def _emitted(namespace: str, name: str) -> float:
+        return counter.labels(namespace=namespace, name=name, reason="Reason")._value.get()
+
+    before_real = _emitted("openstudio-server", "oscm-a")
+    before_unknown = _emitted("<unknown>", "<unknown>")
+
+    emitter = EventEmitter(body=proxy_body, dry_run=False)
+    with patch.object(events_module, "kopf") as mock_kopf:
+        emitter.emit("Normal", "Reason", "message")
+
+    mock_kopf.event.assert_called_once_with(
+        proxy_body, type="Normal", reason="Reason", message="message"
+    )
+    assert emitter.suppressed_count == 0
+
+    # The emitted counter advanced on the REAL-labelled series exactly
+    # once, and the <unknown> fallback series did not move at all —
+    # the labels are extracted identity, not placeholders.
+    assert _emitted("openstudio-server", "oscm-a") - before_real == 1.0
+    assert _emitted("<unknown>", "<unknown>") == before_unknown
