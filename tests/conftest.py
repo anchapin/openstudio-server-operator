@@ -59,6 +59,18 @@ import kubernetes.client
 import pytest
 
 from openstudio_operator import handlers, singleton
+from openstudio_operator.handlers import datapoint_watchdog, web_background_monitor
+
+# Issue #497 — the per-CR cache reset seams join the autouse reset. The two
+# cache-bearing handler modules (see the census in
+# ``openstudio_operator/_cr_cache.py``) expose uniform
+# ``reset_per_cr_caches()`` seams; dropping them here (pre AND post, like
+# the singleton/K8s-client resets above) keeps the suite hermetic against a
+# test that populates a per-CR cache and crashes mid-case. The cache-FREE
+# modules (analysis_sla, worker_recycler — memory lives in CR ``.status``,
+# D04) deliberately expose no seam; ``tests/test_cache_keying_convention.py``
+# fences the census in both directions.
+_PER_CR_CACHE_MODULES = (datapoint_watchdog, web_background_monitor)
 
 # Issue #257 — test-suite duration budget.
 #
@@ -170,6 +182,8 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
     kubernetes.client.Configuration._default = None
+    for module in _PER_CR_CACHE_MODULES:
+        module.reset_per_cr_caches()
     for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
         queue = getattr(handlers, legacy_queue_attr, None)
         if queue is not None and hasattr(queue, "clear"):
@@ -178,6 +192,8 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
     kubernetes.client.Configuration._default = None
+    for module in _PER_CR_CACHE_MODULES:
+        module.reset_per_cr_caches()
     for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
         queue = getattr(handlers, legacy_queue_attr, None)
         if queue is not None and hasattr(queue, "clear"):

@@ -914,6 +914,102 @@ def test_get_tracker_warns_when_singleton_guard_is_bypassed(
         wbm_module._tracker_cache.clear()
 
 
+def test_delete_recreate_starts_fresh_stall_window() -> None:
+    """Issue #497: a delete+recreated singleton CR (#364) starts a fresh window.
+
+    CR A (uid-a) observes the stall holding for 9 of the 10 required
+    minutes, then the CR is deleted and recreated under the SAME
+    ``(namespace, name)`` with a new uid. The pre-#497 leak: the
+    (namespace, name)-keyed tracker survived the delete, so the recreated
+    CR's next holding tick satisfied CR A's window and restarted
+    web_background early — NOT the conservative fresh-observation
+    semantics D07 promises. The #497 uid validation must discard the
+    stale tracker and force the new CR to earn its own full window.
+    """
+    wbm_module._tracker_cache.clear()
+    try:
+        api = FakeCustomObjectsApi(make_cr())
+        apps = FakeAppsV1Api()
+        pods = FakeCoreV1Api([make_pod(), make_pod()])
+        metric_before = restarts_total()
+
+        # CR A (uid-a): stall holds at t=0 and t=9 — window not yet sustained.
+        for offset in (0, 9):
+            fired, events = tick(
+                api,
+                apps,
+                pods,
+                now=NOW + minute(offset),
+                tracker=wbm_module._get_tracker(NAMESPACE, NAME, uid="uid-a"),
+                redis=stall_redis(NOW + minute(offset)),
+            )
+            assert fired is False
+            assert events == []
+        assert apps.patches == []
+        assert (
+            wbm_module._get_tracker(NAMESPACE, NAME, uid="uid-a").first_observed == NOW
+        )
+
+        # Delete + recreate (#364): same (namespace, name), NEW uid — the
+        # uid mismatch must discard CR A's 9-minute accumulation.
+        tracker_b = wbm_module._get_tracker(NAMESPACE, NAME, uid="uid-b")
+        assert tracker_b.first_observed is None  # fresh clock — no leak
+
+        # The recreated CR's first holding tick (t=10 — the timestamp that
+        # WOULD have satisfied CR A's leaked window) must NOT restart.
+        fired, events = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + minute(10),
+            tracker=tracker_b,
+            redis=stall_redis(NOW + minute(10)),
+        )
+        assert fired is False
+        assert events == []
+        assert apps.patches == []
+        assert restarts_total() - metric_before == 0
+
+        # The recreated CR earns its OWN window from t=10 → sustained at t=20.
+        fired, events = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + minute(20),
+            tracker=tracker_b,
+            redis=stall_redis(NOW + minute(20)),
+        )
+        assert fired is True
+        assert len(events) == 1 and events[0][1] == WEB_BACKGROUND_RESTARTED_EVENT
+        assert len(apps.patches) == 1
+        assert restarts_total() - metric_before == 1
+    finally:
+        wbm_module._tracker_cache.clear()
+
+
+def test_reset_per_cr_caches_seam_drops_scoped_and_all() -> None:
+    """Issue #497 reset seam: one-CR drop, full drop, and the ValueError fence."""
+    wbm_module._tracker_cache.clear()
+    try:
+        kept_key = ("other-ns", "other")
+        wbm_module._get_tracker(NAMESPACE, NAME, uid="uid-a")
+        wbm_module._get_tracker(*kept_key, uid="uid-x")
+
+        wbm_module.reset_per_cr_caches(NAMESPACE, NAME)
+        assert (NAMESPACE, NAME) not in wbm_module._tracker_cache
+        assert kept_key in wbm_module._tracker_cache
+
+        wbm_module.reset_per_cr_caches()
+        assert wbm_module._tracker_cache == {}
+
+        with pytest.raises(ValueError):
+            wbm_module.reset_per_cr_caches(namespace=NAMESPACE)
+        with pytest.raises(ValueError):
+            wbm_module.reset_per_cr_caches(name=NAME)
+    finally:
+        wbm_module._tracker_cache.clear()
+
+
 # --- Issue #44 leg-2 non-vacuity safeguard -------------------------------------
 
 

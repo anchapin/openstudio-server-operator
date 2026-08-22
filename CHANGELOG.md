@@ -23,6 +23,38 @@ inventory gate) — alongside the earlier iteration's
 NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 
 ### Changed
+- **`#497`** — one per-CR cache keying + reset convention for the
+  handler modules' in-memory layer (the D04 "cache, never source of
+  truth" tier), documented with a full census in the new
+  `openstudio_operator/_cr_cache.py`: every module-level per-CR cache
+  is keyed by `(namespace, name)` and UID-VALIDATED (a lookup under a
+  different `metadata.uid` is the #364 delete+recreate signature and
+  starts fresh — closes the leak at lookup time, no deletion hook
+  needed), and every cache-bearing module exposes a uniform
+  `reset_per_cr_caches(namespace=None, name=None)` seam. Census
+  outcomes: `datapoint_watchdog._EXHAUSTED_WARNED` was an UN-keyed
+  `set[str]` (one-CR assumption — a recreated CR inherited the deleted
+  CR's exhaustion-dedup entries) → re-keyed + uid-validated + seam;
+  `web_background_monitor._tracker_cache` was already
+  `(namespace, name)`-keyed (#167) but never invalidated → uid
+  validation + seam (the leak could satisfy a sustained stall window
+  with the deleted CR's 9 accumulated minutes and restart
+  web_background early — not conservative); `analysis_sla` and
+  `worker_recycler` hold NO per-CR module cache (memory is CR
+  `.status`, D04) and stay seam-free; the #44 leg-2 safeguard globals
+  are deliberately un-keyed process-lifetime diagnostics (Redis-layout
+  property, not CR property) — documented, unchanged;
+  `events_sinks` queues carry per-entry `(namespace, name)` tuples
+  drained on the DELETED watch event too, and the #402 persisted
+  mirror dies with the CR — documented, unchanged. `singleton` /
+  `client_factory` out of scope (#494/#491 territory; their seams
+  already exist). Seams wired into the autouse conftest reset;
+  delete+recreate leak proofs at the seam AND through the real
+  `run_stall_tick` / `run_watchdog_tick` (a recreated CR earns a fresh
+  stall window and re-earns its one-shot exhaustion Warning).
+  Follow-up gap: no `@kopf.on.delete` handler exists to call the seams
+  on CR deletion — the uid validation makes that wiring optional, not
+  blocking.
 - **`#309`** — outcome / trigger labels on the four unlabelled action
   counters so the dashboard can distinguish distinct outcomes without
   log scraping.

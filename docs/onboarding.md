@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-903 tests across 43 files (run `.venv/bin/pytest --collect-only` to
+919 tests across 44 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -373,6 +373,17 @@ Maps `softStops`/`requeues`/`startedSince`/`archivedAnalyses` plus
 scalars `lastRecycleAt`/`lastWebBackgroundRestart`. In-memory state is
 cache, never source of truth. The status store handles 409 retries
 internally — do not build a parallel retry path on top of it.
+
+If your handler DOES need a module-level per-CR cache (a presentation
+dedup set, a sustained-window clock), follow the #497 convention
+documented with a census in `src/openstudio_operator/_cr_cache.py`:
+key it by `(namespace, name)`, UID-validate the entry (a different
+`metadata.uid` means the singleton CR was deleted and recreated under
+the same name — start fresh), and expose the uniform
+`reset_per_cr_caches(namespace=None, name=None)` seam.
+`tests/test_cache_keying_convention.py` fences the census in both
+directions (cache-bearing modules must have the seam; cache-free
+modules must not).
 
 ### REST contract trapdoors (D12, `docs/contracts/...`)
 

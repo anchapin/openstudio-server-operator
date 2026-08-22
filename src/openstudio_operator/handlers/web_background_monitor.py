@@ -90,6 +90,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException
 
+from openstudio_operator import _cr_cache as cr_cache
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import (
     DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
@@ -177,6 +178,13 @@ _LAYOUT_WARNING_GRACE_SECONDS = LAYOUT_WARNING_GRACE_SECONDS
 #: high-water mark of distinct workers ever observed (drives the monotonic
 #: gauge), the first tick the empty-registry state began (for the
 #: grace-period check), and a one-shot warning emission flag.
+#:
+#: Issue #497 census note: these are deliberately UN-keyed process-lifetime
+#: state, NOT per-CR caches — they diagnose the Resque key layout (a
+#: Redis-server property, not a CR property) and the layout warning is
+#: one-shot PER PROCESS by design. :func:`reset_leg2_safeguard_state` is
+#: the existing test seam; a CR delete+recreate must not re-arm a
+#: process-level diagnostic.
 #:
 #: The Redis client cache that used to live here was retired in #235 — one
 #: ``lru_cache`` in :mod:`openstudio_operator.client_factory` now serves
@@ -272,19 +280,41 @@ class StallWindowTracker:
         return now - self.first_observed >= window
 
 
-_tracker_cache: dict[tuple[str, str], StallWindowTracker] = {}
-# Keyed by ``(namespace, name)``. The D05 singleton guard (see
-# ``openstudio_operator.singleton`` and the invariant captured in
+_tracker_cache: dict[tuple[str, str], tuple[str | None, StallWindowTracker]] = {}
+# Keyed by ``(namespace, name)``; UID-VALIDATED since #497 (values are
+# ``(recorded_uid, tracker)`` — a lookup under a different uid is the #364
+# delete+recreate signature and starts a fresh tracker; see
+# :mod:`openstudio_operator._cr_cache` for the convention + census and
+# :func:`reset_per_cr_caches` for the reset seam). The D05 singleton guard
+# (see ``openstudio_operator.singleton`` and the invariant captured in
 # ``StallWindowTracker.__init__``'s docstring) ensures at most one OSCM
-# CR per namespace, so this tuple uniquely identifies the active CR.
+# CR per namespace, so the tuple uniquely identifies the active CR.
 # See ``tests/test_singleton_registry_coverage.py`` for the test that
 # fails loudly if the singleton guard is bypassed by a new handler.
 # Issue #167.
 
 
-def _get_tracker(namespace: str, name: str) -> StallWindowTracker:
-    tracker = _tracker_cache.get((namespace, name))
-    if tracker is None:
+def _get_tracker(namespace: str, name: str, uid: str | None = None) -> StallWindowTracker:
+    entry = _tracker_cache.get((namespace, name))
+    if entry is not None and cr_cache.uid_is_stale(entry[0], uid):
+        # Issue #497 — the cached tracker belongs to the DELETED
+        # predecessor CR (same ``(namespace, name)``, new uid — the #364
+        # delete+recreate path). Its partially-accumulated window must NOT
+        # carry into the new CR: that leak could satisfy the sustained
+        # window on the new CR's FIRST holding ticks and fire a restart
+        # earlier than a fresh observation would (not conservative).
+        logger.info(
+            "StallWindowTracker cache entry for %s/%s belongs to a deleted "
+            "CR (recorded uid %r != observed %r) — starting a fresh "
+            "sustained-window clock (#364 delete+recreate; #497 uid "
+            "validation)",
+            namespace,
+            name,
+            entry[0],
+            uid,
+        )
+        entry = None
+    if entry is None:
         # D05 invariant — surface (don't raise) if the singleton guard has
         # been bypassed. The tracker would otherwise silently share state
         # between the two CRs, which is the bug the invariant guards
@@ -308,8 +338,34 @@ def _get_tracker(namespace: str, name: str) -> StallWindowTracker:
                 name,
             )
         tracker = StallWindowTracker()
-        _tracker_cache[(namespace, name)] = tracker
-    return tracker
+        _tracker_cache[(namespace, name)] = (uid, tracker)
+        return tracker
+    if uid is not None and entry[0] is None:
+        # First uid sighting for an entry recorded pre-uid (or by a
+        # uid-less caller): record it so later lookups can validate.
+        _tracker_cache[(namespace, name)] = (uid, entry[1])
+    return entry[1]
+
+
+def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
+    """Reset seam (#497): drop tracker-cache entries (all, or one CR).
+
+    Pass neither argument to clear every entry (test isolation); pass both
+    ``namespace`` and ``name`` to clear exactly one CR's entry (the shape a
+    future ``@kopf.on.delete`` handler would call — none exists today; the
+    uid validation in :func:`_get_tracker` closes the delete+recreate leak
+    at lookup time in the meantime). Anything else is a caller bug and
+    raises rather than silently clearing the wrong scope.
+    """
+    if namespace is None and name is None:
+        _tracker_cache.clear()
+    elif namespace is not None and name is not None:
+        _tracker_cache.pop((namespace, name), None)
+    else:
+        raise ValueError(
+            f"reset_per_cr_caches: pass both namespace and name, or neither "
+            f"(got namespace={namespace!r}, name={name!r})"
+        )
 
 
 def _worker_pods_healthy(
@@ -635,7 +691,7 @@ def web_background_monitor(
             redis_client=get_read_only_redis_client(config.redis_url),
             apps_api=operator_apps_api(),
             pods_api=operator_core_api(),
-            tracker=_get_tracker(namespace, name),
+            tracker=_get_tracker(namespace, name, cr_cache.cr_uid(body)),
         )
 
     def tick(
