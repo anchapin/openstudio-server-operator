@@ -360,10 +360,20 @@ from tags would need the subject widened to
    # Issue #293 — ValidatingAdmissionPolicy narrows the operator SA's
    # pods/delete to pods labeled app=worker (RBAC has no labelSelector).
    # Apply AFTER rbac.yaml so the operator SA referenced in the CEL rule
-   # already exists at admission-evaluation time. Skip this apply on a
-   # pre-1.30 cluster (RBAC-only guardrails).
-   kubectl apply -f deploy/pod-delete-admission-policy.yaml
-   ```
+    # already exists at admission-evaluation time. Skip this apply on a
+    # pre-1.30 cluster (RBAC-only guardrails).
+    kubectl apply -f deploy/pod-delete-admission-policy.yaml
+    # Issue #414 — cluster-scoped PriorityClass that BOTH
+    # deploy/operator-deployment.yaml and deploy/storage-cronjob.yaml
+    # reference via `priorityClassName: openstudio-operator-critical`.
+    # Admission rejects pods naming a nonexistent PriorityClass
+    # ("no PriorityClass with the name openstudio-operator-critical
+    # found"), so it must exist BEFORE the operator Deployment (step 4
+    # below) or the Module-4 prune CronJob creates any pod. Cluster-
+    # scoped, so its order relative to the namespaced applies above is
+    # otherwise free.
+    kubectl apply -f deploy/priority-class.yaml
+    ```
 
    The prune-side VAP (#294) has **no apply step of its own**: it rides
    inside `deploy/storage-cronjob.yaml` — the same manifest that ships the
