@@ -5,6 +5,10 @@ sub-agent modifies the orchestrator skill files. **The canonical skill
 files live in the skill home**
 (`~/.config/opencode/skill/github-wave-orchestrator/`), **not in this
 repository** — every file here is a disposable copy of a canonical file.
+Because these are disposable copies, scratch by-products of editing the
+canonical files (`.bak` backups, scratch injection probes) must never be
+committed here — #486 removed two such droppings; the frozen and
+wave-numbered snapshots below are the only things that belong.
 
 ## Naming convention
 
