@@ -29,13 +29,27 @@
 #      tree stays clean — the committed placeholders are preserved.
 #   3. Applies the resulting manifests and updates the live
 #      `openstudio-mongo` Secret in the `openstudio-server` namespace.
-#   4. Prints the password to stdout so you can record it for fixture
-#      captures / cross-cluster debugging. (Mind your terminal scrollback.)
+#   4. Writes the password to a 0600-permission file (default:
+#      ./rotated-mongo-password.txt in the current directory; override with
+#      --out-file PATH) and prints ONLY the path — stdout carries no secret
+#      material (issue #499). Use --print-only to force the password onto
+#      stdout instead (exposure trade-off documented under Usage).
 #
 # Usage:
-#   scripts/rotate_mongo_password.sh                 # generate + apply (default)
+#   scripts/rotate_mongo_password.sh                 # generate + apply (default);
+#                                                    # password -> 0600 file, path on stdout
 #   MONGO_PASSWORD=mysecret scripts/rotate_mongo_password.sh   # use a specific one
-#   scripts/rotate_mongo_password.sh --print-only    # generate + print, do NOT apply
+#   scripts/rotate_mongo_password.sh --out-file PATH # write the password to PATH
+#                                                    # (-o PATH shorthand) instead of the
+#                                                    # default ./rotated-mongo-password.txt
+#   scripts/rotate_mongo_password.sh --print-only    # print the password to stdout; do
+#                                                    # NOT apply and do NOT write the file.
+#                                                    # EXPOSURE TRADE-OFF: stdout ends up in
+#                                                    # terminal scrollback, CI job logs, and
+#                                                    # shared session recordings — the exact
+#                                                    # leak surfaces issue #499 closes. Use
+#                                                    # only when no file with an access
+#                                                    # boundary is available.
 #   scripts/rotate_mongo_password.sh --namespace foo # target a non-default ns
 #
 # Requires on PATH: kubectl, openssl (or `/dev/urandom` as fallback).
@@ -60,6 +74,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 NAMESPACE="${NAMESPACE:-openstudio-server}"
 SECRET_NAME="openstudio-mongo"
 PRINT_ONLY=0
+OUT_FILE="${OUT_FILE:-}"
 
 # Files that contain a placeholder (must match the rotation target).
 # We use python instead of sed because YAML quoting / multi-line strings can
@@ -96,6 +111,14 @@ while [[ $# -gt 0 ]]; do
             PRINT_ONLY=1
             shift
             ;;
+        -o|--out-file)
+            OUT_FILE="$2"
+            shift 2
+            ;;
+        --out-file=*)
+            OUT_FILE="${1#--out-file=}"
+            shift
+            ;;
         --namespace)
             NAMESPACE="$2"
             shift 2
@@ -110,6 +133,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$PRINT_ONLY" == "1" && -n "$OUT_FILE" ]]; then
+    echo "ERROR: --out-file and --print-only are mutually exclusive (issue #499)." >&2
+    exit 2
+fi
+if [[ -z "$OUT_FILE" ]]; then
+    OUT_FILE="./rotated-mongo-password.txt"
+fi
 
 # --- 1. Generate password ----------------------------------------------------
 if [[ -n "${MONGO_PASSWORD:-}" ]]; then
@@ -139,14 +170,27 @@ if [[ "$password" == "CHANGE_ME_RUN_ROTATE_SCRIPT" ]]; then
     exit 1
 fi
 
-echo "Mongo password (record this if you need to debug live clusters):"
-echo "  $password"
-echo
-
 if [[ "$PRINT_ONLY" == "1" ]]; then
-    echo "--print-only set; not applying to the cluster."
+    # Explicit escape hatch (issue #499): the password goes to stdout on
+    # purpose. The one-line stderr note states the exposure trade-off at use
+    # time, not just in --help.
+    echo "WARNING: --print-only puts the password on stdout — mind terminal scrollback, CI job logs, and session recordings (issue #499)." >&2
+    echo "Mongo password (--print-only; not applying to the cluster):"
+    echo "$password"
     exit 0
 fi
+
+# Default (issue #499): the password goes to a 0600 file; stdout gets the
+# path only. umask is scoped to the redirect so the rest of the script keeps
+# its inherited umask; the explicit chmod covers a pre-existing file, which
+# `>` would otherwise leave at its old (possibly wider) permissions.
+(
+    umask 077
+    printf '%s\n' "$password" > "$OUT_FILE"
+)
+chmod 600 "$OUT_FILE"
+echo "Mongo password written to: $OUT_FILE (mode 0600)"
+echo
 
 # --- 2. Pre-flight -----------------------------------------------------------
 for tool in kubectl python3; do
@@ -205,6 +249,7 @@ echo "Mongo password rotated across db Deployment's MONGO_INITDB_ROOT_PASSWORD"
 echo "and the openstudio-mongo Secret (namespace: $NAMESPACE). The web /"
 echo "web-background / worker pods read MONGO_USER / MONGO_PASSWORD from the"
 echo "Secret via valueFrom.secretKeyRef — no manifest changes required there."
+echo "Password retained at: $OUT_FILE (0600) — delete it once recorded."
 echo
 echo "Next step:"
 echo "  scripts/deploy-openstudio-stack.sh   # apply the rest of the kind stack"

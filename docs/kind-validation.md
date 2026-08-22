@@ -534,8 +534,10 @@ the legacy literal `openstudio` (post-#150, the committed default is
 `redis-cli -a openstudio` invocations in the verbatim captures below are
 historical evidence from this pre-#150 run — they worked because the
 manifest's password was that literal at the time. Fresh clusters should
-use `openstudio-rotated` (the committed placeholder) or the value
-`scripts/rotate_redis_password.sh` prints.
+use `openstudio-rotated` (the committed placeholder) or the per-cluster
+password `scripts/rotate_redis_password.sh` writes to its 0600 output
+file (`./rotated-redis-password.txt` by default — stdout stays
+secret-free since #499).
 
 > **Note (issue #172, post-2026-08-18).** The captures below used the
 > pre-#172 image tags (`mongo:6.0.7`, `redis:6.0.9`); the live recipe now
