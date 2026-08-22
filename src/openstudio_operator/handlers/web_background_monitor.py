@@ -124,21 +124,17 @@ from openstudio_operator.singleton import (
     operator_custom_objects_api,
 )
 from openstudio_operator.status_store import (
-    GROUP,
     MERGE_PATCH_CONTENT_TYPE,  # noqa: F401 — re-export: tests import it from this module
-    PLURAL,
-    VERSION,
     StatusStore,
 )
 
 logger = logging.getLogger(__name__)
 
-_SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
-
 #: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WEB_BACKGROUND_POLL_INTERVAL_SECONDS`
 #: — operator behavior, not cluster policy; policy values live in the CRD
 #: spec/config (AGENTS.md).
 from openstudio_operator._constants import (
+    CRD_SPEC,
     LAYOUT_WARNING_GRACE_SECONDS,
     REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL,
     WEB_BACKGROUND_POLL_INTERVAL_SECONDS,
@@ -726,7 +722,7 @@ class _StallTimerClients:
     tracker: StallWindowTracker
 
 
-@kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="web_background_monitor")
 def web_background_monitor(
     body: dict,

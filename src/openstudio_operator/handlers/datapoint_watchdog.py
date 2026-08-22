@@ -85,16 +85,11 @@ from openstudio_operator.metrics import (
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
-    GROUP,
-    PLURAL,
-    VERSION,
     RequeueRecord,
     StatusStore,
 )
 
 logger = logging.getLogger(__name__)
-
-_SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
 #: Poll cadence (issue #165). See :data:`openstudio_operator._constants.DATAPOINT_POLL_INTERVAL_SECONDS`
 #: — not a CRD field, it is operator behavior, not cluster policy (policy values
@@ -102,6 +97,11 @@ _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 from openstudio_operator._constants import DATAPOINT_POLL_INTERVAL_SECONDS
 
 POLL_INTERVAL_SECONDS = DATAPOINT_POLL_INTERVAL_SECONDS
+
+# Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
+# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# dict reassembled from the raw constants.
+from openstudio_operator._constants import CRD_SPEC
 
 DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
@@ -278,7 +278,7 @@ def run_watchdog_tick(
     return requeued
 
 
-@kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="datapoint_watchdog")
 def zombie_datapoint_watchdog(
     body: dict,

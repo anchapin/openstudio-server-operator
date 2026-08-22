@@ -74,16 +74,11 @@ from openstudio_operator.metrics import WORKERS_RECYCLED_TOTAL
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_apps_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
-    GROUP,
     MERGE_PATCH_CONTENT_TYPE,  # noqa: F401 — re-export: tests import it from this module
-    PLURAL,
-    VERSION,
     StatusStore,
 )
 
 logger = logging.getLogger(__name__)
-
-_SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
 #: Tick cadence (issue #165). See :data:`openstudio_operator._constants.WORKER_RECYCLE_POLL_INTERVAL_SECONDS`
 #: — operator behavior, not cluster policy; policy values live in the CRD
@@ -91,6 +86,11 @@ _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 from openstudio_operator._constants import WORKER_RECYCLE_POLL_INTERVAL_SECONDS
 
 POLL_INTERVAL_SECONDS = WORKER_RECYCLE_POLL_INTERVAL_SECONDS
+
+# Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
+# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# dict reassembled from the raw constants.
+from openstudio_operator._constants import CRD_SPEC
 
 # Issue #395 — DEFAULT_WORKER_DEPLOYMENT and RESTARTED_AT_ANNOTATION were
 # declared here AND in web_background_monitor.py; both now live once in
@@ -188,7 +188,7 @@ class _RecyclerTimerClients:
     apps_api: DeploymentManager
 
 
-@kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="worker_recycler")
 def worker_recycler(
     body: dict,

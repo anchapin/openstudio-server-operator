@@ -80,7 +80,7 @@ def register(handler_id: str, fn: Callable) -> Callable:
 
     .. code-block:: python
 
-        @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+        @kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
         @register("my_new_handler", lambda: None)  # bracket-shaped awkward
         def my_new_handler(...): ...
 
@@ -93,7 +93,7 @@ def register(handler_id: str, fn: Callable) -> Callable:
 
         from openstudio_operator._oscm_handlers import register_fn
 
-        @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+        @kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
         def my_new_handler(...): ...
 
         register_fn(my_new_handler)
@@ -123,7 +123,7 @@ def register_fn(fn: Callable) -> Callable:
             register_fn as _register_oscm_handler,
         )
 
-        @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+        @kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
         def my_new_handler(...): ...
 
         _register_oscm_handler(my_new_handler)
@@ -172,7 +172,7 @@ def reset_registry() -> None:
 # Usage:
 #     from openstudio_operator._oscm_handlers import observe_tick_duration
 #
-#     @kopf.timer(GROUP, VERSION, PLURAL, interval=POLL_INTERVAL_SECONDS)
+#     @kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
 #     @observe_tick_duration(module="my_handler")
 #     def my_handler_impl(...): ...
 

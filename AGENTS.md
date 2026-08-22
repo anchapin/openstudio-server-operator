@@ -42,7 +42,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 970 tests across 45 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 971 tests across 45 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -56,7 +56,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 
 - `src/openstudio_operator/handlers/` — Kopf handlers, one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor` (the four OSCM timers), plus `dry_run_audit` (a pure `@kopf.on.event` watch handler — NOT singleton-gated, NOT in the `_oscm_handlers` spawning registry — that emits the `DryRunToggled` audit Event on `spec.dryRun` transitions, #397). `handlers/__init__.py` is the operator entrypoint: it starts the Prometheus `/metrics` server, installs the singleton guard, registers the warning-event sinks (Redis-URL guard, Resque key-layout guard, status-store cap), and boots the JSON-logging handler. **Add new handler modules to its import block** — see `docs/onboarding.md` for the 5-step pattern.
 - Shared utility modules (single source of truth for the cross-handler surface):
-  - `_constants.py` — operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace). Policy values do NOT belong here — cluster policy lives in the CRD `spec` / `config.py`.
+  - `_constants.py` — operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace; owns the canonical CRD identity `CRD_GROUP`/`CRD_VERSION`/`CRD_PLURAL`/`CRD_SPEC`, #495). Policy values do NOT belong here — cluster policy lives in the CRD `spec` / `config.py`.
   - `_time.py` — `parse_iso_utc(...)`; tz-aware UTC, `None`-safe. Use this for any new timestamp parse — don't roll your own. Its `utc_parser(error_cls)` factory absorbs the per-module `_parse_utc` re-raise wrappers (singleton/status_store bind theirs from it, #506).
   - `_k8s.py` — `DeploymentReader` / `DeploymentManager` / `PodLister` Protocols (the shared pod-listing + deployment read/patch slices, #505) + `deployment_label_selector()`. Neutral home for cross-handler K8s surface.
   - `_cr_cache.py` — the per-CR cache convention (#497): every handler-module cache keyed `(namespace, name)` and **uid-validated at lookup** (`cr_uid` / `uid_is_stale` — a #364 delete+recreate yields fresh state with no deletion hook), plus the uniform `reset_per_cr_caches()` seams wired into the conftest autouse reset.

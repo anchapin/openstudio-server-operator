@@ -38,6 +38,7 @@ from typing import Any
 
 from kubernetes.client import ApiException, CustomObjectsApi
 
+from ._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from ._retry import _sleep
 from ._time import utc_parser
 from .metrics import (
@@ -49,9 +50,13 @@ from .metrics import (
     observe_duration,
 )
 
-GROUP = "energy.nrel.gov"
-VERSION = "v1alpha1"
-PLURAL = "openstudioclustermanagers"
+# Issue #495 — the canonical CRD identity lives in ``_constants``
+# (``CRD_GROUP``/``CRD_VERSION``/``CRD_PLURAL``/``CRD_SPEC``). These
+# historical names remain as re-exports: the status-RMW call sites below
+# and the pre-#495 test imports keep working without churn.
+GROUP = CRD_GROUP
+VERSION = CRD_VERSION
+PLURAL = CRD_PLURAL
 
 SOFT_STOPS = "softStops"
 REQUEUES = "requeues"

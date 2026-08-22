@@ -71,8 +71,8 @@ from collections.abc import Mapping
 
 import kopf
 
+from openstudio_operator._constants import CRD_SPEC
 from openstudio_operator.events import EventSink, emit_kopf_event
-from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +220,7 @@ def record_dry_run_transition(
     return True
 
 
-@kopf.on.event(GROUP, VERSION, PLURAL)
+@kopf.on.event(**CRD_SPEC)
 def dry_run_toggle_audit(
     body: kopf.Body,
     namespace: str,
