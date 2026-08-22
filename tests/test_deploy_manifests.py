@@ -378,8 +378,13 @@ def test_pod_delete_admission_binding_binds_policy_to_openstudio_server():
 
 _ADMISSION_POLICY_KIND = "ValidatingAdmissionPolicy"
 _ADMISSION_BINDING_KIND = "ValidatingAdmissionPolicyBinding"
+# Issue #572 added a third admission file (secret-read-admission-policy.yaml);
+# the #565 fence below re-derives the doc inventory from a deploy/ glob, so
+# the new file must be consciously listed here (same discipline as
+# tests/_metrics_inventory.py, issue #406).
 _EXPECTED_VAP_FILES = {
     "pod-delete-admission-policy.yaml",
+    "secret-read-admission-policy.yaml",
     "storage-cronjob.yaml",
 }
 
@@ -3548,3 +3553,264 @@ def test_credential_secret_manifests_ship_only_sentinel_placeholder():
         f"— committed real credentials are CWE-798 defaults; install "
         f"per-cluster passwords via the rotation scripts): {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #572 — the third ValidatingAdmissionPolicy: the operator SA's
+# Secret surface narrowed to the `openstudio-redis*` naming convention.
+#
+# The #463 bounded exception grants `secrets: [get]` namespace-wide in
+# deploy/rbac.yaml; only the operator's own code (one construction
+# site, client_factory._resolve_redis_url) and the CRD pattern
+# ``^openstudio-redis[a-z0-9-]*$`` on spec.redisCredentials.secretRef
+# bound it — neither constrains a compromised operator pod holding the
+# SA token. A PolicyRule has no name-PATTERN slot (resourceNames is an
+# exact-name list, useless for a CR-configurable target), so the fence
+# lives at the admission layer like the #293/#294 policies.
+#
+# Scope honesty (mirrors the manifest's own header): admission runs
+# ONLY on the mutating path — operations accepts exactly
+# CREATE/UPDATE/DELETE/CONNECT, a literal "GET" is an apply-time
+# Invalid reject (the dead-manifest failure mode #565 closed), and RBAC
+# authorization precedes admission anyway. The policy therefore fences
+# the operator SA's MUTATING Secret surface to the naming convention
+# (RBAC-drift insurance for any future widening of the secrets rule),
+# while the read path stays bounded by RBAC get-only + the CRD
+# pattern. The tests below pin that exact shape and evaluate the
+# MANIFEST'S OWN CEL with the #398 interpreter.
+# ---------------------------------------------------------------------------
+
+_SECRET_READ_ADMISSION_DOCS = list(
+    yaml.safe_load_all((DEPLOY / "secret-read-admission-policy.yaml").read_text())
+)
+_REDIS_SECRET_NAME_PREFIX = "openstudio-redis"
+
+
+def _secret_read_admission_policy():
+    """Return the ValidatingAdmissionPolicy doc for #572."""
+    return next(
+        (
+            d
+            for d in _SECRET_READ_ADMISSION_DOCS
+            if d.get("kind") == "ValidatingAdmissionPolicy"
+        ),
+        None,
+    )
+
+
+def _secret_read_admission_binding():
+    """Return the ValidatingAdmissionPolicyBinding doc for #572."""
+    return next(
+        (
+            d
+            for d in _SECRET_READ_ADMISSION_DOCS
+            if d.get("kind") == "ValidatingAdmissionPolicyBinding"
+        ),
+        None,
+    )
+
+
+def _cel_secret_read_allows(expression, *, name, username=_OPERATOR_SA_FULL):
+    """Admission decision for the #572 validation expression against a
+    single-object Secret request identified by ``request.name`` and
+    authenticated as ``username`` (default: the operator SA — the
+    principal the policy constrains). Reuses the #398 minimal
+    interpreter: True = allowed, False = rejected (falsy OR error — a
+    CEL error denies under ``failurePolicy: Fail``)."""
+    ctx = {"request": {"userInfo": {"username": username}, "name": name}}
+    tree = _CelParser(_cel_tokenize(expression)).parse()
+    try:
+        return _cel_eval(tree, ctx) is True
+    except _CelError:
+        return False
+
+
+def test_secret_read_admission_manifest_exists_and_parses():
+    """Issue #572 acceptance #1: deploy/secret-read-admission-policy.yaml
+    exists, parses, and contains exactly the two admissionregistration
+    resources — a lone policy is dormant and a lone binding is
+    unbound."""
+    assert _SECRET_READ_ADMISSION_DOCS, (
+        "deploy/secret-read-admission-policy.yaml is missing or empty — "
+        "the operator SA's Secret surface is unconstrained at the "
+        "admission layer (issue #572)"
+    )
+    kinds = sorted(d["kind"] for d in _SECRET_READ_ADMISSION_DOCS if d)
+    assert kinds == [
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+    ], (
+        "deploy/secret-read-admission-policy.yaml must declare exactly "
+        f"a ValidatingAdmissionPolicy + Binding, got {kinds!r}"
+    )
+
+
+def test_secret_read_admission_policy_targets_secrets_in_openstudio_server():
+    """Issue #572 acceptance #2: the policy matches core/v1 `secrets` in
+    `openstudio-server` only. The operations list is the complete
+    mutating set (CREATE/UPDATE/DELETE) — "GET" is not a valid
+    admission operation (apply-time Invalid reject, the dead-manifest
+    mode #565 closed), so a policy that tried to name it would be
+    un-applyable; the read path is bounded by RBAC + the CRD pattern
+    instead (see the manifest header's scope-honesty block)."""
+    policy = _secret_read_admission_policy()
+    assert policy is not None
+    assert policy["apiVersion"] == "admissionregistration.k8s.io/v1"
+    match = policy["spec"]["matchConstraints"]
+    rule = match["resourceRules"][0]
+    assert rule["apiGroups"] == [""]
+    assert rule["apiVersions"] == ["v1"]
+    assert rule["resources"] == ["secrets"]
+    assert sorted(rule["operations"]) == ["CREATE", "DELETE", "UPDATE"]
+    assert match["namespaceSelector"] == {
+        "matchLabels": {"kubernetes.io/metadata.name": _OPERATOR_NS}
+    }, (
+        "policy namespaceSelector must restrict to "
+        f"{_OPERATOR_NS!r} — a cluster-wide match would evaluate the "
+        "rule in every namespace (issue #572)"
+    )
+
+
+def test_secret_read_admission_policy_cel_carveout_and_name_prefix():
+    """Issue #572 acceptance #3: the CEL is the #293 carve-out shape —
+    exactly one top-level `||`: the leading clause exempts every actor
+    EXCEPT the operator SA (humans and other SAs are untouched), and
+    the trailing clause allows only `openstudio-redis*` names. The
+    prefix must match the CRD's `^openstudio-redis[a-z0-9-]*$` pattern
+    on spec.redisCredentials.secretRef.name so the admission fence and
+    the schema fence name the same convention."""
+    policy = _secret_read_admission_policy()
+    full_expr = _strip_cel_whitespace(
+        " ".join(v["expression"] for v in policy["spec"]["validations"])
+    )
+    assert full_expr.count("||") == 1, (
+        "expected exactly the userInfo carve-out disjunct plus the "
+        f"name-prefix clause; got: {full_expr!r}"
+    )
+    carve_out, name_clause = full_expr.split("||")
+    assert "request.userInfo.username" in carve_out and _OPERATOR_SA_FULL in carve_out, (
+        f"leading clause must be the userInfo carve-out naming the "
+        f"operator SA ({_OPERATOR_SA_FULL!r}); got: {carve_out!r}"
+    )
+    assert name_clause.strip() == (
+        f"request.name.startsWith('{_REDIS_SECRET_NAME_PREFIX}')"
+    ), (
+        f"name clause must allow exactly the {_REDIS_SECRET_NAME_PREFIX!r} "
+        f"prefix via request.name.startsWith; got: {name_clause!r}"
+    )
+    # Cross-fence: the CRD pattern naming the same convention must still
+    # exist verbatim in deploy/crd.yaml (gated in depth by
+    # tests/test_crd_schema.py).
+    crd_text = (DEPLOY / "crd.yaml").read_text()
+    assert f"^{_REDIS_SECRET_NAME_PREFIX}[a-z0-9-]*$" in crd_text, (
+        "deploy/crd.yaml must keep the spec.redisCredentials.secretRef.name "
+        f"pattern ^{_REDIS_SECRET_NAME_PREFIX}[a-z0-9-]*$ — the admission "
+        "fence and the CRD fence must name the same convention (#572/#463)"
+    )
+
+
+def test_secret_read_admission_policy_failure_policy_is_fail_and_message_cites_issue():
+    """Issue #572 acceptance #4: `failurePolicy: Fail` (a CEL runtime
+    error or an empty request.name REJECTS — the safe direction), and
+    the single-line message (the #565 line-break rule is enforced
+    globally by the glob fence) cites the issue an operator hitting the
+    deny needs."""
+    policy = _secret_read_admission_policy()
+    assert policy["spec"]["failurePolicy"] == "Fail", (
+        "ValidatingAdmissionPolicy.failurePolicy must be 'Fail' so a CEL "
+        "evaluation error blocks the request (issue #572); 'Ignore' would "
+        "fail the #572 fence open"
+    )
+    message = policy["spec"]["validations"][0].get("message", "")
+    assert "572" in message, (
+        f"validation message must cite issue #572; got {message!r}"
+    )
+
+
+def test_secret_read_admission_binding_binds_policy_to_openstudio_server():
+    """Issue #572 acceptance #5: the binding names the policy above and
+    is schema-correct per the #565 conventions — `validationActions:
+    ["Deny"]` (required; the only action that blocks), scoping via
+    `matchResources` (the Binding schema has no `selector`), and the
+    openstudio-server namespaceSelector mirroring the policy's gate."""
+    binding = _secret_read_admission_binding()
+    assert binding is not None, (
+        "no ValidatingAdmissionPolicyBinding in "
+        "deploy/secret-read-admission-policy.yaml — the policy is "
+        "dormant without a binding (issue #572)"
+    )
+    assert binding["apiVersion"] == "admissionregistration.k8s.io/v1"
+    spec = binding["spec"]
+    policy = _secret_read_admission_policy()
+    assert spec["policyName"] == policy["metadata"]["name"]
+    assert spec.get("validationActions") == ["Deny"], (
+        "Binding.validationActions must be [\"Deny\"] — required by the v1 "
+        "Binding schema (issue #565) and the only action that blocks; got "
+        f"{spec.get('validationActions')!r}"
+    )
+    assert "selector" not in spec, (
+        "Binding spec has no `selector` field in "
+        "admissionregistration.k8s.io/v1 — scope via matchResources "
+        "(issue #565)"
+    )
+    ns_selector = spec.get("matchResources", {}).get("namespaceSelector")
+    assert ns_selector and ns_selector.get("matchLabels", {}).get(
+        "kubernetes.io/metadata.name"
+    ) == _OPERATOR_NS, (
+        "Binding must scope via matchResources.namespaceSelector to "
+        f"{_OPERATOR_NS!r}; got {ns_selector!r}"
+    )
+
+
+def test_secret_read_admission_cel_denies_operator_sa_non_redis_secret_name():
+    """Issue #572 acceptance #6 (interpreter-evaluated): the MANIFEST'S
+    OWN CEL rejects the compromise scenario — the operator SA reading/
+    touching a Secret OUTSIDE the naming convention (the Mongo
+    credentials, the exact exfiltration target named in the issue)."""
+    policy = _secret_read_admission_policy()
+    expression = policy["spec"]["validations"][0]["expression"]
+    for hostile_name in (
+        "openstudio-mongo-credentials",
+        "os-archive-creds",
+        "tls-ca-bundle",
+        "openstudio-redi",  # near-miss: proper prefix required
+    ):
+        assert _cel_secret_read_allows(
+            expression, name=hostile_name, username=_OPERATOR_SA_FULL
+        ) is False, (
+            f"operator-SA request on Secret {hostile_name!r} must be "
+            "rejected by the #572 CEL"
+        )
+    # An empty request.name (server-named CREATE) must fail CLOSED —
+    # "".startsWith(...) is false, and failurePolicy: Fail denies.
+    assert _cel_secret_read_allows(
+        expression, name="", username=_OPERATOR_SA_FULL
+    ) is False
+
+
+def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
+    """Issue #572 acceptance #7 (interpreter-evaluated): the carve-out
+    works — `openstudio-redis*` names are allowed for the operator SA
+    (the CRD-legal secretRef targets), and EVERY other actor is
+    untouched by the policy (humans via kubectl, the prune SA, helm —
+    the #293-style short-circuit)."""
+    policy = _secret_read_admission_policy()
+    expression = policy["spec"]["validations"][0]["expression"]
+    for legal_name in (
+        "openstudio-redis",
+        "openstudio-redis-url",
+        "openstudio-redis-credentials-v2",
+    ):
+        assert _cel_secret_read_allows(
+            expression, name=legal_name, username=_OPERATOR_SA_FULL
+        ) is True, (
+            f"operator-SA request on {legal_name!r} (CRD-legal "
+            "spec.redisCredentials.secretRef name) must be allowed"
+        )
+    for other_actor in ("kubernetes-admin", PRUNE_SA_FULL, "system:serviceaccount:kube-system:helm"):
+        assert _cel_secret_read_allows(
+            expression, name="openstudio-mongo-credentials", username=other_actor
+        ) is True, (
+            f"non-operator actor {other_actor!r} must be exempt from the "
+            "#572 policy (userInfo carve-out)"
+        )
