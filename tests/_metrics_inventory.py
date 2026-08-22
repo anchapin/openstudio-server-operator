@@ -155,6 +155,15 @@ EXPECTED_COUNTER_FAMILIES = (
 #: STATUS_MAP_MAX_ENTRIES) alert with days of runway. Cardinality is
 #: bounded by the same invariant as the cap counter (one series per
 #: CR-map pair; singleton guard bounds CRs, D05).
+#:
+#: Issue #504 — ``build_info{version, python_version}`` Gauge is the
+#: fleet-identity row: constant ``1`` set once at metrics import time
+#: from the installed distribution metadata (``unknown`` fallback when
+#: the distribution is absent). During an upgrade the operator is a
+#: single-replica Recreate Deployment, so a rolling-window scrape after
+#: redeploy mixes old/new pod series with identical labels — this series
+#: makes the emitting release a scrapeable fact. One series, fixed
+#: cardinality.
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -173,6 +182,10 @@ EXPECTED_GAUGE_FAMILIES = (
     # Issue #489 — per-map CR .status size gauge (lead time before the
     # 10k cap evicts D04 anchors).
     "openstudio_operator_status_map_entries",
+    # Issue #504 — build/version identity gauge (the fleet-identity
+    # row; constant 1 set at metrics import time from the installed
+    # distribution metadata, ``unknown`` fallback when absent).
+    "openstudio_operator_build_info",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

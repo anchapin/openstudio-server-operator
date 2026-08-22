@@ -33,7 +33,9 @@ Prometheus signal, not a log line.
 import hmac
 import logging
 import os
+import sys
 import threading
+from importlib.metadata import PackageNotFoundError, version
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
@@ -1037,6 +1039,55 @@ METRICS_SERVER_BOUND = Gauge(
     "unbound metrics endpoint from a wedged operator).",
     labelnames=["addr", "port"],
 )
+
+# Issue #504 — fleet-identity build gauge. The registry had no build or
+# version identity metric: during an upgrade or a multi-cluster fleet
+# review there was no way to confirm from a scrape which operator
+# release was emitting the series — the operator is a single-replica
+# Recreate Deployment, so a rolling-window scrape after redeploy MIXES
+# series from the old and the new pod with identical labels, and the
+# only post-hoc correlation was pod-start timestamps against the
+# deployment history. This conventional constant gauge is set ONCE at
+# metrics import time — before any handler, config parse, or server
+# bind could run — from the installed distribution metadata, making
+# every other series in the exposition interpretable against a release.
+# It costs exactly one series. Labelled by ``version`` (the
+# ``openstudio-server-operator`` distribution version via
+# importlib.metadata; ``unknown`` when the distribution is not
+# installed — e.g. a bare-venv import — so importing this module never
+# raises) and ``python_version`` (``sys.version.split()[0]`` — the
+# interpreter the process is actually running, the extra dimension a
+# fleet review groups on). Constant value 1; cardinality fixed at one
+# series by construction. Like #393's bind gauge: D11-exempt (set at
+# import time, before any dry-run-gated action could exist).
+BUILD_INFO = Gauge(
+    "openstudio_operator_build_info",
+    "Build/version identity of the emitting operator process (issue #504) "
+    "— the fleet-identity row. Constant ``1`` labelled by ``version`` "
+    "(the installed ``openstudio-server-operator`` distribution version "
+    "resolved via importlib.metadata at metrics import time; ``unknown`` "
+    "when the distribution is absent, so a bare-venv import stays alive) "
+    "and ``python_version`` (``sys.version.split()[0]``). Set once at "
+    "import time, before any handler or server bind runs. The operator "
+    "is a single-replica Recreate Deployment, so a rolling-window scrape "
+    "after redeploy mixes series from the old and the new pod with "
+    "identical labels — this series makes the emitting release a "
+    "scrapeable fact instead of a pod-start-timestamp vs "
+    "deployment-history correlation. One series, fixed cardinality; "
+    "identity, not health — no alert.",
+    labelnames=["version", "python_version"],
+)
+try:
+    _BUILD_VERSION = version("openstudio-server-operator")
+except PackageNotFoundError:
+    # Bare-venv / non-installed import: keep the module importable (and
+    # the fleet-identity series present) with the explicit "unknown"
+    # sentinel — the non-empty-when-installed test lives in
+    # tests/test_metrics_endpoint.py (issue #504).
+    _BUILD_VERSION = "unknown"
+BUILD_INFO.labels(
+    version=_BUILD_VERSION, python_version=sys.version.split()[0]
+).set(1)
 
 _start_lock = threading.Lock()
 _started = False

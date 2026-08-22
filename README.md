@@ -86,7 +86,7 @@ references a metric family missing from `tests/_metrics_inventory.py`.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
-versa) fails CI loudly. **Current shape: 20 counters + 14 gauges + 3 histograms
+versa) fails CI loudly. **Current shape: 20 counters + 15 gauges + 3 histograms
 (post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
@@ -100,7 +100,7 @@ post-#403 singleton-guard loser per-tick skip counter; post-#393 metrics-server
 bind-outcome gauge; post-#471 REST retry-attempt counter; post-#469 handler
 last-tick scheduler-heartbeat gauge; post-#492 config-state posture gauges —
 `dry_run_active`, `server_url_set`, `redis_url_set`,
-`auto_soft_stop_enabled`).**
+`auto_soft_stop_enabled`; post-#504 `build_info` fleet-identity gauge).**
 
 **Optional bearer-token authN (issue #401):** by default the endpoint is open
 plaintext behind the `openstudio-operator-metrics-ingress` NetworkPolicy
@@ -157,6 +157,10 @@ specific family:
   armed. Turns "is this cluster's operator actually armed to mutate?" into a
   scrapeable fact — a quiet dry-run operator was previously indistinguishable
   from a quiet live one.
+- `openstudio_operator_build_info` (gauge, #504) — the fleet-identity row:
+  constant `1` labelled by `(version, python_version)`, set once at metrics
+  import time from the installed distribution metadata; see the metrics table
+  row for the single-replica rolling-window rationale.
 
 | Family | Type | Module / issue origin | Meaning for an on-call |
 |---|---|---|---|
@@ -197,6 +201,7 @@ specific family:
 | `openstudio_operator_warnings_deferred_queue_depth` | gauge | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) · #310 | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up — a companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000) so the drop path can be diagnosed before silent loss starts. |
 | `openstudio_operator_metrics_server_bound{addr,port}` | gauge (labelled) | `metrics` (`start_metrics_server` first bind attempt) · #393 | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address); never re-touched after the first attempt. Labelled by `addr` + `port` (the configured bind target — `0.0.0.0:9090` in the stock deployment, the same surface the `containerPort`, NetworkPolicy, and Prometheus scrape config reference). Covers the bind attempt in BOTH authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). **Alert on `== 0`: the canonical "Prometheus scrape is down because of US" signal** — it distinguishes "the metrics endpoint never bound" from "operator wedged / wrong scrape config" without log scraping for the `Cannot serve /metrics` WARNING. Self-referential edge: when the bind failed, this pod's `/metrics` is dead, so the `0.0` cannot be scraped from the pod itself — pair the alert with blackbox-exporter `up == 0` (the gauge is the durable record for post-mortems and confirms the operator-side cause). |
 | `openstudio_operator_status_map_entries{namespace,name,map_name}` | gauge (labelled) | `status_store` (`_read_status` — the single read site every RMW cycle and typed getter lands on) · #489 | `len(map)` for each of the four capped `.status` maps, stamped on every read (RMW fresh GETs and plain getters alike; read-time semantics — the next read after a write carries the post-write length, so the gauge is fresh within one poll). Labelled by `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`} (the exact `.status` map keys, same vocabulary as `status_map_caps_total`); cardinality bounded by the singleton guard (D05). The LEAD-TIME companion to `status_map_caps_total` (#171): the cap counter + `StatusMapCapped` Warning Event fire only AFTER `STATUS_MAP_MAX_ENTRIES` (10000) is hit and the oldest D04 idempotency anchors are already being dropped — an evicted `softStops`/`startedSince` anchor for a still-relevant analysis silently re-arms the double-soft-stop / double-requeue paths the anchors exist to prevent, and `archivedAnalyses` grows monotonically on a long-lived cluster. **Capacity alert threshold: `> 8000` (0.8 × 10000) sustained 30m** (shipped as `OpenStudioOperatorStatusMapNearCap`) — the 2000-entry headroom is days of runway to prune or revisit the cap before anchor loss; investigate the upstream fill rate, don't wait for duplicate-action anomalies. |
+| `openstudio_operator_build_info{version,python_version}` | gauge (labelled) | `metrics` (import-time constant stamp, `importlib.metadata`) · #504 | **The fleet-identity row** — constant `1` recording which operator release is emitting every other series in this exposition. Set once at metrics import time (before any handler, config parse, or server bind runs): `version` = the installed `openstudio-server-operator` distribution version via `importlib.metadata` (`unknown` when the distribution is absent, keeping bare-venv imports alive), `python_version` = `sys.version.split()[0]` (the interpreter dimension a multi-cluster fleet review groups on). Rationale: during an upgrade the operator is a single-replica `Recreate` Deployment, so a rolling-window scrape after redeploy MIXES series from the old and the new pod with identical labels — previously the only post-hoc correlation was pod-start timestamps against the deployment history. One series, fixed cardinality; identity, not health — no alert (the PrometheusRule deliberately holds no build_info rule, and the Grafana dashboard is unchanged). |
 
 The labelled counters emit one series per label combo; only the observed
 combos appear in the exposition (prometheus_client behaviour for labelled
@@ -216,8 +221,10 @@ one-winner-per-namespace invariant, D05), and
 `resque_queue_depth` by `queue` (2 — the two managed queues). The
 labelled gauges are `metrics_server_bound`, labelled by `(addr, port)`
 (1 series — the single first bind attempt; cardinality is fixed by design,
-not bounded by an invariant), `handler_last_tick_timestamp`, labelled
-by `module` (4 series — the four OSCM timer wrappers), and the four
+not bounded by an invariant), `build_info`, labelled by
+`(version, python_version)` (1 series — set once at import time; fixed
+cardinality like `metrics_server_bound`), `handler_last_tick_timestamp`,
+labelled by `module` (4 series — the four OSCM timer wrappers), and the four
 #492 config-state posture gauges (`dry_run_active`, `server_url_set`,
 `redis_url_set`, `auto_soft_stop_enabled`), each labelled by
 `(namespace, name)` (bounded by the singleton guard's
@@ -351,7 +358,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+14+3)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+15+3)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)
