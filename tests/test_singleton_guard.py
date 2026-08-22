@@ -487,7 +487,7 @@ def test_gated_wrapper_bumps_handler_tick_failures_total_on_api_exception(
 
 def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_crs):
     # Issue #304 — the URL-guard Warning Event now fires via
-    # ``_emit_kopf_event`` directly (no more queue/drain detour through
+    # ``emit_kopf_event`` directly (no more queue/drain detour through
     # ``openstudio_operator.handlers``). Build a guard whose CRs carry an
     # explicit ``redisUrl`` so the URL-guard branch in ``_check`` is a
     # no-op for this case; the conflict Events are the only thing under
@@ -509,7 +509,7 @@ def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_
     )
     monkeypatch.setattr(singleton, "_process_guard", populated_guard)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
 
     singleton.singleton_guard_event(
         body=make_cr(
@@ -529,7 +529,7 @@ def test_event_wrapper_enforces_on_conflict(caplog, log, monkeypatch, guard_two_
 
 
 def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
-    """Issue #304: empty ``spec.redisUrl`` emits ``RedisUrlEmpty`` via ``_emit_kopf_event`` directly.
+    """Issue #304: empty ``spec.redisUrl`` emits ``RedisUrlEmpty`` via ``emit_kopf_event`` directly.
 
     Pre-#304 the URL-guard Warning Event was queued and drained on the next
     OSCM watch tick by the consolidated ``_drain_queued_warning_events``
@@ -539,7 +539,7 @@ def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
     ``@kopf.on.startup`` and ``@kopf.on.event`` callbacks, where
     ``kopf.event(...)`` is callable directly. The fix in
     :func:`openstudio_operator.singleton._emit_redis_url_guard_events`
-    routes the Event through the same :func:`_emit_kopf_event` shim the
+    routes the Event through the same :func:`emit_kopf_event` shim the
     SINGLETON_* conflict/active events use — so a test that monkeypatches
     that shim MUST see the ``RedisUrlEmpty`` Event on the same path as
     the conflict Events.
@@ -562,7 +562,7 @@ def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     # Each test run caches its warned set in a module-level variable;
     # clear it so the Event is re-emitted deterministically.
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
@@ -580,7 +580,7 @@ def test_event_wrapper_url_guard_fires_directly(caplog, log, monkeypatch):
     assert event_triples(events) == [
         ("alpha", "Warning", "RedisUrlEmpty"),
     ], (
-        f"URL-guard Warning Event must fire through _emit_kopf_event "
+        f"URL-guard Warning Event must fire through emit_kopf_event "
         f"directly (issue #304). Got: {event_triples(events)!r}. The "
         f"regression that re-adds a singleton→handlers import would "
         f"break this assertion: the deferred import + queue detour "
@@ -610,7 +610,7 @@ def test_event_wrapper_url_guard_is_idempotent_per_cr(caplog, log, monkeypatch):
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
 
     # First call: the URL-guard fires for alpha (empty redisUrl).
@@ -667,7 +667,7 @@ def test_url_guard_silent_when_secret_ref_present(caplog, log, monkeypatch):
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
 
     singleton.singleton_guard_event(
@@ -704,7 +704,7 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
 
     singleton.singleton_guard_event(
@@ -722,7 +722,7 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
 
     monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi(items=[])))
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
 
     singleton.singleton_guard_event(
         body=make_cr("alpha", OLD_TS),
@@ -741,7 +741,7 @@ def test_startup_wrapper_zero_crs_logs_idle_once(caplog, log, monkeypatch):
     monkeypatch.setattr(singleton, "_process_guard", guard)
     monkeypatch.setenv("POD_NAMESPACE", NAMESPACE)
     events, emit = make_sink()
-    monkeypatch.setattr(singleton, "_emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
 
     singleton.singleton_guard_startup(logger=log)
     singleton.singleton_guard_startup(logger=log)

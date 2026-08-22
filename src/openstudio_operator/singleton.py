@@ -72,6 +72,7 @@ from kubernetes.config import ConfigException
 
 from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator._time import parse_iso_utc
+from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     SINGLETON_ELECTION_TOTAL,
@@ -88,10 +89,6 @@ SINGLETON_ACTIVE_EVENT = "SingletonActive"
 GUARD_MARKER = "_openstudio_singleton_guarded"
 
 _MISSING_CREATED = datetime.max.replace(tzinfo=UTC)
-
-#: ``(object, type, reason, message)`` — kopf.event in production, a recorder
-#: in tests. The object is the full CR body the event is emitted on.
-EventSink = Callable[[dict, str, str, str], None]
 
 
 class SingletonGuardError(Exception):
@@ -640,10 +637,6 @@ def install_singleton_guard(registry: object | None = None) -> int:
     return wrapped
 
 
-def _emit_kopf_event(obj: dict, event_type: str, reason: str, message: str) -> None:
-    kopf.event(obj, type=event_type, reason=reason, message=message)
-
-
 def _check(namespace: str | None, logger: logging.Logger) -> None:
     """Shared loud-check body for the kopf startup/event wrappers."""
     if not namespace:
@@ -661,7 +654,7 @@ def _check(namespace: str | None, logger: logging.Logger) -> None:
         )
         return
     try:
-        guard.enforce(items, logger=logger, emit=_emit_kopf_event)
+        guard.enforce(items, logger=logger, emit=emit_kopf_event)
     except SingletonGuardError as exc:
         logger.warning(
             "singleton guard: skipping this check, will retry on the next "
@@ -714,9 +707,10 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
     it (the URL resolves at client-construction time; a missing Secret/key
     surfaces there as ``RedisCredentialResolutionError`` on the Redis paths).
 
-    The Warning Event is emitted directly via :func:`kopf.event` (the same
-    kopf chokepoint :func:`_emit_kopf_event` uses for the SINGLETON_* events
-    above). :func:`_check` is only called from :func:`singleton_guard_startup`
+    The Warning Event is emitted via
+    :func:`openstudio_operator.events.emit_kopf_event` (the shared direct
+    ``kopf.event`` wrapper, issue #496 — the same chokepoint the SINGLETON_*
+    events above use). :func:`_check` is only called from :func:`singleton_guard_startup`
     (``@kopf.on.startup``) and :func:`singleton_guard_event``
     (``@kopf.on.event``), both active kopf callbacks where ``settings_var``
     is populated and the posting engine is enabled — so the queue/defer/drain
@@ -754,7 +748,7 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
                 "removed.",
                 ns, nm,
             )
-            _emit_kopf_event(
+            emit_kopf_event(
                 {"metadata": {"namespace": ns, "name": nm}},
                 "Warning",
                 "RedisUrlEmpty",

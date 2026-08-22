@@ -40,9 +40,11 @@ Design points:
 * **The audit Event deliberately bypasses the D11 gate.** Routing it through
   :class:`openstudio_operator.events.EventEmitter` would self-suppress
   exactly when an attacker turns dryRun ON — the one moment the signal must
-  fire. It calls :func:`kopf.event` directly, the same chokepoint the
-  singleton guard's ``SingletonConflict``/``SingletonActive`` Events use
-  (those also must not be suppressible by the very flag under audit).
+  fire. It goes through :func:`openstudio_operator.events.emit_kopf_event`
+  (the shared direct ``kopf.event`` wrapper, issue #496), the same
+  chokepoint the singleton guard's ``SingletonConflict``/``SingletonActive``
+  Events use (those also must not be suppressible by the very flag under
+  audit).
 * **Posture gauge flip (issue #492).** On the same transition the handler
   also sets ``metrics.DRY_RUN_ACTIVE{namespace,name}`` (1.0/0.0) — the
   immediate, no-next-tick-latency stamp; the per-tick
@@ -65,17 +67,14 @@ Design points:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import kopf
 
+from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
-
-#: ``(obj, type, reason, message)`` — kopf.event in production, a recorder
-#: in tests (same shape as ``singleton.EventSink``).
-EventSink = Callable[[dict, str, str, str], None]
 
 #: Event reason a cluster admin queries:
 #: ``kubectl get events --field-selector reason=DryRunToggled``
@@ -133,10 +132,6 @@ def _acting_manager(body: object) -> str | None:
     return manager or None
 
 
-def _emit_kopf_event(obj: dict, event_type: str, reason: str, message: str) -> None:
-    kopf.event(obj, type=event_type, reason=reason, message=message)
-
-
 def record_dry_run_transition(
     body: object,
     *,
@@ -151,12 +146,13 @@ def record_dry_run_transition(
     Returns whether an Event was emitted. The old/new values ride in the
     message as the lowercase quoted strings ``"false"``/``"true"`` (kopf's
     ``kopf.event()`` accepts no Event labels in 1.37–1.44 — the reason +
-    message pair is the queryable audit surface). ``emit`` defaults to this
-    module's :func:`_emit_kopf_event`, resolved at call time so tests may
+    message pair is the queryable audit surface). ``emit`` defaults to
+    :func:`openstudio_operator.events.emit_kopf_event` (the shared
+    ``kopf.event`` wrapper, issue #496), resolved at call time so tests may
     inject a sink either way.
     """
     if emit is None:
-        emit = _emit_kopf_event
+        emit = emit_kopf_event
     if not isinstance(body, Mapping):
         return False
     meta = body.get("metadata")

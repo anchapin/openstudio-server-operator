@@ -123,6 +123,7 @@ from kubernetes.client import ApiException
 
 from openstudio_operator.archival import archival_job_name, build_archival_job
 from openstudio_operator.config import OperatorConfig
+from openstudio_operator.events import TickEmitter
 from openstudio_operator.metrics import ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.status_store import (
@@ -132,11 +133,15 @@ from openstudio_operator.status_store import (
 
 logger = logging.getLogger(__name__)
 
-#: ``(event_type, reason, message)`` sink — ``kopf.event`` in the operator
-#: handlers, a CoreV1 Events emitter in the prune entrypoint. Declared here
-#: (not imported from ``handlers.analysis_sla``) so this module carries no
-#: dependency on the kopf handler package.
-EventEmitter = Callable[[str, str, str], None]
+# Issue #496 compatibility note: this module used to declare its own
+# ``EventEmitter`` alias (a ``Callable`` in the 3-arg tick-sink shape)
+# right here — the same public name as
+# :class:`openstudio_operator.events.EventEmitter` (the D11-gated class)
+# but a different, incompatible call signature. The alias is renamed
+# ``TickEmitter`` and lives in ``events.py``; the ``emit=`` parameters
+# below are annotated with it. Readers of pre-#496 code: an
+# ``emit: EventEmitter`` parameter here meant the 3-arg tick sink, never
+# the class.
 
 ANALYSIS_ARCHIVAL_STARTED_EVENT = "AnalysisArchivalStarted"
 ANALYSIS_ARCHIVAL_SUCCEEDED_EVENT = "AnalysisArchivalSucceeded"
@@ -263,7 +268,7 @@ def _datapoint_ids_for(client: OpenStudioClient) -> Callable[[str], list[str]]:
 
 
 def _fail_archival(
-    store: StatusStore, analysis_id: str, job_name: str, detail: str, *, emit: EventEmitter
+    store: StatusStore, analysis_id: str, job_name: str, detail: str, *, emit: TickEmitter
 ) -> None:
     """Job-failure posture: Warning Event, analysis RETAINED, marker cleared for retry."""
     emit(
@@ -282,7 +287,7 @@ def _delete_verified(
     analysis_id: str,
     record: ArchivedAnalysisRecord,
     *,
-    emit: EventEmitter,
+    emit: TickEmitter,
     just_verified: bool,
 ) -> bool:
     """The delete step — reachable ONLY with a verified record (cardinal rule).
@@ -328,7 +333,7 @@ def _reconcile_tracked(
     *,
     completed_by_id: Mapping[str, Mapping],
     now: datetime,
-    emit: EventEmitter,
+    emit: TickEmitter,
     namespace: str,
     batch_api: BatchApi,
     result: RetentionTickResult,
@@ -411,7 +416,7 @@ def _spawn_archival(
     datapoint_ids_for: Callable[[str], list[str]],
     *,
     now: datetime,
-    emit: EventEmitter,
+    emit: TickEmitter,
     namespace: str,
     batch_api: BatchApi,
     result: RetentionTickResult,
@@ -508,7 +513,7 @@ def run_retention_tick(
     config: OperatorConfig,
     *,
     now: datetime,
-    emit: EventEmitter,
+    emit: TickEmitter,
     namespace: str,
     batch_api: BatchApi,
 ) -> RetentionTickResult:

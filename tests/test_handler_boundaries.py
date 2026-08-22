@@ -552,7 +552,7 @@ def test_dry_run_toggle_audit_handler_fires_once_per_kopf_event_transition(
 
     dry_run_audit.reset_audit_state()
     events, emit = _make_audit_sink()
-    monkeypatch.setattr(dry_run_audit, "_emit_kopf_event", emit)
+    monkeypatch.setattr(dry_run_audit, "emit_kopf_event", emit)
 
     handler = dry_run_audit.dry_run_toggle_audit
     handler(
@@ -591,7 +591,7 @@ def test_dry_run_toggle_audit_handler_deleted_evicts_cache(monkeypatch) -> None:
 
     dry_run_audit.reset_audit_state()
     events, emit = _make_audit_sink()
-    monkeypatch.setattr(dry_run_audit, "_emit_kopf_event", emit)
+    monkeypatch.setattr(dry_run_audit, "emit_kopf_event", emit)
 
     handler = dry_run_audit.dry_run_toggle_audit
     common = {"namespace": "openstudio-server", "name": "oscm-a", "logger": _SENTINEL_LOGGER}
