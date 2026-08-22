@@ -31,13 +31,15 @@ Issue #83 — contract drift against the verified v3.11.0 REST + Resque layout:
   the candidate pods exist in the namespace.
 """
 
-import copy
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from types import SimpleNamespace
 
 import responses
 from prometheus_client import REGISTRY, generate_latest
 
+from _fakes import FakeCustomObjectsApi, calls_to, make_emit
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import metrics
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -73,56 +75,8 @@ SPEC = {
 
 WORKER_LABELS = {"app.kubernetes.io/name": "openstudio-server", "component": "worker"}
 
-
-def make_cr(spec: dict | None = None, status: dict | None = None) -> dict:
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {"name": NAME, "namespace": NAMESPACE},
-        "spec": copy.deepcopy(spec if spec is not None else SPEC),
-        "status": copy.deepcopy(status if status is not None else {}),
-    }
-
-
-class FakeCustomObjectsApi:
-    """In-memory CustomObjectsApi stand-in with RFC 7386 merge-patch."""
-
-    def __init__(self, obj: dict) -> None:
-        self.obj = copy.deepcopy(obj)
-        self.patch_calls = 0
-
-    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
-        return copy.deepcopy(self.obj)
-
-    def patch_namespaced_custom_object_status(
-        self, group, version, namespace, plural, name, body, _content_type=None
-    ):
-        self.patch_calls += 1
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
-def make_emit():
-    events: list[tuple[str, str, str]] = []
-
-    def emit(event_type: str, reason: str, message: str) -> None:
-        events.append((event_type, reason, message))
-
-    return events, emit
-
-
-def calls_to(suffix: str) -> int:
-    return sum(1 for call in responses.calls if call.request.url.endswith(suffix))
+# Shared-fake binding (issue #474): this module's make_cr default spec.
+make_cr = partial(_shared_make_cr, default_spec=SPEC)
 
 
 def soft_stops_total() -> float:

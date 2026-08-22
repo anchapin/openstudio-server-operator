@@ -6,12 +6,14 @@ fail patches with synthetic 409s. No extra test dependencies are used beyond
 the [dev] extra (pytest; the kubernetes client ships ApiException).
 """
 
-import copy
 from datetime import UTC, datetime, timedelta, timezone
+from functools import partial
 
 import pytest
 from kubernetes.client import ApiException
 
+from _fakes import FakeCustomObjectsApi
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import status_store
 from openstudio_operator.status_store import (
     MERGE_PATCH_CONTENT_TYPE,
@@ -25,6 +27,9 @@ from openstudio_operator.status_store import (
 
 NAMESPACE = "openstudio-server"
 NAME = "oscm"
+
+# Shared-fake binding (issue #474): status-store tests use an empty spec/status CR.
+make_cr = partial(_shared_make_cr, default_spec={})
 
 
 def make_soft_stop(outcome: str = "issued") -> SoftStopRecord:
@@ -41,52 +46,6 @@ def make_archived() -> ArchivedAnalysisRecord:
         bucket="os-archives",
         verified_at=datetime(2026, 8, 18, 10, 0, 0, tzinfo=UTC),
     )
-
-
-def make_cr() -> dict:
-    return {
-        "apiVersion": f"{status_store.GROUP}/{status_store.VERSION}",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {"name": NAME, "namespace": NAMESPACE},
-        "spec": {},
-        "status": {},
-    }
-
-
-class FakeCustomObjectsApi:
-    """In-memory CustomObjectsApi stand-in with RFC 7386 merge-patch + synthetic 409s."""
-
-    def __init__(self, obj: dict, patch_conflicts: int = 0) -> None:
-        self.obj = copy.deepcopy(obj)
-        self.remaining_conflicts = patch_conflicts
-        self.get_calls = 0
-        self.patch_calls = 0
-        self.patches: list[tuple[dict, str | None]] = []
-
-    def get_namespaced_custom_object_status(self, group, version, namespace, plural, name):
-        self.get_calls += 1
-        return copy.deepcopy(self.obj)
-
-    def patch_namespaced_custom_object_status(
-        self, group, version, namespace, plural, name, body, _content_type=None
-    ):
-        self.patch_calls += 1
-        self.patches.append((copy.deepcopy(body), _content_type))
-        if self.remaining_conflicts > 0:
-            self.remaining_conflicts -= 1
-            raise ApiException(status=409, reason="Conflict")
-        _merge_patch(self.obj, body)
-        return copy.deepcopy(self.obj)
-
-
-def _merge_patch(target: dict, patch: dict) -> None:
-    for key, value in patch.items():
-        if value is None:
-            target.pop(key, None)
-        elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _merge_patch(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
 
 
 @pytest.fixture()
