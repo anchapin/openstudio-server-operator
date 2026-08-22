@@ -1294,6 +1294,38 @@ def test_network_policy_rfc1918_egress_excluded_for_storage():
                 )
 
 
+def test_network_policy_link_local_and_cgnat_egress_excluded_for_storage():
+    """Issue #477: the storage-egress ``0.0.0.0/0`` ipBlock except list MUST
+    additionally exclude link-local 169.254.0.0/16 (the AWS/GCP/Azure instance
+    metadata service range — a compromised archival pod holding envFrom S3/
+    GCS/Azure credentials could otherwise reach IMDS to steal node IAM / kubelet
+    identities) and CGNAT 100.64.0.0/10, alongside the RFC1918 entries. All
+    five ranges asserted together so a future edit that drops any one of them
+    fails here (mirrors the metrics-ingress regression-test style)."""
+    storage_policies = [
+        d for d in NETPOL_DOCS
+        if "storage-egress" in d["metadata"]["name"]
+    ]
+    assert storage_policies, "no storage-egress NetworkPolicy found"
+    storage = storage_policies[0]
+    for rule in storage["spec"]["egress"]:
+        for to in rule.get("to", []):
+            ip_block = to.get("ipBlock", {})
+            if ip_block.get("cidr") == "0.0.0.0/0":
+                excepts = set(ip_block.get("except", []))
+                required = {
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "169.254.0.0/16",
+                    "100.64.0.0/10",
+                }
+                assert required.issubset(excepts), (
+                    f"0.0.0.0/0 egress is missing link-local/CGNAT/RFC1918 "
+                    f"exceptions (issue #477): {excepts}"
+                )
+
+
 # ---- Issue #166: /metrics ingress is restricted -------------------
 #
 # The operator exposes /metrics on port 9090 in plaintext with no auth
