@@ -369,6 +369,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── storage-cronjob.yaml    # prune CronJob (#78)
 │   ├── network-policy.yaml     # NetworkPolicy for the operator surface + /metrics ingress allow (#112, #166)
 │   ├── pod-delete-admission-policy.yaml  # cluster-scoped ValidatingAdmissionPolicy narrowing pods/delete (#293)
+│   ├── secret-read-admission-policy.yaml  # ValidatingAdmissionPolicy narrowing the operator SA's Secret surface to openstudio-redis* names (#572)
 │   ├── priority-class.yaml     # PriorityClass for operator Deployment + prune CronJob (#414)
 │   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
 │   ├── namespace-labels.yaml   # PSS restricted labels for the openstudio-server Namespace — metadata-only, merge-safe apply onto the helm-created namespace (#498, mirrors the #388 kind recipe)

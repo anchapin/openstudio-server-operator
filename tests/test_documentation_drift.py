@@ -344,6 +344,7 @@ DEPLOY_INTRODUCING_ISSUES = {
     "storage-cronjob.yaml": "#78",
     "network-policy.yaml": "#112",
     "pod-delete-admission-policy.yaml": "#293",
+    "secret-read-admission-policy.yaml": "#572",
     "priority-class.yaml": "#414",
     "resource-quota.yaml": "#400",
 }

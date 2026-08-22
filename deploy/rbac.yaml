@@ -59,7 +59,9 @@ rules:
   # and the CRD pins the Secret name to the `openstudio-redis*` convention
   # (issue #463, #240-style fence) so a CR-write principal cannot redirect
   # the read at arbitrary Secrets. RBAC has no per-object-name slot — the
-  # name constraint lives in the CRD schema, not here.
+  # name constraint lives in the CRD schema, not here. Issue #572: the
+  # admission-layer companion narrowing this SA's Secret surface to
+  # openstudio-redis* names lives in deploy/secret-read-admission-policy.yaml.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
