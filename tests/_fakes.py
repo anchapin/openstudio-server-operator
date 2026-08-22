@@ -8,11 +8,17 @@ not collect it (same convention as ``tests/_metrics_inventory.py``).
 Consumers import via pytest's rootdir path insertion — ``from _fakes import
 FakeCustomObjectsApi`` — exactly like the existing ``from _metrics_inventory
 import ...`` style. This module must never import from a ``test_*`` module.
+
+Issue #531 added ``FakeAppsV1Api`` (the deployment-patch surface the worker
+recycler, web_background stall monitor, and ``_k8s`` helper tests share) —
+previously triplicated across three test modules with a divergent
+apply-semantics fourth copy.
 """
 
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import responses
 from kubernetes.client import ApiException
@@ -109,6 +115,78 @@ class FakeCustomObjectsApi:
             self.remaining_conflicts -= 1
             self.conflicts_seen += 1
             raise ApiException(status=409, reason="Conflict")
+        _merge_patch(self.obj, body)
+        return copy.deepcopy(self.obj)
+
+
+#: The helm ``develop`` worker Deployment's selector — the default the shared
+#: ``FakeAppsV1Api`` serves for ``read_namespaced_deployment``. Both handler
+#: tick suites (worker recycler, web_background stall monitor) construct the
+#: fake empty and rely on this default (AGENTS.md fixed identifiers).
+_WORKER_MATCH_LABELS = {"app.kubernetes.io/name": "openstudio-server", "component": "worker"}
+
+
+class FakeAppsV1Api:
+    """In-memory AppsV1Api stand-in: read-selector server + merge-patch-applying Deployment store.
+
+    Consolidates the four per-module copies that existed before #531
+    (test_analysis_sla / test_web_background_monitor / test_worker_recycler
+    each carried a record-only variant; test_k8s_rolling_restart carried the
+    apply-semantics variant) into one union surface:
+
+    - ``read_namespaced_deployment`` — serves the ``match_labels`` /
+      ``match_expressions`` constructor args (the ``deployment_label_selector``
+      surface) and records ``reads`` as ``(name, namespace)`` tuples. Defaults
+      to the worker selector.
+    - ``patch_namespaced_deployment`` — records EVERY attempt (including
+      raising ones) in ``patches`` as ``{"name", "namespace", "body",
+      "kwargs"}``, then applies the patch to ``obj`` with the shared RFC 7386
+      mirror (``_merge_patch``) and returns the patched object. The record
+      shape is byte-identical to the pre-#531 record-only copies, so
+      call-count/body assertions keep working; applying server-side
+      additionally lets merge-semantics assertions (sibling-annotation
+      preservation) run against real state, not just the outgoing body.
+    - ``fail_with`` — exception the NEXT patch raises before touching ``obj``
+      (ApiException propagation tests).
+    - No delete method at all — the operator's AppsV1Api surface is
+      read + rolling-restart patch only (the pre-#531 worker-recycler copy
+      pinned the same absence deliberately).
+    """
+
+    def __init__(
+        self,
+        deployment_obj: dict | None = None,
+        match_labels: dict | None = None,
+        *,
+        match_expressions: list | None = None,
+    ) -> None:
+        self.obj = copy.deepcopy(deployment_obj or {})
+        self.match_labels = dict(
+            match_labels if match_labels is not None else _WORKER_MATCH_LABELS
+        )
+        self.match_expressions = list(match_expressions if match_expressions is not None else [])
+        self.patches: list[dict] = []
+        self.reads: list[tuple[str, str]] = []
+        self.fail_with: ApiException | None = None
+
+    def read_namespaced_deployment(self, name, namespace, **kwargs):
+        self.reads.append((name, namespace))
+        return SimpleNamespace(
+            spec=SimpleNamespace(
+                selector=SimpleNamespace(
+                    match_labels=dict(self.match_labels),
+                    match_expressions=list(self.match_expressions),
+                )
+            )
+        )
+
+    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
+        self.patches.append(
+            {"name": name, "namespace": namespace, "body": copy.deepcopy(body), "kwargs": kwargs}
+        )
+        if self.fail_with is not None:
+            exc, self.fail_with = self.fail_with, None
+            raise exc
         _merge_patch(self.obj, body)
         return copy.deepcopy(self.obj)
 

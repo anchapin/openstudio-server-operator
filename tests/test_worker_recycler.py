@@ -8,7 +8,6 @@ test_status_store.py / test_analysis_sla.py), and the Deployment patch with a
 beyond the ``[dev]`` extra.
 """
 
-import copy
 import logging
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -18,7 +17,7 @@ import responses
 from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
-from _fakes import FakeCustomObjectsApi, make_emit, tick_failures_total
+from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit, tick_failures_total
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
@@ -53,19 +52,6 @@ SPEC = {
 
 # Shared-fake binding (issue #474): this module's make_cr default spec.
 make_cr = partial(_shared_make_cr, default_spec=SPEC)
-
-
-class FakeAppsV1Api:
-    """Records Deployment patches; deliberately has NO delete method at all."""
-
-    def __init__(self) -> None:
-        self.patches: list[dict] = []
-
-    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
-        self.patches.append(
-            {"name": name, "namespace": namespace, "body": copy.deepcopy(body), "kwargs": kwargs}
-        )
-        return {"metadata": {"name": name}}
 
 
 def analyses_payload(*statuses: str) -> list[dict]:
