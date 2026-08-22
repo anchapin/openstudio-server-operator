@@ -279,6 +279,66 @@ N jobs to `resque:queue:simulations` and watching
 queue to drain and watching the same. Live evidence in
 [docs/kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration](kind-validation.md#live-capture-evidence-2026-08-19-issue-77-keda-migration).
 
+## Deploy-time signature verification (#500)
+
+CI proves the operator image is signed (ci.yml `cosign-verify-dev-image`,
+#459), but nothing verified the signature where it matters — when the
+digest-pinned image is applied to a cluster. As of #500,
+`scripts/deploy-openstudio-stack.sh` closes that loop: before any
+`kubectl apply`, it extracts the `image:` line from
+`deploy/operator-deployment.yaml` (digest-pinned by release.yml, #149) and
+runs `cosign verify` against the release workflow identity. If `cosign` is
+not installed it prints a loud skip warning and continues (the kind dev flow
+does not hard-require cosign); if cosign IS installed and verification
+fails, the deploy aborts.
+
+The exact manual command (same identity/issuer pair as ci.yml —
+copy-pasteable for any production install):
+
+```bash
+cosign verify \
+  --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "$(python3 -c 'import yaml; print(next(c["image"] for c in yaml.safe_load(open("deploy/operator-deployment.yaml"))["spec"]["template"]["spec"]["containers"] if c["image"].startswith("ghcr.io/")))')"
+```
+
+For production enforcement, a Kyverno `verifyImages` policy makes the
+kubelet-side check unconditional (Kyverno ≥ 1.8; requires the Kyverno
+admission webhook — a cluster-admin prerequisite like KEDA):
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-operator-image-signature
+spec:
+  validationFailureAction: Enforce
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-openstudio-operator-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [openstudio-server]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/anchapin/openstudio-server-operator:*"
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+```
+
+Note the `subject`/`issuer` pair is the Kyverno spelling of the same
+`--certificate-identity`/`--certificate-oidc-issuer` pair ci.yml encodes —
+keep all three (ci.yml, deploy script, this policy) in sync. Releases cut
+from tags would need the subject widened to
+`...release.yml@refs/tags/v*` (as release.yml's own tag-verify step does).
+
 ## Phase A — deploy the operator with `dryRun: true`
 
 1. **Install the operator's K8s objects** (post-#3 manifests; same as the
