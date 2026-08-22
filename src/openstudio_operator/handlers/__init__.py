@@ -19,6 +19,7 @@ import time
 import kopf
 
 from openstudio_operator import singleton, status_store
+from openstudio_operator._constants import CRD_SPEC
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.events_sinks import get_default_sink
@@ -261,7 +262,7 @@ def _check_redis_key_layout_for_cr(
     return "ok"
 
 
-@kopf.on.event("energy.nrel.gov", "v1alpha1", "openstudioclustermanagers")
+@kopf.on.event(**CRD_SPEC)
 def _redis_key_layout_check(
     name: str, namespace: str, body: kopf.Body, **_kwargs: object
 ) -> None:
@@ -302,7 +303,7 @@ def _emit_status_map_cap_event(
 status_store.set_event_sink(_emit_status_map_cap_event)
 
 
-@kopf.on.event("energy.nrel.gov", "v1alpha1", "openstudioclustermanagers")
+@kopf.on.event(**CRD_SPEC)
 def _drain_queued_warning_events(
     name: str, namespace: str, **_kwargs: object
 ) -> None:

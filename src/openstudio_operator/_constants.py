@@ -21,6 +21,32 @@ from __future__ import annotations
 from datetime import timedelta
 
 # -----------------------------------------------------------------------------
+# CRD identity — the canonical group/version/plural wiring (issue #495)
+# -----------------------------------------------------------------------------
+
+#: The OSCM custom-resource identity. Every ``@kopf.timer`` /
+#: ``@kopf.on.event`` decorator and every CustomObjectsApi call site in the
+#: operator consumes these constants — no raw identity strings anywhere
+#: else. Rationale: the wiring used to be reassembled in six places (the
+#: status_store constants, four per-module ``_SPEC`` dict literals, and two
+#: hardcoded decorators in handlers/__init__.py); a typo or a version bump
+#: edited in only one place would silently detach a watch handler from the
+#: watched resource — the handler simply never fires. The CI fence
+#: ``tests/test_singleton_registry_coverage.py::test_crd_identity_literals_live_only_in_constants``
+#: fails the build if a raw literal reappears outside this module.
+CRD_GROUP = "energy.nrel.gov"
+CRD_VERSION = "v1alpha1"
+CRD_PLURAL = "openstudioclustermanagers"
+
+#: Uniform decorator-consumption form:
+#: ``@kopf.on.event(**CRD_SPEC)`` / ``@kopf.timer(**CRD_SPEC, interval=...)``.
+#: kopf's resource selectors accept ``group``/``version``/``plural`` as
+#: keyword arguments, so passing the canonical object as kwargs makes an
+#: argument-order swap (a silent mis-wiring) impossible. The dict literal
+#: exists exactly once — here.
+CRD_SPEC = {"group": CRD_GROUP, "version": CRD_VERSION, "plural": CRD_PLURAL}
+
+# -----------------------------------------------------------------------------
 # Module 1 — analysis SLA polling
 # -----------------------------------------------------------------------------
 

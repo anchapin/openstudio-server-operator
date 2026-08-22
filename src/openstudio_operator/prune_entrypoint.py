@@ -70,6 +70,7 @@ from kubernetes.client import ApiException, BatchV1Api
 from kubernetes.config import ConfigException
 
 from openstudio_operator import singleton
+from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
@@ -82,7 +83,7 @@ from openstudio_operator.singleton import (
     operator_core_api,
     operator_custom_objects_api,
 )
-from openstudio_operator.status_store import GROUP, PLURAL, VERSION, StatusStore, StatusStoreError
+from openstudio_operator.status_store import StatusStore, StatusStoreError
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def build_event_emitter(
     """
     meta = cr.get("metadata") or {}
     involved = {
-        "apiVersion": f"{GROUP}/{VERSION}",
+        "apiVersion": f"{CRD_GROUP}/{CRD_VERSION}",
         "kind": "OpenStudioClusterManager",
         "name": str(meta.get("name") or ""),
         "namespace": namespace,
@@ -170,7 +171,9 @@ def build_event_emitter(
 
 
 def _list_crs(custom_api: CustomApi, namespace: str) -> list[dict]:
-    resp = custom_api.list_namespaced_custom_object(GROUP, VERSION, namespace, PLURAL)
+    resp = custom_api.list_namespaced_custom_object(
+        CRD_GROUP, CRD_VERSION, namespace, CRD_PLURAL
+    )
     items = resp.get("items") or []
     return [item for item in items if isinstance(item, dict)]
 

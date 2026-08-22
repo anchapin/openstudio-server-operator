@@ -34,6 +34,7 @@ import kopf
 import pytest
 
 from openstudio_operator import singleton
+from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.handlers import _check_redis_key_layout_for_cr
 from openstudio_operator.redis_client import RedisClientError
@@ -41,7 +42,7 @@ from openstudio_operator.status_store import GROUP, PLURAL
 
 # Every handler module the operator ships under ``openstudio_operator.handlers/``
 # registers exactly one ``@kopf.timer`` for the OSCM resource
-# (``_SPEC["group"]/_SPEC["version"]/_SPEC["plural"]`` in each module). Adding a
+# (``@kopf.timer(**CRD_SPEC, ...)`` in each module). Adding a
 # new module under that directory MUST either:
 #
 # (a) appear in this set, in which case this test enforces its timer is wrapped,
@@ -990,6 +991,39 @@ def test_only_one_kubeconfig_loader_call_site() -> None:
         f"AST scan root drifted: expected 'openstudio_operator', got "
         f"{src_root.name!r}. Update the #158, #251, and #305 AST "
         f"tests in lockstep."
+    )
+
+
+def test_crd_identity_literals_live_only_in_constants() -> None:
+    """Issue #495: the raw CRD identity strings appear in exactly one module.
+
+    ``_constants`` owns the canonical identity (``CRD_GROUP`` /
+    ``CRD_VERSION`` / ``CRD_PLURAL`` / ``CRD_SPEC``); every ``@kopf.timer``
+    and ``@kopf.on.event`` in the operator consumes ``**CRD_SPEC``. A raw
+    literal anywhere else is the silent-detachment regression #495 removed:
+    a typo'd or half-updated decorator wires a handler to a resource whose
+    watch never fires — the operator looks healthy while doing nothing for
+    that CR. Exact-match on the three strings, so prose/docstring mentions
+    do not trip the fence; the assert also pins that each literal is still
+    DEFINED in ``_constants.py`` (a deletion cannot pass silently either).
+    """
+    src_root = Path(__file__).resolve().parents[1] / "src" / "openstudio_operator"
+    magic = {CRD_GROUP, CRD_VERSION, CRD_PLURAL}
+    seen: dict[str, set[str]] = {}
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        hits = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in magic
+        }
+        if hits:
+            seen[str(py.relative_to(src_root))] = hits
+    assert seen == {"_constants.py": magic}, (
+        f"raw CRD identity literals outside _constants.py (issue #495 "
+        f"regression — decorators must consume **CRD_SPEC): {seen}"
     )
 
 

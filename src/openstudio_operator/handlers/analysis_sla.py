@@ -119,16 +119,11 @@ from openstudio_operator.metrics import (
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_core_api, operator_custom_objects_api
 from openstudio_operator.status_store import (
-    GROUP,
-    PLURAL,
-    VERSION,
     SoftStopRecord,
     StatusStore,
 )
 
 logger = logging.getLogger(__name__)
-
-_SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 
 #: Poll cadence (issue #165). See :data:`openstudio_operator._constants.SLA_POLL_INTERVAL_SECONDS`
 #: — not a CRD field, it is operator behavior, not cluster policy (policy values
@@ -136,6 +131,11 @@ _SPEC = {"group": GROUP, "version": VERSION, "plural": PLURAL}
 from openstudio_operator._constants import SLA_POLL_INTERVAL_SECONDS
 
 POLL_INTERVAL_SECONDS = SLA_POLL_INTERVAL_SECONDS
+
+# Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
+# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# dict reassembled from the raw constants.
+from openstudio_operator._constants import CRD_SPEC
 
 ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /
@@ -619,7 +619,7 @@ class _SlaTimerClients:
     redis_client: RedisClientLike
 
 
-@kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)
+@kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
 @observe_tick_duration(module="analysis_sla")
 def analysis_sla_monitor(
     body: dict,

@@ -70,6 +70,7 @@ from kubernetes.client import (
 )
 from kubernetes.config import ConfigException
 
+from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_SPEC, CRD_VERSION
 from openstudio_operator._k8s import load_operator_kube_config
 from openstudio_operator._time import utc_parser
 from openstudio_operator.events import EventSink, emit_kopf_event
@@ -79,7 +80,6 @@ from openstudio_operator.metrics import (
     SINGLETON_LOSER_SKIPS_TOTAL,
     SINGLETON_WRAPPED_HANDLERS,
 )
-from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +164,7 @@ class SingletonGuard:
     def list_crs(self, namespace: str) -> list[dict]:
         """All OSCM CRs in ``namespace`` (K8s custom-objects list)."""
         resp = self._custom_api.list_namespaced_custom_object(
-            GROUP, VERSION, namespace, PLURAL
+            CRD_GROUP, CRD_VERSION, namespace, CRD_PLURAL
         )
         items = resp.get("items") or []
         return [item for item in items if isinstance(item, dict)]
@@ -528,7 +528,9 @@ def _selector_matches_oscms(handler: object) -> bool:
         return False
     group = getattr(sel, "group", None)
     names = (getattr(sel, "any_name", None), getattr(sel, "plural", None))
-    return str(group) == GROUP and any(str(name) == PLURAL for name in names if name is not None)
+    return str(group) == CRD_GROUP and any(
+        str(name) == CRD_PLURAL for name in names if name is not None
+    )
 
 
 def install_singleton_guard(registry: object | None = None) -> int:
@@ -797,7 +799,7 @@ def singleton_guard_startup(logger: kopf.Logger, **_: object) -> None:
     _check(os.getenv("POD_NAMESPACE"), logger)
 
 
-@kopf.on.event(GROUP, VERSION, PLURAL)
+@kopf.on.event(**CRD_SPEC)
 def singleton_guard_event(namespace: str, logger: kopf.Logger, **_: object) -> None:
     """On every OSCM change (incl. the initial listing): re-resolve + enforce."""
     _check(namespace, logger)

@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-970 tests across 45 files (run `.venv/bin/pytest --collect-only` to
+971 tests across 45 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -191,8 +191,9 @@ step and `tests/test_singleton_registry_coverage.py` will fail loudly
    cross-cutting contracts (D04/D05/D11/D12) inline.
 
 2. **Register exactly one `@kopf.timer`** for the OSCM resource using
-   `_SPEC["group"]/_SPEC["version"]/_SPEC["plural"]` from
-   `src/openstudio_operator/config.py`. The handler's `id` is what the
+   `@kopf.timer(**CRD_SPEC, interval=...)` with `CRD_SPEC` from
+   `src/openstudio_operator/_constants.py` (the canonical CRD identity,
+   issue #495 — no raw group/version/plural literals). The handler's `id` is what the
    singleton guard will look up. The timer body is a thin delegate to
    `run_oscm_tick` in `src/openstudio_operator/_oscm_handlers.py`
    (issue #473): the shared runner owns config parse, the
