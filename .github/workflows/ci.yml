@@ -222,3 +222,61 @@ jobs:
           set -euo pipefail
           bash scripts/check_metrics_family_claim.sh
 
+  # Issue #481: supply-chain vulnerability gate. CI generates an SPDX SBOM
+  # + SLSA provenance for every published image (#113) but nothing ever
+  # consumed them — the operator image could carry a critical-severity
+  # dependency to a digest-pinned production Deployment with all checks
+  # green. This job closes that loop at PR time (the release.yml scans
+  # cover the actually-pushed image):
+  #   (a) pip-audit over the hash-pinned requirements.lock (runtime+dev,
+  #       exactly what CI itself installs). Severity floor: fails the
+  #       build on ANY known advisory — deliberately stricter than
+  #       critical/high, because the PyPI/OSV advisory feed pip-audit
+  #       queries is not severity-filtered. Triaged exceptions live in
+  #       .pip-audit-ignore.txt.
+  #   (b) trivy scan of the locally-built image (build with load=true,
+  #       never pushed) with a CRITICAL,HIGH severity floor. Triaged
+  #       exceptions live in .trivyignore. release.yml re-scans the
+  #       pushed image with the same floor BEFORE the digest-pin commit.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # pip-audit is a CI-only auditing tool — deliberately NOT a project
+      # dependency (#481 constraint): it appears in neither lockfile nor
+      # pyproject.toml, so it can never enter the runtime image.
+      - name: pip-audit requirements.lock (issue #481)
+        run: |
+          set -euo pipefail
+          pip install pip-audit
+          # Turn each non-comment line of .pip-audit-ignore.txt into a
+          # --ignore-vuln argument (triaged exceptions only — see that
+          # file's header for the triage rules).
+          set --
+          while IFS= read -r id; do
+            set -- "$@" --ignore-vuln "$id"
+          done < <(grep -vE '^[[:space:]]*(#|$)' .pip-audit-ignore.txt || true)
+          pip-audit --require-hashes -r requirements.lock "$@"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Local build of the exact production image (same Dockerfile the
+      # release workflow builds), loaded into the daemon — never pushed.
+      - name: Build image locally (no push)
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: oscm-operator:ci-vuln-scan
+      # Severity floor: CRITICAL,HIGH findings fail the build (exit-code 1).
+      - name: Trivy scan the built image (issue #481)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: oscm-operator:ci-vuln-scan
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignorefile: .trivyignore
+

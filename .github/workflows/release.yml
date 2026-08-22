@@ -68,6 +68,20 @@ jobs:
           DIGEST="${{ steps.build.outputs.digest }}"
           docker run --rm --entrypoint python "${IMAGE_NAME}@${DIGEST}" -c \
             "import importlib.util as u; assert not any(u.find_spec(m) for m in ['pytest','hypothesis','responses','fakeredis','ruff']), 'dev deps leaked into runtime image'"
+      # Issue #481: trivy scan of the actually-pushed image, BEFORE the
+      # digest-pin commit below — a CRITICAL/HIGH finding fails the job so
+      # a vulnerable layer set can never be pinned into the deploy/
+      # manifests (same placement rationale as the #479 dev-dep assert:
+      # the pin step must be the last thing that runs). Same severity
+      # floor and .trivyignore triage file as the PR-time scan in ci.yml;
+      # scanning by digest pins the exact layer set just pushed.
+      - name: Trivy scan the pushed image (CRITICAL,HIGH gate, issue #481)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignorefile: .trivyignore
       # Issue #149: after the build step resolves the digest, pin
       # deploy/operator-deployment.yaml AND deploy/storage-cronjob.yaml
       # to `@sha256:<digest>` and commit back to develop. The standard
@@ -225,6 +239,17 @@ jobs:
           DIGEST="${{ steps.build.outputs.digest }}"
           docker run --rm --entrypoint python "${IMAGE_NAME}@${DIGEST}" -c \
             "import importlib.util as u; assert not any(u.find_spec(m) for m in ['pytest','hypothesis','responses','fakeredis','ruff']), 'dev deps leaked into runtime image'"
+      # Issue #481: same post-push trivy gate as publish-dev — the
+      # versioned tag is what production pulls on a release, so it gets
+      # the identical CRITICAL,HIGH floor + .trivyignore triage file
+      # before it is signed and released.
+      - name: Trivy scan the pushed image (CRITICAL,HIGH gate, issue #481)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignorefile: .trivyignore
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign + attest the versioned image

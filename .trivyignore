@@ -1,0 +1,22 @@
+# Trivy ignore list — the triaged-exception file for the image
+# vulnerability gates (issue #481: the ci.yml `audit` job scan of the
+# locally-built image + the release.yml post-push scans of the published
+# image, both running with `--severity CRITICAL,HIGH --exit-code 1`).
+#
+# Usage: one vulnerability identifier (CVE-… or GHSA-…) per line; `#`
+# starts a comment and blank lines are skipped. An id listed here is
+# excluded from the CRITICAL/HIGH failure in BOTH gates (they share this
+# file on purpose — an exception must not be narrower than the triage).
+#
+# Triage rules:
+#   * Only list ids that have been INVESTIGATED, not merely observed:
+#     each entry needs an adjacent justification comment (why it is not
+#     exploitable in this image — e.g. the vulnerable code path is never
+#     executed by the operator) and a follow-up issue owning the rebuild.
+#   * Never delete a gate to make a finding pass; add the id here.
+#   * Re-review entries on every base-image digest bump (#124) and
+#     lockfile bump — an entry whose fixing version has shipped should
+#     be deleted in the same PR.
+#
+# There are currently no triaged exceptions — keep it that way unless a
+# real triage happens.
