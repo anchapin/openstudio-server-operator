@@ -2454,6 +2454,123 @@ def test_namespace_has_pss_enforce_audit_labels():
     )
 
 
+# ---- Issue #498: PSS labels on the PRODUCTION deploy/ path ----------
+#
+# #388 labeled the kind recipe's namespace (scripts/manifests/
+# 00-namespace.yaml) but deploy/ — the production story alongside the
+# helm chart — shipped no Namespace labels or labeling step, so a
+# helm-created `openstudio-server` namespace ran with whatever PSS
+# default the cluster had (usually none). #498 ships
+# deploy/namespace-labels.yaml: a Namespace carrying ONLY metadata so
+# `kubectl apply` MERGES the PSS labels onto the existing helm-owned
+# namespace instead of replacing it (three-way apply semantics leave
+# labels absent from this manifest untouched). The label set is the
+# #388 kind shape plus `warn` — enforce, enforce-version, audit, warn.
+DEPLOY_NAMESPACE_MANIFEST = DEPLOY / "namespace-labels.yaml"
+DEPLOY_NAMESPACE_DOC = next(
+    iter(yaml.safe_load_all(DEPLOY_NAMESPACE_MANIFEST.read_text()))
+)
+EXPECTED_DEPLOY_PSS_LABELS = {
+    "pod-security.kubernetes.io/enforce": "restricted",
+    "pod-security.kubernetes.io/enforce-version": "latest",
+    "pod-security.kubernetes.io/audit": "restricted",
+    "pod-security.kubernetes.io/warn": "restricted",
+}
+
+
+def test_deploy_namespace_labels_manifest_exists_and_parses():
+    """Issue #498 acceptance: deploy/namespace-labels.yaml exists, parses
+    as YAML, and declares exactly one Namespace targeting
+    `openstudio-server` — the fixed identifier every other deploy/
+    manifest assumes (AGENTS.md §Fixed identifiers). A doc of any other
+    kind (or name) would silently apply nothing to the production
+    namespace."""
+    assert DEPLOY_NAMESPACE_MANIFEST.exists(), (
+        f"{DEPLOY_NAMESPACE_MANIFEST} is missing — the production deploy/ "
+        "path ships no PSS labels for the openstudio-server namespace, so "
+        "the per-pod securityContext stays defense-in-depth instead of "
+        "enforced (issue #498)"
+    )
+    docs = [d for d in yaml.safe_load_all(DEPLOY_NAMESPACE_MANIFEST.read_text()) if d]
+    assert len(docs) == 1, (
+        f"namespace-labels.yaml must declare exactly one doc, got {len(docs)}"
+    )
+    assert DEPLOY_NAMESPACE_DOC.get("kind") == "Namespace", (
+        f"deploy/namespace-labels.yaml must declare a Namespace, got "
+        f"kind={DEPLOY_NAMESPACE_DOC.get('kind')!r}"
+    )
+    assert DEPLOY_NAMESPACE_DOC["metadata"]["name"] == "openstudio-server", (
+        f"namespace-labels.yaml must name `openstudio-server`, got "
+        f"{DEPLOY_NAMESPACE_DOC['metadata']['name']!r}"
+    )
+
+
+def test_deploy_namespace_labels_carry_pss_restricted_set():
+    """Issue #498 acceptance: the manifest carries the full PSS label set
+    — enforce=restricted + enforce-version=latest (the acceptance
+    criterion's minimum), plus audit=restricted and warn=restricted (the
+    #388 kind shape widened with the before-the-fact kubectl signal). A
+    regression that drops or retypes any label turns admission
+    enforcement back into optional defense-in-depth."""
+    labels = DEPLOY_NAMESPACE_DOC["metadata"].get("labels") or {}
+    missing = {
+        key: {"expected": value, "got": labels.get(key)}
+        for key, value in EXPECTED_DEPLOY_PSS_LABELS.items()
+        if labels.get(key) != value
+    }
+    assert not missing, (
+        "deploy/namespace-labels.yaml is missing PSS `restricted` labels "
+        f"(issue #498): {missing}. The production namespace runs with no "
+        "admission enforcement without them. The labels must be: "
+        f"{EXPECTED_DEPLOY_PSS_LABELS!r}."
+    )
+
+
+def test_deploy_namespace_labels_manifest_is_merge_safe():
+    """Issue #498 shape fence: the manifest declares ONLY
+    `apiVersion`/`kind`/`metadata` (name + labels) — no `spec`, no
+    `finalizers`, no annotations. That is what makes `kubectl apply` a
+    label merge on a helm-owned namespace rather than a replacement: a
+    future edit that grows a `spec:` block (or moves labels into
+    annotations) would change apply semantics on an object the helm
+    chart believes it owns."""
+    assert set(DEPLOY_NAMESPACE_DOC) <= {"apiVersion", "kind", "metadata"}, (
+        f"namespace-labels.yaml must declare only apiVersion/kind/metadata "
+        f"to stay merge-safe on the helm-created namespace (issue #498); "
+        f"got top-level keys {sorted(DEPLOY_NAMESPACE_DOC)}"
+    )
+    assert set(DEPLOY_NAMESPACE_DOC["metadata"]) <= {"name", "labels"}, (
+        f"namespace-labels.yaml metadata must carry only name + labels "
+        f"(issue #498); got {sorted(DEPLOY_NAMESPACE_DOC['metadata'])}"
+    )
+
+
+def test_deploy_namespace_labels_manifest_documents_downgrade_note():
+    """Issue #498 acceptance criterion, prose half: the manifest must
+    document (a) the apply-merge semantics that make it safe on a
+    helm-owned namespace and (b) the downgrade note — chart pods must
+    satisfy `restricted` or the labels must be deliberately downgraded
+    per-environment. A future rewrite that strips the header comments
+    silently loses the operator guidance the acceptance criterion
+    demands; this fence trips on exactly that."""
+    text = DEPLOY_NAMESPACE_MANIFEST.read_text()
+    lowered = text.lower()
+    assert "merge" in lowered, (
+        "namespace-labels.yaml must document the kubectl apply merge "
+        "semantics that make a metadata-only Namespace manifest safe on "
+        "the helm-created namespace (issue #498)"
+    )
+    assert "downgrad" in lowered, (
+        "namespace-labels.yaml must carry the downgrade note: chart pods "
+        "must satisfy `restricted` or the labels must be deliberately "
+        "downgraded per-environment (issue #498 acceptance criterion)"
+    )
+    assert "#498" in text and "#388" in text, (
+        "namespace-labels.yaml header must cite both #498 (this "
+        "manifest) and #388 (the kind-recipe label set it mirrors)"
+    )
+
+
 HELM_CHART_POD_BASELINE_FILES = (
     "scripts/manifests/04-web.yaml",
     "scripts/manifests/05-web-background.yaml",

@@ -358,6 +358,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── pod-delete-admission-policy.yaml  # cluster-scoped ValidatingAdmissionPolicy narrowing pods/delete (#293)
 │   ├── priority-class.yaml     # PriorityClass for operator Deployment + prune CronJob (#414)
 │   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
+│   ├── namespace-labels.yaml   # PSS restricted labels for the openstudio-server Namespace — metadata-only, merge-safe apply onto the helm-created namespace (#498, mirrors the #388 kind recipe)
 │   ├── prometheustrule.yaml    # PrometheusRule alert definitions for the /metrics surface (#468)
 │   └── grafana-dashboard.json  # Grafana dashboard JSON — action counters, tick histograms, Resque gauges (#468)
 ├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/, adr/, skill-snapshot/ (frozen wave-orchestrator skill copies, #379/#486)

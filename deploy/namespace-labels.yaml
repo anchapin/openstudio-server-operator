@@ -1,0 +1,45 @@
+# Pod Security Standards `restricted` labels for the `openstudio-server`
+# namespace — the production twin of the kind recipe's labeled Namespace
+# (scripts/manifests/00-namespace.yaml, issue #388). Shipped in deploy/
+# per issue #498: until now only the kind recipe carried these labels, so
+# a helm-created namespace ran with whatever PSS default the cluster had
+# (usually none) and the per-pod securityContext hardening (#115/#162)
+# was defense-in-depth, not enforced. With enforce=restricted a future
+# manifest regression or a compromised principal cannot admit a
+# privileged pod next to the operator — admission says no.
+#
+# Merge semantics — safe to apply on a helm-owned namespace: this
+# manifest declares ONLY `metadata` (name + labels), no `spec`, no
+# finalizers. `kubectl apply` merges metadata.labels onto an existing
+# Namespace (three-way merge against the last-applied-configuration
+# annotation): labels present live but absent from this manifest — the
+# helm chart's app.kubernetes.io labels, etc. — are left untouched, and
+# nothing else about the object changes. On a fresh cluster the same
+# apply creates the namespace with the labels already set.
+#
+# The labels (the #388 kind-recipe set plus `warn`):
+#   * enforce: restricted — reject non-compliant pods at admission time
+#     (kubelet-level, not just operator-managed surface).
+#   * enforce-version: latest — pin to the PSS profile bundled with the
+#     running cluster (the supported K8s-version-aligned mode).
+#   * audit: restricted — record admitted-but-non-compliant workloads in
+#     the audit log so a regression is caught after the fact.
+#   * warn: restricted — surface a warning to principals creating
+#     non-compliant pods (the before-the-fact signal kubectl prints).
+#
+# Downgrade note (issue #498 acceptance criterion): every pod in the
+# namespace must satisfy the `restricted` profile once enforce is active.
+# The helm chart's pods do — proven live on the kind validation cluster
+# (#388). If an environment runs a workload that cannot comply (e.g. a
+# third-party stateful image whose entrypoint needs uid 0), deliberately
+# downgrade THAT environment's labels (e.g. enforce=baseline) instead of
+# dropping this manifest — per-environment, never fleet-wide.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openstudio-server
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
