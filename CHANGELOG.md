@@ -62,6 +62,23 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   pip-compile pair.
 
 ### Added
+- **`#491`** — `openstudio_operator_singleton_wrapped_handlers`: boot-time
+  gauge recording how many OSCM spawning (timer/daemon) handlers
+  `install_singleton_guard` actually wrapped (set at the end of the
+  install — the count of registry entries whose fn carries the gate
+  marker, so an idempotent re-install keeps reporting the gated
+  population; `0` on the registry-internals-mismatch branch). The kopf
+  pin exists because the gate walks kopf's private
+  `registry._spawning._handlers`; a kopf upgrade that moves that
+  internal wraps NOTHING — silently disabling D05 enforcement while the
+  operator appears healthy. The registry-coverage CI test fences the
+  layout at build time; this gauge is the runtime fence, scrapeable:
+  `== 0` on a booted operator that expects timers is the silent-unwrap
+  failure mode (shipped as the `OpenStudioOperatorSingletonGuardUnwrapped`
+  alert in `deploy/prometheustrule.yaml`, `for: 5m` — the complement of
+  the #469 heartbeat: heartbeat proves scheduling, wrap count proves
+  guarding). Unlabelled, one series; registry now 20 counters + 16
+  gauges + 3 histograms.
 - **`#492`** — config-state posture gauges: `openstudio_operator_dry_run_active`,
   `openstudio_operator_server_url_set`, `openstudio_operator_redis_url_set`,
   `openstudio_operator_auto_soft_stop_enabled`, each 1/0 labelled by

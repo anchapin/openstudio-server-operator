@@ -257,6 +257,42 @@ SINGLETON_LOSER_SKIPS_TOTAL = Counter(
     labelnames=["module", "namespace", "name"],
 )
 
+# Issue #491 — boot-time singleton-guard wrap-count Gauge. The kopf pin
+# (``kopf>=1.37,<1.45``) exists because ``install_singleton_guard`` reaches
+# into kopf's private ``registry._spawning._handlers`` to wrap the OSCM
+# timers; a kopf upgrade that renames or moves that internal makes the gate
+# find nothing and return 0 wrapped — silently disabling D05 enforcement
+# while the operator appears healthy (every timer still fires, ungated). The
+# registry-coverage CI test fences the layout at BUILD time; this gauge is
+# the RUNTIME fence: set once at the end of ``install_singleton_guard`` (the
+# single boot-time wiring site, called from ``handlers/__init__.py``) to the
+# number of OSCM spawning handlers whose fn actually carries the gate
+# marker. ``0`` on a booted operator that expects timers is the
+# silent-unwrap failure mode, scrapeable. Like the #403 counter this is an
+# in-process metric set at boot wiring time, before any dry-run-gated action
+# could exist — D11-exempt.
+SINGLETON_WRAPPED_HANDLERS = Gauge(
+    "openstudio_operator_singleton_wrapped_handlers",
+    "Number of OSCM spawning (timer/daemon) handlers the singleton guard "
+    "actually wrapped at boot (issue #491). Set once at the end of "
+    "``singleton.install_singleton_guard`` to the count of OSCM "
+    "``@kopf.timer``/``@kopf.daemon`` registry entries whose fn carries "
+    "the gate marker. The gate reaches into kopf's private "
+    "``registry._spawning._handlers`` (the reason kopf is pinned "
+    "``>=1.37,<1.45``); a kopf upgrade that moves that internal makes the "
+    "gate wrap NOTHING and return 0 — silently disabling D05 enforcement "
+    "while the operator appears healthy (every timer still fires, "
+    "ungated). The registry-coverage CI test fences the layout at build "
+    "time; this gauge is the runtime fence. Alert on "
+    "``openstudio_operator_singleton_wrapped_handlers == 0`` sustained on "
+    "a booted operator that expects timers (shipped as "
+    "``OpenStudioOperatorSingletonGuardUnwrapped``) — the complement of "
+    "the #469 scheduler heartbeat (``handler_last_tick_timestamp``): the "
+    "heartbeat proves the scheduler is invoking the timers, this gauge "
+    "proves those invocations are guarded. Unlabelled — one series per "
+    "process (the wrap count is process-wide).",
+)
+
 # Issue #253 — Redis key-layout validation status as a Gauge. The boot-time
 # validator (#163) returns one of ``ok | degraded | unreachable | error |
 # skipped`` and emits a structured log line per CR; the Warning Event on the
