@@ -57,6 +57,7 @@ commons" by design.
 from __future__ import annotations
 
 import ast
+import logging
 from pathlib import Path
 
 from prometheus_client import generate_latest
@@ -80,8 +81,6 @@ ALLOWED_IMPORTERS_FROM_HANDLERS_PACKAGE: frozenset[Path] = frozenset({PACKAGE_IN
 # whose ``warning`` is a no-op is sufficient. Using a real logging
 # Logger is overkill for this gate and would couple the test to the
 # JSON-logging install (issue #256).
-import logging
-
 _SENTINEL_LOGGER = logging.getLogger("openstudio_operator.tests.handler_boundaries_sentinel")
 _SENTINEL_LOGGER.addHandler(logging.NullHandler())
 

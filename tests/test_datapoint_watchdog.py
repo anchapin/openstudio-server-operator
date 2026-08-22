@@ -9,6 +9,7 @@ directly; the kopf timer wrapper is thin wiring.
 """
 
 import logging
+import types
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -462,9 +463,6 @@ def test_dry_run_suppresses_rest_call_and_burns_budget_like_real():
 
 
 # --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
-
-
-import types
 
 
 @responses.activate

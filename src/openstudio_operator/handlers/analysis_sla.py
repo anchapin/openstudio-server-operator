@@ -95,6 +95,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException
 
+from openstudio_operator._constants import CRD_SPEC, SLA_POLL_INTERVAL_SECONDS
 from openstudio_operator._k8s import PodLister
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
@@ -128,14 +129,12 @@ logger = logging.getLogger(__name__)
 #: Poll cadence (issue #165). See :data:`openstudio_operator._constants.SLA_POLL_INTERVAL_SECONDS`
 #: — not a CRD field, it is operator behavior, not cluster policy (policy values
 #: live in the CRD spec/config).
-from openstudio_operator._constants import SLA_POLL_INTERVAL_SECONDS
-
 POLL_INTERVAL_SECONDS = SLA_POLL_INTERVAL_SECONDS
 
 # Issue #495 — the ``@kopf.timer`` below consumes the canonical CRD identity
-# object (``**CRD_SPEC`` from ``_constants``) instead of a per-module ``_SPEC``
+# object (``**CRD_SPEC`` from ``_constants``, imported at the top of this module
+# with the rest of the dependency surface) instead of a per-module ``_SPEC``
 # dict reassembled from the raw constants.
-from openstudio_operator._constants import CRD_SPEC
 
 ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /

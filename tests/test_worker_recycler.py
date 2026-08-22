@@ -9,6 +9,7 @@ beyond the ``[dev]`` extra.
 """
 
 import logging
+import types
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -466,9 +467,6 @@ def test_dry_run_suppresses_patch_marks_event_and_advances_last_recycle_at():
 
 
 # --- Issue #232: kopf 1.4x MappingView body end-to-end through EventEmitter -----
-
-
-import types
 
 
 @responses.activate

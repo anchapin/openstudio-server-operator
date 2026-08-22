@@ -10,14 +10,19 @@ Layers of read-only proof exercised here:
 """
 
 import inspect
+import logging
 import re
 from datetime import UTC, datetime
 
 import fakeredis
 import pytest
 import redis
+from prometheus_client import REGISTRY
 
+import openstudio_operator.handlers as handlers_pkg
+from openstudio_operator import metrics as _metrics_module
 from openstudio_operator import redis_client
+from openstudio_operator.handlers import _check_redis_key_layout_for_cr
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
     REQUEUED_QUEUE,
@@ -712,10 +717,6 @@ def test_allowlist_includes_get_for_worker_records():
 # itself), but live here because the underlying contract is the redis
 # layout's behavior and the surrounding log fixture is keyed off
 # ``ReadOnlyRedisClient``.
-import logging
-
-import openstudio_operator.handlers as handlers_pkg
-from openstudio_operator.handlers import _check_redis_key_layout_for_cr
 
 
 def _patched_client_factory(fake, monkeypatch):
@@ -1030,9 +1031,6 @@ def test_consolidated_drain_handler_emits_redis_key_layout_drift_event(
 # on the success path and on representative failure/skip paths, so a
 # future branch added without the helper fails CI instead of silently
 # reintroducing the blind-holds-value risk #490 fixed.
-from prometheus_client import REGISTRY
-
-from openstudio_operator import metrics as _metrics_module
 
 _FRESH_SAMPLE = "openstudio_operator_redis_key_layout_status_fresh"
 _STATUS_SAMPLE = "openstudio_operator_redis_key_layout_status"

@@ -7,7 +7,9 @@ least-privilege Role), and the new Role must keep the house style —
 namespaced, enumerated verbs, no wildcards, no secrets/volume inspection.
 """
 
+import ast
 import re
+import sys
 from pathlib import Path
 
 import yaml
@@ -1803,11 +1805,6 @@ def test_no_port_443_egress_block_uses_kube_dns_placeholder_selector():
 # check requires reading the test in context and is what the #315
 # audit PR body records; automating it would re-create the
 # "encode-the-bug-as-a-feature" failure mode in the verifier itself.
-
-
-import ast
-import sys
-from pathlib import Path
 
 
 def _collect_test_functions():

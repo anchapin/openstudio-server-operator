@@ -43,7 +43,7 @@ bash scripts/check_editable_install.sh
 # when confident, run the full suite
 .venv/bin/pytest
 
-# lint (line-length 100; CI pins ruff>=0.16)
+# lint (line-length 100; E402 enforced via [tool.ruff.lint] extend-select, #507; CI pins ruff>=0.16)
 ruff check .
 ```
 
