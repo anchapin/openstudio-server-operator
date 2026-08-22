@@ -96,6 +96,11 @@ rename it. Full rationale and the maintainer admin-bypass path (for
 GitHub Actions outages) live in
 [`docs/onboarding.md`](./docs/onboarding.md#branching--pr-conventions).
 
+Dependabot bump PRs (`.github/dependabot.yml`, issue #480) must pass
+these same checks: add the `Scope guard:` line to the PR body (#301),
+and for pip floor bumps append a commit regenerating both lockfiles
+before merging.
+
 ## Where to go next
 
 - First time here? Start with

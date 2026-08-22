@@ -1,0 +1,76 @@
+# Dependabot version updates (issue #480) — the freshness half of the
+# supply-chain pinning discipline. The pins guarantee reproducibility, not
+# freshness: the hash-pinned lockfile pair (#173/#479), the SHA-pinned
+# actions (#389), and the digest-pinned base image (#124) can all sit on
+# known-CVE versions indefinitely. These weekly updaters open the bump PRs.
+#
+# All bump PRs ride the normal develop PR path (default branch is develop):
+# `lint` + `test` and every drift guard run on them unchanged. NOTE: a
+# Dependabot PR starts red on `lint` until a maintainer adds the
+# `Scope guard:` line to its PR body (#301) — edit the body, then push to
+# the branch (`@dependabot rebase` works) so the check re-runs.
+
+version: 2
+updates:
+  # (a) pip — manifest-only "signal PR" strategy.
+  #
+  # Dependabot cannot run pip-compile, and this repo's lockfiles are a
+  # #479 PAIR (requirements.lock = the --extra=dev compile; requirements.txt
+  # = the runtime-only compile the Dockerfile installs from) that must be
+  # regenerated TOGETHER. If Dependabot scanned requirements.txt it would
+  # rewrite its pins one file at a time (fetching fresh hashes per pin) and
+  # silently desync the pair — the drift gate checks structure and hashes,
+  # not pin parity between the two files. Both lockfiles are therefore
+  # excluded: Dependabot only bumps the pyproject.toml floors, and the pip
+  # PRs are signal PRs — before merging, append a commit running BOTH
+  # pip-compile commands (see AGENTS.md, the authoritative refresh).
+  # Proposals that raise the kopf `>=1.37,<1.45` or kubernetes `<37` caps
+  # are deliberate-bump decisions (singleton-guard / RBAC-drift rules in
+  # AGENTS.md) — review them as such. Dependabot security updates, if
+  # enabled at the repo level, are independent of this file and may touch
+  # the lockfiles directly: same rule, append the pip-compile regen before
+  # merging.
+  - package-ecosystem: "pip"
+    directory: "/"
+    exclude-paths:
+      - "requirements.txt"
+      - "requirements.lock"
+    schedule:
+      interval: "weekly"
+    groups:
+      # Acceptance criterion: grouped runtime-dep PRs — the five operator
+      # runtime dependencies (kopf, kubernetes, redis, requests,
+      # prometheus-client) ride one weekly PR.
+      runtime-deps:
+        dependency-type: "production"
+      dev-deps:
+        dependency-type: "development"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # (b) github-actions — SHA pins stay SHA pins: Dependabot updates the
+  # pinned commit and refreshes the trailing `# vX.Y` comment, so the #389
+  # mutable-tag gate keeps passing. Minor+patch bumps ride one grouped PR;
+  # majors stay solo because action majors routinely break inputs.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore(ci)"
+
+  # (c) docker — refreshes the python:3.12-slim digest pin in the root
+  # Dockerfile (#124). The rclone image referenced by archival.py Job
+  # manifests is NOT visible to this ecosystem (Dockerfile FROM lines only)
+  # and remains a manual pin.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
