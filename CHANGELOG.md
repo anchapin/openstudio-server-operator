@@ -7,14 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Auto-improvement-loop sessions post-0.2.0 (2026-08-20 → 2026-08-21):
+Auto-improvement-loop sessions post-0.2.0 (2026-08-20 → 2026-08-22):
 three full audits opened `#387`–`#417` and `#462`–`#507`; waves closed
 the security/reliability/observability headliners — credential fences
-(`#462` sentinel Secrets, `#463` Redis secretRef), scheduler
-observability (`#469` heartbeat gauge, `#471` REST retries counter,
-`#468` PrometheusRule + Grafana), prune-failure surfacing (`#470`),
-the `#473` tick-runner extraction ending four-copy wrapper drift, and
-the `#475` exception-hierarchy fix — alongside the earlier iteration's
+(`#462` sentinel Secrets, `#463` Redis secretRef, `#479` runtime-only
+image lockfile), scheduler observability (`#469` heartbeat gauge,
+`#471` REST retries counter, `#468` PrometheusRule + Grafana),
+prune-failure surfacing (`#470`), transport + egress hardening
+(`#476` rediss:// TLS, `#477` IMDS/CGNAT egress blocks), the `#473`
+tick-runner extraction ending four-copy wrapper drift (completed by
+`#493` wiring-failure skip-tick), the `#475` exception-hierarchy fix,
+and the test-infrastructure consolidation wave (`#474` shared fakes,
+`#482` config parsing, `#483` rolling-restart paths, `#485` deploy-
+inventory gate) — alongside the earlier iteration's
 NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 
 ### Changed
@@ -43,8 +48,59 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   "add a new OSCM timer handler" 5-step pattern shrinks accordingly.
   The remaining half of `#395`: timing + rolling-restart went first;
   this extracts the wrapper wiring itself.
+- **`#479`** — the production image installs from a runtime-only,
+  hash-pinned `requirements.txt` (30 packages vs 40 in the dev
+  `requirements.lock` — the dropped 10 are exactly the dev closure);
+  `requirements.lock` stays byte-identical for CI. release.yml asserts
+  dev-tool absence by running the BUILT image (`importlib.find_spec`
+  blacklist on pytest/hypothesis/responses/fakeredis/ruff) — in
+  publish-dev between build and the digest-pin commit so a leak can
+  never be pinned into `deploy/` — and ci.yml verifies the runtime
+  lockfile installs hash-clean in a fresh venv on every PR.
+  `tests/test_dependency_drift.py` gates both lockfiles against
+  `pyproject.toml`; both are refreshed together by the documented
+  pip-compile pair.
 
 ### Added
+- **`#474`** — `tests/_fakes.py` is the single definition site for the
+  byte-identical test fakes: `FakeCustomObjectsApi` (union semantics;
+  the 409 injector folded in as `patch_conflicts=`; prune's list+get
+  shape via `items=`), RFC 7386 `_merge_patch`, `make_emit`,
+  parameterized `make_cr` (`default_spec=`), `calls_to`,
+  `tick_failures_total`. 10 consumer files converted, net −226 lines,
+  zero assertion-logic changes, collected count unchanged. Genuinely
+  divergent variants stay local and documented (singleton's
+  read-only-proof fake, landed-only counting subclasses, 3 divergent
+  `make_cr` locals).
+- **`#476`** — `rediss://` TLS end-to-end: CRD `redisUrl` pattern + CEL
+  rule accept both schemes with the `#463` no-embedded-userinfo fence
+  intact; the client connects via `redis.Redis.from_url` (redis-py
+  selects `SSLConnection` natively — cert required, hostname check,
+  system CAs); `REDIS_TLS_CA_BUNDLE` overrides the CA path, validated
+  like `#296` (`OperatorConfigError` from `config.py`, the `#475`
+  hierarchy pinned by test). The `#463` secretRef path passes
+  `rediss://` values through the same fence checks.
+- **`#482`** — `tests/test_config.py` (11 tests) pins
+  `OperatorConfig.from_spec`'s actual contract: the full camelCase →
+  snake_case mapping walk, empty-spec defaults, missing policy
+  sub-dicts, string-int pass-through (`maxDurationMinutes: "180"` —
+  CRD admission is the real type gate), invalid storage backend
+  (validated at `archival.build_archival_job` + CRD enum),
+  `maxAutoRequeues: 0` warn-only semantics, `#463` redisCredentials
+  null/absent/malformed handling.
+- **`#483`** — `tests/test_k8s_rolling_restart.py` (8 tests) pins the
+  shared `#395` helper directly: merge-patch body carries ONLY
+  `kubectl.kubernetes.io/restartedAt` (sibling annotations survive via
+  a fake applying real RFC 7386 semantics), tz-aware UTC timestamp
+  (`parse_iso_utc` round-trip), `ApiException` 500/409 both propagate
+  with no retry (caller-side D12), and `load_operator_kube_config`
+  falls back to kubeconfig only on `ConfigException` (non-Config
+  raises straight out; both-fail propagates the second).
+- **`#485`** — CI drift gate: `assert_deploy_inventory_matches` asserts
+  `set(glob deploy/*)` equals the documented inventory in BOTH AGENTS.md
+  (the Layout bullet) and README (the `deploy/` tree comment), both
+  directions, globbed at test time — a manifest added without doc
+  updates (or a doc naming a phantom) fails CI naming the file + doc.
 - **`#469`** — `openstudio_operator_handler_last_tick_timestamp{module}`:
   the scheduler-heartbeat gauge. Every other runtime signal is
   event-driven (tick-failure counters increment only when a tick runs and
@@ -553,6 +609,11 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 ### Docs
 - **`#465`** — AGENTS.md `deploy/` inventory lists all 11 manifests
   (`priority-class.yaml` #414, `resource-quota.yaml` #400 were missing).
+- **`#484`** — `docs/audit-policy.md` (the `#399` kube-apiserver
+  audit-policy recipe) is indexed where readers look: the AGENTS.md
+  key-references block and README's intro doc links; README's `docs/`
+  tree comment now names all six top-level docs so it matches the
+  directory.
 
 ### Fixed
 - **`#470`** — the storage-prune CronJob no longer masks failures behind
@@ -579,6 +640,28 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   explicit membership restores the exact historical runtime set (D12:
   wiring/config failure → counter-bumped skip + retry next poll, where
   a fixed Secret, CR spec, or re-mounted CA bundle is picked up live).
+- **`#477`** — the storage egress NetworkPolicy's `0.0.0.0/0` except
+  list now also excludes `169.254.0.0/16` (link-local — hosts the
+  AWS/GCP/Azure instance-metadata service; archival pods hold live
+  object-store credentials via envFrom, so this closes the
+  node-credential pivot AWS's own guidance recommends blocking) and
+  `100.64.0.0/10` (CGNAT), alongside the existing RFC1918 entries.
+  Dual-stack caveat documented in-manifest (`0.0.0.0/0` ipBlock does
+  not constrain IPv6 egress on dual-stack CNIs). Regression test
+  asserts all five CIDRs.
+- **`#493`** — wiring failures get the D12 skip-tick treatment:
+  `run_oscm_tick` now invokes `custom_objects_api()`/`StatusStore`/
+  `EventEmitter`/`wire()` INSIDE the guarded region, and
+  `SKIP_TICK_EXCEPTIONS` gains the construction-failure pair —
+  `kubernetes.config.ConfigException` +
+  `urllib3.exceptions.LocationValueError` (the issue's hinted
+  `kube_config` import path is dead in modern kubernetes; the urllib3
+  home is stable 1.26→2.x). A bad kubeconfig or bare URL now bumps
+  `HANDLER_TICK_FAILURES_TOTAL`, logs the single skip line, and
+  returns cleanly — while the `#469` heartbeat still stamps via the
+  finally (wiring-failing-but-scheduled reads ALIVE + climbing, the
+  signature SREs need). Non-tuple wiring errors (e.g. `RuntimeError`)
+  still propagate fail-closed.
 
 ## [0.2.0] - 2026-08-19
 
