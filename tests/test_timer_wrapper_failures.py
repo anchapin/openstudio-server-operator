@@ -42,7 +42,9 @@ import logging
 
 import pytest
 from kubernetes.client import ApiException
+from kubernetes.config import ConfigException
 from prometheus_client import REGISTRY
+from urllib3.exceptions import LocationValueError
 
 from openstudio_operator.handlers import (
     analysis_sla,
@@ -537,6 +539,63 @@ def test_web_background_monitor_wrapper_empty_server_url_logs_idle_and_no_failur
     assert "web_background monitor idle" in caplog.text
 
 
+# --- Issue #493 — wiring/construction failure through a real handler wire -----
+
+
+def test_analysis_sla_monitor_wrapper_counts_client_construction_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """Issue #493: a client-construction failure inside ``wire`` skips the tick.
+
+    Representative handler-level check of the #493 semantics (the shared
+    wrapper is exercised per-exception in ``tests/test_oscm_tick_runner.py``;
+    this test proves the wiring seam reaches it from a real ``@kopf.timer``
+    entrypoint). ``analysis_sla_monitor``'s ``wire`` closure builds its REST
+    client, ``operator_core_api()``, and Redis client each tick; the
+    kubeconfig-load failure class (``ConfigException`` — what the factory
+    propagates when neither the in-cluster config nor ``~/.kube/config``
+    loads) previously escaped ``run_oscm_tick`` as an uncaught kopf handler
+    error. Since #493 the ``wire`` call runs inside the guarded region, so
+    the same failure yields the standard D12 posture: warning log,
+    ``HANDLER_TICK_FAILURES_TOTAL{module=analysis_sla,
+    error_type=ConfigException}`` +1, clean ``None`` return.
+    """
+    monkeypatch.setattr(
+        analysis_sla,
+        "operator_core_api",
+        _raise(ConfigException("no kubeconfig anywhere (#493)")),
+    )
+
+    before = _counter("analysis_sla", "ConfigException")
+    with caplog.at_level(logging.WARNING, logger="openstudio_operator.handlers.analysis_sla"):
+        result = analysis_sla.analysis_sla_monitor(
+            body=BODY,
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("analysis_sla", "ConfigException")
+
+    assert result is None, (
+        "wrapper must skip the tick on a wiring ConfigException (D12: retry "
+        "next poll); the fix lands outside the tick loop"
+    )
+    assert after - before == 1.0, (
+        "HANDLER_TICK_FAILURES_TOTAL{module=analysis_sla, "
+        "error_type=ConfigException} must increment by exactly 1 on a client-"
+        f"construction failure; observed delta {after - before}."
+    )
+    assert (
+        "analysis SLA tick skipped, retrying next poll (ConfigException" in caplog.text
+    ), (
+        f"wrapper must log the WARNING describing the skipped wiring failure; "
+        f"got {caplog.text!r}"
+    )
+
+
 # --- Issue #249 — per-wrapper exception-tuple negative coverage ----------------
 #
 # The four parametrised cases above assert that every class INSIDE the
@@ -549,16 +608,22 @@ def test_web_background_monitor_wrapper_empty_server_url_logs_idle_and_no_failur
 # silently skipped ticks). The negative cases here cover that surface:
 #
 #   * each wrapper is invoked with run_*_tick monkeypatched to raise a
-#     class NOT in its declared tuple (``ValueError`` — chosen because it
+#     class NOT in the shared tuple (``ValueError`` — chosen because it
 #     is the stdlib's generic "something went wrong" exception and is
-#     guaranteed not to subclass any of the four tuple classes);
+#     guaranteed not to subclass any tuple member);
 #   * the wrapper's HANDLER_TICK_FAILURES_TOTAL must NOT increment on
 #     this branch;
 #   * the exception must propagate out (re-raise through the wrapper)
 #     because the wrapper's ``except`` tuple does not catch it.
 #
+# Note the #493 subclass subtlety: ``urllib3.exceptions.LocationValueError``
+# IS a :class:`ValueError` subclass AND a tuple member — but exception
+# matching is subclass-directed, so ``except LocationValueError`` does not
+# catch the bare PARENT ``ValueError``; the negative cases below still
+# propagate exactly as they did pre-#493.
+#
 # Without these tests a future patch that adds ``ValueError`` (or any
-# other class) to a wrapper's tuple would silently widen the catch and
+# other class) to the tuple would silently widen the catch and
 # the ``error_type`` label cardinality would drift undetected — the
 # on-call would only notice once ``rate(handler_tick_failures_total)``
 # stops firing on the genuine kopf-handler-error signal they expect to
@@ -567,9 +632,10 @@ def test_web_background_monitor_wrapper_empty_server_url_logs_idle_and_no_failur
 # The four modules use distinct sets so the "not in tuple" assertion
 # truly tests a class that is NOT in the wrapper's declared set:
 
-#: ``ValueError`` is NOT a subclass of any of the four tuple classes and
-#: not in any wrapper's tuple — a clean "out of tuple" sentinel for the
-#: negative cases below.
+#: ``ValueError`` is NOT a subclass of any tuple member and not itself
+#: in the shared tuple — a clean "out of tuple" sentinel for the
+#: negative cases below. (Its subclass ``LocationValueError`` joined the
+#: tuple in #493; the parent stays out.)
 _OUT_OF_TUPLE_EXCEPTION = ValueError("out of tuple — must propagate, not increment")
 
 
@@ -713,7 +779,14 @@ def test_each_wrapper_out_of_tuple_class_is_distinct_from_in_tuple_class() -> No
     regression would never surface. This sanity test pins the
     subclass relationship explicitly so any drift here fails loud.
     """
-    for in_tuple_cls in (OpenStudioApiError, StatusStoreError, ApiException, RedisClientError):
+    for in_tuple_cls in (
+        OpenStudioApiError,
+        StatusStoreError,
+        ApiException,
+        RedisClientError,
+        ConfigException,
+        LocationValueError,
+    ):
         assert not issubclass(ValueError, in_tuple_cls), (
             f"ValueError unexpectedly subclasses {in_tuple_cls.__name__}; "
             f"the issue #249 negative-case tests would silently start "

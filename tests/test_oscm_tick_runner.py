@@ -21,7 +21,9 @@ from datetime import datetime
 
 import pytest
 from kubernetes.client import ApiException
+from kubernetes.config import ConfigException
 from prometheus_client import REGISTRY
+from urllib3.exceptions import LocationValueError
 
 from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS, run_oscm_tick
 from openstudio_operator.config import OperatorConfigError
@@ -74,8 +76,13 @@ def _run(
     *,
     spec: dict = SPEC,
     logger: logging.Logger | None = None,
+    wire=None,
 ):
-    """Invoke the runner with the probe module label and no-op wiring."""
+    """Invoke the runner with the probe module label and no-op wiring.
+
+    ``wire`` defaults to a no-op closure; the #493 wiring-failure tests
+    pass a raising one.
+    """
     return run_oscm_tick(
         spec=spec,
         body={"metadata": {"name": NAME, "namespace": NAMESPACE}},
@@ -86,7 +93,7 @@ def _run(
         tick_label="tick runner probe",
         idle_label="tick runner probe",
         custom_objects_api=lambda: object(),
-        wire=lambda config: object(),
+        wire=wire or (lambda config: object()),
         tick=tick,
     )
 
@@ -113,9 +120,13 @@ def test_run_oscm_tick_owns_failure_counter_and_skip_log(
         ApiException,
         RedisClientError,
         OperatorConfigError,
+        ConfigException,
+        LocationValueError,
     ), (
         "the canonical tuple must stay the runtime-effective union of the four "
-        "historical wrapper tuples (OperatorConfigError explicitly, per #475)"
+        "historical wrapper tuples (OperatorConfigError explicitly, per #475) "
+        "plus the #493 wiring/construction-failure members (ConfigException, "
+        "LocationValueError)"
     )
 
     def wire(config: object) -> object:
@@ -264,3 +275,135 @@ def test_run_oscm_tick_skips_on_operator_config_error(
     assert (
         "tick runner probe tick skipped, retrying next poll (OperatorConfigError" in caplog.text
     ), "the shared site must log the OperatorConfigError skip-tick warning"
+
+
+# --- Issue #493 — wiring/construction failures get the D12 skip treatment ------
+
+
+def test_run_oscm_tick_skips_on_wiring_config_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #493: a ``wire`` closure raising ``ConfigException`` skips the tick.
+
+    The kubeconfig-load failure class (what
+    ``load_operator_kube_config`` / the strict ``operator_custom_objects_api``
+    factory propagate) is an explicit ``SKIP_TICK_EXCEPTIONS`` member and the
+    ``wire`` call runs INSIDE the guarded region — so a client-construction
+    failure produces the standard warning log plus a
+    ``HANDLER_TICK_FAILURES_TOTAL`` bump with ``error_type=ConfigException``
+    and a clean ``None`` return, not an exception escaping the wrapper.
+
+    Also pins the #469 heartbeat interaction: a wiring-failing-but-scheduled
+    operator must read as ALIVE on ``HANDLER_LAST_TICK_TIMESTAMP`` (the
+    outer ``finally`` still stamps it) while its failure counter climbs —
+    the sustained-outage signature SREs alert on.
+    """
+
+    def wire(config: object) -> object:
+        raise ConfigException("no kubeconfig anywhere (#493)")
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise AssertionError("a wire failure must never reach the tick closure")
+
+    before = _counter("ConfigException")
+    stamped_before = _heartbeat()
+    with caplog.at_level(logging.WARNING):
+        result = _run(tick, wire=wire)
+
+    assert result is None, "runner must skip the tick on a wiring ConfigException (D12)"
+    assert _counter("ConfigException") - before == 1.0, (
+        "HANDLER_TICK_FAILURES_TOTAL{module=tick_runner_probe, "
+        "error_type=ConfigException} must increment by exactly 1 on a wiring "
+        "failure"
+    )
+    assert (
+        "tick runner probe tick skipped, retrying next poll (ConfigException" in caplog.text
+    ), "the shared site must log the wiring-failure skip-tick warning"
+    stamped = _heartbeat()
+    assert stamped is not None, "wire-failure path must stamp the heartbeat gauge"
+    assert stamped >= (stamped_before or 0.0), (
+        "heartbeat must advance even when the tick was skipped on a wiring "
+        "failure (scheduler alive; counter climbs instead)"
+    )
+
+
+def test_run_oscm_tick_skips_on_wiring_location_value_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #493: a ``wire`` closure raising ``LocationValueError`` skips the tick.
+
+    ``urllib3.exceptions.LocationValueError`` ("No host specified.") is what
+    the kubernetes client's transport raises through when an API object built
+    against an uninitialised default ``Configuration`` makes its first real
+    call (the lenient ``operator_*_api`` placeholder path — proven live in
+    #66's kind validation). Pre-#493 it escaped the wrapper as an uncaught
+    kopf handler error; now it is an explicit tuple member and gets the
+    counted skip.
+    """
+
+    def wire(config: object) -> object:
+        raise LocationValueError("No host specified.")
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise AssertionError("a wire failure must never reach the tick closure")
+
+    before = _counter("LocationValueError")
+    with caplog.at_level(logging.WARNING):
+        result = _run(tick, wire=wire)
+
+    assert result is None, "runner must skip the tick on a wiring LocationValueError (D12)"
+    assert _counter("LocationValueError") - before == 1.0, (
+        "HANDLER_TICK_FAILURES_TOTAL{module=tick_runner_probe, "
+        "error_type=LocationValueError} must increment by exactly 1 on a "
+        "wiring failure"
+    )
+    assert (
+        "tick runner probe tick skipped, retrying next poll (LocationValueError"
+        in caplog.text
+    ), "the shared site must log the wiring-failure skip-tick warning"
+
+
+def test_run_oscm_tick_propagates_non_tuple_wiring_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #493 negative: a NON-tuple construction error still propagates (fail-closed).
+
+    The tuple widening is deliberately narrow — only ``ConfigException`` and
+    ``LocationValueError`` joined. A random ``RuntimeError`` from a ``wire``
+    closure must NOT be silently skipped: it propagates out of the runner as
+    an uncaught kopf handler error and the failure counter stays flat
+    (pinning the #249 fail-closed posture at the wiring seam).
+
+    The heartbeat still stamps — the outer ``finally`` covers the
+    propagating path too (#469), so the scheduler-alive signal survives
+    even a crash-looping construction bug.
+    """
+
+    def wire(config: object) -> object:
+        raise RuntimeError("unexpected construction bug (#493 negative)")
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise AssertionError("a wire failure must never reach the tick closure")
+
+    before = _counter("RuntimeError")
+    stamped_before = _heartbeat()
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="unexpected construction bug"),
+    ):
+        _run(tick, wire=wire)
+
+    assert _counter("RuntimeError") - before == 0.0, (
+        "HANDLER_TICK_FAILURES_TOTAL must NOT increment for an out-of-tuple "
+        "wiring error; observed delta "
+        f"{_counter('RuntimeError') - before}. See issue #249 — fail-closed."
+    )
+    assert "tick skipped, retrying next poll" not in caplog.text, (
+        "no skip-tick warning may be logged for an out-of-tuple wiring error"
+    )
+    stamped = _heartbeat()
+    assert stamped is not None, "propagating path must still stamp the heartbeat gauge"
+    assert stamped >= (stamped_before or 0.0), (
+        "heartbeat must advance even on a propagating wiring error (#469: "
+        "the scheduler invoked the timer = alive)"
+    )
