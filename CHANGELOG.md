@@ -42,8 +42,9 @@ deadline + wedged-pipeline alert, `#396` TLS CA-bundle mount recipe,
 `#401` /metrics bearer authN, `#414` PriorityClass), the supply-chain
 CI repair (`#456` SLSA predicate shape, `#459` cosign digest
 extraction, `#564` base-image CVE refresh, `#565` VAP schemas, `#567`
-secretRef tick wiring), and the earlier iteration's test/refactor/docs
-wave (`#286`–`#316`, `#381`, `#382`).
+secretRef tick wiring, `#568` rotation-proof Redis client cache), the
+`#566` PriorityClass runbook step, and the earlier iteration's
+test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`).
 
 ### Changed
 - **`#497`** — one per-CR cache keying + reset convention for the
@@ -1098,6 +1099,12 @@ wave (`#286`–`#316`, `#381`, `#382`).
   secretRef-only CR (empty `spec.redisUrl`, the preferred production
   shape) no longer trips the empty-URL Warning and gets a working
   client.
+- **`#568`** — the read-only Redis client cache now keys on the
+  *resolved* URL (the `lru_cache` sits below Secret resolution), so a
+  `rotate_redis_password.sh` rotation is picked up in-band on the very
+  next tick instead of wedging every Resque read on WRONGPASS until a
+  manual operator restart; the rotation script's next-step text gains
+  the optional rollout-restart line as belt-and-suspenders.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
@@ -1121,6 +1128,12 @@ wave (`#286`–`#316`, `#381`, `#382`).
   runbook and the module-status table.
 - **`#412`** — docs/onboarding.md "Working rules that bite" gains the
   `#295` `metrics-scraper` label rule and the VAP narrowing rules.
+- **`#566`** — the validation runbooks (docs/validation.md Phase A +
+  docs/kind-validation.md) apply `deploy/priority-class.yaml` before
+  any pod references `openstudio-operator-critical` — previously a
+  fresh-cluster run of the documented steps failed at Deployment
+  admission with "no PriorityClass … found" (`#414` shipped the
+  manifest without its runbook step).
 
 ## [0.2.0] - 2026-08-19
 
