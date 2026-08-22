@@ -43,6 +43,7 @@ from .metrics import (
     STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL,
     STATUS_CONFLICTS_TOTAL,
     STATUS_MAP_CAPS_TOTAL,
+    STATUS_MAP_ENTRIES,
 )
 
 GROUP = "energy.nrel.gov"
@@ -74,6 +75,12 @@ _BACKOFF_BASE_SECONDS = 1.0
 # etcd's 1.5 MB default and enough headroom for the other three maps plus
 # CR-level metadata.
 STATUS_MAP_MAX_ENTRIES = 10_000
+
+#: Issue #489 — the four capped ``.status`` maps, in no particular order.
+#: The tuple drives the per-map size-gauge stamp in ``_read_status`` so the
+#: vocabulary of ``STATUS_MAP_ENTRIES{map_name}`` is the exact ``.status``
+#: map key set (same vocabulary as ``STATUS_MAP_CAPS_TOTAL{map_name}``).
+_STATUS_MAP_FIELDS = (SOFT_STOPS, REQUEUES, STARTED_SINCE, ARCHIVED_ANALYSES)
 
 #: Issue #171 — event reason for the cap-eviction Warning Event. A single
 #: short string so dashboard filters / alert rules can match it.
@@ -308,6 +315,21 @@ class StatusStore:
             GROUP, VERSION, self._namespace, PLURAL, self._name
         )
         status = obj.get("status") or {}
+        # Issue #489 — stamp the per-map size gauges at the single read site
+        # every RMW cycle (inside ``_mutate``, post-409-retry-loop fresh GET)
+        # and every typed getter lands on, so all four maps are stamped on
+        # every read. ``.set()`` is idempotent, so a 409 burst re-stamping
+        # per attempt is free; a corrupt non-mapping field is skipped (the
+        # getter will raise on it — stamping 0 would under-report a map the
+        # read is about to reject). The lead-time signal for the #171 cap:
+        # the gauge trends toward STATUS_MAP_MAX_ENTRIES before the
+        # post-hoc ``STATUS_MAP_CAPS_TOTAL`` + ``StatusMapCapped`` Event.
+        for field in _STATUS_MAP_FIELDS:
+            raw = status.get(field)
+            if isinstance(raw, Mapping) or raw is None:
+                STATUS_MAP_ENTRIES.labels(
+                    namespace=self._namespace, name=self._name, map_name=field
+                ).set(len(raw) if isinstance(raw, Mapping) else 0)
         self._cache = status
         return status
 

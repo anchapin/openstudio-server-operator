@@ -681,6 +681,49 @@ STATUS_MAP_CAPS_TOTAL = Counter(
     labelnames=["namespace", "name", "map_name"],
 )
 
+# Issue #489 — per-map size Gauge for the four CR .status maps, the LEAD-TIME
+# companion to ``status_map_caps_total`` above. The cap counter and the
+# ``StatusMapCapped`` Warning Event only fire AFTER a map has hit
+# STATUS_MAP_MAX_ENTRIES (10000) and the oldest entries are already being
+# dropped — and those entries are the D04 idempotency anchors (a softStops or
+# startedSince anchor evicted for a still-relevant analysis silently re-arms
+# the double-soft-stop / double-requeue paths the anchors exist to prevent).
+# The signal was post-hoc: no capacity trend was visible on a long-lived
+# cluster where ``archivedAnalyses`` grows monotonically with every archived
+# analysis. This Gauge is set to ``len(map)`` from inside
+# ``status_store.StatusStore._read_status`` — the single read site every RMW
+# cycle and every typed getter lands on — so all four maps are stamped on
+# every read, giving an SRE a capacity panel and an alert with days of
+# runway instead of duplicate-action anomalies after the fact. Canonical
+# alert threshold: ``> 8000`` (0.8 × 10000) sustained — shipped as the
+# ``OpenStudioOperatorStatusMapNearCap`` PrometheusRule (``for: 30m``). At
+# typical fill rates the 2000-entry headroom is multiple days of runway,
+# enough to schedule a prune or a cap-size review before anchors are lost.
+# Labelled by ``namespace`` + ``name`` (CR identity, issue #311) +
+# ``map_name`` (softStops | requeues | startedSince | archivedAnalyses — the
+# exact ``.status`` map keys, same vocabulary as the cap counter).
+# Cardinality is bounded by the same invariant as the cap counter: one
+# series per CR-map pair (4 per CR), and the singleton guard bounds CRs
+# (D05).
+STATUS_MAP_ENTRIES = Gauge(
+    "openstudio_operator_status_map_entries",
+    "Number of entries in each CR .status map (issue #489) — set to "
+    "``len(map)`` from ``status_store.StatusStore._read_status`` on every "
+    "read (RMW cycles and typed getters alike), so all four maps "
+    "(softStops | requeues | startedSince | archivedAnalyses) are stamped "
+    "per read. Lead-time companion to ``status_map_caps_total``: the cap "
+    "counter + ``StatusMapCapped`` Warning Event fire only AFTER "
+    "STATUS_MAP_MAX_ENTRIES (10000) is hit and the oldest D04 idempotency "
+    "anchors are already being dropped. Alert on "
+    "``openstudio_operator_status_map_entries > 8000`` (0.8 × 10000) "
+    "sustained for 30m — the 2000-entry headroom is days of runway to "
+    "prune or revisit the cap before anchor loss re-arms the "
+    "double-soft-stop / double-requeue paths. Labelled by ``namespace`` + "
+    "``name`` (CR identity, issue #311) + ``map_name``; cardinality bounded "
+    "by the singleton guard (D05), same bound as the cap counter.",
+    labelnames=["namespace", "name", "map_name"],
+)
+
 STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL = Counter(
     "openstudio_operator_status_conflict_retries_exhausted_total",
     "Status-store RMW cycles that exhausted the 409 retry budget and "

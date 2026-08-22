@@ -216,7 +216,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (894 tests across 43 files, current count)
+ruff check . && pytest                       # both green (897 tests across 43 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -230,7 +230,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 13 gauges + 3 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 14 gauges + 3 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
@@ -259,7 +259,15 @@ expansion to 20+9+3 is #469 (handler last-tick scheduler-heartbeat gauge
 `handler_last_tick_timestamp{module}` — stamped to `time.time()` at the
 end of every `run_oscm_tick` invocation on every terminal path; the only
 signal whose flatness means the scheduler itself is dead, generalizing
-the #312 freshness-pair idiom to the timers).
+the #312 freshness-pair idiom to the timers). The post-#469 expansions:
+#492 added the four config-state posture gauges (`dry_run_active`,
+`server_url_set`, `redis_url_set`, `auto_soft_stop_enabled` — 20+13+3),
+and #489 added the status-map size gauge (`status_map_entries`, taking
+the inventory to 20+14+3 — the lead-time companion to the #171 cap
+counter: set to `len(map)` inside `status_store._read_status` on every
+read, so a map trending toward `STATUS_MAP_MAX_ENTRIES` is visible days
+before the post-hoc counter + `StatusMapCapped` Event fire at the first
+anchor eviction).
 
 Counters and the gauge follow the same in-process, dryRun-transparent
 convention (D11-exempt category — in-process metrics, not cluster
@@ -326,6 +334,7 @@ unlabelled counter here is exactly the regression #181 guards against.
 | `openstudio_operator_server_url_set` | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) (#492) | 1.0 when the CR carries a non-empty `spec.serverUrl` (the authoritative config path, #3); 0.0 = the idle posture (every tick returns early at the empty-serverUrl branch). **Labelled by `(namespace, name)`** (#311; bounded by D05). | n/a — an unexpected 0 on a cluster that should be working means the CR spec is incomplete. |
 | `openstudio_operator_redis_url_set` | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) (#492) | 1.0 when the CR has a Redis URL source at config-parse time — non-empty inline `spec.redisUrl` OR the #463 `spec.redisCredentials.secretRef` (the preferred production shape; the ref wins when both are present); 0.0 = the #116 refuse-to-operate posture. **Labelled by `(namespace, name)`** (#311; bounded by D05). Distinct from secret-resolution success (client_factory owns that). | n/a — pairs with the per-CR redis-URL guard Warning Event (#116): 0.0 is the posture that guard fires on. |
 | `openstudio_operator_auto_soft_stop_enabled` | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) (#492) | 1.0 when `analysisPolicy.autoSoftStop` is true (the CRD default) — the SLA monitor is armed; 0.0 = the SLA monitor is fully passive (a full stop — no soft-stop, no escalation, no anchors written). **Labelled by `(namespace, name)`** (#311; bounded by D05). | n/a — previously the debug log line was the only record of a passive SLA monitor. Alert on an unexpected 0 on production. |
+| `openstudio_operator_status_map_entries` | `status_store` (`_read_status` — the single read site every RMW cycle and typed getter lands on) (#489) | `len(map)` for each of the four capped `.status` maps, stamped on every read (RMW fresh GETs and plain getters alike; a 409 burst re-stamps per attempt — idempotent `.set()`). **Labelled by `(namespace, name, map_name)`** — `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`} (the exact `.status` map keys, same vocabulary as `status_map_caps_total`); cardinality bounded by D05, one series per CR-map pair. The stamp is read-time: a write's own RMW stamps the pre-write map, the next read stamps the post-write length (every tick reads before deciding, so the gauge is fresh within one poll). | n/a — the LEAD-TIME companion to `status_map_caps_total` (#171): the cap counter + `StatusMapCapped` Warning Event fire only AFTER `STATUS_MAP_MAX_ENTRIES` (10000) is hit and the oldest D04 idempotency anchors are already being dropped (an evicted `softStops`/`startedSince` anchor for a still-relevant analysis silently re-arms the double-soft-stop / double-requeue paths the anchors exist to prevent). Alert on `> 8000` (0.8 × 10000) sustained 30m — shipped as `OpenStudioOperatorStatusMapNearCap`; the 2000-entry headroom is days of runway at typical fill rates, with `archivedAnalyses`' monotonic growth the canonical long-lived-cluster case. In-process metric — D11-exempt; read-path only, forces no write. |
 
 ### Histograms
 
