@@ -2,7 +2,7 @@
 
 A Kubernetes operator that automates day-2 operations for [OpenStudio Server](https://github.com/NREL/OpenStudio-server) deployments (Ruby/Rails `web` + `web_background` + MongoDB + `worker` pods + NFS-shared volumes). It runs **alongside** the existing [`openstudio-server-helm`](https://github.com/NREL/openstudio-server-helm) chart — it manages that stack; it does not replace it.
 
-**Status: implementation complete (Phases 1–4, issues #2–#21); live kind-cluster validation done for modules 2/3/5/singleton and the full-module `dryRun: true` walkthrough (#66/#67/#84); Phase-4 autoscaling is now driven by a standard KEDA ScaledObject (#77, replacing the custom HPA-floor adjuster #18); D1/D2 contract drift resolved by #96 (Resque-worker identity path — see Module 1 row).** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). First-time contributors and AI agents: start at [`docs/onboarding.md`](./docs/onboarding.md) (issue #178). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
+**Status: implementation complete (Phases 1–4, issues #2–#21); live kind-cluster validation done for modules 2/3/5/singleton and the full-module `dryRun: true` walkthrough (#66/#67/#84); Phase-4 autoscaling is now driven by a standard KEDA ScaledObject (#77, replacing the custom HPA-floor adjuster #18); D1/D2 contract drift resolved by #96 (Resque-worker identity path — see Module 1 row).** The verified API ground truth is [`docs/contracts/openstudio-server-v3.11.0-rest.md`](./docs/contracts/openstudio-server-v3.11.0-rest.md). Cross-cutting audit: [`docs/audit-dryrun-idempotency.md`](./docs/audit-dryrun-idempotency.md). Cluster validation runbook: [`docs/validation.md`](./docs/validation.md). kube-apiserver audit-policy recipe: [`docs/audit-policy.md`](./docs/audit-policy.md) (#399). First-time contributors and AI agents: start at [`docs/onboarding.md`](./docs/onboarding.md) (issue #178). Framework: **Python + [Kopf](https://kopf.readthedocs.io/)**.
 
 Changelog: [CHANGELOG.md](./CHANGELOG.md) — curated per-release notes (Keep a Changelog format; see issue #177). Contributing: [CONTRIBUTING.md](./CONTRIBUTING.md) — branch, PR-body, and merge-subject conventions (issue #302).
 
@@ -310,7 +310,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
 │   ├── prometheustrule.yaml    # PrometheusRule alert definitions for the /metrics surface (#468)
 │   └── grafana-dashboard.json  # Grafana dashboard JSON — action counters, tick histograms, Resque gauges (#468)
-├── docs/                       # audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
+├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
 │   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
