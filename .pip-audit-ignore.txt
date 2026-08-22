@@ -1,0 +1,24 @@
+# pip-audit ignore list — the triaged-exception file for the lockfile
+# vulnerability gate (issue #481: the `pip-audit requirements.lock` step
+# in the ci.yml `audit` job).
+#
+# Usage: one advisory identifier (GHSA-…, OSV-…, or PYSEC-…) per
+# non-comment line. The CI step turns every non-comment line into a
+# `--ignore-vuln` argument, so pip-audit exits 0 despite that advisory.
+# Lines starting with `#` and blank lines are skipped.
+#
+# Severity floor: the gate fails the build on ANY known advisory —
+# deliberately stricter than the CRITICAL/HIGH trivy floor, because the
+# PyPI/OSV advisory feed pip-audit queries is not severity-filtered.
+#
+# Triage rules:
+#   * Only list advisories that have been INVESTIGATED, not merely
+#     observed: each entry needs an adjacent justification comment (why
+#     it is not exploitable here) and a follow-up issue owning the
+#     upgrade that removes it.
+#   * Never delete the gate to make a finding pass; add the id here.
+#   * Re-review entries on every Dependabot lockfile bump — an entry
+#     whose fixing version has shipped should be deleted in the same PR.
+#
+# Verified clean as of 2026-08-22: pip-audit 2.10.1 over requirements.lock
+# at develop 5049d7d reported no known vulnerabilities — no entries.

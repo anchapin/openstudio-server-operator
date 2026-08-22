@@ -101,6 +101,15 @@ these same checks: add the `Scope guard:` line to the PR body (#301),
 and for pip floor bumps append a commit regenerating both lockfiles
 before merging.
 
+Beyond the required pair, the `audit` job (issue #481) gates every PR
+and develop push on supply-chain findings: `pip-audit --require-hashes`
+over `requirements.lock` (fails on any known advisory) and a trivy scan
+of the locally-built image failing on CRITICAL/HIGH; `release.yml`
+re-scans the pushed image with the same floor before the digest-pin
+commit. Triaged exceptions go in `.pip-audit-ignore.txt` /
+`.trivyignore` (one advisory id per line with a justification comment)
+— never delete a gate to make a finding pass.
+
 ## Where to go next
 
 - First time here? Start with
