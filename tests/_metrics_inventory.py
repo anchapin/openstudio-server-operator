@@ -215,6 +215,17 @@ EXPECTED_GAUGE_FAMILIES = (
     # Issue #491 — boot-time singleton-guard wrap count (0 on a booted
     # operator with timers expected = the silent-unwrap failure mode).
     "openstudio_operator_singleton_wrapped_handlers",
+    # Issue #570 — boot-time singleton-guard EXPECTED count, the
+    # denominator of the #491 wrap gauge. Sized at install time from the
+    # OSCM spawning-handler population kopf actually reports (the same
+    # scan the coverage test performs; the Python-level registry
+    # population stands in on the internals-mismatch branch). A PARTIAL
+    # unwrap — one handler skipped for missing #250 registration or a
+    # dataclasses.replace TypeError — reads wrapped < expected while the
+    # historical == 0 alert stayed silent; the strict-< alert
+    # (rekeyed OpenStudioOperatorSingletonGuardUnwrapped) subsumes the
+    # old == 0 clause.
+    "openstudio_operator_singleton_expected_handlers",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

@@ -77,6 +77,7 @@ from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
     SINGLETON_ELECTION_TOTAL,
+    SINGLETON_EXPECTED_HANDLERS,
     SINGLETON_LOSER_SKIPS_TOTAL,
     SINGLETON_WRAPPED_HANDLERS,
 )
@@ -565,6 +566,21 @@ def install_singleton_guard(registry: object | None = None) -> int:
     (not newly-wrapped ones), so an idempotent re-install — which wraps
     nothing new — keeps reporting the actual gated population instead
     of clobbering the reading to 0.
+
+    Issue #570 — the EXPECTED count is recorded alongside it on
+    :data:`openstudio_operator.metrics.SINGLETON_EXPECTED_HANDLERS`,
+    sized from the OSCM spawning-handler population kopf actually
+    reports (this function's own scan, counted before wrapping). A
+    PARTIAL unwrap — one handler skipped on the missing-registration
+    (#250) or ``dataclasses.replace`` TypeError ``continue`` paths —
+    leaves a kopf-registered OSCM timer running UN-GATED while the #491
+    wrap gauge reads a plausible ``3 of 4``; the pair makes the gap
+    scrapeable and alertable (``wrapped < expected``). On the
+    registry-internals-mismatch branch the kopf-side scan is impossible,
+    so the Python-level ``_oscm_handlers.REGISTRY`` population (the
+    operator's own declaration of its OSCM timers) stands in as the
+    expectation — keeping ``0 < expected`` firing for the total-unwrap
+    shape under a strict ``<`` alert expression.
     """
     # Local import: avoiding a top-level dependency on the Python-level
     # registry so the gate's import graph stays shallow (the registry is
@@ -582,9 +598,31 @@ def install_singleton_guard(registry: object | None = None) -> int:
         # Issue #491 — the silent-unwrap shape, made scrapeable: whatever
         # the reason the gate could not run (kopf upgrade moved the
         # private _spawning._handlers layout), the boot gauge must record
-        # ZERO wrapped handlers so the == 0 alert fires.
+        # ZERO wrapped handlers so the wrap-gap alert fires.
         SINGLETON_WRAPPED_HANDLERS.set(0)
+        # Issue #570 — the kopf-side scan is impossible here, so the
+        # Python-level registry (#250 — the operator's own declaration of
+        # its OSCM timer population) stands in as the expectation. This
+        # keeps ``wrapped == 0 < expected`` firing under the strict-``<``
+        # alert expression: with expected sourced from the (unreadable)
+        # kopf layout the pair would read 0 < 0 and the total unwrap
+        # would fall back to being invisible again.
+        SINGLETON_EXPECTED_HANDLERS.set(len(_oscm_handlers.REGISTRY))
         return 0
+
+    # Issue #570 — expected-count pre-pass: the OSCM spawning-handler
+    # population kopf actually reports (the same scan the coverage test
+    # performs), counted BEFORE wrapping. Entries whose fn is None are
+    # excluded — they can never carry the gate, so counting them would
+    # permanently depress the pair; entries already carrying the marker
+    # (an idempotent re-install) ARE counted, keeping expected == gated
+    # on the healthy re-install path.
+    expected = sum(
+        1
+        for h in handlers
+        if _selector_matches_oscms(h) and getattr(h, "fn", None) is not None
+    )
+    SINGLETON_EXPECTED_HANDLERS.set(expected)
 
     wrapped = 0
     skipped_unregistered = 0
@@ -648,6 +686,10 @@ def install_singleton_guard(registry: object | None = None) -> int:
     # population — a re-invocation must not clobber the gauge to 0, the
     # value that IS the silent-unwrap alert expression. Handlers skipped
     # for missing registration carry no marker and are correctly absent.
+    # Issue #570 — the #491 reading alone cannot express "3 is wrong";
+    # the expected-count gauge set in the pre-pass above is the
+    # denominator that makes the partial skip (wrapped < expected) a
+    # scrapeable, alertable gap instead of a plausible-looking fraction.
     gated = sum(
         1
         for h in handlers
