@@ -420,6 +420,11 @@ _REDIS_URL_BAD = (
     "redis://QUEUE:6379",
     # Bare scheme, no host: no Service to talk to, no admission.
     "redis://",
+    # Issue #476: the TLS scheme inherits the #390 SSRF fence — accepting a
+    # public-host rediss:// would re-open the exfiltration surface the
+    # pattern exists to close.
+    "rediss://attacker.example.com:6379",
+    "rediss://:password@attacker.example.com:6379",
 )
 # Issue #463: URLs with EMBEDDED CREDENTIALS — the helm-recipe shapes that
 # were the pre-#463 pattern's headline acceptance cases are now REJECTED.
@@ -435,6 +440,10 @@ _REDIS_URL_EMBEDDED_CREDS = (
     # Credentialed FQDN with a db selector (the pre-#463
     # test_config_from_spec_camelcase value).
     "redis://:secret@queue.openstudio-server.svc.cluster.local:6379/1",
+    # Issue #476: the TLS twin must inherit the #463 no-inline-credentials
+    # rule — switching scheme must not become a side door for passwords.
+    "rediss://:openstudio-rotated@queue:6379",
+    "rediss://user:password@queue:6379",
 )
 _REDIS_URL_GOOD = (
     # Credential-free bare Service label with port — the post-#463 inline
@@ -453,6 +462,16 @@ _REDIS_URL_GOOD = (
     "redis://queue.openstudio-server.svc.cluster.local:6379/1",
 )
 _REDIS_URL_EMPTY = ""  # documented empty-default escape hatch (#116)
+
+# Issue #476: credential-free TLS shapes — every in-cluster DNS form the
+# plaintext tuple covers, with the ``rediss://`` scheme.
+_REDIS_URL_TLS_GOOD = (
+    "rediss://queue:6379",
+    "rediss://queue.openstudio-server:6379",
+    "rediss://queue.openstudio-server.svc:6379",
+    "rediss://queue.openstudio-server.svc.cluster.local:6379",
+    "rediss://queue.openstudio-server.svc.cluster.local:6379/1",
+)
 
 
 def test_redis_url_rejects_off_cluster_host():
@@ -520,6 +539,53 @@ def test_redis_url_has_cel_redis_scheme_rule():
     )
     assert any("issue #390" in r["message"].lower() for r in rules), (
         f"spec.redisUrl: CEL rule message must reference 'issue #390'; got: {rules!r}"
+    )
+
+
+def test_redis_url_accepts_rediss_tls_scheme_476():
+    """Issue #476 acceptance: every credential-free in-cluster DNS shape the
+    plaintext tuple covers must ALSO pass with the ``rediss://`` TLS scheme —
+    TLS-only Redis (Azure Cache / Memorystore / ElastiCache) deployments
+    point the operator at the same in-cluster Service shape, just encrypted.
+    The ``rediss?`` alternation must not loosen anything else (host fence,
+    port/db shape, #116 empty branch — covered by their own tests)."""
+    schema = _spec_field("redisUrl")
+    for good in _REDIS_URL_TLS_GOOD:
+        assert _matches_pattern(good, schema), (
+            f"spec.redisUrl: TLS in-cluster URL {good!r} must be accepted "
+            f"by the pattern (issue #476)"
+        )
+
+
+def test_redis_url_scheme_alternation_is_exactly_redis_and_rediss_476():
+    """Issue #476: the alternation is ``rediss?`` — exactly ``redis://`` and
+    ``rediss://``. Degenerate spellings (extra s, missing slash) must NOT
+    sneak through the alternation."""
+    schema = _spec_field("redisUrl")
+    for bad in ("redissss://queue:6379", "redi://queue:6379", "rediss:/queue:6379"):
+        assert not _matches_pattern(bad, schema), (
+            f"spec.redisUrl: {bad!r} is not a legal scheme spelling and must "
+            f"be rejected (issue #476)"
+        )
+
+
+def test_redis_url_cel_scheme_rule_accepts_rediss_476():
+    """Issue #476: the CEL scheme rule must carry an explicit
+    ``startsWith('rediss://')`` branch — ``rediss://queue`` does NOT start
+    with ``redis://`` (the 7th char is ``s``, not ``:``), so without the
+    branch the CEL layer would reject what the pattern accepts."""
+    rules = _cel_rules(_spec_field("redisUrl"))
+    scheme_rules = [r for r in rules if "startsWith" in r["rule"]]
+    assert any("startsWith('rediss://')" in r["rule"] for r in scheme_rules), (
+        f"spec.redisUrl: no CEL scheme rule covering the rediss:// TLS "
+        f"scheme (issue #476); got: {rules!r}"
+    )
+    assert any(
+        "self == '' ||" in r["rule"] and "rediss://" in r["rule"] for r in scheme_rules
+    ), (
+        "spec.redisUrl: the CEL scheme rule must keep the #116 empty-string "
+        "short-circuit while accepting both schemes (issue #476); got: "
+        f"{rules!r}"
     )
 
 

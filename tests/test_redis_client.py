@@ -418,6 +418,128 @@ def test_redis_credential_resolution_error_subclasses_client_error():
     assert issubclass(RedisCredentialResolutionError, RedisClientError)
 
 
+# --- TLS (rediss://) support — issue #476 ------------------------------------
+
+
+def test_secret_url_validation_accepts_rediss_tls_urls_476():
+    """Issue #476: the #463 Secret fence accepts the TLS twin — credentialed
+    (the point of the Secret) and credential-free — against the same
+    in-cluster Service host shapes, returned unchanged."""
+    from openstudio_operator.redis_client import redis_url_from_secret_value
+
+    for good in (
+        "rediss://:rotated-pw@queue:6379",
+        "rediss://user:pass@queue.openstudio-server.svc.cluster.local:6379/1",
+        "rediss://queue:6379",
+    ):
+        assert redis_url_from_secret_value(good, secret_name="s", secret_key="k") == good
+
+
+def test_secret_url_validation_rejects_rediss_off_cluster_476():
+    """The #390 SSRF fence is scheme-independent: a ``rediss://`` URL to an
+    off-cluster host must be rejected exactly like the plaintext twin —
+    adding TLS must not add an exfiltration side door on the Secret path."""
+    from openstudio_operator.redis_client import (
+        RedisCredentialResolutionError,
+        redis_url_from_secret_value,
+    )
+
+    for bad in (
+        "rediss://:pw@attacker.example.com:6379",
+        "rediss://attacker.example.com",
+        "https://queue:6379",
+    ):
+        with pytest.raises(RedisCredentialResolutionError):
+            redis_url_from_secret_value(bad, secret_name="s", secret_key="k")
+
+
+def test_plaintext_url_builds_plain_connection(monkeypatch):
+    """The plaintext path is unchanged by #476: a ``redis://`` URL builds the
+    plain TCP connection class with no ssl kwargs — and never even reads the
+    REDIS_TLS_CA_BUNDLE env var (a garbage value there must not break a
+    plaintext cluster)."""
+    from redis.connection import Connection
+
+    monkeypatch.setenv("REDIS_TLS_CA_BUNDLE", "/nonexistent/garbage.pem")
+    client = ReadOnlyRedisClient("redis://queue:6379")
+    pool = client._redis.connection_pool
+    assert pool.connection_class is Connection
+    assert not [k for k in pool.connection_kwargs if k.startswith("ssl_")]
+
+
+def test_rediss_url_builds_tls_connection_with_system_cas(monkeypatch):
+    """Issue #476 acceptance: a ``rediss://`` URL builds the SSL connection
+    class with certificate verification REQUIRED. With no explicit bundle
+    configured, no ``ssl_ca_certs`` kwarg is injected — redis-py then wraps
+    the socket via ``ssl.create_default_context()`` (system trust store),
+    and the operator never weakens ``ssl_cert_reqs``/hostname checking."""
+    from redis.connection import SSLConnection
+
+    monkeypatch.delenv("REDIS_TLS_CA_BUNDLE", raising=False)
+    client = ReadOnlyRedisClient("rediss://queue:6379")
+    pool = client._redis.connection_pool
+    assert pool.connection_class is SSLConnection
+    assert pool.connection_kwargs.get("host") == "queue"
+    assert pool.connection_kwargs.get("port") == 6379
+    assert "ssl_ca_certs" not in pool.connection_kwargs
+    # Verification is never downgraded by the operator's wiring.
+    assert pool.connection_kwargs.get("ssl_cert_reqs", "required") == "required"
+
+
+def test_rediss_url_honors_ca_bundle_env(monkeypatch, tmp_path):
+    """Issue #476 acceptance: a valid ``REDIS_TLS_CA_BUNDLE`` (readable PEM
+    file) is forwarded as ``ssl_ca_certs`` so the TLS handshake validates
+    against THAT bundle instead of the system trust store — the mirror of
+    the REST client's ``OPENSTUDIO_TLS_CA_BUNDLE`` (issue #296)."""
+    from redis.connection import SSLConnection
+
+    bundle = tmp_path / "ca.pem"
+    pem = "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n"
+    bundle.write_text(pem)
+    monkeypatch.setenv("REDIS_TLS_CA_BUNDLE", str(bundle))
+
+    client = ReadOnlyRedisClient("rediss://queue:6379")
+
+    assert client._redis.connection_pool.connection_class is SSLConnection
+    assert client._redis.connection_pool.connection_kwargs["ssl_ca_certs"] == str(bundle)
+
+
+def test_rediss_url_empty_ca_bundle_env_means_system_cas(monkeypatch):
+    """An EMPTY ``REDIS_TLS_CA_BUNDLE`` value means the system trust store —
+    the same truthy-string refusal the REST client applies (#296): a
+    templated boolean flag must not become a bogus CA path."""
+    monkeypatch.setenv("REDIS_TLS_CA_BUNDLE", "")
+    client = ReadOnlyRedisClient("rediss://queue:6379")
+    assert "ssl_ca_certs" not in client._redis.connection_pool.connection_kwargs
+
+
+def test_rediss_url_missing_ca_bundle_path_raises_config_error(monkeypatch):
+    """Issue #476 acceptance: a ``REDIS_TLS_CA_BUNDLE`` that names no
+    existing file raises ``OperatorConfigError`` from its #475 neutral home
+    (``openstudio_operator.config``) — and, per the #475 hierarchy, it is
+    NOT a ``RedisClientError`` (so ``except RedisClientError`` cannot
+    silently swallow a TLS misconfiguration)."""
+    from openstudio_operator.config import OperatorConfigError as ConfigError
+
+    monkeypatch.setenv("REDIS_TLS_CA_BUNDLE", "/nonexistent/ca-bundle.pem")
+    with pytest.raises(ConfigError, match="REDIS_TLS_CA_BUNDLE") as excinfo:
+        ReadOnlyRedisClient("rediss://queue:6379")
+    assert not isinstance(excinfo.value, RedisClientError)
+
+
+def test_rediss_url_non_pem_ca_bundle_raises_config_error(monkeypatch, tmp_path):
+    """A file that exists but carries no PEM marker is refused too (the #296
+    shape) — pinning the env value to a real bundle instead of trusting any
+    readable path."""
+    from openstudio_operator.config import OperatorConfigError as ConfigError
+
+    bundle = tmp_path / "not-pem.txt"
+    bundle.write_text("definitely not a certificate bundle\n")
+    monkeypatch.setenv("REDIS_TLS_CA_BUNDLE", str(bundle))
+    with pytest.raises(ConfigError, match="PEM marker"):
+        ReadOnlyRedisClient("rediss://queue:6379")
+
+
 def test_redis_errors_are_wrapped_as_client_errors(fake, client, monkeypatch):
     def _boom(*args, **kwargs):
         raise redis.exceptions.ConnectionError("queue fabric unreachable")
