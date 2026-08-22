@@ -49,7 +49,6 @@ kind: ValidatingAdmissionPolicy
 metadata:
   name: openstudio-operator-pod-delete-scope
 spec:
-  admissionReviewVersions: ["v1"]
   failurePolicy: Fail
   matchConstraints:
     resourceRules:
@@ -72,7 +71,11 @@ spec:
         ||
         (has(object.metadata.labels) &&
          object.metadata.labels['app'] == 'worker')
-      message: >
+      # Issue #565: the message MUST be a single line — the API server
+      # rejects any validation message containing "\n" ("message must
+      # not contain line breaks"). The folded `>-` scalar (strip-
+      # chomped) yields exactly one line with no trailing newline.
+      message: >-
         openstudio-operator-sa may only DELETE pods carrying the
         `app=worker` label (the helm chart's worker Deployment pod
         selector). All other pod deletes from this ServiceAccount
@@ -92,6 +95,14 @@ metadata:
   name: openstudio-operator-pod-delete-scope
 spec:
   policyName: openstudio-operator-pod-delete-scope
+  # Issue #565: `validationActions` is REQUIRED on a v1
+  # ValidatingAdmissionPolicyBinding — the API server rejects an
+  # omitted/empty list ("at least one validation action is
+  # required"), which made this whole manifest un-applyable and the
+  # operator SA's pods/delete unconstrained. `Deny` is the only
+  # action that actually blocks the request (Warn/Audit alone would
+  # re-open the #293 gap).
+  validationActions: ["Deny"]
   matchResources:
     namespaceSelector:
       matchLabels:

@@ -278,6 +278,21 @@ spec:
 # fails `startsWith` — fail-closed, which is the correct stance.
 #
 # Requires: Kubernetes 1.30+ (ValidatingAdmissionPolicy v1 GA).
+#
+# Issue #565 — the CEL expression below short-circuits on the
+# requesting principal: `request.userInfo.username != '<prune SA>'
+# || ...` means actors OTHER than the prune SA are NOT restricted by
+# this policy — humans via kubectl and controllers keep their normal
+# Job create/update/delete access in the namespace (the same
+# carve-out shape the pod-delete VAP in
+# deploy/pod-delete-admission-policy.yaml uses for the operator SA).
+# Pre-#565 the expression applied to EVERY principal, contradicting
+# the "humans via kubectl are left unrestricted" contract in
+# AGENTS.md. Also per #565: the validation `message` must be a
+# single line (folded `>-`, strip-chomped) — the API server rejects
+# any message containing "\n" — and the Binding below carries the
+# required `validationActions` and scopes via `matchResources`
+# (the v1 Binding schema has no `selector` field).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -294,7 +309,8 @@ metadata:
       create/delete Jobs that look exactly like the ones retention
       spawns, so a compromised prune pod cannot spawn arbitrary Jobs
       (labels alone are spoofable; the name pattern is the second
-      factor).
+      factor). Since #565 only the prune SA is constrained — other
+      principals are unrestricted.
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -308,6 +324,9 @@ spec:
         resources: ["jobs"]
   validations:
     - expression: |
+        request.userInfo.username !=
+        'system:serviceaccount:openstudio-server:openstudio-storage-pruner-sa'
+        ||
         (has(object.metadata.labels) &&
          object.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
          object.metadata.labels["app.kubernetes.io/component"] == "archival" &&
@@ -316,16 +335,15 @@ spec:
          oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
          oldObject.metadata.labels["app.kubernetes.io/component"] == "archival" &&
          oldObject.metadata.name.startsWith("oscm-archive-"))
-      message: |
-        Jobs in openstudio-server must be named with the
-        `oscm-archive-` prefix (the deterministic-name convention of
-        archival.py::archival_job_name) AND labelled with BOTH
-        app.kubernetes.io/managed-by=openstudio-operator AND
-        app.kubernetes.io/component=archival (issues #294, #398). The
-        prune SA's batch/jobs verbs are scoped to archival Jobs only;
+      message: >-
+        openstudio-storage-pruner-sa may only create/update/delete
+        Jobs named with the `oscm-archive-` prefix (the
+        deterministic-name convention of archival.py::archival_job_name)
+        AND labelled with BOTH app.kubernetes.io/managed-by=openstudio-operator
+        AND app.kubernetes.io/component=archival (issues #294, #398, #565):
         labels alone are spoofable, so the name pattern is the second
-        factor — any other Job create/update/delete attempt is
-        rejected.
+        factor. Every other principal (humans via kubectl, controllers)
+        is unrestricted by this policy.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -336,10 +354,15 @@ metadata:
     app.kubernetes.io/component: archival-admission
 spec:
   policyName: openstudio-prune-job-scope
-  # Empty selector matches every namespace that the policy's own
-  # namespaceSelector already filtered to `openstudio-server`. The
-  # binding is required because a ValidatingAdmissionPolicy with no
-  # binding is dormant — see K8s docs on ValidatingAdmissionPolicy.
-  # Re-stating the namespace label here would be redundant; the
-  # matchConstraints.namespaceSelector above is the canonical gate.
-  selector: {}
+  # Issue #565: the v1 ValidatingAdmissionPolicyBinding schema has NO
+  # `selector` field (the pre-fix `selector: {}` was a strict-decoding
+  # unknown-field reject that made the whole manifest un-applyable) and
+  # REQUIRES `validationActions`. `Deny` is the only action that
+  # actually blocks the request. `matchResources` mirrors the policy's
+  # own namespaceSelector gate (additive — both must match), the same
+  # shape the pod-delete binding uses.
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openstudio-server
