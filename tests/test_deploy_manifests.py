@@ -358,6 +358,141 @@ def test_pod_delete_admission_binding_binds_policy_to_openstudio_server():
     )
 
 
+# ---- Issue #565: schema-valid VAP/Binding shape across ALL of deploy/ ----
+#
+# All four admission documents (2 VAPs + 2 Bindings across
+# pod-delete-admission-policy.yaml and storage-cronjob.yaml) were
+# REJECTED by a live Kubernetes 1.31 API server under
+# `kubectl apply --dry-run=server` before #565: the webhook-only
+# `spec.admissionReviewVersions` on the pod-delete VAP (strict-decoding
+# unknown field), the omitted required `spec.validationActions` on both
+# Bindings ("at least one validation action is required"), a multi-line
+# CEL `message` ("message must not contain line breaks"), and the
+# nonexistent Binding `spec.selector` field (unknown-field reject).
+# Dead manifests mean dead defense-in-depth: the #293/#294/#398
+# narrowings silently vanish at apply time. The fence below re-derives
+# the inventory from a glob of deploy/ so a newly added admission doc
+# cannot dodge it by living in a new file, and pins the schema rules
+# the API server enforces — a regression fails CI instead of failing
+# silently at apply time.
+
+_ADMISSION_POLICY_KIND = "ValidatingAdmissionPolicy"
+_ADMISSION_BINDING_KIND = "ValidatingAdmissionPolicyBinding"
+_EXPECTED_VAP_FILES = {
+    "pod-delete-admission-policy.yaml",
+    "storage-cronjob.yaml",
+}
+
+
+def _iter_admission_docs():
+    """Yield (filename, doc) for every ValidatingAdmissionPolicy /
+    ValidatingAdmissionPolicyBinding under deploy/, globbing all
+    manifests so a new admission doc in a new file is still fenced."""
+    for path in sorted(DEPLOY.glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text()):
+            if doc and doc.get("kind") in (
+                _ADMISSION_POLICY_KIND,
+                _ADMISSION_BINDING_KIND,
+            ):
+                yield path.name, doc
+
+
+def test_all_vap_docs_have_no_admission_review_versions_and_single_line_messages():
+    """Fence half 1 (VAP shape, issue #565): `spec.admissionReviewVersions`
+    is a ValidatingWebhook-only field — strict decoding on the API
+    server rejects it on a ValidatingAdmissionPolicy — and a CEL
+    `message` containing a line break (including the trailing newline
+    of a plain folded `>` block) is an outright Invalid reject. Both
+    were live 1.31 rejects before #565; messages must use a strip-
+    chomped `>-` folded scalar or a quoted single-line string."""
+    vap_docs = [
+        (fname, doc)
+        for fname, doc in _iter_admission_docs()
+        if doc["kind"] == _ADMISSION_POLICY_KIND
+    ]
+    assert {fname for fname, _ in vap_docs} == _EXPECTED_VAP_FILES, (
+        "expected the two known VAP files under deploy/; a new "
+        "admission doc must consciously extend this inventory (same "
+        "discipline as tests/_metrics_inventory.py, issue #406)"
+    )
+    for fname, vap in vap_docs:
+        assert "admissionReviewVersions" not in vap["spec"], (
+            f"{fname}: spec.admissionReviewVersions is a webhook-only "
+            "field unknown on ValidatingAdmissionPolicy — the API "
+            "server rejects the whole manifest (issue #565)"
+        )
+        for i, validation in enumerate(vap["spec"].get("validations", [])):
+            message = validation.get("message", "")
+            assert message, (
+                f"{fname}: validations[{i}].message is required — the "
+                "generated default would not cite the issue rationale "
+                "an operator hitting the policy at apply time needs"
+            )
+            assert "\n" not in message, (
+                f"{fname}: validations[{i}].message must be a single "
+                'line — the API server rejects "message must not '
+                f'contain line breaks" (issue #565); got {message!r}'
+            )
+
+
+def test_all_vap_bindings_have_validation_actions_and_match_resources():
+    """Fence half 2 (Binding shape, issue #565): `spec.validationActions`
+    is REQUIRED on a ValidatingAdmissionPolicyBinding (omission is a
+    hard Invalid reject) and must include `Deny` — `Warn`/`Audit`
+    alone would not block the request the fence exists to stop — and
+    `spec.matchResources` is the only scoping field: the Binding schema
+    has NO `selector`, so the pre-#565 `selector: {}` was a
+    strict-decoding unknown-field reject. Every binding must also
+    reference a VAP that actually exists under deploy/."""
+    admission_docs = list(_iter_admission_docs())
+    binding_docs = [
+        (fname, doc)
+        for fname, doc in admission_docs
+        if doc["kind"] == _ADMISSION_BINDING_KIND
+    ]
+    vap_names = {
+        doc["metadata"]["name"]
+        for _, doc in admission_docs
+        if doc["kind"] == _ADMISSION_POLICY_KIND
+    }
+    assert {fname for fname, _ in binding_docs} == _EXPECTED_VAP_FILES, (
+        "expected the two known Binding files under deploy/; a new "
+        "admission doc must consciously extend this inventory (same "
+        "discipline as tests/_metrics_inventory.py, issue #406)"
+    )
+    for fname, binding in binding_docs:
+        spec = binding["spec"]
+        assert spec.get("policyName") in vap_names, (
+            f"{fname}: Binding.policyName {spec.get('policyName')!r} "
+            "matches no ValidatingAdmissionPolicy under deploy/ — the "
+            "bound policy is dormant (issue #565)"
+        )
+        actions = spec.get("validationActions")
+        assert actions, (
+            f"{fname}: Binding.validationActions is required by the "
+            "v1 schema — an omitted/empty list is an API-server "
+            "Invalid reject that kills the whole manifest apply "
+            "(issue #565)"
+        )
+        assert "Deny" in actions, (
+            f"{fname}: validationActions must include 'Deny'; got "
+            f"{actions!r} — Warn/Audit alone does not block the "
+            "admission request the fence exists to stop"
+        )
+        assert "selector" not in spec, (
+            f"{fname}: Binding spec has no `selector` field in "
+            "admissionregistration.k8s.io/v1 — the API server rejects "
+            "the unknown field wholesale; scope via matchResources "
+            "(issue #565)"
+        )
+        assert "matchResources" in spec, (
+            f"{fname}: Binding must scope via matchResources (the "
+            "namespaceSelector gate mirroring the policy's own "
+            "matchConstraints); got spec keys "
+            f"{sorted(spec)!r}"
+        )
+
+
 def test_operator_role_still_grants_pods_delete_verb():
     """The RBAC `pods/delete` verb MUST remain in deploy/rbac.yaml —
     the admission policy is an additional defense-in-depth layer,
@@ -1925,6 +2060,9 @@ ARCHIVAL_LABELS = {
     "app.kubernetes.io/managed-by": "openstudio-operator",
     "app.kubernetes.io/component": "archival",
 }
+# Issue #565 — the principal the prune-scope VAP constrains (and the
+# actor whose carve-out disjunct leads the CEL expression).
+PRUNE_SA_FULL = "system:serviceaccount:openstudio-server:openstudio-storage-pruner-sa"
 
 
 def _strip_cel_whitespace(expr: str) -> str:
@@ -2019,22 +2157,44 @@ def test_prune_job_scope_vap_failure_policy_is_fail():
 
 def test_prune_job_scope_vap_binding_binds_to_policy():
     """A ValidatingAdmissionPolicy with no binding is dormant. The
-    binding must name the policy above, and the binding itself must
-    have no resource-level selectors that would narrow scope below
-    what the policy's matchConstraints already enforce."""
+    binding must name the policy above AND be schema-valid per the
+    admissionregistration.k8s.io/v1 Binding shape (issue #565, verified
+    against a live 1.31 API server with --dry-run=server):
+    `validationActions` is REQUIRED — an omitted/empty list is a hard
+    Invalid reject ("at least one validation action is required") that
+    made the whole storage-cronjob.yaml apply fail after the
+    Role/CronJob had already landed — and `matchResources` is the only
+    scoping field: the schema has NO `selector`, so the pre-#565
+    `selector: {}` was a strict-decoding unknown-field reject."""
     assert PRUNE_JOB_SCOPE_BINDING is not None, (
         "no ValidatingAdmissionPolicyBinding in deploy/storage-cronjob.yaml — "
         "the policy is dormant without a binding (issue #294)"
     )
     assert PRUNE_JOB_SCOPE_BINDING["apiVersion"] == "admissionregistration.k8s.io/v1"
-    assert PRUNE_JOB_SCOPE_BINDING["spec"]["policyName"] == (
+    spec = PRUNE_JOB_SCOPE_BINDING["spec"]
+    assert spec["policyName"] == (
         PRUNE_JOB_SCOPE_VAP["metadata"]["name"]
     )
-    # The binding's `selector` is `{}` (matches everything, as the policy
-    # itself scopes by namespaceSelector). This is the canonical K8s
-    # pattern; a non-empty selector would silently exclude the
-    # openstudio-server namespace.
-    assert PRUNE_JOB_SCOPE_BINDING["spec"]["selector"] == {}
+    assert spec.get("validationActions") == ["Deny"], (
+        "Binding.validationActions must be [\"Deny\"] — required by the "
+        "v1 Binding schema (an omitted list is an API-server reject, "
+        "issue #565) and the only action that actually blocks the "
+        f"request; got {spec.get('validationActions')!r}"
+    )
+    assert "selector" not in spec, (
+        "Binding spec has no `selector` field in "
+        "admissionregistration.k8s.io/v1 — the API server rejects the "
+        "unknown field wholesale; scope via matchResources instead "
+        "(issue #565)"
+    )
+    ns_selector = spec.get("matchResources", {}).get("namespaceSelector")
+    assert ns_selector and ns_selector.get("matchLabels", {}).get(
+        "kubernetes.io/metadata.name"
+    ) == _OPERATOR_NS, (
+        "Binding must scope via matchResources.namespaceSelector to "
+        f"{_OPERATOR_NS!r} (mirroring the policy's own gate); got "
+        f"{ns_selector!r}"
+    )
 
 
 def test_prune_job_scope_vap_label_keys_match_archival_manifest():
@@ -2325,12 +2485,19 @@ def _cel_eval(node, ctx):
     raise _CelError(f"unknown node kind {kind!r}")
 
 
-def _cel_allows(expression, *, obj, old):
+def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL):
     """Admission decision for one validation expression: True when the
     expression evaluates truthy (request allowed), False when it
     evaluates falsy OR errors — a CEL error denies under
-    `failurePolicy: Fail`, so both paths are rejections."""
-    ctx = {"object": obj, "oldObject": old}
+    `failurePolicy: Fail`, so both paths are rejections. The context
+    carries `request.userInfo.username` (default: the prune SA — the
+    principal the policy constrains) so the #565 carve-out disjunct
+    evaluates the way the API server would."""
+    ctx = {
+        "object": obj,
+        "oldObject": old,
+        "request": {"userInfo": {"username": username}},
+    }
     tree = _CelParser(_cel_tokenize(expression)).parse()
     try:
         return _cel_eval(tree, ctx) is True
@@ -2344,15 +2511,25 @@ def test_prune_job_scope_vap_validations_require_oscm_archive_name_prefix():
     `metadata.name.startsWith("oscm-archive-")` clause INSIDE both the
     object clause (CREATE/UPDATE) and the oldObject clause (DELETE) —
     not bolted on as a third disjunct, which a spoofed name could
-    satisfy independently of the labels."""
+    satisfy independently of the labels.
+
+    Issue #565 adds a LEADING carve-out disjunct (non-prune actors are
+    unrestricted — see the carve-out test below), so the top-level
+    shape is now `userInfo != '<prune SA>' || object-clause ||
+    oldObject-clause`: exactly two `||`, three clauses."""
     full_expr = _strip_cel_whitespace(
         " ".join(v["expression"] for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"])
     )
-    assert full_expr.count("||") == 1, (
-        "expected exactly one top-level disjunction (object-side clause "
-        f"|| oldObject-side clause); got: {full_expr!r}"
+    assert full_expr.count("||") == 2, (
+        "expected the #565 userInfo carve-out disjunct plus exactly "
+        "one object-side/oldObject-side disjunction pair; got: "
+        f"{full_expr!r}"
     )
-    object_clause, old_object_clause = full_expr.split("||")
+    carve_out, object_clause, old_object_clause = full_expr.split("||")
+    assert "request.userInfo.username" in carve_out and PRUNE_SA_FULL in carve_out, (
+        f"leading clause must be the #565 userInfo carve-out naming "
+        f"the prune SA ({PRUNE_SA_FULL!r}); got: {carve_out!r}"
+    )
     for side, clause in (("object", object_clause), ("oldObject", old_object_clause)):
         assert f"{side}.metadata.name.startsWith(\"{_OSCM_ARCHIVE_NAME_PREFIX}\")" in clause, (
             f"{side}-side clause missing the startsWith name check "
@@ -2431,6 +2608,45 @@ def test_prune_job_scope_vap_accepts_real_archival_job_name():
     assert _cel_allows(expression, obj=None, old=job) is True, (
         "DELETE of a real archival Job must pass admission (failed-Job "
         "cleanup path; issues #294, #398)"
+    )
+
+
+def test_prune_job_scope_vap_userinfo_carveout_leaves_non_prune_actors_unrestricted():
+    """Issue #565 acceptance: the pre-fix CEL constrained EVERY
+    principal's Job create/update/delete in the namespace — a human
+    running `kubectl create job` for a legitimate non-archival Job
+    would have been rejected, contradicting AGENTS.md's "humans via
+    kubectl are left unrestricted" contract. The leading
+    `request.userInfo.username != '<prune SA>' ||` short-circuit
+    (mirroring the pod-delete VAP's operator-SA carve-out) means only
+    the prune SA is constrained. The manifest's own CEL text is
+    evaluated with the minimal interpreter: a non-prune actor must be
+    ALLOWED on a non-archival Job (both CREATE and DELETE paths), and
+    the prune SA must stay DENIED on the same Job."""
+    expression = PRUNE_JOB_SCOPE_VAP["spec"]["validations"][0]["expression"]
+    non_archival = {
+        "metadata": {
+            "name": "kube-system-cleanup",
+            "labels": {"app.kubernetes.io/component": "debug"},
+        }
+    }
+    human = "kubernetes-admin"
+    assert _cel_allows(expression, obj=non_archival, old=None, username=human) is True, (
+        "a non-prune actor creating a non-archival Job must NOT be "
+        "constrained by the policy (issue #565 carve-out)"
+    )
+    assert _cel_allows(expression, obj=None, old=non_archival, username=human) is True, (
+        "a non-prune actor deleting a non-archival Job must NOT be "
+        "constrained by the policy (issue #565 carve-out)"
+    )
+    assert _cel_allows(expression, obj=non_archival, old=None) is False, (
+        "the prune SA creating the same non-archival Job must still be "
+        "rejected — the carve-out must not weaken the #294/#398 fence "
+        "(default username is the prune SA)"
+    )
+    assert _cel_allows(expression, obj=None, old=non_archival) is False, (
+        "the prune SA deleting the same non-archival Job must still be "
+        "rejected (default username is the prune SA)"
     )
 
 
