@@ -58,7 +58,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeVar
 
 import kopf
 from kubernetes.client import (
@@ -263,197 +263,152 @@ def set_guard(guard: SingletonGuard | None) -> None:
     _process_guard = guard
 
 
-# Issue #158 — the operator's single ``CustomObjectsApi()`` construction
-# point. Every handler that talks to the K8s API server for the OSCM custom
-# object imports THIS function — never ``CustomObjectsApi()`` directly. The
-# factory loads the operator pod's service-account config (falling back to
-# ``kube_config`` for local ``kopf run`` dev sessions), then caches the
-# resulting client for the operator's lifetime. The AST test in
-# ``tests/test_singleton_registry_coverage.py::test_only_one_custom_objects_api_construction_point``
-# enforces "exactly one construction site" so a future regression that
-# bypasses the factory fails the CI gate loudly.
+# Issue #158 + #251 — the operator's single ``CustomObjectsApi()`` /
+# ``AppsV1Api()`` / ``BatchV1Api()`` / ``CoreV1Api()`` construction points.
+# Every handler and entrypoint that talks to the K8s API server imports the
+# factories below — never the client classes directly. The per-class module
+# globals are the cache slots (the :func:`reset_operator_k8s_client` test
+# seam; ``tests/test_client_factory.py`` also patches
+# ``singleton._operator_core_api`` directly). Since issue #494 the shared
+# :func:`_cached_k8s_api` helper owns the load/cache/fallback logic ONCE;
+# the AST tests in ``tests/test_singleton_registry_coverage.py``
+# (``test_only_one_custom_objects_api_construction_point`` and
+# ``test_only_one_v1_api_construction_point_per_factory``) enforce "exactly
+# one bare no-arg construction call per client type in this file", which is
+# why each wrapper passes its construction as a thunk carrying the literal
+# ``XApi()`` call.
 _operator_custom_objects_api: CustomObjectsApi | None = None
-
-
-def operator_custom_objects_api() -> CustomObjectsApi:
-    """Return the process-wide :class:`CustomObjectsApi` (issue #158).
-
-    The SINGLE ``CustomObjectsApi()`` construction point in the operator —
-    every handler that needs to read or patch the OSCM ``.status``
-    subresource (``StatusStore``'s RMW path), list CRs
-    (``SingletonGuard.list_crs``), or talk to the K8s API server for any
-    other custom-object reason imports this factory. Inline
-    ``CustomObjectsApi()`` calls outside this function are a regression: a
-    bare ``CustomObjectsApi()`` carries whatever the default kubeconfig
-    resolution picks up (typically ``KUBERNETES_SERVICE_HOST`` /
-    ``KUBERNETES_SERVICE_PORT`` envs and a service-account token mount),
-    which is correct only because the operator Deployment is in-cluster.
-    Any future change to this loader (kubeconfig Secret reference,
-    network-proxy client, etc.) would silently leave inline callsites
-    behind.
-
-    Behaviour:
-
-    * Loads the operator pod's in-cluster service-account config via
-      :func:`openstudio_operator._k8s.load_operator_kube_config` (the
-      SINGLE public loader, issue #305); the loader tries
-      ``kubernetes.config.load_incluster_config`` first, on
-      ``ConfigException`` falls back to
-      ``kubernetes.config.load_kube_config``. Same posture as the
-      original ``_build_custom_objects_api`` (issue #79) — kopf >=1.44
-      never initializes client-python's default ``Configuration``, so a
-      bare ``CustomObjectsApi()`` with no loaded config raises
-      ``LocationValueError`` on every call (proven live in #66's kind
-      validation).
-    * Caches the resulting :class:`CustomObjectsApi` for the process's
-      lifetime. All callers share the same instance, so the underlying
-      :class:`kubernetes.client.ApiClient` (HTTP connection pool, retry
-      config) is reused across every operator tick.
-    * On config-loading failure, raises — callers fail closed (skip the
-      tick, retry next poll per D12).
-
-    Tests that mock ``kubernetes.config.load_incluster_config`` use
-    :func:`reset_operator_k8s_client` to drop the cache between cases so
-    the next call to :func:`operator_custom_objects_api` re-runs the
-    load path with the freshly patched loader.
-    """
-    global _operator_custom_objects_api
-    if _operator_custom_objects_api is None:
-        load_operator_kube_config()
-        _operator_custom_objects_api = CustomObjectsApi()
-    return _operator_custom_objects_api
-
-
-# Issue #251 — the operator's single ``AppsV1Api()`` / ``BatchV1Api()`` /
-# ``CoreV1Api()`` construction points. The CustomObjectsApi analogue
-# (:func:`operator_custom_objects_api`, issue #158) was the only centrally
-# constructed K8s client; the other three were built inline at their
-# call sites. The structural inconsistency (one K8s client centralised,
-# three not) is the issue's motivation: a future change to the loader
-# (kubeconfig Secret reference, network-proxy client, …) silently leaves
-# the inline callsites behind. The factories below retire every inline
-# ``*V1Api()`` site; the AST test in
-# ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
-# enforces "exactly one construction site per client type" so a future
-# regression that bypasses the factory fails the CI gate loudly.
 _operator_apps_api: AppsV1Api | None = None
 _operator_batch_api: BatchV1Api | None = None
 _operator_core_api: CoreV1Api | None = None
 
+_K8sClientT = TypeVar("_K8sClientT")
+
+
+def _cached_k8s_api(
+    cache_attr: str,
+    build: Callable[[], _K8sClientT],
+    *,
+    label: str,
+    strict: bool,
+) -> _K8sClientT:
+    """Return the process-wide K8s client cached under ``cache_attr`` (issue #494).
+
+    Shared engine for the four ``operator_*_api`` factories (issues #158 +
+    #251). Behaviour, documented ONCE:
+
+    * Cache: the client is cached in the factory's per-class module global
+      (``cache_attr``) for the process's lifetime; all callers share one
+      instance, so the underlying :class:`kubernetes.client.ApiClient`
+      (HTTP connection pool, retry config) is reused across every operator
+      tick. A non-``None`` cache slot short-circuits — no loader call, no
+      construction.
+    * Load: :func:`openstudio_operator._k8s.load_operator_kube_config` —
+      the SINGLE public loader (issue #305) — tries
+      ``kubernetes.config.load_incluster_config`` first, falling back to
+      ``load_kube_config`` for local ``kopf run`` dev sessions. kopf >=1.44
+      never initializes client-python's default ``Configuration``, so a
+      client built with no loaded config raises ``LocationValueError`` on
+      every call (proven live in #66's kind validation; since #493 the
+      timer wrappers count + skip that).
+    * Strict (``strict=True`` — the CustomObjectsApi factory): a
+      :class:`kubernetes.config.ConfigException` from the loader propagates
+      — callers fail closed (skip the tick, retry next poll per D12). The
+      singleton guard's ``_gated`` wrapper relies on this raise to skip the
+      tick when config is truly unavailable.
+    * Lenient (``strict=False`` — the three ``*V1Api`` factories): the
+      ``ConfigException`` is swallowed with one WARNING naming the API type
+      (``label``) and a placeholder client is constructed against the
+      uninitialised default ``Configuration`` — the ``*V1Api()`` constructor
+      stores the default without raising; actual API calls fail later and
+      handlers fail closed via ``HANDLER_TICK_FAILURES_TOTAL`` (issues #251
+      / #286). This keeps the operator booting in CI / bare-clone
+      environments where no kubeconfig exists.
+    * Single construction point: each wrapper's ``build`` thunk carries the
+      literal ``XApi()`` call so the AST gates in
+      ``tests/test_singleton_registry_coverage.py`` (#158 / #251) keep
+      seeing exactly one bare construction per client type in this file.
+      Inline ``*Api()`` calls anywhere else are a regression: a future
+      change to the loader (kubeconfig Secret reference, network-proxy
+      client, …) would silently leave inline callsites behind, and the CI
+      gate fails loudly.
+    * Reset seam: tests drop the caches via
+      :func:`reset_operator_k8s_client` (or by patching a slot directly)
+      so the next factory call re-runs the load path with the freshly
+      patched loaders.
+    """
+    cached = globals().get(cache_attr)
+    if cached is not None:
+        return cached
+    try:
+        load_operator_kube_config()
+    except ConfigException:
+        if strict:
+            raise
+        logger.warning(
+            "K8s config not loaded for %s: returning placeholder client.", label
+        )
+    client = build()
+    globals()[cache_attr] = client
+    return client
+
+
+def operator_custom_objects_api() -> CustomObjectsApi:
+    """Process-wide :class:`CustomObjectsApi` (issue #158) — strict; raises on no-config.
+
+    Consumers: ``StatusStore``'s ``.status`` RMW path, ``SingletonGuard.list_crs``,
+    and every handler's OSCM custom-object access. See :func:`_cached_k8s_api`.
+    """
+    return _cached_k8s_api(
+        "_operator_custom_objects_api",
+        lambda: CustomObjectsApi(),
+        label="CustomObjectsApi",
+        strict=True,
+    )
+
 
 def operator_apps_api() -> AppsV1Api:
-    """Return the process-wide :class:`AppsV1Api` (issue #251).
+    """Process-wide :class:`AppsV1Api` (issue #251) — lenient placeholder on no-config.
 
-    The SINGLE ``AppsV1Api()`` construction point in the operator. Every
-    handler that needs to read or patch a Deployment (the worker recycler
-    in :mod:`openstudio_operator.handlers.worker_recycler`, the
-    web_background monitor in
-    :mod:`openstudio_operator.handlers.web_background_monitor`) imports
-    this factory instead of instantiating ``AppsV1Api`` inline. The
-    factory loads the in-cluster / kubeconfig fallback via
-    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
-    SINGLE public loader, issue #305) and caches the client for the
-    operator's lifetime, sharing the underlying
-    :class:`kubernetes.client.ApiClient` HTTP connection pool across
-    every operator tick. Inline ``AppsV1Api()`` calls outside this
-    function are a regression; the
-    AST test in
-    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
-    fails the CI gate loudly.
+    Consumers: the worker recycler and the web_background monitor's Deployment
+    reads/patches. See :func:`_cached_k8s_api`.
     """
-    global _operator_apps_api
-    if _operator_apps_api is None:
-        try:
-            load_operator_kube_config()
-        except ConfigException:
-            # CI / bare-clone environments: leave the default
-            # Configuration uninitialised. The AppsV1Api() constructor
-            # stores the default without raising; actual API calls
-            # would fail later, but handlers fail closed via
-            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
-            # factory above still raises so the singleton guard correctly
-            # skips the tick when config is truly unavailable.
-            logger.warning(
-                "K8s config not loaded for AppsV1Api: returning placeholder client."
-            )
-        _operator_apps_api = AppsV1Api()
-    return _operator_apps_api
+    return _cached_k8s_api(
+        "_operator_apps_api",
+        lambda: AppsV1Api(),
+        label="AppsV1Api",
+        strict=False,
+    )
 
 
 def operator_batch_api() -> BatchV1Api:
-    """Return the process-wide :class:`BatchV1Api` (issue #251).
+    """Process-wide :class:`BatchV1Api` (issue #251) — lenient placeholder on no-config.
 
-    The SINGLE ``BatchV1Api()`` construction point in the operator. The
-    retention pipeline's archive Job create/read/delete
-    (:mod:`openstudio_operator.retention`) and the prune CronJob
-    (:mod:`openstudio_operator.prune_entrypoint`) import this factory
-    instead of instantiating ``BatchV1Api`` inline. The factory loads
-    the in-cluster / kubeconfig fallback via
-    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
-    SINGLE public loader, issue #305) and caches the client for the
-    operator's lifetime. Inline ``BatchV1Api()`` calls outside this
-    function are a regression; the
-    AST test in
-    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
-    fails the CI gate loudly.
+    Consumers: the retention pipeline's archive Job create/read/delete and the
+    prune CronJob. See :func:`_cached_k8s_api`.
     """
-    global _operator_batch_api
-    if _operator_batch_api is None:
-        try:
-            load_operator_kube_config()
-        except ConfigException:
-            # CI / bare-clone environments: leave the default
-            # Configuration uninitialised. The BatchV1Api() constructor
-            # stores the default without raising; actual API calls
-            # would fail later, but handlers fail closed via
-            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
-            # factory above still raises so the singleton guard correctly
-            # skips the tick when config is truly unavailable.
-            logger.warning(
-                "K8s config not loaded for BatchV1Api: returning placeholder client."
-            )
-        _operator_batch_api = BatchV1Api()
-    return _operator_batch_api
+    return _cached_k8s_api(
+        "_operator_batch_api",
+        lambda: BatchV1Api(),
+        label="BatchV1Api",
+        strict=False,
+    )
 
 
 def operator_core_api() -> CoreV1Api:
-    """Return the process-wide :class:`CoreV1Api` (issue #251).
+    """Process-wide :class:`CoreV1Api` (issue #251) — lenient placeholder on no-config.
 
-    The SINGLE ``CoreV1Api()`` construction point in the operator. The
-    SLA monitor's worker-pod-eviction path
-    (:mod:`openstudio_operator.handlers.analysis_sla`,
-    :func:`_escalate_analysis`), the web_background monitor's worker-pod
-    liveness check
-    (:mod:`openstudio_operator.handlers.web_background_monitor`), and the
-    prune CronJob's Event emitter
-    (:mod:`openstudio_operator.prune_entrypoint`) import this factory
-    instead of instantiating ``CoreV1Api`` inline. The factory loads the
-    in-cluster / kubeconfig fallback via
-    :func:`openstudio_operator._k8s.load_operator_kube_config` (the
-    SINGLE public loader, issue #305) and caches the client for the
-    operator's lifetime. Inline ``CoreV1Api()`` calls outside this
-    function are a regression; the
-    AST test in
-    ``tests/test_singleton_registry_coverage.py::test_only_one_v1_api_construction_point_per_factory``
-    fails the CI gate loudly.
+    Consumers: the SLA monitor's worker-pod eviction, the web_background
+    monitor's worker-pod liveness check, the prune CronJob's Event emitter,
+    and the #463 Secret read in :mod:`openstudio_operator.client_factory`.
+    See :func:`_cached_k8s_api`.
     """
-    global _operator_core_api
-    if _operator_core_api is None:
-        try:
-            load_operator_kube_config()
-        except ConfigException:
-            # CI / bare-clone environments: leave the default
-            # Configuration uninitialised. The CoreV1Api() constructor
-            # stores the default without raising; actual API calls
-            # would fail later, but handlers fail closed via
-            # HANDLER_TICK_FAILURES_TOTAL. The strict operator_custom_objects_api
-            # factory above still raises so the singleton guard correctly
-            # skips the tick when config is truly unavailable.
-            logger.warning(
-                "K8s config not loaded for CoreV1Api: returning placeholder client."
-            )
-        _operator_core_api = CoreV1Api()
-    return _operator_core_api
+    return _cached_k8s_api(
+        "_operator_core_api",
+        lambda: CoreV1Api(),
+        label="CoreV1Api",
+        strict=False,
+    )
 
 
 def reset_operator_k8s_client() -> None:
