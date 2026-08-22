@@ -378,11 +378,13 @@ def test_pod_delete_admission_binding_binds_policy_to_openstudio_server():
 
 _ADMISSION_POLICY_KIND = "ValidatingAdmissionPolicy"
 _ADMISSION_BINDING_KIND = "ValidatingAdmissionPolicyBinding"
-# Issue #572 added a third admission file (secret-read-admission-policy.yaml);
+# Issue #572 added a third admission file (secret-read-admission-policy.yaml)
+# and #573 a fourth (deployment-patch-admission-policy.yaml);
 # the #565 fence below re-derives the doc inventory from a deploy/ glob, so
 # the new file must be consciously listed here (same discipline as
 # tests/_metrics_inventory.py, issue #406).
 _EXPECTED_VAP_FILES = {
+    "deployment-patch-admission-policy.yaml",
     "pod-delete-admission-policy.yaml",
     "secret-read-admission-policy.yaml",
     "storage-cronjob.yaml",
@@ -3888,4 +3890,284 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
         ) is True, (
             f"non-operator actor {other_actor!r} must be exempt from the "
             "#572 policy (userInfo carve-out)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #573 — the fourth ValidatingAdmissionPolicy: the operator SA's
+# Deployment mutating surface narrowed to the two managed names,
+# `worker` and `web-background`.
+#
+# deploy/rbac.yaml grants `deployments: [get, list, watch, patch,
+# update]` namespace-wide; the documented mutating surface is exactly
+# two names (worker_recycler's worker scale-down and
+# web_background_monitor's restartedAt restart). A compromised operator
+# pod could otherwise patch the `web` Deployment — the Rails pod
+# holding the Mongo credentials and the read-write NFS mount — and
+# pivot to full app compromise without touching pods/delete (#293) or
+# Secrets (#572).
+#
+# Scope note (mirrors the manifest's own header): the operations list
+# is ["UPDATE"] alone because the admission chain presents every HTTP
+# PATCH as operation UPDATE — the NamedRuleWithOperations enum has no
+# PATCH literal, and naming one is an apply-time Invalid reject (the
+# #565 dead-manifest failure mode). Both handler modules mutate
+# Deployments via patch_namespaced_deployment, so UPDATE covers 100%
+# of the real surface. The tests below pin that shape and evaluate the
+# MANIFEST'S OWN CEL with the #398 interpreter.
+# ---------------------------------------------------------------------------
+
+_DEPLOYMENT_PATCH_ADMISSION_DOCS = list(
+    yaml.safe_load_all((DEPLOY / "deployment-patch-admission-policy.yaml").read_text())
+)
+
+
+def _deployment_patch_admission_policy():
+    """Return the ValidatingAdmissionPolicy doc for #573."""
+    return next(
+        (
+            d
+            for d in _DEPLOYMENT_PATCH_ADMISSION_DOCS
+            if d.get("kind") == "ValidatingAdmissionPolicy"
+        ),
+        None,
+    )
+
+
+def _deployment_patch_admission_binding():
+    """Return the ValidatingAdmissionPolicyBinding doc for #573."""
+    return next(
+        (
+            d
+            for d in _DEPLOYMENT_PATCH_ADMISSION_DOCS
+            if d.get("kind") == "ValidatingAdmissionPolicyBinding"
+        ),
+        None,
+    )
+
+
+def _cel_deployment_patch_allows(expression, *, name, username=_OPERATOR_SA_FULL):
+    """Admission decision for the #573 validation expression against a
+    single-object Deployment request identified by ``request.name`` and
+    authenticated as ``username`` (default: the operator SA — the
+    principal the policy constrains). Reuses the #398 minimal
+    interpreter: True = allowed, False = rejected (falsy OR error — a
+    CEL error denies under ``failurePolicy: Fail``)."""
+    ctx = {"request": {"userInfo": {"username": username}, "name": name}}
+    tree = _CelParser(_cel_tokenize(expression)).parse()
+    try:
+        return _cel_eval(tree, ctx) is True
+    except _CelError:
+        return False
+
+
+def test_deployment_patch_admission_manifest_exists_and_parses():
+    """Issue #573 acceptance #1: deploy/deployment-patch-admission-policy.yaml
+    exists, parses, and contains exactly the two admissionregistration
+    resources — a lone policy is dormant and a lone binding is
+    unbound."""
+    assert _DEPLOYMENT_PATCH_ADMISSION_DOCS, (
+        "deploy/deployment-patch-admission-policy.yaml is missing or empty — "
+        "the operator SA's Deployment mutating surface is unconstrained at "
+        "the admission layer (issue #573)"
+    )
+    kinds = sorted(d["kind"] for d in _DEPLOYMENT_PATCH_ADMISSION_DOCS if d)
+    assert kinds == [
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+    ], (
+        "deploy/deployment-patch-admission-policy.yaml must declare exactly "
+        f"a ValidatingAdmissionPolicy + Binding, got {kinds!r}"
+    )
+
+
+def test_deployment_patch_admission_policy_targets_updates_on_apps_deployments():
+    """Issue #573 acceptance #2: the policy matches apps/v1 `deployments`
+    in `openstudio-server` only. The operations list is `["UPDATE"]`
+    ALONE — admission presents every HTTP PATCH (the operator's only
+    Deployment mutation path, patch_namespaced_deployment) as operation
+    UPDATE, the operations enum has no PATCH literal, and naming one is
+    an apply-time Invalid reject (the #565 dead-manifest mode). A
+    literal "PATCH" here must fail this fence, not an apiserver apply."""
+    policy = _deployment_patch_admission_policy()
+    assert policy is not None
+    assert policy["apiVersion"] == "admissionregistration.k8s.io/v1"
+    match = policy["spec"]["matchConstraints"]
+    rule = match["resourceRules"][0]
+    assert rule["apiGroups"] == ["apps"]
+    assert rule["apiVersions"] == ["v1"]
+    assert rule["resources"] == ["deployments"]
+    assert rule["operations"] == ["UPDATE"], (
+        "operations must be [\"UPDATE\"] — the admission layer presents "
+        "HTTP PATCH as UPDATE and there is no PATCH literal in the enum "
+        "(a literal 'PATCH' is an apply-time Invalid reject, issue #565); "
+        f"got {rule['operations']!r}"
+    )
+    assert match["namespaceSelector"] == {
+        "matchLabels": {"kubernetes.io/metadata.name": _OPERATOR_NS}
+    }, (
+        "policy namespaceSelector must restrict to "
+        f"{_OPERATOR_NS!r} — a cluster-wide match would evaluate the "
+        "rule in every namespace (issue #573)"
+    )
+
+
+def test_deployment_patch_admission_policy_cel_carveout_and_managed_names():
+    """Issue #573 acceptance #3: the CEL is the #293 carve-out shape —
+    the leading clause exempts every actor EXCEPT the operator SA
+    (humans and other SAs are untouched), and the trailing clauses
+    allow exactly the two managed Deployment names. Cross-fenced
+    against the Python constants the handlers actually default to and
+    the CRD's #160 enum, so the admission fence, the code, and the
+    schema can never drift to different name sets."""
+    from openstudio_operator._k8s import DEFAULT_WORKER_DEPLOYMENT
+    from openstudio_operator.handlers.web_background_monitor import (
+        DEFAULT_WEB_BACKGROUND_DEPLOYMENT,
+    )
+
+    policy = _deployment_patch_admission_policy()
+    full_expr = _strip_cel_whitespace(
+        " ".join(v["expression"] for v in policy["spec"]["validations"])
+    )
+    assert full_expr.count("||") == 2, (
+        "expected exactly the userInfo carve-out disjunct plus the two "
+        f"name clauses; got: {full_expr!r}"
+    )
+    carve_out, worker_clause, web_bg_clause = full_expr.split("||")
+    assert "request.userInfo.username" in carve_out and _OPERATOR_SA_FULL in carve_out, (
+        f"leading clause must be the userInfo carve-out naming the "
+        f"operator SA ({_OPERATOR_SA_FULL!r}); got: {carve_out!r}"
+    )
+    assert worker_clause.strip() == (
+        f"request.name == '{DEFAULT_WORKER_DEPLOYMENT}'"
+    ), (
+        "first name clause must allow exactly the worker Deployment "
+        f"(DEFAULT_WORKER_DEPLOYMENT == {DEFAULT_WORKER_DEPLOYMENT!r}); "
+        f"got: {worker_clause!r}"
+    )
+    assert web_bg_clause.strip() == (
+        f"request.name == '{DEFAULT_WEB_BACKGROUND_DEPLOYMENT}'"
+    ), (
+        "second name clause must allow exactly the web-background "
+        "Deployment (DEFAULT_WEB_BACKGROUND_DEPLOYMENT == "
+        f"{DEFAULT_WEB_BACKGROUND_DEPLOYMENT!r}); got: {web_bg_clause!r}"
+    )
+    # Cross-fence: the CRD's #160 enum admits exactly the same two names
+    # for both target fields (gated in depth by tests/test_crd_schema.py).
+    crd_text = (DEPLOY / "crd.yaml").read_text()
+    assert crd_text.count("self in ['worker', 'web-background']") >= 2, (
+        "deploy/crd.yaml must keep the #160 enum "
+        "\"self in ['worker', 'web-background']\" on BOTH "
+        "spec.targetWorkerDeployment and spec.targetWebBackgroundDeployment "
+        "— the #573 admission fence and the CRD enum must name the same "
+        "pair (worker / web-background)"
+    )
+
+
+def test_deployment_patch_admission_policy_failure_policy_is_fail_and_message_cites_issue():
+    """Issue #573 acceptance #4: `failurePolicy: Fail` (a CEL runtime
+    error or an unexpected request shape REJECTS — the safe direction),
+    and the single-line message (the #565 line-break rule is enforced
+    globally by the glob fence) cites the issue an operator hitting the
+    deny needs."""
+    policy = _deployment_patch_admission_policy()
+    assert policy["spec"]["failurePolicy"] == "Fail", (
+        "ValidatingAdmissionPolicy.failurePolicy must be 'Fail' so a CEL "
+        "evaluation error blocks the request (issue #573); 'Ignore' would "
+        "fail the #573 fence open"
+    )
+    message = policy["spec"]["validations"][0].get("message", "")
+    assert "573" in message, (
+        f"validation message must cite issue #573; got {message!r}"
+    )
+
+
+def test_deployment_patch_admission_binding_binds_policy_to_openstudio_server():
+    """Issue #573 acceptance #5: the binding names the policy above and
+    is schema-correct per the #565 conventions — `validationActions:
+    ["Deny"]` (required; the only action that blocks), scoping via
+    `matchResources` (the Binding schema has no `selector`), and the
+    openstudio-server namespaceSelector mirroring the policy's gate."""
+    binding = _deployment_patch_admission_binding()
+    assert binding is not None, (
+        "no ValidatingAdmissionPolicyBinding in "
+        "deploy/deployment-patch-admission-policy.yaml — the policy is "
+        "dormant without a binding (issue #573)"
+    )
+    assert binding["apiVersion"] == "admissionregistration.k8s.io/v1"
+    spec = binding["spec"]
+    policy = _deployment_patch_admission_policy()
+    assert spec["policyName"] == policy["metadata"]["name"]
+    assert spec.get("validationActions") == ["Deny"], (
+        "Binding.validationActions must be [\"Deny\"] — required by the v1 "
+        "Binding schema (issue #565) and the only action that blocks; got "
+        f"{spec.get('validationActions')!r}"
+    )
+    assert "selector" not in spec, (
+        "Binding spec has no `selector` field in "
+        "admissionregistration.k8s.io/v1 — scope via matchResources "
+        "(issue #565)"
+    )
+    ns_selector = spec.get("matchResources", {}).get("namespaceSelector")
+    assert ns_selector and ns_selector.get("matchLabels", {}).get(
+        "kubernetes.io/metadata.name"
+    ) == _OPERATOR_NS, (
+        "Binding must scope via matchResources.namespaceSelector to "
+        f"{_OPERATOR_NS!r}; got {ns_selector!r}"
+    )
+
+
+def test_deployment_patch_admission_cel_denies_operator_sa_unmanaged_deployment_names():
+    """Issue #573 acceptance #6 (interpreter-evaluated): the MANIFEST'S
+    OWN CEL rejects the compromise scenario — the operator SA patching
+    a Deployment OUTSIDE the managed pair, including the `web`
+    Deployment (the Rails pod holding the Mongo credentials and the
+    read-write NFS mount — the exact pivot named in the issue) and
+    near-miss names."""
+    policy = _deployment_patch_admission_policy()
+    expression = policy["spec"]["validations"][0]["expression"]
+    for hostile_name in (
+        "web",  # the Rails pod: Mongo creds + read-write NFS
+        "db",  # the Mongo Deployment
+        "redis",
+        "queue",
+        "workerz",  # near-miss: exact name required
+        "web-backgroundz",  # near-miss: exact name required
+        "openstudio-operator",  # the operator's own Deployment
+    ):
+        assert _cel_deployment_patch_allows(
+            expression, name=hostile_name, username=_OPERATOR_SA_FULL
+        ) is False, (
+            f"operator-SA request on Deployment {hostile_name!r} must be "
+            "rejected by the #573 CEL"
+        )
+    # An empty request.name must fail CLOSED — '' == 'worker' is false,
+    # '' == 'web-background' is false, and failurePolicy: Fail denies.
+    assert _cel_deployment_patch_allows(
+        expression, name="", username=_OPERATOR_SA_FULL
+    ) is False
+
+
+def test_deployment_patch_admission_cel_allows_managed_names_and_other_actors():
+    """Issue #573 acceptance #7 (interpreter-evaluated): the carve-out
+    works — the two managed names are allowed for the operator SA (the
+    worker-recycler and web-background-restart surfaces), and EVERY
+    other actor is untouched by the policy (humans via kubectl, the
+    prune SA, helm — the #293-style short-circuit), including on the
+    `web` Deployment the policy exists to protect."""
+    policy = _deployment_patch_admission_policy()
+    expression = policy["spec"]["validations"][0]["expression"]
+    for legal_name in ("worker", "web-background"):
+        assert _cel_deployment_patch_allows(
+            expression, name=legal_name, username=_OPERATOR_SA_FULL
+        ) is True, (
+            f"operator-SA request on {legal_name!r} (a managed Deployment "
+            "name) must be allowed"
+        )
+    for other_actor in ("kubernetes-admin", PRUNE_SA_FULL, "system:serviceaccount:kube-system:helm"):
+        assert _cel_deployment_patch_allows(
+            expression, name="web", username=other_actor
+        ) is True, (
+            f"non-operator actor {other_actor!r} must be exempt from the "
+            "#573 policy (userInfo carve-out)"
         )
