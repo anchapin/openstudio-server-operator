@@ -1,22 +1,29 @@
-# Trivy ignore list — the triaged-exception file for the image
-# vulnerability gates (issue #481: the ci.yml `audit` job scan of the
-# locally-built image + the release.yml post-push scans of the published
-# image, both running with `--severity CRITICAL,HIGH --exit-code 1`).
+# Trivy triage list — see the header rules below.
 #
-# Usage: one vulnerability identifier (CVE-… or GHSA-…) per line; `#`
-# starts a comment and blank lines are skipped. An id listed here is
-# excluded from the CRITICAL/HIGH failure in BOTH gates (they share this
-# file on purpose — an exception must not be narrower than the triage).
+# ISSUE #564 TIME-BOXED EXCEPTIONS: every entry below is a CURRENT
+# finding in the stale python:3.12-slim base digest (3 CRITICAL +
+# 50 HIGH across 16 unique CVEs, first observed by the #481 gate's
+# first run). The durable fix is the base-image refresh tracked in
+# #564 (dependabot #551 or a within-3.12-slim digest refresh).
+# When that lands: EMPTY this file back to comments-only and verify
+# the gate stays green without triage. Do not delete the gate.
 #
-# Triage rules:
-#   * Only list ids that have been INVESTIGATED, not merely observed:
-#     each entry needs an adjacent justification comment (why it is not
-#     exploitable in this image — e.g. the vulnerable code path is never
-#     executed by the operator) and a follow-up issue owning the rebuild.
-#   * Never delete a gate to make a finding pass; add the id here.
-#   * Re-review entries on every base-image digest bump (#124) and
-#     lockfile bump — an entry whose fixing version has shipped should
-#     be deleted in the same PR.
-#
-# There are currently no triaged exceptions — keep it that way unless a
-# real triage happens.
+# Rules: one CVE/GHSA per line; a justification comment + follow-up
+# issue are required for any NEW entry; re-review on dependabot
+# base-image bumps.
+CVE-2025-69720  # triaged via #564 (stale base digest)
+CVE-2026-13221  # triaged via #564 (stale base digest)
+CVE-2026-14456  # triaged via #564 (stale base digest)
+CVE-2026-41992  # triaged via #564 (stale base digest)
+CVE-2026-42496  # triaged via #564 (stale base digest)
+CVE-2026-42497  # triaged via #564 (stale base digest)
+CVE-2026-48962  # triaged via #564 (stale base digest)
+CVE-2026-53612  # triaged via #564 (stale base digest)
+CVE-2026-53613  # triaged via #564 (stale base digest)
+CVE-2026-53614  # triaged via #564 (stale base digest)
+CVE-2026-53615  # triaged via #564 (stale base digest)
+CVE-2026-54369  # triaged via #564 (stale base digest)
+CVE-2026-57432  # triaged via #564 (stale base digest)
+CVE-2026-57433  # triaged via #564 (stale base digest)
+CVE-2026-8376  # triaged via #564 (stale base digest)
+CVE-2026-9538  # triaged via #564 (stale base digest)

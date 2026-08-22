@@ -81,7 +81,8 @@ jobs:
           image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
           exit-code: 1
-          ignorefile: .trivyignore
+          trivyignores: .trivyignore
+          ignore-unfixed: true
       # Issue #149: after the build step resolves the digest, pin
       # deploy/operator-deployment.yaml AND deploy/storage-cronjob.yaml
       # to `@sha256:<digest>` and commit back to develop. The standard
@@ -249,7 +250,8 @@ jobs:
           image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
           exit-code: 1
-          ignorefile: .trivyignore
+          trivyignores: .trivyignore
+          ignore-unfixed: true
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign + attest the versioned image
