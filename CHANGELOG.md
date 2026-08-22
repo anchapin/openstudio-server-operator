@@ -62,6 +62,28 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   pip-compile pair.
 
 ### Added
+- **`#492`** — config-state posture gauges: `openstudio_operator_dry_run_active`,
+  `openstudio_operator_server_url_set`, `openstudio_operator_redis_url_set`,
+  `openstudio_operator_auto_soft_stop_enabled`, each 1/0 labelled by
+  `(namespace, name)` (CR identity, #311; bounded by D05). The operator's
+  behavior is steered by CR spec fields but none were represented at
+  /metrics: an audit-only install (`dryRun=true` left on after canary
+  staging) was invisible in an idle cluster because
+  `events_dry_run_suppressed_total` (#237) only increments when an action
+  is attempted — a quiet dry-run operator and a quiet live operator
+  produced identical scrapes. Two stamp sites by design: the shared
+  tick-runner `run_oscm_tick` stamps all four immediately after
+  `OperatorConfig.from_spec` succeeds (before the idle check and the
+  guarded try — posture survives idle and wiring-failing ticks, #493),
+  and the `dry_run_audit` watch handler (#397 wiring point) flips
+  `dry_run_active` immediately on real `spec.dryRun` transitions (no
+  next-tick latency; transition-gated like the DryRunToggled Event,
+  D11-exempt, loser CRs covered). `redis_url_set` counts the #463
+  `secretRef` as a URL source alongside inline `spec.redisUrl`. Shipped
+  with the `OpenStudioOperatorDryRunActive` alert (`== 1` for 1h, the
+  migration window; deploy/prometheustrule.yaml) and a "Config posture"
+  stat panel (deploy/grafana-dashboard.json, 14 panels). Registry now
+  20 counters + 13 gauges + 3 histograms.
 - **`#474`** — `tests/_fakes.py` is the single definition site for the
   byte-identical test fakes: `FakeCustomObjectsApi` (union semantics;
   the 409 injector folded in as `patch_conflicts=`; prune's list+get

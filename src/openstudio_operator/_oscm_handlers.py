@@ -305,6 +305,13 @@ def run_oscm_tick(
     Owns everything the four handler wrappers used to duplicate:
 
     * ``OperatorConfig.from_spec(spec)`` — the single config path;
+    * the #492 config-state posture gauges — ``stamp_config_posture_
+      gauges`` sets ``dry_run_active`` / ``server_url_set`` /
+      ``redis_url_set`` / ``auto_soft_stop_enabled`` for this CR
+      immediately after the config parse succeeds and BEFORE the idle
+      check / guarded try (posture is stamped on idle and
+      wiring-failing ticks too — it exists independent of tick
+      success);
     * the empty-``spec.serverUrl`` idle check — logs ``"<idle_label> idle
       this tick"`` and returns ``None`` WITHOUT touching the failure
       counter (an incomplete CR is not a tick failure);
@@ -362,6 +369,25 @@ def run_oscm_tick(
     thresholded.
     """
     config = OperatorConfig.from_spec(spec)
+    # Issue #492 — config-state posture gauges: stamped immediately
+    # after the config parse succeeds and BEFORE the idle check / the
+    # guarded try, so all four gauges advance even on ticks that go
+    # idle (empty serverUrl → server_url_set=0 IS the posture) or fail
+    # wiring (#493) — posture exists independent of tick success. The
+    # ``dry_run_audit`` watch handler additionally flips
+    # ``dry_run_active`` immediately on a spec.dryRun transition (no
+    # next-tick latency); this per-tick stamp is the backstop for all
+    # four fields (worst case one timer interval).
+    from openstudio_operator.metrics import stamp_config_posture_gauges
+
+    stamp_config_posture_gauges(
+        namespace=namespace,
+        name=name,
+        dry_run=config.dry_run,
+        server_url_set=bool(config.server_url),
+        redis_url_set=bool(config.redis_url or config.redis_credentials.secret_ref),
+        auto_soft_stop=config.analysis_policy.auto_soft_stop,
+    )
     try:
         if not config.server_url:
             logger.warning("spec.serverUrl is empty — %s idle this tick", idle_label)

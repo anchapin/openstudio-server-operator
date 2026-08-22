@@ -533,6 +533,109 @@
       ],
       "title": "Handler heartbeat lag (#469)",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Config posture of the active CR (#492) — dry_run_active, server_url_set, redis_url_set, auto_soft_stop_enabled, each 1/0 per (namespace, name). dry_run_active=1 (red) left on past a migration window means the operator is unarmed (D11 suppresses every mutation); server_url_set=0 is the idle posture; redis_url_set=0 is the #116 refuse-to-operate posture; auto_soft_stop_enabled=0 means the SLA monitor is passive.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "server_url_set" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "redis_url_set" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "auto_soft_stop_enabled" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "id": 14,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max by (namespace, name) (openstudio_operator_dry_run_active)",
+          "legendFormat": "dry_run_active",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max by (namespace, name) (openstudio_operator_server_url_set)",
+          "legendFormat": "server_url_set",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max by (namespace, name) (openstudio_operator_redis_url_set)",
+          "legendFormat": "redis_url_set",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max by (namespace, name) (openstudio_operator_auto_soft_stop_enabled)",
+          "legendFormat": "auto_soft_stop_enabled",
+          "refId": "D"
+        }
+      ],
+      "title": "Config posture (dry-run / URLs / autoSoftStop, #492)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
