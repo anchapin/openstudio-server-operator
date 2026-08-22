@@ -417,8 +417,12 @@ Fresh installs MUST run `scripts/rotate_redis_password.sh` first —
 it generates a per-cluster 32-character random password, substitutes
 it into the five manifests at apply time, and updates the live
 `openstudio-redis` Secret so the helm chart's `web` / `web_background`
-/ `worker` Deployments pick it up. The companion CI guard
-`scripts/check_redis_password_unique.sh` fails the build if the
+/ `worker` Deployments pick it up. Since #499 the script writes the
+password to a 0600 file (default `./rotated-redis-password.txt`, or
+`--out-file PATH`) and prints only the path — stdout carries no secret
+material; `--print-only` is the explicit escape hatch whose help text
+documents the scrollback/CI-log exposure trade-off. The companion CI
+guard `scripts/check_redis_password_unique.sh` fails the build if the
 legacy `openstudio` literal re-appears as a Redis password in any of
 the five manifest files (#150 was a real incident; this is the
 regression fence), and — since #462 — if
@@ -426,7 +430,8 @@ regression fence), and — since #462 — if
 unusable sentinel `CHANGE_ME_RUN_ROTATE_SCRIPT` as its committed
 password (the renamed `openstudio-rotated` placeholder was itself a
 publicly-known credential). The same rules hold for Mongo via
-`scripts/rotate_mongo_password.sh` +
+`scripts/rotate_mongo_password.sh` (same #499 file-based output,
+default `./rotated-mongo-password.txt`) +
 `scripts/check_mongo_password_unique.sh` (#219/#462).
 
 ### `/metrics` ingress is namespace-scoped (#166)
