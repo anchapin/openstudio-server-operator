@@ -8,6 +8,28 @@ good-first-PR candidates) lives in
 [`docs/onboarding.md`](./docs/onboarding.md) — read that first if you
 are new here.
 
+## Local development setup
+
+From a clean checkout:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e '.[dev]'
+
+ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
+.venv/bin/pytest # use the venv pytest — system pytest won't resolve `openstudio_operator`
+```
+
+Local installs are editable; CI installs from the hash-pinned
+`requirements.lock` instead (#173). For the full walkthrough
+(prerequisites, lockfile notes, first-green-run orientation) see
+[`docs/onboarding.md` → Quick start](./docs/onboarding.md#quick-start).
+
+- **Venv drift guard (#71):** in wave-orchestration worktrees the shared
+  venv can resolve `openstudio_operator` against a different checkout —
+  re-run `pip install -e '.[dev]'` from the new checkout, or verify with
+  `scripts/check_editable_install.sh`.
+
 ## Branching model
 
 - `develop` — the default branch. All work lands here. Direct pushes are
