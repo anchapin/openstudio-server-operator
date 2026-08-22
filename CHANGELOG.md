@@ -42,7 +42,9 @@ deadline + wedged-pipeline alert, `#396` TLS CA-bundle mount recipe,
 `#401` /metrics bearer authN, `#414` PriorityClass), the supply-chain
 CI repair (`#456` SLSA predicate shape, `#459` cosign digest
 extraction, `#564` base-image CVE refresh, `#565` VAP schemas, `#567`
-secretRef tick wiring, `#568` rotation-proof Redis client cache), the
+secretRef tick wiring, `#568` rotation-proof Redis client cache, `#569`
+prune deadline + staleness alert, `#570` partial-unwrap visibility,
+`#572`/`#573` Secret-mutation + Deployment-patch VAP fences), the
 `#566` PriorityClass runbook step, and the earlier iteration's
 test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`).
 
@@ -1105,6 +1107,30 @@ test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`).
   next tick instead of wedging every Resque read on WRONGPASS until a
   manual operator restart; the rotation script's next-step text gains
   the optional rollout-restart line as belt-and-suspenders.
+- **`#569`** — the prune CronJob's Job template carries
+  `activeDeadlineSeconds: 1800` (3 full schedule intervals, the `#394`
+  sizing pattern): a hung prune pod is DeadlineExceeded-killed within
+  ≤2 skipped schedules instead of starving every subsequent schedule
+  under `concurrencyPolicy: Forbid` with zero signal. Complemented by
+  the `OpenStudioOperatorPruneJobNoSuccess` warning (no successful
+  `openstudio-storage-pruner-*` Job in 1h) the `#468` set deferred.
+- **`#570`** — `openstudio_operator_singleton_expected_handlers` gauge
+  + the unwrap alert rekeyed to `wrapped < expected`: a PARTIAL
+  singleton-guard unwrap (one timer left running un-gated by a missing
+  `#250` registration or a `dataclasses.replace` TypeError) is now
+  visible at /metrics and pages, instead of only the total-unwrap
+  `== 0` case.
+- **`#572`** — `deploy/secret-read-admission-policy.yaml`: VAP fencing
+  the operator SA's Secret *mutations* to `openstudio-redis*` names
+  (RBAC-drift insurance for the `#463` exception; empty `request.name`
+  fails closed under `failurePolicy: Fail`). Material platform
+  constraint documented: admission cannot intercept GET — the
+  GET-exfiltration mechanism is tracked as `#606`.
+- **`#573`** — `deploy/deployment-patch-admission-policy.yaml`: VAP
+  constraining operator-SA Deployment patches to `worker` +
+  `web-background` (`operations: ["UPDATE"]` — HTTP PATCH presents as
+  UPDATE), closing the pivot where a compromised operator pod patches
+  the `web` Deployment (Mongo creds + RW NFS) or `db`.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
