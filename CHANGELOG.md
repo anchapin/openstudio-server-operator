@@ -8,18 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 Auto-improvement-loop sessions post-0.2.0 (2026-08-20 → 2026-08-22):
-three full audits opened `#387`–`#417` and `#462`–`#507`; waves closed
-the security/reliability/observability headliners — credential fences
-(`#462` sentinel Secrets, `#463` Redis secretRef, `#479` runtime-only
-image lockfile), scheduler observability (`#469` heartbeat gauge,
-`#471` REST retries counter, `#468` PrometheusRule + Grafana),
-prune-failure surfacing (`#470`), transport + egress hardening
-(`#476` rediss:// TLS, `#477` IMDS/CGNAT egress blocks), the `#473`
-tick-runner extraction ending four-copy wrapper drift (completed by
-`#493` wiring-failure skip-tick), the `#475` exception-hierarchy fix,
-and the test-infrastructure consolidation wave (`#474` shared fakes,
-`#482` config parsing, `#483` rolling-restart paths, `#485` deploy-
-inventory gate) — alongside the earlier iteration's
+four full audits opened `#387`–`#417`, `#462`–`#507`, and follow-ups
+(`#531`, `#544`); waves closed the security/reliability/observability/
+architecture headliners — credential fences (`#462` sentinel Secrets,
+`#463` Redis secretRef, `#479` runtime-only image lockfile), scheduler
+observability (`#469` heartbeat gauge, `#471` REST retries counter,
+`#468` PrometheusRule + Grafana, `#492` config-posture gauges,
+`#489` status-map lead-time gauge, `#504` build_info, `#491`
+wrap-count gauge), prune-failure surfacing (`#470`), transport +
+egress hardening (`#476` rediss:// TLS, `#477` IMDS/CGNAT egress
+blocks), the `#473` tick-runner extraction ending four-copy wrapper
+drift (completed by `#493` wiring-failure skip-tick), the `#475`
+exception-hierarchy fix, architecture consolidation (`#494` K8s
+factory helper, `#496` events alias unification, `#497` per-CR
+cache convention), the test-infrastructure waves (`#474`+`#531`
+shared fakes, `#482` config parsing, `#483` rolling-restart paths,
+`#485` deploy-inventory gate, `#501` EventEmitter coverage), and
+the documentation set (`#484` audit-policy index, `#487` ADR index,
+`#486` snapshot-cruft prune, `#503` CONTRIBUTING setup) — alongside
+the earlier iteration's
 NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 
 ### Changed
@@ -92,6 +99,36 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   `tests/test_dependency_drift.py` gates both lockfiles against
   `pyproject.toml`; both are refreshed together by the documented
   pip-compile pair.
+- **`#494`** — one `_cached_k8s_api(cache_attr, build, *, label, strict)`
+  helper owns the lazy-global caching, `load_operator_kube_config()`,
+  strict-raise vs placeholder-on-`ConfigException` semantics, and the
+  once-stated rationale docstring for the four K8s client factories;
+  the public names (`operator_custom_objects_api` etc.) stay as thin
+  delegates. Per-class module globals preserved deliberately (tests
+  monkeypatch them; `reset_operator_k8s_client()` assigns them), and
+  the construction-thunk shape keeps the bare `XApi()` call
+  AST-visible so the #158/#251/#305 gates are green unmodified.
+  singleton.py 835→790 lines.
+- **`#496`** — `events.py` is the canonical home for the emitter
+  aliases and the kopf.event wrapper: `TickEmitter` (3-arg),
+  `EventSink` (4-arg object-attached), and the shared
+  `emit_kopf_event()`. retention.py's colliding
+  `EventEmitter = Callable[...]` alias (same public name as the
+  events.py class, incompatible signature — a live trap) is gone;
+  singleton.py and dry_run_audit.py drop their duplicate
+  `EventSink`/`_emit_kopf_event` definitions.
+  `status_store.EmitStatusEvent` stays local with a justification
+  comment (zero external importers; `events_sinks.StatusEventSink` is
+  the public seam for that shape).
+- **`#531`** — one shared `FakeAppsV1Api` in `tests/_fakes.py` for the
+  deployment-patch surface: records every patch attempt (byte-identical
+  shape to the old copies) AND applies real RFC 7386 merge semantics
+  via `_fakes._merge_patch`, with `fail_with` injection and the helm
+  worker selector as the default `match_labels`. All four consumers
+  (test_analysis_sla, test_web_background_monitor, test_worker_recycler,
+  test_k8s_rolling_restart) import it; the #483 variant folds in; no
+  subclasses needed; zero assertion rewrites. Completes the #474
+  census.
 
 ### Added
 - **`#491`** — `openstudio_operator_singleton_wrapped_handlers`: boot-time
@@ -420,6 +457,27 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   the boot-time check fires on `#163`).
 - **`#257`** — `pytest` `slow` marker + duration budget to catch
   test-suite regressions before they land.
+- **`#489`** — `openstudio_operator_status_map_entries{namespace,name,
+  map_name}` (softStops/requeues/startedSince/archivedAnalyses) stamped
+  from map length in `StatusStore._read_status` — the fresh GET every
+  RMW cycle and typed getter lands on. SREs get a capacity panel and
+  the `OpenStudioOperatorStatusMapNearCap` alert (>8000 for 30m, the
+  0.8 × STATUS_MAP_MAX_ENTRIES threshold) with days of runway, instead
+  of learning about D04 anchor loss from duplicate-action anomalies
+  after `STATUS_MAP_CAPS_TOTAL` already fired.
+- **`#504`** — `openstudio_operator_build_info{version, python_version}`
+  fleet-identity gauge, set once at metrics import from
+  `importlib.metadata` (`PackageNotFoundError` → `"unknown"` fallback).
+  One series; makes every other series interpretable against a
+  release — the single-replica Recreate rolling-window scrape mix
+  becomes readable from the scrape itself.
+- **`#501`** — 15 tests pinning the D11 chokepoint's actual contract:
+  `__call__` delegation to `emit` (identical positional shape, same
+  counter labels, None return), mixed shim/emit suppression sharing
+  one counter series, ten metadata-missing body shapes pinning the
+  `<unknown>` fallbacks, and the kopf-1.4x MappingView behavior
+  (emits fine; extraction pinned as `<unknown>` — the production
+  label-degradation gap this surfaced is tracked as `#544`).
 - **`#298`** — CI drift gate for `pyproject.toml` dev deps vs
   `requirements.lock`. `tests/test_dependency_drift.py` parses
   `[project.optional-dependencies].dev` and asserts every entry has a
@@ -685,6 +743,25 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   key-references block and README's intro doc links; README's `docs/`
   tree comment now names all six top-level docs so it matches the
   directory.
+- **`#487`** — `docs/adr/` with an index + five records in
+  context/decision/consequences format (kopf pin, single-replica
+  Recreate, KEDA-only, VAPs, redisUrl fence) — each stands alone
+  offline, with issue numbers as pointers only. Linked from the
+  AGENTS.md key-references list; README's tree comment gains `adr/`.
+- **`#503`** — CONTRIBUTING.md gains the local development setup
+  section: venv + editable install + ruff + venv-pytest commands
+  verbatim from AGENTS.md, the docs/onboarding.md#quick-start link,
+  the lockfile-vs-editable note (#173), and the one-line venv-drift
+  warning (#71) at the conventional human entry point.
+- **`#486`** — the wave-orchestration surface is documented, not
+  mysterious: the two skill-snapshot cruft files
+  (`wave-planner.js.bak`, `_injection-test.js`) are deleted (zero
+  references); AGENTS.md's scripts/ bullet names the four orchestration
+  tools as the deliberate load-bearing exception to the
+  validation-toolkit framing; a docs bullet covers the
+  frozen-legacy + wave-numbered snapshot lineage (#379) with the
+  `~/.config/opencode/` canonical pointer; README's layout tree
+  mentions both.
 
 ### Fixed
 - **`#470`** — the storage-prune CronJob no longer masks failures behind
