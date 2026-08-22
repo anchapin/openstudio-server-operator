@@ -19,6 +19,14 @@ none of the four handler modules owns. Today it hosts:
 * :class:`DeploymentReader` — the structural ``AppsV1Api`` slice the operator
   needs (read-only lookup), so handlers can type-hint the same Protocol and
   tests can fake exactly one shape,
+* :class:`PodLister` — the structural ``CoreV1Api`` slice for read-only pod
+  listing, shared by the web_background stall monitor (leg-C liveness
+  corroboration) and — via the ``WorkerPodApi`` extension in
+  ``handlers/analysis_sla.py`` — the SLA escalation path (issue #505),
+* :class:`DeploymentManager` — :class:`DeploymentReader` extended with
+  ``patch_namespaced_deployment`` for the rolling-restart/recycle paths,
+  imported by both ``worker_recycler`` and ``web_background_monitor``
+  (issue #505),
 * :func:`deployment_label_selector` — build a Kubernetes ``label_selector=``
   query string from a Deployment's own ``spec.selector`` (honors BOTH
   ``matchLabels`` AND ``matchExpressions``; the narrow-fallback-on-unsupported
@@ -69,18 +77,68 @@ class DeploymentReader(Protocol):
     ``read_namespaced_deployment(name, namespace)`` callable satisfies the
     Protocol. The wider ``AppsV1Api`` shape (deployments, stateful sets, etc.)
     is intentionally NOT captured here: handlers that need additional methods
-    should declare their own narrow Protocol and extend the surface
-    deliberately, rather than type-hinting against the full ``AppsV1Api`` and
-    forcing every test fake to reproduce the same broad interface.
+    should declare their own Protocol that EXTENDS a ``_k8s`` Protocol and
+    adds only the genuinely handler-specific surface, rather than
+    type-hinting against the full ``AppsV1Api`` and forcing every test fake
+    to reproduce the same broad interface. Since #505 the shared slices live
+    here (``DeploymentReader``/``DeploymentManager``/``PodLister``); the
+    handler-local exemption is reserved for genuine extensions only — e.g.
+    ``analysis_sla.WorkerPodApi`` extending :class:`PodLister` with the
+    eviction-path ``delete_namespaced_pod``.
 
     Issue #236 surfaced a second Protocol (``WorkerDeploymentApi`` in
     :mod:`openstudio_operator.handlers.web_background_monitor`) that wraps
     ``DeploymentReader`` with a ``patch_namespaced_deployment`` method for the
-    rolling-restart path. That Protocol is handler-local and stays put —
-    :func:`deployment_label_selector` only needs the read-only slice.
+    rolling-restart path. Issue #505 moved that superset here as
+    :class:`DeploymentManager` (its worker_recycler subset
+    ``DeploymentPatcher`` was folded into the same import) —
+    :func:`deployment_label_selector` still needs only the read-only slice.
     """
 
     def read_namespaced_deployment(self, name: str, namespace: str, **_: object) -> object: ...
+
+
+class DeploymentManager(DeploymentReader, Protocol):
+    """Structural type of ``AppsV1Api`` for Deployment read + patch (issue #505).
+
+    ``worker_recycler``'s ``DeploymentPatcher`` (patch-only) and
+    ``web_background_monitor``'s ``WorkerDeploymentApi`` (read + patch) were
+    two handler-local views of the same method pair — a future signature
+    change would have had to be mirrored in both or the two handlers' views
+    of ``AppsV1Api`` would silently diverge. The superset now lives here;
+    both handlers import it. The recycle path only exercises the patch
+    method, but Protocols are structural: consumers may use a subset of the
+    declared surface, and the real ``AppsV1Api`` satisfies the whole
+    Protocol either way.
+
+    Tests fake exactly the methods they exercise — a fake with only
+    ``patch_namespaced_deployment`` satisfies every ``worker_recycler`` call
+    site; ``web_background_monitor`` call sites additionally read the
+    Deployment through :func:`deployment_label_selector`.
+    """
+
+    def patch_namespaced_deployment(
+        self, name: str, namespace: str, body: dict, **_: object
+    ) -> object: ...
+
+
+class PodLister(Protocol):
+    """Structural type of ``CoreV1Api`` for read-only pod listing (issue #505).
+
+    ``analysis_sla``'s ``WorkerPodApi`` and ``web_background_monitor``'s
+    handler-local ``PodLister`` both declared ``list_namespaced_pod`` with
+    identical signatures — two structural types for one K8s method meant
+    test fakes typed against one did not document compatibility with the
+    other. The shared slice now lives here; ``web_background_monitor``
+    imports it directly, and ``analysis_sla``'s ``WorkerPodApi`` extends it
+    with the eviction-path ``delete_namespaced_pod`` (a genuine surface
+    extension — that module is the only pod-deleting consumer).
+
+    Tests fake exactly this — passing any object with a
+    ``list_namespaced_pod(namespace)`` callable satisfies the Protocol.
+    """
+
+    def list_namespaced_pod(self, namespace: str, **_: object) -> object: ...
 
 
 def deployment_label_selector(

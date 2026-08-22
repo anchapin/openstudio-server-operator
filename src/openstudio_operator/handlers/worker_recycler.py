@@ -51,13 +51,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
 
 import kopf
 
 from openstudio_operator._k8s import (
     DEFAULT_WORKER_DEPLOYMENT,
     RESTARTED_AT_ANNOTATION,
+    DeploymentManager,
     rolling_restart_deployment,
 )
 from openstudio_operator._oscm_handlers import (
@@ -104,13 +104,6 @@ TRIGGER_INTERVAL_ELAPSED = "interval-elapsed"
 
 _COMPLETED = "completed"
 
-class DeploymentPatcher(Protocol):
-    """Structural type of ``AppsV1Api`` as used here — tests fake exactly this."""
-
-    def patch_namespaced_deployment(
-        self, name: str, namespace: str, body: dict, **_: object
-    ) -> object: ...
-
 
 def _blocks_recycle(status: object) -> bool:
     """Only ``started`` counts as in-flight work (issue #11 spec).
@@ -143,7 +136,7 @@ def run_recycler_tick(
     client: OpenStudioClient,
     store: StatusStore,
     config: OperatorConfig,
-    apps_api: DeploymentPatcher,
+    apps_api: DeploymentManager,
     *,
     namespace: str,
     now: datetime,
@@ -192,7 +185,7 @@ class _RecyclerTimerClients:
     """Client bundle the recycler timer's ``wire`` closure builds each tick (#473)."""
 
     client: OpenStudioClient
-    apps_api: DeploymentPatcher
+    apps_api: DeploymentManager
 
 
 @kopf.timer(_SPEC["group"], _SPEC["version"], _SPEC["plural"], interval=POLL_INTERVAL_SECONDS)

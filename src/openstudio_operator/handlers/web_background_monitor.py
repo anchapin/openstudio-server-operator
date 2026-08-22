@@ -96,7 +96,6 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
 
 import kopf
 from kubernetes.client import ApiException
@@ -147,6 +146,8 @@ from openstudio_operator._constants import (
 from openstudio_operator._k8s import (
     DEFAULT_WORKER_DEPLOYMENT,
     RESTARTED_AT_ANNOTATION,
+    DeploymentManager,
+    PodLister,
     deployment_label_selector,
     rolling_restart_deployment,
 )
@@ -294,22 +295,6 @@ _RUNNING = "Running"
 # in one place.
 
 
-class WorkerDeploymentApi(Protocol):
-    """Structural type of ``AppsV1Api`` as used here — tests fake exactly this."""
-
-    def read_namespaced_deployment(self, name: str, namespace: str, **_: object) -> object: ...
-
-    def patch_namespaced_deployment(
-        self, name: str, namespace: str, body: dict, **_: object
-    ) -> object: ...
-
-
-class PodLister(Protocol):
-    """Structural type of ``CoreV1Api`` as used here — tests fake exactly this."""
-
-    def list_namespaced_pod(self, namespace: str, **_: object) -> object: ...
-
-
 class StallWindowTracker:
     """In-memory sustained-window clock for one CR (conservative cache, D04).
 
@@ -445,7 +430,7 @@ def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -
 
 
 def _worker_pods_healthy(
-    apps_api: WorkerDeploymentApi, pods_api: PodLister, *, namespace: str, deployment: str
+    apps_api: DeploymentManager, pods_api: PodLister, *, namespace: str, deployment: str
 ) -> bool:
     """Leg C: the worker fleet looks fine to Kubernetes.
 
@@ -485,7 +470,7 @@ def _worker_pods_healthy(
 
 def _stall_condition_holds(
     redis_client: ReadOnlyRedisClient,
-    apps_api: WorkerDeploymentApi,
+    apps_api: DeploymentManager,
     pods_api: PodLister,
     *,
     namespace: str,
@@ -619,7 +604,7 @@ def run_stall_tick(
     redis_client: ReadOnlyRedisClient,
     store: StatusStore,
     config: OperatorConfig,
-    apps_api: WorkerDeploymentApi,
+    apps_api: DeploymentManager,
     pods_api: PodLister,
     *,
     namespace: str,
@@ -736,7 +721,7 @@ class _StallTimerClients:
     """Client bundle the stall monitor's ``wire`` closure builds each tick (#473)."""
 
     redis_client: ReadOnlyRedisClient
-    apps_api: WorkerDeploymentApi
+    apps_api: DeploymentManager
     pods_api: PodLister
     tracker: StallWindowTracker
 
