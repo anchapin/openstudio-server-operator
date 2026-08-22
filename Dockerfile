@@ -1,9 +1,17 @@
 # Pinned by digest — issue #124 (operator/rclone/python base image drift).
-# 3.12-slim @ 876416ecde9aca2bcc90e1fb0c7a9500bbf749f5788b70f82d4c5a5c2357f8b4
+# 3.12-slim-bookworm @ a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134
+# Issue #564: moved from python:3.12-slim (trixie) to the bookworm variant.
+# The 2026-08 trixie digests still ship 4 gate-visible HIGHs (util-linux
+# CVE-2026-53612/53613/53614/53615 — fixed in 2.41.5-0+deb13u1 upstream but
+# not yet rebuilt into any published digest), while bookworm scans clean at
+# the #481 trivy floor (CRITICAL,HIGH with --ignore-unfixed, the ci.yml
+# audit-job flags) with .trivyignore empty. Same Python 3.12 line, so no
+# test-matrix change; the 3.12-vs-3.14 evidence is on issue #564.
 # Refresh this digest on Python security releases by running:
-#   docker buildx imagetools inspect python:3.12-slim
-# and updating both this line and the cosign-trust step in release.yml.
-FROM python:3.12-slim@sha256:876416ecde9aca2bcc90e1fb0c7a9500bbf749f5788b70f82d4c5a5c2357f8b4
+#   docker buildx imagetools inspect python:3.12-slim-bookworm
+# and updating this line. (release.yml cosign signs the built image's own
+# digest — it carries no base-digest reference.)
+FROM python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134
 
 WORKDIR /app
 
