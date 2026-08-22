@@ -219,10 +219,18 @@ dev machine with kubeconfig pointed at kind:
    kubectl apply -f deploy/rbac.yaml
    # Issue #293 — ValidatingAdmissionPolicy narrows the operator's
    # pods/delete blast radius (native RBAC has no label-selector slot).
-   # Apply AFTER rbac.yaml so the operator SA referenced in the CEL
-   # rule already exists at admission-evaluation time.
-   kubectl apply -f deploy/pod-delete-admission-policy.yaml
-   ```
+    # Apply AFTER rbac.yaml so the operator SA referenced in the CEL
+    # rule already exists at admission-evaluation time.
+    kubectl apply -f deploy/pod-delete-admission-policy.yaml
+    # Issue #414 — cluster-scoped PriorityClass referenced at admission
+    # by the operator Deployment and prune CronJob pods
+    # (`priorityClassName: openstudio-operator-critical`); admission
+    # rejects pods naming a class that does not exist. This walkthrough
+    # runs kopf locally (step 3), so nothing references it yet — apply
+    # it here to mirror validation.md Phase A step 1, whose step 4
+    # creates the operator Deployment.
+    kubectl apply -f deploy/priority-class.yaml
+    ```
 
 2. **Create the OSCM custom resource in dry-run mode** — the CRD
    `spec.serverUrl` is the authoritative server URL (D-decision; the env
