@@ -46,6 +46,8 @@ from datetime import UTC, datetime
 from typing import TypeVar
 
 from kubernetes.client import ApiException
+from kubernetes.config import ConfigException
+from urllib3.exceptions import LocationValueError
 
 from openstudio_operator.config import OperatorConfig, OperatorConfigError
 from openstudio_operator.events import EventEmitter
@@ -221,10 +223,11 @@ def observe_tick_duration(*, module: str):
 
 #: The canonical skip-tick exception tuple (issue #473): the UNION of the
 #: four historical per-wrapper tuples, so no handler silently lost a
-#: catch in the unification. Wiring failures skip the tick and retry on
-#: the next poll (D12); anything outside this tuple propagates to kopf as
-#: an uncaught handler error (fail-closed, pinned by the issue #249
-#: negative tests in ``tests/test_timer_wrapper_failures.py``).
+#: catch in the unification. Tick failures AND wiring failures skip the
+#: tick and retry on the next poll (D12); anything outside this tuple
+#: propagates to kopf as an uncaught handler error (fail-closed, pinned
+#: by the issue #249 negative tests in
+#: ``tests/test_timer_wrapper_failures.py``).
 #:
 #: Issue #475 added ``OperatorConfigError`` as an EXPLICIT member. Pre-#475
 #: it subclassed ``RedisClientError``, so the historical wrappers'
@@ -236,12 +239,47 @@ def observe_tick_duration(*, module: str):
 #: bumps the failure counter, and retries on the next poll — where a fixed
 #: Secret, CR spec, or re-mounted bundle is picked up live — instead of
 #: propagating as an uncaught kopf handler error.
+#:
+#: Issue #493 added the wiring/CONSTRUCTION failure members (the two
+#: classes the client-construction path actually raises through — see the
+#: explicit block inside the tuple below) and moved ``wire(config)`` (and
+#: the store/emitter construction that precedes it) INSIDE the guarded
+#: region, so a kubeconfig-load or client-construction failure gets the
+#: same counted skip as a tick failure instead of escaping as an uncaught
+#: kopf handler error.
 SKIP_TICK_EXCEPTIONS: tuple[type[Exception], ...] = (
     OpenStudioApiError,
     StatusStoreError,
     ApiException,
     RedisClientError,
     OperatorConfigError,
+    # Wiring/construction failures (issue #493): the classes the
+    # client-construction path actually raises through.
+    #
+    # * ``ConfigException`` — ``kubernetes.config.ConfigException``, what
+    #   :func:`openstudio_operator._k8s.load_operator_kube_config` /
+    #   the strict ``operator_custom_objects_api`` factory propagate when
+    #   neither the in-cluster service-account config nor the
+    #   ``~/.kube/config`` fallback can be loaded.
+    # * ``LocationValueError`` — ``urllib3.exceptions.LocationValueError``
+    #   ("No host specified."), what the kubernetes client's urllib3
+    #   transport raises when an API object built against an uninitialised
+    #   default ``Configuration`` makes its first real call (the lenient
+    #   ``operator_*_api`` placeholder path; proven live in #66's kind
+    #   validation). It exists in both urllib3 1.26 and 2.x, so the import
+    #   is stable across the whole supported ``kubernetes>=29.3,<37`` range.
+    #
+    # D12 correctness of skip-on-wiring-failure: the fix for a wiring
+    # failure (misconfigured chart, rotated secret, re-mounted kubeconfig)
+    # lands OUTSIDE the tick loop, so skipping + retrying next poll picks
+    # the fix up live — the same D12 reasoning #475 documented for
+    # ``OperatorConfigError``. Deliberately NOT caught: bare ``Exception``
+    # or ``ValueError`` — a malformed (non-empty) redis URL still fails
+    # closed as an uncaught kopf handler error (pinned by the #249
+    # negative tests); only these two named construction-failure classes
+    # widened the tuple.
+    ConfigException,
+    LocationValueError,
 )
 
 _DepsT = TypeVar("_DepsT")
@@ -274,19 +312,27 @@ def run_oscm_tick(
       passes its module-level factory so tests can monkeypatch the name
       in the handler module's namespace exactly as before;
     * ``EventEmitter(body=body, dry_run=config.dry_run)`` — the D11 gate;
-    * the try/tick/except tail — a tick raising anything in
-      :data:`SKIP_TICK_EXCEPTIONS` increments
-      ``HANDLER_TICK_FAILURES_TOTAL.labels(namespace, name, module,
-      error_type)`` exactly once and logs the single per-handler
-      skip-tick warning (the sole ``%``-formatted site of that wording
-      in ``src/``); anything else propagates.
+    * the guarded try — client construction (``custom_objects_api()``,
+      :class:`StatusStore`, :class:`EventEmitter`, ``wire(config)``) AND
+      the tick invocation run INSIDE the region catching
+      :data:`SKIP_TICK_EXCEPTIONS` (issue #493 — pre-#493 the wire call
+      ran outside it, so a kubeconfig-load / client-construction failure
+      escaped as an uncaught kopf handler error instead of the counted
+      skip). Anything in the tuple — whether raised by the wiring or by
+      the tick — increments ``HANDLER_TICK_FAILURES_TOTAL.labels(
+      namespace, name, module, error_type)`` exactly once and logs the
+      single per-handler skip-tick warning (the sole ``%``-formatted
+      site of that wording in ``src/``); anything else propagates.
 
     The handler module contributes the two closures:
 
     * ``wire(config)`` — build the module's own clients (REST client,
-      Redis client, core/apps APIs, tracker caches, …); runs OUTSIDE the
-      try so a raising constructor still propagates uncounted, exactly
-      like the pre-#473 wrappers;
+      Redis client, core/apps APIs, tracker caches, …); runs INSIDE the
+      guarded try (issue #493), so a raising constructor (kubeconfig
+      load, TLS validation, URL parsing that raises an in-tuple class)
+      is counted, logged, and skipped like a tick failure — the D12
+      posture, because the fix lands outside the tick loop and the next
+      poll picks it up live;
     * ``tick(config=..., store=..., emit=..., deps=..., now=...)`` —
       invoke the module's ``run_*_tick``; receives the constructed
       wiring plus ``now=datetime.now(UTC)``.
@@ -299,7 +345,11 @@ def run_oscm_tick(
     ``HANDLER_LAST_TICK_TIMESTAMP.labels(module=module)`` to
     ``time.time()`` in the outer ``finally`` below, on ALL terminal
     paths (successful tick, empty-``serverUrl`` idle return, caught
-    skip-tuple failure, and propagating uncaught exception). The
+    skip-tuple failure — including wiring/construction failures since
+    #493 —, and propagating uncaught exception). A wiring-failing-but-
+    scheduled operator therefore reads as ALIVE on the heartbeat gauge
+    while its ``HANDLER_TICK_FAILURES_TOTAL`` climbs — exactly the
+    sustained-outage signature SREs alert on. The
     heartbeat answers whether the scheduler is invoking this module's
     timer at all — a flat gauge is the only /metrics-visible signature
     of a silently-dead scheduler (kopf internals shift so
@@ -316,11 +366,17 @@ def run_oscm_tick(
         if not config.server_url:
             logger.warning("spec.serverUrl is empty — %s idle this tick", idle_label)
             return None
-        store = StatusStore(namespace, name, custom_objects_api())
-        emit = EventEmitter(body=body, dry_run=config.dry_run)
-        deps = wire(config)
         now = datetime.now(UTC)
         try:
+            # Issue #493 — client construction (the kube-API factory
+            # call, StatusStore/EventEmitter, and the handler's wire
+            # closure) runs INSIDE the guarded region: a kubeconfig-load
+            # or client-construction failure raises an in-tuple class
+            # (ConfigException / LocationValueError) and gets the same
+            # counted skip-tick treatment as a tick failure.
+            store = StatusStore(namespace, name, custom_objects_api())
+            emit = EventEmitter(body=body, dry_run=config.dry_run)
+            deps = wire(config)
             return tick(config=config, store=store, emit=emit, deps=deps, now=now)
         except SKIP_TICK_EXCEPTIONS as exc:
             from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL

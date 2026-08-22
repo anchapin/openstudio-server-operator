@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-885 tests across 43 files (run `.venv/bin/pytest --collect-only` to
+889 tests across 43 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -201,9 +201,12 @@ step and `tests/test_singleton_registry_coverage.py` will fail loudly
    `HANDLER_TICK_FAILURES_TOTAL` increment, and the single skip-tick
    log line — your module supplies only a `wire` closure (its specific
    clients) and a `tick` closure (the `run_*_tick` invocation), plus
-   any result-specific tail logging. Do NOT copy a pre-#473 ~35-line
-   wrapper; the four existing modules are the canonical `wire`/`tick`
-   templates.
+   any result-specific tail logging. Since #493 the `wire` call runs
+   INSIDE the runner's guarded region, so a client-construction failure
+   (kubeconfig load, TLS validation) gets the standard counted skip-tick
+   instead of an uncaught kopf handler error. Do NOT copy a pre-#473
+   ~35-line wrapper; the four existing modules are the canonical
+   `wire`/`tick` templates.
 
 3. **Add the module to the import block** in
    `src/openstudio_operator/handlers/__init__.py`. The import block is

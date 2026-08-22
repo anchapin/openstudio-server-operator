@@ -16,7 +16,9 @@ the factories return placeholders; the singleton-guard-wrapped tick skips
 without touching :data:`openstudio_operator.metrics.HANDLER_TICK_FAILURES_TOTAL`;
 a direct API call against the placeholder raises ``urllib3.exceptions.
 LocationValueError('No host specified.')`` (a :class:`ValueError` subclass
-NOT in any wrapper's catch tuple — the wrapper re-raises); a direct handler
+— since issue #493 a member of the shared ``SKIP_TICK_EXCEPTIONS`` tuple,
+so through a timer wrapper it is now counted and skipped; pre-#493 it
+re-raised); a direct handler
 that catches an in-tuple exception (e.g. :class:`kubernetes.client.ApiException`)
 on the operator_core_api call site increments
 ``HANDLER_TICK_FAILURES_TOTAL{module=..., error_type=...}`` by exactly 1 and
@@ -170,13 +172,16 @@ def _stub_operator_k8s_client(monkeypatch: pytest.MonkeyPatch) -> None:
     The ``analysis_sla_monitor`` wrapper constructs
     ``StatusStore(namespace, name, operator_custom_objects_api())`` before
     invoking ``run_sla_tick``. Under the no-config state the strict factory
-    would raise :class:`ConfigException` BEFORE the wrapper's try/except
-    block runs — i.e. the wrapper would propagate the exception, never
-    reaching the lenient path. Test 3 needs the handler to reach its
-    ``operator_core_api()`` call site, which means the strict factory must
-    succeed first. We swap the strict factory for a sentinel object so
-    :class:`StatusStore` is constructable; the lenient factory remains the
-    real one (the system under test).
+    would raise :class:`ConfigException` inside the runner's guarded
+    region — since #493 that is counted + skipped as
+    ``HANDLER_TICK_FAILURES_TOTAL{error_type=ConfigException}`` (pre-#493
+    it propagated uncounted out of the wrapper), and in both postures the
+    handler never reaches the lenient path. Test 3 needs the handler to
+    reach its ``operator_core_api()`` call site without that construction-
+    failure skip, which means the strict factory must succeed first. We
+    swap the strict factory for a sentinel object so :class:`StatusStore`
+    is constructable; the lenient factory remains the real one (the
+    system under test).
     """
     sentinel = object()
     monkeypatch.setattr(analysis_sla, "operator_custom_objects_api", lambda: sentinel)
@@ -446,10 +451,12 @@ def test_handler_with_lenient_api_call_increments_tick_failures(
     * The handler body's ``run_sla_tick`` is monkeypatched to raise
       :class:`ApiException` — simulating the failure mode the issue
       describes ("the first real API call against one raises LocationValueError
-      or similar"). :class:`ApiException` is in the wrapper's catch tuple
-      (the natural :class:`urllib3.exceptions.LocationValueError` is NOT,
-      so we use the closest in-tuple analogue — the contract asserted is
-      "exceptions in the wrapper's tuple cause the counter to bump").
+      or similar"). :class:`ApiException` is in the wrapper's catch tuple;
+      the natural :class:`urllib3.exceptions.LocationValueError` also joined
+      the tuple in #493 (it now gets the same counted skip), but ApiException
+      remains the simulated failure here so the #286 scenario shape stays
+      decoupled from urllib3 internals — the contract asserted is
+      "exceptions in the wrapper's tuple cause the counter to bump".
 
     Three contracts asserted:
 
@@ -480,8 +487,9 @@ def test_handler_with_lenient_api_call_increments_tick_failures(
     # stands in for whatever exception the placeholder's actual API
     # method (e.g. ``list_namespaced_pod``) would raise in the real
     # no-config state — see the module docstring for why we use
-    # ApiException (in the wrapper's tuple) rather than LocationValueError
-    # (NOT in the wrapper's tuple).
+    # ApiException: LocationValueError (the real no-config call error)
+    # joined the shared skip tuple in #493, so either class now bumps
+    # the counter; ApiException keeps the seam decoupled from urllib3.
     simulated_failure = ApiException(status=500, reason="lenient-path API call failed (#286)")
 
     def _boom(*_a: object, **_k: object) -> object:
