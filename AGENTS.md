@@ -15,6 +15,7 @@ Codebase structure and key references:
 - `docs/audit-dryrun-idempotency.md` — cross-cutting idempotency / dry-run audit (D04 / D05 / D11 / D12).
 - `docs/validation.md`, `docs/kind-validation.md` — cluster validation runbooks + live evidence.
 - `docs/audit-policy.md` — kube-apiserver audit-policy recipe for the operator's API surface (#399).
+- `docs/adr/` — ADR index for the load-bearing decisions (kopf pin, single-replica, KEDA-only, VAPs, redisUrl fence) (#487).
 - `CHANGELOG.md` — curated Keep-a-Changelog notes per release (issue #177).
 
 OpenCode-specific: the `codebase-memory-mcp` server is wired up for this repo (see `~/.config/opencode/AGENTS.md`). Prefer `search_graph` / `trace_path` / `get_code_snippet` over grep/glob for structural questions (handler wiring, callers, call chain). Use grep/glob only for string literals and non-code files.

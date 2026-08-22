@@ -310,7 +310,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
 │   ├── prometheustrule.yaml    # PrometheusRule alert definitions for the /metrics surface (#468)
 │   └── grafana-dashboard.json  # Grafana dashboard JSON — action counters, tick histograms, Resque gauges (#468)
-├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/
+├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/, adr/
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker
 ├── src/openstudio_operator/
 │   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
