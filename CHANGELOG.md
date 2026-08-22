@@ -9,24 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Auto-improvement-loop sessions post-0.2.0 (2026-08-20 → 2026-08-22):
 four full audits opened `#387`–`#417`, `#462`–`#507`, and follow-ups
-(`#531`, `#544`); waves closed the security/reliability/observability/
-architecture headliners — credential fences (`#462` sentinel Secrets,
-`#463` Redis secretRef, `#479` runtime-only image lockfile), scheduler
-observability (`#469` heartbeat gauge, `#471` REST retries counter,
-`#468` PrometheusRule + Grafana, `#492` config-posture gauges,
-`#489` status-map lead-time gauge, `#504` build_info, `#491`
-wrap-count gauge), prune-failure surfacing (`#470`), transport +
-egress hardening (`#476` rediss:// TLS, `#477` IMDS/CGNAT egress
-blocks), the `#473` tick-runner extraction ending four-copy wrapper
-drift (completed by `#493` wiring-failure skip-tick), the `#475`
+(`#531`, `#544`, `#564`); waves closed the
+security/reliability/observability/architecture headliners — credential
+fences (`#462` sentinel Secrets, `#463` Redis secretRef, `#479`
+runtime-only image lockfile), scheduler observability (`#469`
+heartbeat gauge, `#471` REST retries counter, `#468` PrometheusRule +
+Grafana, `#492` config-posture gauges, `#489` status-map lead-time
+gauge, `#504` build_info, `#491` wrap-count gauge, `#488` dependency
+latency histograms, `#490` key-layout freshness), bug fixes (`#544`
+MappingView labels, `#470` prune-failure surfacing, `#499`
+rotation-script secrets, `#478` pruner-metrics parity), supply-chain
+automation (`#480` dependabot, `#481` pip-audit + trivy gates,
+`#500` deploy-time cosign), transport + egress hardening (`#476`
+rediss:// TLS, `#477` IMDS/CGNAT egress blocks, `#498` PSS labels),
+the `#473` tick-runner extraction ending four-copy wrapper drift
+(completed by `#493` wiring-failure skip-tick), the `#475`
 exception-hierarchy fix, architecture consolidation (`#494` K8s
-factory helper, `#496` events alias unification, `#497` per-CR
-cache convention, `#506` parse-wrapper dedup), the test-infrastructure waves (`#474`+`#531`
-shared fakes, `#482` config parsing, `#483` rolling-restart paths,
-`#485` deploy-inventory gate, `#501` EventEmitter coverage), and
-the documentation set (`#484` audit-policy index, `#487` ADR index,
-`#486` snapshot-cruft prune, `#503` CONTRIBUTING setup) — alongside
-the earlier iteration's
+factory helper, `#495` CRD identity constants, `#496` events alias
+unification, `#497` per-CR cache convention, `#505` Protocol slices,
+`#506` parse-wrapper factory, `#507` E402 enforcement), the
+test-infrastructure waves (`#474`+`#531` shared fakes, `#482` config
+parsing, `#483` rolling-restart paths, `#485` deploy-inventory gate,
+`#501` EventEmitter coverage), and the documentation set (`#484`
+audit-policy index, `#487` ADR index, `#486` snapshot-cruft prune,
+`#503` CONTRIBUTING setup) — alongside the earlier iteration's
 NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
 
 ### Changed
@@ -764,6 +770,61 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   409 → `StatusStoreConflictError` (pins the re-attempt-next-poll shape);
   raw non-409 `ApiException` escapes the wrapper's 2-tuple uncounted
   (pinned; `#493` owns the tuple standardization).
+- **`#499`** — the rotation scripts stop printing rotated passwords to
+  stdout: symmetric `--out-file` (0600 via umask 077 subshell + explicit
+  chmod; default `./rotated-<service>-password.txt`) with stdout printing
+  only the path, plus an explicit `--print-only` escape hatch whose help
+  states the scrollback/CI-log/session-recording exposure trade-off.
+  Stdout-secret-freedom verified by a 34-assertion live smoke test across
+  both scripts (default-mode stdout AND stderr grepped for the known test
+  password — zero matches) plus a repo-wide `set -x` audit.
+- **`#480`** — `.github/dependabot.yml` covers the three pin surfaces
+  weekly, all targeting develop so bumps ride the normal PR path: pip
+  (manifest-only signal PRs — `exclude-paths` scopes away both lockfiles
+  since dependabot can't run pip-compile; merging appends the documented
+  pip-compile-pair regen), github-actions (grouped minor/patch; SHA pins
+  stay SHA pins under the #389 gate), and docker (the base digest).
+- **`#498`** — `deploy/namespace-labels.yaml` ships the PSS labels for
+  production installs: a metadata-only Namespace carrying the #388 kind
+  set plus `warn` (enforce/audit/warn = restricted, enforce-version =
+  latest). Merge-safe by construction — declaring only `metadata` makes
+  `kubectl apply` a three-way label merge on the helm-owned namespace —
+  and fenced by a test asserting the manifest stays metadata-only.
+- **`#478`** — the pruner's metrics surface reaches parity with the
+  operator's: the storage-pruner metrics-ingress policy drops
+  `podSelector: {}` for the #295 `metrics-scraper` label selector, and
+  the CronJob carries the empty-by-default `OPENSTUDIO_METRICS_TOKEN_FILE`
+  opt-in with fail-closed 401 semantics via the shared
+  `metrics.start_metrics_server` (no new helper — the #401 logic was
+  already shared; prune_entrypoint.main just consumes it).
+- **`#505`** — `_k8s.py` hosts the shared K8s Protocol slices:
+  `PodLister` (list) absorbs the duplicated handler-local declarations,
+  `DeploymentManager(DeploymentReader)` absorbs the deployment read+patch
+  superset, and analysis_sla's eviction surface becomes a thin genuine
+  extension. One definition per K8s method across src/.
+- **`#495`** — `_constants.py` owns the canonical CRD identity:
+  `CRD_GROUP`/`CRD_VERSION`/`CRD_PLURAL` + `CRD_SPEC`, consumed as
+  `**CRD_SPEC` by every `@kopf.timer`/`@kopf.on.event` (kwargs form —
+  argument-order swaps become impossible). The raw identity literals
+  live only in `_constants.py`, enforced by a new AST fence in the
+  singleton-registry coverage suite.
+- **`#500`** — deploy-time signature verification closes the loop the
+  release pipeline opens: `scripts/deploy-openstudio-stack.sh` extracts
+  the digest-pinned image and runs `cosign verify` with the exact
+  certificate-identity/oidc-issuer pair from ci.yml (loud skip when
+  cosign is absent — kind dev must not hard-require it; abort on
+  verification failure), and docs/validation.md documents the copy-paste
+  command plus a Kyverno `verifyImages` Enforce sketch for production.
+- **`#481`** — the supply chain finally consumes its own SBOMs: a CI
+  `audit` job runs `pip-audit --require-hashes -r requirements.lock`
+  (verified clean) and a no-push image build + trivy scan
+  (CRITICAL,HIGH gate), and release.yml scans the actually-pushed image
+  in both jobs before the digest-pin commit — a vulnerable layer set can
+  never be pinned into `deploy/`. Triage templates `.pip-audit-ignore.txt`
+  + `.trivyignore` ship with the triage rules; `.trivyignore` currently
+  carries the 16 time-boxed exceptions from the gate's first run (3
+  CRITICAL + 50 HIGH in the stale python:3.12-slim base digest), each
+  citing `#564` which owns the durable base-image refresh.
 - **`#467`** — tick-level error-path coverage for `worker_recycler`
   (was 20 tests, zero error paths), mirroring the #466 pattern: sustained
   503 on `/analyses.json` → counter + clean skip; 409-then-success on
