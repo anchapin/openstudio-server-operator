@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 from kubernetes.client import ApiException
 
+from _fakes import FakeSecretsCoreV1Api
 from openstudio_operator import client_factory, singleton
 from openstudio_operator.client_factory import (
     CLIENT_CACHE_MAXSIZE,
@@ -467,3 +468,81 @@ def test_secret_ref_resolves_rediss_tls_url_end_to_end_476(monkeypatch):
 
     assert client._redis_url == tls_url
     assert client._redis.connection_pool.connection_class is SSLConnection
+
+
+# --- Issue #568 — Secret-content rotation is picked up in-band ------------------
+#
+# Pre-#568 the cache key was ``(redis_url, secret_ref, namespace)``: the
+# Secret's CONTENT was not part of the key, so rotating the password in
+# place (exactly what ``scripts/rotate_redis_password.sh`` does) left the
+# cached client authenticating with the OLD password — WRONGPASS →
+# ``RedisClientError`` → counted skip-ticks, Resque-dependent features
+# dark — until someone bounced the operator pod. The factory now
+# re-resolves the Secret on EVERY call and keys the client LRU by the
+# resolved URL, so a rotation is a new key ⇒ a fresh client on the very
+# next tick. These cases use the shared ``FakeSecretsCoreV1Api`` (extended
+# with ``resource_version`` + ``rotate()`` for #568) rather than the local
+# ``FakeCoreV1Api`` above.
+
+ROTATED_SECRET_URL = "redis://:new-rotated-pw@queue.openstudio-server.svc.cluster.local:6379"
+
+
+def _install_shared_secret_api(monkeypatch, fake: FakeSecretsCoreV1Api) -> None:
+    monkeypatch.setattr(singleton, "_operator_core_api", fake)
+
+
+def test_secret_rotation_yields_fresh_client_568(monkeypatch):
+    """Same secretRef + namespace, rotated Secret content ⇒ a NEW client.
+
+    The stale entry is never handed back out: the rotated password changes
+    the resolved URL, the URL is the cache key, and the very next call
+    builds from the new credential — the in-band fix #568 demands (no
+    operator restart, picked up within one tick)."""
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    _install_shared_secret_api(monkeypatch, fake)
+
+    stale = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    fake.rotate({"redis-url": _encoded(ROTATED_SECRET_URL)})
+
+    fresh = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    assert fresh is not stale
+    assert fresh._redis_url == ROTATED_SECRET_URL
+    assert stale._redis_url == SECRET_URL
+    assert fake.calls == [("openstudio-redis", NAMESPACE), ("openstudio-redis", NAMESPACE)]
+    assert fake.versions_read == ["1000", "1001"]  # the rotation bumped the rv
+
+
+def test_unchanged_secret_keeps_cached_client_and_pool_568(monkeypatch):
+    """Unchanged Secret content ⇒ the SAME client object (and connection
+    pool). The rotation probe costs one bounded ``secrets: get`` per call,
+    but the pool only churns when the credential actually changes."""
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    _install_shared_secret_api(monkeypatch, fake)
+
+    first = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+    second = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    assert first is second
+    assert first._redis is second._redis
+    assert len(fake.calls) == 2  # re-resolved every call — the #568 rotation probe
+
+
+def test_resource_version_bump_without_content_change_keeps_client_568(monkeypatch):
+    """A Secret update that bumps ``resourceVersion`` but leaves the URL
+    byte-identical keeps the cached client.
+
+    Keying the LRU on the resolved URL (not the bare resourceVersion) is
+    deliberate: any credential rotation changes the URL, while a
+    content-less metadata touch must not churn the connection pool."""
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    _install_shared_secret_api(monkeypatch, fake)
+
+    first = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    fake.rotate({"redis-url": _encoded(SECRET_URL)})  # same content, new rv
+
+    second = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
+
+    assert first is second
