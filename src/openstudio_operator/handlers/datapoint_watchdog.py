@@ -43,11 +43,13 @@ Documented decisions (beyond the issue text):
   so flipping ``spec.dryRun`` off never double-burns the budget. This
   mirrors the #8 anchor semantics (identical accounting, suppressed
   mutation only).
-* Exhaustion Events fire once per datapoint per operator process
-  (in-memory ``exhausted_seen`` set): presentation-only cache, D04-clean —
-  no mutation depends on it, and the worst case after an operator restart
-  is one duplicate Warning Event per still-exhausted datapoint. The
-  ``requeues`` map alone drives the never-requeue-again guarantee.
+* Exhaustion Events fire once per datapoint per CR per operator process
+  (the in-memory ``_EXHAUSTED_WARNED`` cache, keyed per CR + uid-validated
+  since #497): presentation-only cache, D04-clean — no mutation depends on
+  it, and the worst case after an operator restart (or a delete+recreate
+  of the CR, #364/#497) is one duplicate Warning Event per still-exhausted
+  datapoint. The ``requeues`` map alone drives the never-requeue-again
+  guarantee.
 * ``maxAutoRequeues: 0`` is the supported warn-only mode: over-runtime
   datapoints get the exhaustion Event immediately and are never requeued.
 
@@ -64,6 +66,7 @@ from datetime import datetime, timedelta
 
 import kopf
 
+from openstudio_operator import _cr_cache as cr_cache
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
     run_oscm_tick,
@@ -104,10 +107,74 @@ DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
 
 # Presentation-only (D04): datapoints whose exhaustion Warning has already
-# been emitted in this operator process — dedupes per-tick Event spam. Not a
-# source of truth: after a restart each still-exhausted datapoint re-emits
-# exactly once, and no mutating decision reads this set.
-_EXHAUSTED_WARNED: set[str] = set()
+# been emitted for THIS CR in this operator process — dedupes per-tick Event
+# spam. Not a source of truth: after a restart each still-exhausted datapoint
+# re-emits exactly once, and no mutating decision reads this set.
+#
+# Issue #497 — per-CR cache keying convention: keyed by
+# ``(namespace, name)`` and UID-VALIDATED (values are
+# ``(recorded_uid, seen_ids)``; a lookup under a different uid is the #364
+# delete+recreate signature and starts a fresh set — see
+# :mod:`openstudio_operator._cr_cache` for the convention + census and
+# :func:`reset_per_cr_caches` for the reset seam). Pre-#497 this was an
+# UN-KEYED ``set[str]`` of datapoint ids, which assumed one CR for the
+# process lifetime and could suppress CR B's exhaustion Warnings with CR
+# A's dedup entries after a delete+recreate.
+_EXHAUSTED_WARNED: dict[tuple[str, str], tuple[str | None, set[str]]] = {}
+
+
+def _get_exhausted_seen(namespace: str, name: str, uid: str | None = None) -> set[str]:
+    """Return the per-CR exhaustion-dedup set, uid-validating the entry (#497).
+
+    Lookup-time staleness check: a cached entry recorded under a different
+    uid belongs to the DELETED predecessor CR (same ``(namespace, name)``,
+    the #364 delete+recreate path) and is replaced with a fresh set — the
+    new CR's still-exhausted datapoints re-earn their one-shot Warning
+    instead of being silenced by the old CR's dedup bookkeeping.
+    """
+    key = (namespace, name)
+    entry = _EXHAUSTED_WARNED.get(key)
+    if entry is not None and cr_cache.uid_is_stale(entry[0], uid):
+        logger.info(
+            "exhaustion-dedup cache for %s/%s belongs to a deleted CR "
+            "(recorded uid %r != observed %r) — starting fresh (#364 "
+            "delete+recreate; #497 uid validation)",
+            namespace,
+            name,
+            entry[0],
+            uid,
+        )
+        entry = None
+    if entry is None:
+        fresh: set[str] = set()
+        _EXHAUSTED_WARNED[key] = (uid, fresh)
+        return fresh
+    if uid is not None and entry[0] is None:
+        # First uid sighting for an entry recorded pre-uid (or by a
+        # uid-less caller): record it so later lookups can validate.
+        _EXHAUSTED_WARNED[key] = (uid, entry[1])
+    return entry[1]
+
+
+def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
+    """Reset seam (#497): drop exhaustion-dedup entries (all, or one CR).
+
+    Pass neither argument to clear every entry (test isolation); pass both
+    ``namespace`` and ``name`` to clear exactly one CR's entry (the shape a
+    future ``@kopf.on.delete`` handler would call — none exists today; the
+    uid validation in :func:`_get_exhausted_seen` closes the delete+recreate
+    leak at lookup time in the meantime). Anything else is a caller bug and
+    raises rather than silently clearing the wrong scope.
+    """
+    if namespace is None and name is None:
+        _EXHAUSTED_WARNED.clear()
+    elif namespace is not None and name is not None:
+        _EXHAUSTED_WARNED.pop((namespace, name), None)
+    else:
+        raise ValueError(
+            f"reset_per_cr_caches: pass both namespace and name, or neither "
+            f"(got namespace={namespace!r}, name={name!r})"
+        )
 
 
 def _datapoint_ids(docs: list[dict]) -> list[str]:
@@ -251,7 +318,7 @@ def zombie_datapoint_watchdog(
             config,
             now=now,
             emit=emit,
-            exhausted_seen=_EXHAUSTED_WARNED,
+            exhausted_seen=_get_exhausted_seen(namespace, name, cr_cache.cr_uid(body)),
         )
 
     requeued = run_oscm_tick(

@@ -290,6 +290,56 @@ def test_exhaustion_reemits_once_after_simulated_restart():
 
 
 @responses.activate
+def test_delete_recreate_rearms_exhaustion_warning():
+    """Issue #497: a delete+recreated singleton CR (#364) starts a fresh dedup set.
+
+    The exhaustion-dedup cache is per-CR (keyed ``(namespace, name)``,
+    uid-validated). Pre-#497 it was an UN-KEYED set of datapoint ids, so a
+    recreated CR would inherit the deleted CR's dedup entries and its
+    still-exhausted datapoints would be SILENCED — a presentation-only
+    leak, but exactly the cross-CR state bleed #497 exists to close. The
+    recreated CR (new uid) must re-earn its one-shot Warning.
+    """
+    from openstudio_operator.handlers import datapoint_watchdog as dpw_module
+
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "startedSince": {"d1": (NOW - timedelta(minutes=90)).isoformat()},
+                "requeues": {"d1": {"count": 2, "lastRequeuedAt": NOW.isoformat()}},
+            }
+        )
+    )
+    register_started("d1")
+    dpw_module.reset_per_cr_caches()
+    try:
+        # CR A (uid-a): the exhaustion Warning fires once, then dedups.
+        requeued, events = tick(
+            api, exhausted_seen=dpw_module._get_exhausted_seen(NAMESPACE, NAME, "uid-a")
+        )
+        assert len(events) == 1 and events[0][1] == DATAPOINT_REQUEUE_EXHAUSTED_EVENT
+        requeued, events2 = tick(
+            api,
+            exhausted_seen=dpw_module._get_exhausted_seen(NAMESPACE, NAME, "uid-a"),
+            now=NOW + timedelta(minutes=1),
+        )
+        assert events2 == []
+
+        # Delete + recreate (#364): same (namespace, name), NEW uid — the
+        # lookup must return a FRESH set (the leak would return CR A's set
+        # with "d1" already in it) and the Warning re-fires for the new CR.
+        seen_b = dpw_module._get_exhausted_seen(NAMESPACE, NAME, "uid-b")
+        assert seen_b == set()
+        requeued, events3 = tick(api, exhausted_seen=seen_b, now=NOW + timedelta(minutes=2))
+        assert requeued == []
+        assert len(events3) == 1
+        assert events3[0][1] == DATAPOINT_REQUEUE_EXHAUSTED_EVENT
+        assert calls_to("/requeue") == 0  # still exhausted: never requeued, ever
+    finally:
+        dpw_module.reset_per_cr_caches()
+
+
+@responses.activate
 def test_max_auto_requeues_zero_is_warn_only_mode():
     spec = {**SPEC, "datapointPolicy": {"maxDatapointRuntimeMinutes": 45, "maxAutoRequeues": 0}}
     api = FakeCustomObjectsApi(
