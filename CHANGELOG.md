@@ -131,6 +131,25 @@ NetworkPolicy/RBAC/JSON-logging/metrics-expansion themes (`#224`–`#257`).
   census.
 
 ### Added
+- **`#488`** — `openstudio_operator_redis_request_duration_seconds{operation}`
+  + `openstudio_operator_kube_api_request_duration_seconds{verb}`: the two
+  dependencies the #308 REST histogram left uninstrumented got the same
+  duration treatment. Every `ReadOnlyRedisClient` read method
+  (`queue_depth`/`queue_depths` LLENs, `worker_heartbeats` SMEMBERS+HGETALL
+  incl. the `stale_workers` delegation, `validate_key_layout` SCAN loop,
+  `workers_for_analysis`) and every wrapped kube chokepoint
+  (`status_store._read_status` GET / `_mutate` PATCH,
+  `deployment_label_selector` GET, `rolling_restart_deployment` PATCH,
+  `analysis_sla` escalation pod LIST/DELETE, `web_background_monitor`
+  leg-C pod LIST) observes its wall-clock duration on BOTH success and
+  failure paths via the shared `metrics.observe_duration` context
+  manager. Label vocabularies are issue-pinned (`llen|smembers|scan`,
+  `get|patch|delete|list`) and both families share the #308 bucket set
+  `(0.05, 0.1, 0.5, 1, 2, 5)` so the three per-dependency histograms
+  render on one dashboard axis — an inflated
+  `handler_tick_duration_seconds` bucket can finally be attributed to
+  Redis vs REST vs kube during an incident (a slow-but-successful
+  kube-apiserver used to be invisible behind the #119 409 counters).
 - **`#491`** — `openstudio_operator_singleton_wrapped_handlers`: boot-time
   gauge recording how many OSCM spawning (timer/daemon) handlers
   `install_singleton_guard` actually wrapped (set at the end of the

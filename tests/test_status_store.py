@@ -79,6 +79,35 @@ def test_soft_stop_round_trip_and_wire_format(store, api):
     }
 
 
+# --- Issue #488 — kube-api request-duration histogram --------------------------
+
+
+def test_rmw_cycle_observes_kube_api_duration_histogram(store, api):
+    """Issue #488 acceptance: a status-store RMW cycle observes the kube-api
+    request-duration histogram on BOTH legs — the fresh GET in
+    ``_read_status`` and the merge PATCH in ``_mutate`` — so a
+    slow-but-successful apiserver is no longer invisible behind the #119
+    409 counters."""
+    from openstudio_operator import metrics
+
+    histogram = metrics.KUBE_API_REQUEST_DURATION_SECONDS
+
+    def count(verb: str) -> float:
+        child = histogram.labels(verb=verb)
+        return float(
+            next(s.value for s in child._child_samples() if s.name == "_count")
+        )
+
+    get_before = count("get")
+    patch_before = count("patch")
+
+    store.set_soft_stop("a1", make_soft_stop())
+    assert store.get_soft_stop("a1") == make_soft_stop()
+
+    assert count("get") - get_before >= 1
+    assert count("patch") - patch_before >= 1
+
+
 # --- softStops escalation marker + prune (#9) ----------------------------------
 
 

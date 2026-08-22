@@ -40,10 +40,12 @@ from kubernetes.client import ApiException, CustomObjectsApi
 from ._retry import _sleep
 from ._time import parse_iso_utc
 from .metrics import (
+    KUBE_API_REQUEST_DURATION_SECONDS,
     STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL,
     STATUS_CONFLICTS_TOTAL,
     STATUS_MAP_CAPS_TOTAL,
     STATUS_MAP_ENTRIES,
+    observe_duration,
 )
 
 GROUP = "energy.nrel.gov"
@@ -321,9 +323,12 @@ class StatusStore:
     # --- Transport core -----------------------------------------------------
 
     def _read_status(self) -> dict[str, Any]:
-        obj = self._api.get_namespaced_custom_object_status(
-            GROUP, VERSION, self._namespace, PLURAL, self._name
-        )
+        # Issue #488 — time the apiserver GET itself (the network surface);
+        # the #489 gauge stamping below is pure computation.
+        with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="get"):
+            obj = self._api.get_namespaced_custom_object_status(
+                GROUP, VERSION, self._namespace, PLURAL, self._name
+            )
         status = obj.get("status") or {}
         # Issue #489 — stamp the per-map size gauges at the single read site
         # every RMW cycle (inside ``_mutate``, post-409-retry-loop fresh GET)
@@ -361,15 +366,18 @@ class StatusStore:
             if patch is None:
                 return
             try:
-                self._api.patch_namespaced_custom_object_status(
-                    GROUP,
-                    VERSION,
-                    self._namespace,
-                    PLURAL,
-                    self._name,
-                    body=patch,
-                    _content_type=MERGE_PATCH_CONTENT_TYPE,
-                )
+                # Issue #488 — time the apiserver PATCH itself; the 409
+                # counting below stays per-attempt on the error side.
+                with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="patch"):
+                    self._api.patch_namespaced_custom_object_status(
+                        GROUP,
+                        VERSION,
+                        self._namespace,
+                        PLURAL,
+                        self._name,
+                        body=patch,
+                        _content_type=MERGE_PATCH_CONTENT_TYPE,
+                    )
             except ApiException as exc:
                 if exc.status != 409:
                     raise

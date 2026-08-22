@@ -85,6 +85,14 @@ def test_every_declared_histogram_family_in_registry_exposition():
     metrics.REST_REQUEST_DURATION_SECONDS.labels(
         method="GET", outcome="200"
     ).observe(0.1)
+    # Issue #488 — same pre-touch for the two dependency-latency
+    # histograms (operation / verb label sets).
+    metrics.REDIS_REQUEST_DURATION_SECONDS.labels(
+        operation="__metrics_test_sentinel__"
+    ).observe(0.1)
+    metrics.KUBE_API_REQUEST_DURATION_SECONDS.labels(
+        verb="__metrics_test_sentinel__"
+    ).observe(0.1)
     exposition = generate_latest().decode()
     for name in _declared_histogram_families():
         assert f"# TYPE {name} histogram" in exposition
@@ -466,6 +474,14 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.REST_REQUEST_DURATION_SECONDS.labels(
         method="GET", outcome="200"
     ).observe(0.1)
+    # Issue #488 — pre-touch the two dependency-latency histograms so
+    # their labelled family lines are exposed (same #117 pattern).
+    metrics.REDIS_REQUEST_DURATION_SECONDS.labels(
+        operation="__metrics_test_sentinel__"
+    ).observe(0.1)
+    metrics.KUBE_API_REQUEST_DURATION_SECONDS.labels(
+        verb="__metrics_test_sentinel__"
+    ).observe(0.1)
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     for name in _declared_histogram_families():
         assert f"# TYPE {name} histogram" in response.text
@@ -489,6 +505,22 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_rest_request_duration_seconds":
             assert (
                 'openstudio_operator_rest_request_duration_seconds_bucket{le="0.1",method="GET",outcome="200"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_redis_request_duration_seconds":
+            # Issue #488 — labelled by ``operation``; labels are
+            # alphabetical (``le`` < ``operation``).
+            assert (
+                'openstudio_operator_redis_request_duration_seconds_bucket'
+                '{le="0.1",operation="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_kube_api_request_duration_seconds":
+            # Issue #488 — labelled by ``verb``; labels are alphabetical
+            # (``le`` < ``verb``).
+            assert (
+                'openstudio_operator_kube_api_request_duration_seconds_bucket'
+                '{le="0.1",verb="__metrics_test_sentinel__"}'
                 in response.text
             )
 
@@ -1175,6 +1207,89 @@ def test_handler_tick_duration_histogram_uses_issue_308_bucket_set():
         )
     assert (
         'openstudio_operator_handler_tick_duration_seconds_bucket{le="+Inf",module="analysis_sla"}'
+        in exposition
+    )
+
+
+# --- Issue #488 — Redis + kube-api dependency duration Histograms ----------------
+
+
+def test_redis_request_duration_histogram_exposes_per_operation_series():
+    """Issue #488 acceptance: ``openstudio_operator_redis_request_duration_
+    seconds`` Histogram exposes one labelled series per ``operation``. The
+    vocabulary is the issue-pinned three-value set (llen | smembers |
+    scan) — pinned here so a future refactor that drops the label (or
+    invents a fourth value without expanding the pin) is caught at CI.
+    The call-site integration (fakeredis happy paths asserting real
+    observation) lives in ``tests/test_redis_client.py``."""
+    histogram = metrics.REDIS_REQUEST_DURATION_SECONDS
+    for operation in ("llen", "smembers", "scan"):
+        histogram.labels(operation=operation).observe(0.1)
+    exposition = generate_latest().decode()
+    for operation in ("llen", "smembers", "scan"):
+        # Labels are alphabetical (``le`` < ``operation``); pin the shape
+        # so a label rename is caught here, not on the on-call's board.
+        assert (
+            f'openstudio_operator_redis_request_duration_seconds_count{{operation="{operation}"}}'
+            in exposition
+        )
+        assert (
+            f'openstudio_operator_redis_request_duration_seconds_bucket{{le="0.1",operation="{operation}"}}'
+            in exposition
+        )
+
+
+def test_kube_api_request_duration_histogram_exposes_per_verb_series():
+    """Issue #488 acceptance: ``openstudio_operator_kube_api_request_
+    duration_seconds`` Histogram exposes one labelled series per ``verb``.
+    The vocabulary is the four Kubernetes verbs the wrapped chokepoints
+    issue (get | patch | delete | list). The call-site integrations
+    (status_store RMW get+patch, rolling_restart patch) live in
+    ``tests/test_status_store.py`` / ``tests/test_k8s_rolling_restart.py``."""
+    histogram = metrics.KUBE_API_REQUEST_DURATION_SECONDS
+    for verb in ("get", "patch", "delete", "list"):
+        histogram.labels(verb=verb).observe(0.1)
+    exposition = generate_latest().decode()
+    for verb in ("get", "patch", "delete", "list"):
+        assert (
+            f'openstudio_operator_kube_api_request_duration_seconds_count{{verb="{verb}"}}'
+            in exposition
+        )
+        assert (
+            f'openstudio_operator_kube_api_request_duration_seconds_bucket{{le="0.1",verb="{verb}"}}'
+            in exposition
+        )
+
+
+def test_dependency_duration_histograms_use_issue_308_bucket_set():
+    """Issue #488 — both dependency histograms share the canonical #308
+    REST bucket set ``(0.05, 0.1, 0.5, 1, 2, 5)``: Redis reads are
+    sub-ms-to-ms and kube calls ms-to-s on a healthy cluster, so one
+    spread keeps resolution at the healthy band for both AND makes the
+    three per-dependency histograms directly comparable on one dashboard
+    axis (the issue's attribution ask). Pinning the boundaries catches a
+    future refactor that broadens or narrows the resolution silently."""
+    for histogram, label_kw in (
+        (metrics.REDIS_REQUEST_DURATION_SECONDS, {"operation": "llen"}),
+        (metrics.KUBE_API_REQUEST_DURATION_SECONDS, {"verb": "get"}),
+    ):
+        histogram.labels(**label_kw).observe(0.1)
+    exposition = generate_latest().decode()
+    for le in ("0.05", "0.1", "0.5", "1.0", "2.0", "5.0"):
+        assert (
+            f'openstudio_operator_redis_request_duration_seconds_bucket{{le="{le}",operation="llen"}}'
+            in exposition
+        )
+        assert (
+            f'openstudio_operator_kube_api_request_duration_seconds_bucket{{le="{le}",verb="get"}}'
+            in exposition
+        )
+    assert (
+        'openstudio_operator_redis_request_duration_seconds_bucket{le="+Inf",operation="llen"}'
+        in exposition
+    )
+    assert (
+        'openstudio_operator_kube_api_request_duration_seconds_bucket{le="+Inf",verb="get"}'
         in exposition
     )
 

@@ -111,6 +111,11 @@ import redis
 # ``validate_key_layout`` raise sites and historical importers keep working.
 from .config import OperatorConfigError
 
+# Issue #488 — per-operation request-duration telemetry for every network
+# read this client performs. ``observe_duration`` observes on BOTH success
+# and failure paths; see REDIS_REQUEST_DURATION_SECONDS in metrics.py.
+from .metrics import REDIS_REQUEST_DURATION_SECONDS, observe_duration
+
 READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"})
 
 #: Queue-depth keys. Live-verified on kind/v3.11.0 (issue #67): Resque 2.x
@@ -419,19 +424,22 @@ class ReadOnlyRedisClient:
         """
         seen: set[str] = set()
         cursor: int | str = 0
-        try:
-            while True:
-                cursor, batch = self._execute(
-                    "scan",
-                    cursor,
-                    match=f"{WORKER_REGISTRY_KEY.rsplit(':', 1)[0]}:*",
-                    count=100,
-                )
-                seen.update(batch)
-                if int(cursor) == 0 or len(seen) >= VALIDATE_SCAN_KEY_BUDGET:
-                    break
-        except redis.RedisError as exc:
-            raise RedisClientError(f"SCAN failed: {exc}") from exc
+        # Issue #488 — time the SCAN loop (the network surface); the
+        # post-scan layout validation below is pure computation.
+        with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="scan"):
+            try:
+                while True:
+                    cursor, batch = self._execute(
+                        "scan",
+                        cursor,
+                        match=f"{WORKER_REGISTRY_KEY.rsplit(':', 1)[0]}:*",
+                        count=100,
+                    )
+                    seen.update(batch)
+                    if int(cursor) == 0 or len(seen) >= VALIDATE_SCAN_KEY_BUDGET:
+                        break
+            except redis.RedisError as exc:
+                raise RedisClientError(f"SCAN failed: {exc}") from exc
 
         if not seen:
             raise OperatorConfigError(
@@ -464,7 +472,9 @@ class ReadOnlyRedisClient:
 
     def queue_depth(self, queue: str) -> int:
         """LLEN of a Resque queue key — 0 for unknown/empty queues."""
-        return int(self._execute("llen", queue))
+        # Issue #488 — every LLEN is a Redis round-trip; observe its duration.
+        with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="llen"):
+            return int(self._execute("llen", queue))
 
     def queue_depths(self) -> dict[str, int]:
         """LLEN of both managed Resque queues: ``{simulations: n, requeued: n}``."""
@@ -485,18 +495,23 @@ class ReadOnlyRedisClient:
         heartbeat value raises ``RedisClientError`` (registry garbage should be
         loud, never silently fresh).
         """
-        worker_ids = self._execute("smembers", WORKER_REGISTRY_KEY)
-        if not worker_ids:
-            return {}
-        beats: dict[str, str] = self._execute("hgetall", WORKER_HEARTBEAT_HASH_KEY)
-        heartbeats: dict[str, float | None] = {}
-        for worker_id in sorted(worker_ids):
-            raw = beats.get(worker_id)
-            if raw is None:
-                heartbeats[worker_id] = None
-                continue
-            heartbeats[worker_id] = _parse_heartbeat(raw, worker_id)
-        return heartbeats
+        # Issue #488 — two network calls (SMEMBERS + HGETALL) timed ONCE under
+        # the dominant operation label, per the issue's label vocabulary
+        # (llen | smembers | scan). stale_workers() delegates here, so its
+        # Redis time is observed through this same site.
+        with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="smembers"):
+            worker_ids = self._execute("smembers", WORKER_REGISTRY_KEY)
+            if not worker_ids:
+                return {}
+            beats: dict[str, str] = self._execute("hgetall", WORKER_HEARTBEAT_HASH_KEY)
+            heartbeats: dict[str, float | None] = {}
+            for worker_id in sorted(worker_ids):
+                raw = beats.get(worker_id)
+                if raw is None:
+                    heartbeats[worker_id] = None
+                    continue
+                heartbeats[worker_id] = _parse_heartbeat(raw, worker_id)
+            return heartbeats
 
     def stale_workers(self, threshold_seconds: float) -> set[str]:
         """Worker ids whose heartbeat is missing or older than ``threshold_seconds``.
@@ -539,27 +554,30 @@ class ReadOnlyRedisClient:
         the rest of the module.
         """
         matches: list[str] = []
-        worker_ids = self._execute("smembers", WORKER_REGISTRY_KEY)
-        for worker_id in worker_ids:
-            raw = self._execute("get", f"resque:worker:{worker_id}")
-            if raw is None:
-                # Worker is registered but the per-worker record has no
-                # payload (idle) — not a match, not an error.
-                continue
-            try:
-                record = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise RedisClientError(
-                    f"unparseable worker record for {worker_id!r}: {raw!r}"
-                ) from exc
-            payload = record.get("payload") if isinstance(record, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            args = payload.get("args")
-            if not isinstance(args, list):
-                continue
-            if analysis_id in args:
-                matches.append(worker_id)
+        # Issue #488 — one SMEMBERS + N GETs timed once under the dominant
+        # operation label (the issue vocabulary is llen | smembers | scan).
+        with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="smembers"):
+            worker_ids = self._execute("smembers", WORKER_REGISTRY_KEY)
+            for worker_id in worker_ids:
+                raw = self._execute("get", f"resque:worker:{worker_id}")
+                if raw is None:
+                    # Worker is registered but the per-worker record has no
+                    # payload (idle) — not a match, not an error.
+                    continue
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise RedisClientError(
+                        f"unparseable worker record for {worker_id!r}: {raw!r}"
+                    ) from exc
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                args = payload.get("args")
+                if not isinstance(args, list):
+                    continue
+                if analysis_id in args:
+                    matches.append(worker_id)
         return matches
 
     def pod_name_for_worker(self, worker_id: str) -> str | None:

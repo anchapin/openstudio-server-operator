@@ -1019,3 +1019,83 @@ def test_consolidated_drain_handler_emits_redis_key_layout_drift_event(
         f"Second drain emitted another event: {emitted!r}. See issue #163 — "
         f"the drain must be idempotent."
     )
+
+
+# --- Issue #488 — Redis request-duration histogram -------------------------
+
+
+def _sample_count(histogram, **labels) -> float:
+    """Read a labelled Histogram's observation count (the ``_count`` child)."""
+    child = histogram.labels(**labels)
+    samples = getattr(child, "_child_samples", None)
+    if samples is not None:
+        return float(next(s.value for s in samples() if s.name == "_count"))
+    return float(child._count.get())  # type: ignore[attr-defined]  # older client shape
+
+
+def test_queue_depths_observe_llen_duration(fake, client):
+    """Issue #488 acceptance: the ``queue_depths`` happy path observes the
+    Redis request-duration histogram — one LLEN observation per managed
+    queue (two), so the sub-ms-to-ms Redis round-trips are visible at
+    /metrics instead of hiding inside an inflated tick-duration bucket."""
+    from openstudio_operator import metrics
+
+    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="llen")
+    client.queue_depths()
+    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="llen")
+    assert after - before >= 2, "expected one llen observation per managed queue"
+
+
+def test_worker_heartbeats_observe_smembers_duration(fake, client):
+    """Issue #488 acceptance: ``worker_heartbeats`` observes under its
+    dominant operation label (``smembers`` — the SMEMBERS + HGETALL pair
+    is timed once, per the issue's label vocabulary). ``stale_workers``
+    delegates here, so its delegation is asserted to observe too."""
+    from openstudio_operator import metrics
+
+    seed_workers(fake, {"worker-1:1:simulations": NOW - 5, "worker-2:2:simulations": NOW - 5})
+    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="smembers")
+    assert client.worker_heartbeats() == {
+        "worker-1:1:simulations": NOW - 5,
+        "worker-2:2:simulations": NOW - 5,
+    }
+    assert client.stale_workers(threshold_seconds=60) == set()
+    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="smembers")
+    # worker_heartbeats() + the stale_workers() delegation: >= 2 observations.
+    assert after - before >= 2
+
+
+def test_validate_key_layout_observe_scan_duration(fake, client):
+    """Issue #488 acceptance: the ``validate_key_layout`` happy path observes
+    under the ``scan`` operation label (the whole SCAN loop is the timed
+    network surface)."""
+    from openstudio_operator import metrics
+
+    seed_workers(fake, {"worker-1:1:simulations": NOW - 5})
+    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    client.validate_key_layout()
+    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    assert after - before >= 1
+
+
+def test_failed_llen_still_observes_duration():
+    """Issue #488: duration is duration — the observation fires on the
+    FAILURE path too (the error itself is counted by the tick-failure
+    counters; this histogram only times)."""
+    from openstudio_operator import metrics
+
+    class _BrokenLlen:
+        def llen(self, *args, **kwargs):
+            raise redis.ConnectionError("socket timeout")
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    client = ReadOnlyRedisClient(
+        "redis://:pw@queue.test:6379", connection=_BrokenLlen(), now_fn=lambda: NOW
+    )
+    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="llen")
+    with pytest.raises(RedisClientError):
+        client.queue_depth(SIMULATIONS_QUEUE)
+    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="llen")
+    assert after - before == 1
