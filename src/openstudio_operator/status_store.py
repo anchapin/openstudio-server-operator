@@ -94,6 +94,16 @@ STATUS_MAP_CAPPED_EVENT = "StatusMapCapped"
 #: don't care about Events). The ``handlers/__init__.py`` entrypoint
 #: installs the production kopf-backed sink at operator startup; tests
 #: install a recorder via :func:`set_event_sink`.
+#:
+#: Issue #496 scope note: this alias is deliberately LOCAL (not moved to
+#: :mod:`openstudio_operator.events` with ``TickEmitter``/``EventSink``).
+#: It is used only inside this module (the ``set_event_sink`` seam's
+#: annotations), its arity is genuinely distinct (namespace/name as separate
+#: strings — the sink constructs the object itself, unlike
+#: ``events.EventSink``'s leading CR-body dict), and the PUBLIC alias for
+#: this exact seam already exists as
+#: :data:`openstudio_operator.events_sinks.StatusEventSink`. Re-homing it
+#: under yet another name would recreate the drift #496 collapses.
 EmitStatusEvent = Callable[[str, str, str, str], None]
 
 

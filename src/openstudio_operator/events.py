@@ -7,6 +7,12 @@ into a sibling handler module. The class form also lets the dry-run gate
 (D11) and the suppressed-event counter live here instead of being
 open-coded at every call site.
 
+Issue #496 makes this module the canonical home for the event-emission
+type aliases (``TickEmitter``, ``EventSink``) and the one shared direct
+``kopf.event`` wrapper (:func:`emit_kopf_event`) — previously those were
+declared independently (and drifted) in ``retention.py``,
+``singleton.py`` and ``handlers/dry_run_audit.py``.
+
 Construction pattern (one per tick):
 
 * The timer wrapper for each kopf handler creates an :class:`EventEmitter`
@@ -34,6 +40,7 @@ apiserver. Tests and metrics can read the counter to distinguish
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import kopf
 
@@ -44,6 +51,36 @@ from openstudio_operator.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: ``(event_type, reason, message)`` sink — the tick-scoped emission shape
+#: shared by the OSCM timer handlers (via :class:`EventEmitter` below) and
+#: the retention pipeline. Issue #496: this shape used to be declared as a
+#: local ``EventEmitter`` alias (``Callable`` over the 3-arg tick-sink
+#: signature) in ``retention.py`` — the same public name as this module's
+#: class but a different, incompatible call signature. The alias lives
+#: here under a non-colliding name so exactly one module defines it.
+TickEmitter = Callable[[str, str, str], None]
+
+#: ``(obj, event_type, reason, message)`` — an Event attached to a full
+#: object body via ``kopf.event`` in production, a recorder in tests.
+#: Issue #496: identical aliases lived in ``singleton.py`` and
+#: ``handlers/dry_run_audit.py``; both now import this one.
+EventSink = Callable[[dict, str, str, str], None]
+
+
+def emit_kopf_event(obj: dict, event_type: str, reason: str, message: str) -> None:
+    """Post a Kubernetes Event on ``obj`` via ``kopf.event`` — the shared wrapper.
+
+    Issue #496 collapses the two module-private ``_emit_kopf_event`` copies
+    (``singleton.py``, ``handlers/dry_run_audit.py``) into this one helper.
+    It is a DIRECT ``kopf.event`` call that deliberately bypasses the D11
+    dry-run gate: its callers (the singleton guard's SINGLETON_* /
+    RedisUrlEmpty Events, the dry-run audit's ``DryRunToggled`` Event) must
+    not be suppressible by the very flag or election state they report on.
+    Handler paths that SHOULD be gated use :class:`EventEmitter` instead.
+    """
+    kopf.event(obj, type=event_type, reason=reason, message=message)
 
 
 class EventEmitter:
