@@ -127,6 +127,39 @@ spec:
               multiple writers on one CR is the usual cause (D05).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
+        # metrics.py STATUS_MAP_ENTRIES (#489) — the LEAD-TIME companion to
+        # the #171 cap counter: status_map_caps_total and the
+        # StatusMapCapped Warning Event fire only AFTER a map has hit
+        # STATUS_MAP_MAX_ENTRIES (10000) and the oldest D04 idempotency
+        # anchors are already being dropped (an evicted softStops /
+        # startedSince anchor for a still-relevant analysis silently
+        # re-arms the double-soft-stop / double-requeue paths the anchors
+        # exist to prevent). Threshold 8000 = 0.8 x the cap; at typical
+        # fill rates the 2000-entry headroom is days of runway to prune
+        # or revisit the cap — archivedAnalyses' monotonic growth on a
+        # long-lived cluster is the canonical case.
+        - alert: OpenStudioOperatorStatusMapNearCap
+          expr: openstudio_operator_status_map_entries > 8000
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: CR .status map nearing the 10k eviction cap ({{ $labels.namespace }}/{{ $labels.name }} {{ $labels.map_name }})
+            description: >-
+              openstudio_operator_status_map_entries > 8000 (0.8 x
+              STATUS_MAP_MAX_ENTRIES) sustained for 30m on CR
+              {{ $labels.namespace }}/{{ $labels.name }}, map {{ $labels.map_name }} —
+              at the current fill rate the #171 defensive cap will start evicting the
+              OLDEST entries, and those entries are the D04 idempotency anchors (an
+              evicted softStops / startedSince anchor for a still-relevant analysis
+              silently re-arms the double-soft-stop / double-requeue paths the anchors
+              exist to prevent). The post-hoc signals (status_map_caps_total +
+              StatusMapCapped Warning Event) fire only once anchors are already lost.
+              Act inside the runway: prune completed analyses (the retention
+              pipeline's archivedAnalyses entries are the usual monotonic growth),
+              or revisit the cap sizing — do not wait for duplicate-action anomalies.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
         # metrics.py HANDLER_LAST_TICK_TIMESTAMP (#469) — the scheduler
         # heartbeat: the ONLY signal that advances when the scheduler is
         # merely invoking the timers. Every other family here is

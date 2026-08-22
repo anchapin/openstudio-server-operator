@@ -144,6 +144,17 @@ EXPECTED_COUNTER_FAMILIES = (
 #: Turn operator policy posture into a scrapeable fact: a quiet dry-run
 #: operator was previously indistinguishable from a quiet live one.
 #: Alert: ``dry_run_active == 1`` sustained beyond a migration window.
+#:
+#: Issue #489 — ``status_map_entries{namespace,name,map_name}`` Gauge is
+#: the LEAD-TIME companion to the #171 cap counter: set to ``len(map)``
+#: inside ``status_store.StatusStore._read_status`` (the single read site
+#: every RMW cycle and typed getter lands on), so all four .status maps
+#: are stamped on every read. The cap counter + ``StatusMapCapped``
+#: Warning Event fire only after anchors are already being dropped;
+#: the gauge gives an SRE a capacity panel and a ``> 8000`` (0.8 ×
+#: STATUS_MAP_MAX_ENTRIES) alert with days of runway. Cardinality is
+#: bounded by the same invariant as the cap counter (one series per
+#: CR-map pair; singleton guard bounds CRs, D05).
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -159,6 +170,9 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_server_url_set",
     "openstudio_operator_redis_url_set",
     "openstudio_operator_auto_soft_stop_enabled",
+    # Issue #489 — per-map CR .status size gauge (lead time before the
+    # 10k cap evicts D04 anchors).
+    "openstudio_operator_status_map_entries",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

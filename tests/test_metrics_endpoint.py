@@ -223,6 +223,15 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.AUTO_SOFT_STOP_ENABLED.labels(
         namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
     ).set(0)
+    # Issue #489 — pre-touch the labelled status-map size Gauge so the
+    # family's sample series is exposed. Labelled by (namespace, name,
+    # map_name) — CR identity (the #311 convention) + the four .status
+    # map keys (same vocabulary as status_map_caps_total).
+    metrics.STATUS_MAP_ENTRIES.labels(
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        map_name="__metrics_test_sentinel__",
+    ).set(0)
     # Issue #310 — pre-touch the labelled drop Counter so the family
     # line is exposed. ``reason`` label vocabulary currently includes
     # ``queue_full`` (the only drop path today); a future second reason
@@ -396,6 +405,17 @@ def test_metrics_http_server_serves_all_declared_counters():
             assert (
                 f'{name}{{name="{SENTINEL_NAME}",'
                 f'namespace="{SENTINEL_NAMESPACE}"}}'
+                in response.text
+            )
+        elif name == "openstudio_operator_status_map_entries":
+            # Issue #489 — labelled by (namespace, name, map_name);
+            # exposition writes labels alphabetically
+            # (map_name < name < namespace).
+            assert (
+                'openstudio_operator_status_map_entries{map_name="__metrics_test_sentinel__",'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
                 in response.text
             )
         else:

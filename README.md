@@ -86,7 +86,7 @@ references a metric family missing from `tests/_metrics_inventory.py`.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
-versa) fails CI loudly. **Current shape: 20 counters + 13 gauges + 3 histograms
+versa) fails CI loudly. **Current shape: 20 counters + 14 gauges + 3 histograms
 (post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
@@ -196,6 +196,7 @@ specific family:
 | `openstudio_operator_auto_soft_stop_enabled{namespace,name}` | gauge (labelled) | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) · #492 | 1.0 when `analysisPolicy.autoSoftStop` is true (the CRD default) — the SLA monitor is armed to soft-stop analyses past `maxDurationMinutes`. 0.0 = the SLA monitor is fully passive (a full stop — no soft-stop, no escalation, no anchors written); previously the debug log line was the only record. Alert on an unexpected 0 on production: someone disabled the analysis SLA. |
 | `openstudio_operator_warnings_deferred_queue_depth` | gauge | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) · #310 | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up — a companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000) so the drop path can be diagnosed before silent loss starts. |
 | `openstudio_operator_metrics_server_bound{addr,port}` | gauge (labelled) | `metrics` (`start_metrics_server` first bind attempt) · #393 | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address); never re-touched after the first attempt. Labelled by `addr` + `port` (the configured bind target — `0.0.0.0:9090` in the stock deployment, the same surface the `containerPort`, NetworkPolicy, and Prometheus scrape config reference). Covers the bind attempt in BOTH authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). **Alert on `== 0`: the canonical "Prometheus scrape is down because of US" signal** — it distinguishes "the metrics endpoint never bound" from "operator wedged / wrong scrape config" without log scraping for the `Cannot serve /metrics` WARNING. Self-referential edge: when the bind failed, this pod's `/metrics` is dead, so the `0.0` cannot be scraped from the pod itself — pair the alert with blackbox-exporter `up == 0` (the gauge is the durable record for post-mortems and confirms the operator-side cause). |
+| `openstudio_operator_status_map_entries{namespace,name,map_name}` | gauge (labelled) | `status_store` (`_read_status` — the single read site every RMW cycle and typed getter lands on) · #489 | `len(map)` for each of the four capped `.status` maps, stamped on every read (RMW fresh GETs and plain getters alike; read-time semantics — the next read after a write carries the post-write length, so the gauge is fresh within one poll). Labelled by `map_name` ∈ {`softStops`, `requeues`, `startedSince`, `archivedAnalyses`} (the exact `.status` map keys, same vocabulary as `status_map_caps_total`); cardinality bounded by the singleton guard (D05). The LEAD-TIME companion to `status_map_caps_total` (#171): the cap counter + `StatusMapCapped` Warning Event fire only AFTER `STATUS_MAP_MAX_ENTRIES` (10000) is hit and the oldest D04 idempotency anchors are already being dropped — an evicted `softStops`/`startedSince` anchor for a still-relevant analysis silently re-arms the double-soft-stop / double-requeue paths the anchors exist to prevent, and `archivedAnalyses` grows monotonically on a long-lived cluster. **Capacity alert threshold: `> 8000` (0.8 × 10000) sustained 30m** (shipped as `OpenStudioOperatorStatusMapNearCap`) — the 2000-entry headroom is days of runway to prune or revisit the cap before anchor loss; investigate the upstream fill rate, don't wait for duplicate-action anomalies. |
 
 The labelled counters emit one series per label combo; only the observed
 combos appear in the exposition (prometheus_client behaviour for labelled
@@ -221,7 +222,11 @@ by `module` (4 series — the four OSCM timer wrappers), and the four
 `redis_url_set`, `auto_soft_stop_enabled`), each labelled by
 `(namespace, name)` (bounded by the singleton guard's
 one-winner-per-namespace invariant, D05 — the same bound the
-`singleton_loser_skips_total` cross-product relies on). The labelled
+`singleton_loser_skips_total` cross-product relies on), and
+`status_map_entries`, labelled by `(namespace, name, map_name)` (4
+series per CR — one per `.status` map; the namespace × name
+cross-product is bounded by D05, the same bound the cap counter's
+twin labelling relies on). The labelled
 histograms (`handler_tick_duration_seconds`, `rest_request_duration_seconds`)
 follow the same convention — one labelled series per label combo. See each
 row for the vocabulary.
@@ -346,7 +351,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+13+3)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+14+3)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

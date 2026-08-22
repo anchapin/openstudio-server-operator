@@ -652,6 +652,127 @@ def test_status_map_cap_does_not_evict_on_clear(api, store, status_event_sink):
     assert "a00042" not in store.get_soft_stops()
 
 
+# --- Issue #489 — status_map_entries lead-time gauge ----------------------------
+
+
+def _gauge_map_entries(map_name: str) -> float:
+    """Read ``STATUS_MAP_ENTRIES{NAMESPACE, NAME, map_name}`` current value.
+
+    Calling ``.labels(...)`` creates the series at 0 if absent — the same
+    pre-touch idiom the cap-counter tests above use, so before/after reads
+    are observable without relying on a prior test having touched the series.
+    """
+    from openstudio_operator import metrics as metrics_module
+
+    child = metrics_module.STATUS_MAP_ENTRIES.labels(
+        namespace=NAMESPACE, name=NAME, map_name=map_name
+    )
+    return float(child._value.get())
+
+
+def test_status_map_entries_gauge_tracks_len_for_all_four_maps(api, store):
+    """Issue #489: after RMW writes into each map, the per-map gauge reads
+    ``len(map)`` for all four ``map_name`` label values — the exact ``.status``
+    map keys, same vocabulary as ``status_map_caps_total``.
+
+    The stamp site is ``_read_status`` (shared by the RMW cycle's fresh GET
+    and the typed getters), so the final write's read stamped all four maps
+    and the getter re-reads below stamp identical values.
+    """
+    store.set_soft_stop("a1", make_soft_stop())
+    store.set_soft_stop("a2", make_soft_stop(outcome="dry-run"))
+    store.set_requeue("dp1", make_requeue(count=2))
+    store.set_started_since("dp1", datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC))
+    store.set_archived_analysis("a1", make_archived())
+
+    assert len(store.get_soft_stops()) == 2
+    assert len(store.get_requeues()) == 1
+    assert len(store.get_started_since_map()) == 1
+    assert len(store.get_archived_analyses()) == 1
+
+    assert _gauge_map_entries("softStops") == 2.0
+    assert _gauge_map_entries("requeues") == 1.0
+    assert _gauge_map_entries("startedSince") == 1.0
+    assert _gauge_map_entries("archivedAnalyses") == 1.0
+
+    # Exposition shape — labels alphabetical (map_name < name < namespace),
+    # so a future label rename/reorder is caught here, not on the on-call's
+    # Grafana board.
+    from prometheus_client import generate_latest
+
+    exposition = generate_latest().decode()
+    assert (
+        f'openstudio_operator_status_map_entries{{map_name="softStops",'
+        f'name="{NAME}",namespace="{NAMESPACE}"}} 2.0' in exposition
+    )
+
+
+def test_status_map_entries_gauge_stamped_on_plain_reads_without_writes(api, store):
+    """Issue #489: read-only getters stamp the gauge — no RMW needed.
+
+    The monotonic ``archivedAnalyses`` case matters most: on a long-lived
+    cluster the operator reads the map on ticks where it writes nothing,
+    and the gauge must still trend toward the cap. A map absent from the
+    status stamps 0 — verified here against a pre-seeded nonzero sentinel
+    so the 0.0 proves the read stamped it (not merely that ``.labels()``
+    creates the series at 0).
+    """
+    from openstudio_operator import metrics as metrics_module
+
+    api.obj["status"] = {
+        "archivedAnalyses": {f"a{i}": make_archived().to_dict() for i in range(7)},
+        "softStops": {"x1": make_soft_stop().to_dict()},
+    }
+    # Pre-seed the absent-map series at a nonzero sentinel.
+    metrics_module.STATUS_MAP_ENTRIES.labels(
+        namespace=NAMESPACE, name=NAME, map_name="requeues"
+    ).set(42.0)
+
+    assert len(store.get_archived_analyses()) == 7
+
+    assert _gauge_map_entries("archivedAnalyses") == 7.0
+    assert _gauge_map_entries("softStops") == 1.0
+    assert _gauge_map_entries("requeues") == 0.0  # stamped 0 by the read
+    assert _gauge_map_entries("startedSince") == 0.0
+    assert api.patch_calls == 0  # pure reads — the gauge never forces a write
+
+
+def test_status_map_entries_gauge_tracks_len_up_to_and_through_the_cap(
+    api, store, monkeypatch, status_event_sink
+):
+    """Issue #489: with a small cap, the gauge reports ``len`` pre-cap and
+    holds at the cap once evictions begin — the lead-time window the gauge
+    exists to expose (the counter + Warning Event fire only at the eviction).
+    """
+    monkeypatch.setattr(status_store, "STATUS_MAP_MAX_ENTRIES", 5)
+    cap = status_store.STATUS_MAP_MAX_ENTRIES
+    api.obj["status"] = {
+        "archivedAnalyses": {f"k{i}": make_archived().to_dict() for i in range(cap - 1)}
+    }
+
+    # Pre-cap: one below the cap — the alert band (> 0.8 * cap) territory.
+    assert len(store.get_archived_analyses()) == cap - 1
+    assert _gauge_map_entries("archivedAnalyses") == float(cap - 1)
+    assert status_event_sink == []
+
+    # Reaching the cap: adding the 5th entry evicts nothing (len < cap on add).
+    # The stamp is READ-time — the RMW's fresh GET observed the pre-write
+    # map — so the next read (every real tick reads before deciding) stamps
+    # the post-write length.
+    store.set_archived_analysis("new-1", make_archived())
+    assert len(store.get_archived_analyses()) == cap
+    assert _gauge_map_entries("archivedAnalyses") == float(cap)
+    assert status_event_sink == []
+
+    # Past the cap: the post-hoc signals fire and the map holds AT the cap —
+    # the gauge reads the steady-state bound, the trend before it was the
+    # lead time.
+    store.set_archived_analysis("new-2", make_archived())
+    assert len(store.get_archived_analyses()) == cap
+    assert _gauge_map_entries("archivedAnalyses") == float(cap)
+    assert status_event_sink  # fired only now — after the gauge already trended
+
+
 # --- deferredEvents (#402) -----------------------------------------------------
 
 
