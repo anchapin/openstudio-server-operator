@@ -171,6 +171,26 @@ def test_rolling_restart_patch_api_exception_409_propagates() -> None:
     assert RESTARTED_AT_ANNOTATION not in fake.obj["spec"]["template"]["metadata"]["annotations"]
 
 
+def test_rolling_restart_observes_kube_api_duration_histogram() -> None:
+    """Issue #488 acceptance: the rolling-restart patch observes the kube-api
+    request-duration histogram under ``verb="patch"`` — the Deployment patch
+    is one of the kube chokepoints whose latency was previously invisible
+    (only the #119 status-store 409 counters covered any kube path)."""
+    from openstudio_operator import metrics
+
+    fake = FakeAppsV1Api(make_deployment_obj())
+    histogram = metrics.KUBE_API_REQUEST_DURATION_SECONDS
+    child = histogram.labels(verb="patch")
+    before = float(next(s.value for s in child._child_samples() if s.name == "_count"))
+
+    rolling_restart_deployment(
+        fake, deployment=DEPLOYMENT, namespace=NAMESPACE, now=datetime.now(UTC)
+    )
+
+    after = float(next(s.value for s in child._child_samples() if s.name == "_count"))
+    assert after - before >= 1
+
+
 def test_loader_falls_back_to_kubeconfig_on_config_exception() -> None:
     """Incluster ``ConfigException`` → ``load_kube_config`` runs, in that order.
 

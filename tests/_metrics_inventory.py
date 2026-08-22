@@ -229,8 +229,29 @@ EXPECTED_GAUGE_FAMILIES = (
 #: retry envelope, labelled by ``method`` and ``outcome`` (``"200"`` |
 #: ``"exception"``). A sustained non-zero rate on ``outcome="exception"``
 #: is the canonical REST-degraded alert.
+#:
+#: Issue #488 — Redis request-duration Histogram. Every
+#: ``ReadOnlyRedisClient`` read method (queue_depths LLENs,
+#: worker_heartbeats SMEMBERS + the stale_workers delegation,
+#: validate_key_layout scans, the #83 D2 workers_for_analysis read)
+#: observes its wall-clock duration on BOTH success and failure, labelled
+#: by ``operation`` (llen | smembers | scan — the issue-pinned
+#: vocabulary; multi-command methods timed once under their dominant
+#: label). Companion to the REST histogram above: attributes an inflated
+#: tick-duration bucket to Redis vs REST vs kube.
+#:
+#: Issue #488 — Kubernetes API request-duration Histogram. The kube
+#: client chokepoints (status_store RMW get/patch, the rolling-restart
+#: Deployment patch, pod list/delete in the SLA escalation, the
+#: Deployment reads behind deployment_label_selector) observe their
+#: wall-clock duration on BOTH success and failure, labelled by ``verb``
+#: (get | patch | delete | list). A slow-but-SUCCESSFUL apiserver is the
+#: blind spot the #119 409 counters leave open. Same #308 bucket set.
 EXPECTED_HISTOGRAM_FAMILIES = (
     "openstudio_operator_analysis_datapoint_count",
     "openstudio_operator_handler_tick_duration_seconds",
     "openstudio_operator_rest_request_duration_seconds",
+    # Issue #488 — per-dependency latency attribution histograms.
+    "openstudio_operator_redis_request_duration_seconds",
+    "openstudio_operator_kube_api_request_duration_seconds",
 )

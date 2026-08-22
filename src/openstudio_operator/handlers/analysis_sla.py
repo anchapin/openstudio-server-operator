@@ -110,8 +110,10 @@ from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
+    KUBE_API_REQUEST_DURATION_SECONDS,
     SOFT_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
+    observe_duration,
 )
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_core_api, operator_custom_objects_api
@@ -454,7 +456,12 @@ def _resque_matched_worker_pods(
     worker_ids = redis_client.workers_for_analysis(analysis_id)
     if not worker_ids:
         return []
-    pods_response = pod_api.list_namespaced_pod(namespace) if pod_api is not None else None
+    # Issue #488 — time the apiserver LIST (the network surface); the
+    # candidate matching below is pure computation.
+    with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="list"):
+        pods_response = (
+            pod_api.list_namespaced_pod(namespace) if pod_api is not None else None
+        )
     candidate_pod_names: set[str] = set()
     for pod in getattr(pods_response, "items", None) or []:
         name = getattr(getattr(pod, "metadata", None), "name", None)
@@ -548,7 +555,12 @@ def _escalate_analysis(
             evicted_count += 1
             continue
         try:
-            pod_api.delete_namespaced_pod(pod_name, namespace, grace_period_seconds=grace_seconds)
+            # Issue #488 — time the apiserver DELETE; observed on the
+            # failure path too (the except below keeps counting errors).
+            with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="delete"):
+                pod_api.delete_namespaced_pod(
+                    pod_name, namespace, grace_period_seconds=grace_seconds
+                )
         except ApiException as exc:
             failed_count += 1
             last_failure = exc

@@ -98,12 +98,14 @@ from openstudio_operator.config import (
 )
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.metrics import (
+    KUBE_API_REQUEST_DURATION_SECONDS,
     RESQUE_QUEUE_DEPTH,
     RESQUE_QUEUE_DEPTH_FRESH,
     RESQUE_WORKERS_SEEN_MAX,
     STALL_WINDOW_ELAPSED_SECONDS,
     STALL_WINDOW_FRESH,
     WEB_BACKGROUND_RESTARTS_TOTAL,
+    observe_duration,
 )
 from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
 from openstudio_operator.singleton import (
@@ -391,7 +393,10 @@ def _worker_pods_healthy(
             deployment,
         )
         return False
-    pods = pods_api.list_namespaced_pod(namespace, label_selector=selector).items or []
+    # Issue #488 — time the apiserver LIST (the network surface); the
+    # phase checks below are pure computation.
+    with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="list"):
+        pods = pods_api.list_namespaced_pod(namespace, label_selector=selector).items or []
     if not pods:
         return False
     for pod in pods:

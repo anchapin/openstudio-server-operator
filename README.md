@@ -86,7 +86,7 @@ references a metric family missing from `tests/_metrics_inventory.py`.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
- versa) fails CI loudly. **Current shape: 20 counters + 16 gauges + 3 histograms
+ versa) fails CI loudly. **Current shape: 20 counters + 16 gauges + 5 histograms
 (post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
@@ -101,7 +101,8 @@ bind-outcome gauge; post-#471 REST retry-attempt counter; post-#469 handler
 last-tick scheduler-heartbeat gauge; post-#492 config-state posture gauges —
 `dry_run_active`, `server_url_set`, `redis_url_set`,
 `auto_soft_stop_enabled`; post-#504 `build_info` fleet-identity gauge;
-post-#491 `singleton_wrapped_handlers` boot-time wrap-count gauge).**
+post-#491 `singleton_wrapped_handlers` boot-time wrap-count gauge;
+post-#488 Redis + kube-api request-duration histograms).**
 
 **Optional bearer-token authN (issue #401):** by default the endpoint is open
 plaintext behind the `openstudio-operator-metrics-ingress` NetworkPolicy
@@ -139,6 +140,13 @@ specific family:
   per-`module` wall-clock duration of the four @kopf.timer wrappers.
 - `openstudio_operator_rest_request_duration_seconds` (histogram, #308) —
   per-`(method, outcome)` wall-clock duration of OpenStudioClient REST calls.
+- `openstudio_operator_redis_request_duration_seconds` (histogram, #488) —
+  per-`operation` (`llen` | `smembers` | `scan`) wall-clock duration of
+  ReadOnlyRedisClient read methods.
+- `openstudio_operator_kube_api_request_duration_seconds` (histogram, #488) —
+  per-`verb` (`get` | `patch` | `delete` | `list`) wall-clock duration of the
+  operator's Kubernetes API calls (status-store RMW, rolling-restart patch,
+  pod list/delete, Deployment reads).
 - `openstudio_operator_singleton_loser_skips_total` (counter, #403) — per-tick
   singleton-guard loser suppressions (per `(module, namespace, name)`).
 - `openstudio_operator_metrics_server_bound` (gauge, #393) — outcome of
@@ -193,6 +201,8 @@ specific family:
 | `openstudio_operator_analysis_datapoint_count` | histogram | `analysis_sla` (Module 1) + `datapoint_watchdog` (Module 2) · #179, relabelled #472 | Per-tick counts observed by the SLA tick (analyses returned by the `/analyses.json` poll, governs soft-stop timing) and the watchdog tick (started datapoints from the light `/data_points/status` view, governs zombie requeue timing). **Labelled by `view`** (#472): `view="analyses_per_tick"` at the SLA site, `view="started_datapoints_per_tick"` at the watchdog site — the two populations have different units (analyses are typically an order of magnitude fewer than in-flight datapoints), so the pre-#472 unlabelled merge produced meaningless percentiles and silently reweighted on any cadence change. Dashboard queries MUST pin the `view` label; two series total, cardinality still bounded (per-observation, not per-CR). Buckets `[5, 10, 50, 100, 500, 1000, 5000]` — still surfacing the "we just started getting 5000-point analyses" shift. Lets an on-call correlate "why are SLA stops spiking?" with a shift in analysis-size distribution. |
 | `openstudio_operator_handler_tick_duration_seconds` | histogram (labelled, `module`) | all four timer wrappers (`analysis_sla` / `datapoint_watchdog` / `worker_recycler` / `web_background_monitor`) · #308 | Per-`module` wall-clock duration of the four `@kopf.timer` wrappers, observed regardless of success or caught-exception outcome. Sustained degradation (REST 5xx storm, GC pause, kopf bus contention, NFS stall) is visible to Prometheus BEFORE it crosses the failure threshold captured by `handler_tick_failures_total`. Labelled by `module` (same vocabulary as the failure counter) so a dashboard can correlate latency with failure rate on the same dimension. Buckets `[0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60]` seconds — covers the healthy band (sub-second typical) through the action threshold (the timer wrappers run at cadence 30-60s; an observation > 60s means the tick crossed the next-cadence boundary). |
 | `openstudio_operator_rest_request_duration_seconds` | histogram (labelled, `method`, `outcome`) | `openstudio_client` (`_request` retry envelope) · #308 | Per-`(method, outcome)` wall-clock duration of OpenStudioClient REST calls — includes the GET-only 3× retry envelope. `outcome` ∈ {`"200"`, `"exception"`} — `"200"` covers any successful 2xx/3xx (the success branch returns early); `"exception"` covers any raised `OpenStudioApiError`. Sustained non-zero rate on `outcome="exception"` is the canonical REST-degraded alert (REST 5xx, network, cluster down). Labelled by `method` ∈ {`GET`, `POST`, `DELETE`} (the verbs the operator actually uses). Buckets `(0.05, 0.1, 0.5, 1, 2, 5)` — the canonical set from #308; pinned so a future refactor that broadens or narrows the resolution at the healthy band is caught at CI. |
+| `openstudio_operator_redis_request_duration_seconds` | histogram (labelled, `operation`) | `redis_client` (`queue_depth` LLEN · `worker_heartbeats` SMEMBERS+HGETALL (incl. `stale_workers` delegation) · `validate_key_layout` SCAN loop · `workers_for_analysis` SMEMBERS+GETs) · #488 | Wall-clock duration of every ReadOnlyRedisClient read method, observed at the END of each method on BOTH success and failure paths (duration is duration — error counting lives on the tick-failure counters). A slowing Redis (fork stalls, persistence pauses, network degrade) previously showed up only as an inflated `handler_tick_duration_seconds` bucket that could not be attributed to Redis vs REST vs kube. Labelled by `operation` ∈ {`llen`, `smembers`, `scan`} — the issue-pinned vocabulary; a method issuing multiple commands (e.g. `worker_heartbeats`'s SMEMBERS + HGETALL) is timed once under its dominant operation label. Buckets `(0.05, 0.1, 0.5, 1, 2, 5)` — same set as the #308 REST histogram so the three per-dependency histograms render on one dashboard axis. |
+| `openstudio_operator_kube_api_request_duration_seconds` | histogram (labelled, `verb`) | `status_store` (`_read_status` GET · `_mutate` PATCH) · `_k8s` (`deployment_label_selector` GET · `rolling_restart_deployment` PATCH) · `analysis_sla` (escalation LIST + DELETE) · `web_background_monitor` (leg-C pod LIST) · #488 | Wall-clock duration of the operator's Kubernetes API calls at the wrapped chokepoints, observed on BOTH success and failure paths. A slow-but-SUCCESSFUL apiserver is the exact blind spot the #119 409 counters leave open — and a kube-apiserver slowdown used to present identically to a REST slowdown in the registry. Labelled by `verb` ∈ {`get`, `patch`, `delete`, `list`}. Companion to `rest_request_duration_seconds` and `redis_request_duration_seconds`; same #308 bucket set. |
 | `openstudio_operator_resque_workers_seen_max` | gauge | `web_background_monitor` (Module 4) · #44 / #87 | Monotonic max of distinct Resque worker ids ever observed in process lifetime (SMEMBERS `resque:workers` cardinality, read on **every** sensing tick since #87 regardless of queue depth). **`== 0` with reachable Redis means no workers are registered** — the leg-2 non-vacuity safeguard is then vacuously true and the operator will periodic-restart `web_background` while everything looks healthy. Alert on `== 0`. |
 | `openstudio_operator_resque_queue_depth{queue}` | gauge (labelled) | `web_background_monitor` (`_stall_condition_holds` leg-A read) · #238 | LLEN of the two managed Resque queues (`resque:queue:simulations` and `resque:queue:requeued`) on **every** sensing tick (issue #87-style unconditional emission — the same path the stall-condition leg-A reads, no separate cost). Labelled by `queue` (cardinality bounded to the two managed queues — 2 total). Surfaces the operator's authoritative reading as a cross-check against KEDA's external metrics view — a centralized-constants / live v3.11.0 layout drift (#44/#66/#67) shows up as the operator's depths disagreeing with KEDA's. Alert on `simulations` > 0 sustained while `resque_workers_seen_max == 0` (the dangerous silent misbehavior signature). |
 | `openstudio_operator_redis_key_layout_status` | gauge | `handlers` (`_check_redis_key_layout_for_cr` per-CR check) · #253 | Cluster-wide latest observation of the boot-time Redis key-layout validator (#163). `1.0` when the most recent `validate_key_layout()` call returned `ok`; `0.0` for every other terminal status (`degraded` \| `unreachable` \| `error` \| `skipped`). One series for the cluster-wide validator state (no per-CR labels — cardinality stays bounded regardless of CR count). Alert on `== 0` — the post-#44 failure mode (a v3.11.0 layout drift takes `resque_workers_seen_max` silent, the stall condition fires vacuously, and the operator periodic-restarts `web_background` while everything looks healthy) is observable here without log scraping. |
@@ -241,7 +251,8 @@ one-winner-per-namespace invariant, D05 — the same bound the
 series per CR — one per `.status` map; the namespace × name
 cross-product is bounded by D05, the same bound the cap counter's
 twin labelling relies on). The labelled
-histograms (`handler_tick_duration_seconds`, `rest_request_duration_seconds`)
+histograms (`handler_tick_duration_seconds`, `rest_request_duration_seconds`,
+`redis_request_duration_seconds`, `kube_api_request_duration_seconds`)
 follow the same convention — one labelled series per label combo. See each
 row for the vocabulary.
 
@@ -365,7 +376,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+16+3)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+16+5)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

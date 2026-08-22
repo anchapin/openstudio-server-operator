@@ -35,6 +35,9 @@ import logging
 import os
 import sys
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -60,6 +63,16 @@ _HANDLER_TICK_BUCKETS = (0.05, 0.1, 0.5, 1, 2, 5, 10, 30)
 # fast (< 1 s on a healthy cluster; #242 timing data); a 5 s cap keeps
 # resolution at the healthy band where a degrade is detectable.
 _REST_REQUEST_BUCKETS = (0.05, 0.1, 0.5, 1, 2, 5)
+
+# Default bucket set for the Redis + Kubernetes-API dependency
+# request-duration Histograms (issue #488). Deliberately the SAME values
+# as the #308 REST set: Redis reads are sub-ms-to-ms and kube-apiserver
+# calls ms-to-s on a healthy cluster, so one 50 ms–5 s spread keeps
+# resolution at the healthy band for BOTH dependencies and — the issue's
+# core ask — makes the three per-dependency histograms directly
+# comparable on a single dashboard axis when attributing an inflated
+# HANDLER_TICK_DURATION bucket to Redis vs REST vs kube.
+_DEPENDENCY_REQUEST_BUCKETS = (0.05, 0.1, 0.5, 1, 2, 5)
 
 logger = logging.getLogger(__name__)
 
@@ -1028,6 +1041,84 @@ REST_RETRIES_TOTAL = Counter(
     "early-degrade companion to outcome=\"exception\".",
     labelnames=["method"],
 )
+
+# Issue #488 — Redis request-duration Histogram. The read-only Redis client
+# (queue_depths LLENs, worker_heartbeats SMEMBERS + the stale_workers
+# delegation, validate_key_layout scans, the #83 D2 workers_for_analysis
+# read) runs on every web_background tick with no latency telemetry of its
+# own — a slowing Redis (fork stalls, persistence pauses, network degrade)
+# previously showed up only as an inflated HANDLER_TICK_DURATION bucket
+# that could not be attributed to Redis vs REST vs kube. This Histogram
+# observes the wall-clock duration of each wrapped client method — a
+# method issuing multiple commands is timed once under its dominant
+# operation label — on BOTH success and failure paths (duration is
+# duration; the error counters elsewhere own failure counting). Labelled
+# by ``operation`` with the issue-pinned vocabulary llen | smembers |
+# scan (the HGETALL/GET calls ride inside worker_heartbeats /
+# workers_for_analysis under their dominant label). Buckets match the
+# #308 REST set — see ``_DEPENDENCY_REQUEST_BUCKETS``.
+REDIS_REQUEST_DURATION_SECONDS = Histogram(
+    "openstudio_operator_redis_request_duration_seconds",
+    "Wall-clock duration of ReadOnlyRedisClient read methods (issue #488), "
+    "observed at the END of each method on BOTH success and failure "
+    "paths — duration is duration; error COUNTING lives on the existing "
+    "tick-failure counters, so this family never double-counts errors. "
+    "Labelled by ``operation`` (llen | smembers | scan — the issue-pinned "
+    "vocabulary; a method issuing multiple commands is timed once under "
+    "its dominant operation label). Makes a slowing Redis (fork stalls, "
+    "persistence pauses, network degrade) separable from a REST or "
+    "kube-apiserver degrade — the three dependency histograms share the "
+    "#308 bucket set so they render on one dashboard axis.",
+    labelnames=["operation"],
+    buckets=_DEPENDENCY_REQUEST_BUCKETS,
+)
+
+# Issue #488 — Kubernetes API request-duration Histogram. The operator's
+# kube client surface (status_store RMW get/patch, the rolling-restart
+# Deployment patch, pod list/delete in the SLA escalation path, the
+# Deployment reads behind deployment_label_selector) previously had only
+# the #119 409 counters covering it — a slow-but-SUCCESSFUL apiserver was
+# invisible, and a kube-apiserver slowdown presented identically to a REST
+# slowdown in the registry. This Histogram observes the wall-clock
+# duration of each wrapped call, labelled by ``verb``
+# (get | patch | delete | list), on BOTH success and failure paths.
+# Buckets match the #308 REST set — see ``_DEPENDENCY_REQUEST_BUCKETS``.
+KUBE_API_REQUEST_DURATION_SECONDS = Histogram(
+    "openstudio_operator_kube_api_request_duration_seconds",
+    "Wall-clock duration of the operator's Kubernetes API calls (issue "
+    "#488): status_store RMW GET/PATCH, the rolling-restart Deployment "
+    "patch, pod list/delete in the SLA escalation path, and the "
+    "Deployment reads behind deployment_label_selector. Observed on BOTH "
+    "success and failure paths — a slow-but-successful apiserver is the "
+    "exact blind spot the 409 counters (#119) leave open. Labelled by "
+    "``verb`` (get | patch | delete | list). Companion to "
+    "rest_request_duration_seconds and redis_request_duration_seconds: "
+    "the three share the #308 bucket set so an inflated tick-duration "
+    "bucket can be attributed to Redis vs REST vs kube during an incident.",
+    labelnames=["verb"],
+    buckets=_DEPENDENCY_REQUEST_BUCKETS,
+)
+
+
+@contextmanager
+def observe_duration(histogram: Histogram, **labels: str) -> Iterator[None]:
+    """Time a dependency call and observe it on ``histogram`` (issue #488).
+
+    Minimal time-context helper shared by the Redis and kube-api wrap
+    sites so no call site needs its own try/finally: the observation
+    happens in the ``finally``, so a RAISED error still records the
+    duration it cost. Errors are COUNTED by the existing failure
+    counters (``HANDLER_TICK_FAILURES_TOTAL`` etc.) — this helper only
+    times, never classifies. Uses ``time.perf_counter`` (monotonic,
+    highest-resolution wall clock), matching the #308 REST/ tick-duration
+    convention of timing wall-clock elapsed seconds.
+    """
+    child = histogram.labels(**labels) if labels else histogram
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        child.observe(time.perf_counter() - start)
 
 #: Re-exported alias for back-compat with the historical ``DEFAULT_METRICS_PORT``
 #: identifier and any external callers that import it from this module (issue #165

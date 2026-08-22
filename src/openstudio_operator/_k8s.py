@@ -56,6 +56,7 @@ from typing import Protocol
 
 from kubernetes.client import AppsV1Api
 
+from openstudio_operator.metrics import KUBE_API_REQUEST_DURATION_SECONDS, observe_duration
 from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,10 @@ def deployment_label_selector(
     conservative direction (the worst case is a missed-eviction, not a
     false-eviction). Returns ``None`` only when neither is set.
     """
-    dep = apps_api.read_namespaced_deployment(deployment, namespace)
+    # Issue #488 — time the apiserver Deployment read; the selector
+    # building below is pure computation.
+    with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="get"):
+        dep = apps_api.read_namespaced_deployment(deployment, namespace)
     selector = getattr(getattr(dep, "spec", None), "selector", None)
     match_labels = getattr(selector, "match_labels", None) or {}
     match_expressions = list(getattr(selector, "match_expressions", None) or [])
@@ -221,12 +225,16 @@ def rolling_restart_deployment(
             }
         }
     }
-    apps_api.patch_namespaced_deployment(
-        deployment,
-        namespace,
-        body=patch_body,
-        _content_type=content_type,
-    )
+    # Issue #488 — time the apiserver PATCH itself (the network surface);
+    # a slow-but-successful apiserver is the blind spot the 409 counters
+    # leave open. Observed on failure too — duration is duration.
+    with observe_duration(KUBE_API_REQUEST_DURATION_SECONDS, verb="patch"):
+        apps_api.patch_namespaced_deployment(
+            deployment,
+            namespace,
+            body=patch_body,
+            _content_type=content_type,
+        )
     return restart_value
 
 
