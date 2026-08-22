@@ -39,12 +39,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 858 tests across 42 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 862 tests across 42 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
 - **Venv drift guard (issue #71):** in wave-orchestration worktrees the shared venv can resolve `openstudio_operator` against a different checkout. Before running tests/lint against a new checkout, re-run `pip install -e '.[dev]'` from that checkout, or verify with `scripts/check_editable_install.sh`.
-- **CI uses a hash-pinned lockfile** (`requirements.lock`, issue #173) — `pip install --require-hashes -r requirements.lock`. Local `pip install -e '.[dev]'` is fine because it's editable; the lockfile exists so CI installs are reproducible across runs.
+- **CI uses a hash-pinned lockfile** (`requirements.lock`, issue #173) — `pip install --require-hashes -r requirements.lock`. Local `pip install -e '.[dev]'` is fine because it's editable; the lockfile exists so CI installs are reproducible across runs. There is a SECOND lockfile, `requirements.txt` (issue #479): the runtime-only compile (no `--extra=dev`) that the Dockerfile installs from, keeping pytest/hypothesis/responses/fakeredis/ruff out of the production image. Refresh BOTH together — `pip-compile --extra=dev --generate-hashes --no-strip-extras --output-file=requirements.lock pyproject.toml` AND the same command without `--extra=dev` targeting `requirements.txt` (`tests/test_dependency_drift.py` gates both).
 - **Mocking deps are pinned in `pyproject.toml`**: `responses` for the OpenStudio REST API, `fakeredis` for the read-only Redis client, `hypothesis` for the D12 timestamp boundary (issue #246). Don't add another HTTP/Redis mocking library.
 - **Single-test focus:** `pytest tests/test_metrics_endpoint.py::test_declared_counters_match_expected_set` — pytest's `-k` and path syntax work; node IDs are `<file>::<test>`.
 - **`scripts/` is the validation toolkit** (kind cluster lifecycle, password rotation, fixture capture/drift, KEDA install). It is **not** build glue. The `check_*_unique.sh` scripts are CI gates; never delete them.

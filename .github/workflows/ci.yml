@@ -155,6 +155,12 @@ jobs:
           python -m venv /tmp/lockfile-verify
           /tmp/lockfile-verify/bin/python -m pip install --upgrade pip
           /tmp/lockfile-verify/bin/pip install --require-hashes -r requirements.lock
+          # Issue #479: the runtime-only lockfile the Dockerfile installs
+          # from must verify hash-clean in a fresh venv as well — a broken
+          # requirements.txt otherwise only surfaces at release build time.
+          python -m venv /tmp/runtime-lockfile-verify
+          /tmp/runtime-lockfile-verify/bin/python -m pip install --upgrade pip
+          /tmp/runtime-lockfile-verify/bin/pip install --require-hashes -r requirements.txt
       - run: pytest
       # Issues #151 / #220 / #423 — guard against test-count claim drift.
       # The `N tests across M files` claim lives in FOUR prose locations:
