@@ -139,7 +139,7 @@ jobs:
       # using GitHub Actions OIDC (no long-lived key). Pushes the signature
       # to the public Sigstore transparency log + the GHCR signature store.
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign + attest the dev image
         env:
           COSIGN_EXPERIMENTAL: "true"
@@ -253,7 +253,7 @@ jobs:
           trivyignores: .trivyignore
           ignore-unfixed: true
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign + attest the versioned image
         env:
           COSIGN_EXPERIMENTAL: "true"
