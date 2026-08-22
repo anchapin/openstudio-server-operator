@@ -21,7 +21,7 @@ import kopf
 from openstudio_operator import singleton, status_store
 from openstudio_operator._constants import CRD_SPEC
 from openstudio_operator.client_factory import get_read_only_redis_client
-from openstudio_operator.config import OperatorConfigError
+from openstudio_operator.config import OperatorConfig, OperatorConfigError
 from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
@@ -147,10 +147,25 @@ def _check_redis_key_layout_for_cr(
     """Run ``validate_key_layout()`` for one OSCM CR; return a status string.
 
     Returns one of ``"ok"``, ``"degraded"``, ``"unreachable"``, ``"error"``,
-    or ``"skipped"`` (empty redis_url, nameless item, etc.). The handler
-    controls the structured log line based on the return value; the test
-    suite asserts the line is emitted (see
+    or ``"skipped"`` (empty redis_url with no secretRef, nameless item,
+    etc.). The handler controls the structured log line based on the return
+    value; the test suite asserts the line is emitted (see
     ``tests/test_redis_client.py::test_redis_key_layout_check_emits_*``).
+
+    Issue #567 — the check is secretRef-aware: the effective Redis URL is
+    resolved through the factory's #463 path (``secret_ref`` from
+    ``spec.redisCredentials.secretRef`` plus the CR's ``namespace``), so a
+    secretRef-only CR (``spec.redisUrl`` empty — the preferred production
+    shape) VALIDATES instead of returning ``"skipped"``. The skip branch
+    survives only for a CR with neither an inline URL nor a secretRef
+    (the #116 empty-``spec.redisUrl`` concern). A resolution failure
+    (missing Secret/key, bad value) raises
+    :class:`~openstudio_operator.redis_client.RedisCredentialResolutionError`
+    — a :class:`~openstudio_operator.redis_client.RedisClientError`
+    subclass — and therefore lands on the ``"unreachable"`` branch; a
+    malformed secretRef raises ``ValueError`` in the config parse and
+    lands on the ``"error"`` branch (the function stays total — never
+    raises).
 
     Wrapped in try/except so a Redis connectivity failure (network down,
     DNS failure, refused connection, timeout) does NOT crash the boot —
@@ -188,19 +203,29 @@ def _check_redis_key_layout_for_cr(
         _set_redis_key_layout_status(0.0)
         return "skipped"
     spec = item.get("spec") or {}
-    redis_url = str(spec.get("redisUrl") or "")
-    if not redis_url:
-        # Empty URL is a separate concern (#116) — don't fail layout
-        # validation on the operator's intentional refusal to default.
-        logger.debug(
-            "redis_key_layout skip: OSCM %s/%s has empty spec.redisUrl (#116)",
-            ns,
-            nm,
-        )
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
     try:
-        get_read_only_redis_client(redis_url).validate_key_layout()
+        # Issue #567 — parse through OperatorConfig (the single config
+        # path) so the secretRef resolution matches the timer wire
+        # closures exactly; the parse runs INSIDE the try so a malformed
+        # secretRef keeps the function total (broad-except → "error").
+        config = OperatorConfig.from_spec(spec)
+        if not config.redis_url and config.redis_credentials.secret_ref is None:
+            # Neither credential source is set — a separate concern
+            # (#116) — don't fail layout validation on the operator's
+            # intentional refusal to default.
+            logger.debug(
+                "redis_key_layout skip: OSCM %s/%s has empty spec.redisUrl "
+                "and no spec.redisCredentials.secretRef (#116)",
+                ns,
+                nm,
+            )
+            _set_redis_key_layout_status(0.0)
+            return "skipped"
+        get_read_only_redis_client(
+            config.redis_url,
+            secret_ref=config.redis_credentials.secret_ref,
+            namespace=ns,
+        ).validate_key_layout()
     except OperatorConfigError as exc:
         # Layout drift (issue #44). Since #475 this class lives in config.py
         # and is NOT a RedisClientError subclass, so the ordering of this
@@ -232,9 +257,13 @@ def _check_redis_key_layout_for_cr(
         return "degraded"
     except (RedisClientError, OSError) as exc:
         # Redis connectivity failure (refused, DNS, timeout) — wire-level,
-        # not a layout drift. Loud warning, no event (we don't know the
-        # layout drifted; we just couldn't reach the server). Operator
-        # MUST continue to boot — the issue's hard requirement.
+        # not a layout drift. Since #567 this branch also absorbs the
+        # secretRef resolution failures (``RedisCredentialResolutionError``
+        # is a ``RedisClientError`` subclass): a missing Secret/key or a
+        # fence-violating value reads as "unreachable", and the log line
+        # names the exact object to fix. Loud warning, no event (we don't
+        # know the layout drifted; we just couldn't reach the server).
+        # Operator MUST continue to boot — the issue's hard requirement.
         logger.warning(
             "redis_key_layout=unreachable namespace=%s name=%s: %s",
             ns,

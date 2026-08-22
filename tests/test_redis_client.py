@@ -22,6 +22,7 @@ from prometheus_client import REGISTRY
 import openstudio_operator.handlers as handlers_pkg
 from openstudio_operator import metrics as _metrics_module
 from openstudio_operator import redis_client
+from openstudio_operator.config import RedisSecretRef
 from openstudio_operator.handlers import _check_redis_key_layout_for_cr
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
@@ -946,6 +947,132 @@ def test_redis_key_layout_check_skips_empty_redis_url(
     assert "redis_key_layout=degraded" not in caplog.text
     assert "redis_key_layout=unreachable" not in caplog.text
     assert "redis_key_layout=ok" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("redis_url", "spec_id"),
+    [
+        ("", "secret-ref-only"),
+        ("redis://:stale-inline-pw@queue.test:6379", "secret-ref-wins-over-inline"),
+    ],
+)
+def test_redis_key_layout_check_runs_via_secret_ref(
+    fake,
+    client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_url: str,
+    spec_id: str,
+) -> None:
+    """Issue #567: a secretRef CR VALIDATES instead of returning ``skipped``.
+
+    Pre-#567 the check read ``spec.redisUrl`` directly: a secretRef-only
+    CR (``redisUrl`` empty — the #463 preferred production shape) was
+    "skipped" forever, so the boot-time and #490 periodic layout
+    validation never ran for exactly the CRs most likely to be
+    misconfigured. The factory is patched (the ``_patched_client_factory``
+    pattern) to a capturing stub backed by fakeredis seeded with the
+    valid v3.11.0 layout, so the test asserts BOTH that validation runs
+    (status ``ok``, not ``skipped``) AND that the check passes the parsed
+    secretRef + the CR's namespace into the factory (the #567 wiring
+    contract; the Secret resolution itself is covered in
+    ``tests/test_client_factory.py``).
+    """
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+
+    seen: dict[str, object] = {}
+
+    def _factory(redis_url_arg: str, *, secret_ref=None, namespace=""):
+        seen["redis_url"] = redis_url_arg
+        seen["secret_ref"] = secret_ref
+        seen["namespace"] = namespace
+        return ReadOnlyRedisClient(
+            # The resolved URL is irrelevant to the stub — the fakeredis
+            # connection is the data source; a non-empty URL keeps the
+            # constructor's URL parsing happy on the secret-ref-only spec.
+            redis_url_arg or "redis://queue.test:6379",
+            connection=fake,
+            now_fn=lambda: NOW,
+        )
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+    )
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {
+            "redisUrl": redis_url,
+            "redisCredentials": {
+                "secretRef": {"name": "openstudio-redis", "key": "redis-url"}
+            },
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "ok", (
+        f"Expected status='ok' ({spec_id} spec) — validation must RUN for a "
+        f"secretRef CR, not return 'skipped'; got {status!r}. Captured: "
+        f"{caplog.text!r}. See issue #567."
+    )
+    assert "redis_key_layout=ok" in caplog.text
+    assert seen["secret_ref"] == RedisSecretRef(name="openstudio-redis", key="redis-url"), (
+        f"the check must pass the parsed secret_ref into the factory; got "
+        f"{seen['secret_ref']!r}. See issue #567."
+    )
+    assert seen["namespace"] == "test-ns", (
+        f"the check must pass the CR's namespace for the Secret read; got "
+        f"{seen['namespace']!r}. See issue #567."
+    )
+
+
+def test_redis_key_layout_check_secret_ref_resolution_failure_is_unreachable(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #567: a secretRef that cannot resolve lands on ``unreachable``, not a crash.
+
+    The function must stay total (never raise — the #490 rider rides a
+    stall tick on it): a resolution failure raises
+    ``RedisCredentialResolutionError``, a ``RedisClientError`` subclass,
+    so the existing wire-level branch absorbs it and the log line names
+    the Secret to fix.
+    """
+    from openstudio_operator.redis_client import RedisCredentialResolutionError
+
+    def _factory(redis_url_arg: str, *, secret_ref=None, namespace=""):
+        raise RedisCredentialResolutionError(
+            "cannot read Secret test-ns/openstudio-redis (issue #463): 404 Not Found"
+        )
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+    )
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {
+            "redisUrl": "",
+            "redisCredentials": {
+                "secretRef": {"name": "openstudio-redis", "key": "redis-url"}
+            },
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        # MUST NOT raise — totality is the #163/#490 invariant.
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "unreachable"
+    assert "redis_key_layout=unreachable" in caplog.text
+    assert "openstudio-redis" in caplog.text
 
 
 def test_redis_key_layout_check_skips_nameless_item(

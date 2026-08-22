@@ -1563,8 +1563,10 @@ def test_web_background_timer_tick_carries_key_layout_revalidation(
     # stubbed so a sentinel never gets used (the test_timer_wrapper_failures
     # pattern).
     monkeypatch.setattr(_wbm, "operator_custom_objects_api", lambda: object())
+    # #567 — the wire closure now passes secret_ref=/namespace= kwargs
+    # (secretRef-aware factory path); the stub absorbs them.
     monkeypatch.setattr(
-        _wbm, "get_read_only_redis_client", lambda redis_url: object()
+        _wbm, "get_read_only_redis_client", lambda redis_url, **_kwargs: object()
     )
 
     spec = {**SPEC, "dryRun": True}

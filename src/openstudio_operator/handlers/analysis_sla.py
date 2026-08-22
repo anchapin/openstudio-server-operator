@@ -268,8 +268,12 @@ def run_sla_tick(
 
     ``namespace``/``pod_api`` wire the Kubernetes side of
     the escalation (pod deletion in the CR's namespace); ``redis_client``
-    wires the Resque side (worker → analysis match). All three default to
-    live clients in production and are injection seams for tests.
+    wires the Resque side (worker → analysis match). In production all
+    three arrive from the timer's #473 wire closure (since #567 the Redis
+    client is resolved through the secretRef-aware factory path); the
+    ``None`` defaults are injection seams for tests that exercise
+    non-escalation paths — a ``None`` reaching the escalation path is a
+    caller bug that fails loudly (see :func:`_escalate_analysis`).
     """
     if not config.analysis_policy.auto_soft_stop:
         logger.debug("analysisPolicy.autoSoftStop is false — SLA monitor passive this tick")
@@ -503,8 +507,8 @@ def _escalate_analysis(
     now: datetime,
     emit: EventEmitter,
     namespace: str,
-    pod_api: WorkerPodApi | None,
-    redis_client: RedisClientLike | None,
+    pod_api: WorkerPodApi,
+    redis_client: RedisClientLike,
 ) -> str:
     """Evict the worker pods processing ``analysis_id`` (issue #9, #83 D2).
 
@@ -519,15 +523,20 @@ def _escalate_analysis(
     hostname segment → ``list_namespaced_pod`` to verify the candidate
     pods exist in the namespace → delete those pods.
 
+    Issue #567 — the pre-#567 live-client fallback (``pod_api is None``
+    → ``operator_core_api()``; ``redis_client is None`` → the 1-arg
+    factory call) is REMOVED: deps always arrive via the timer's wire
+    closure, matching the #473 pattern of the other handler modules (and
+    the fallback's 1-arg factory call was secretRef-blind — the exact
+    #567 defect). A ``None`` reaching this function is now a caller bug
+    that fails loudly (``AttributeError``) instead of silently building
+    an unauthenticated client.
+
     Delete-before-anchor (D12): if the anchor marker write fails after
     deletes, the next tick re-escalates — at most one extra eviction
     burst for pods that likely no longer exist, the same accepted race
     as #8's stop-then-anchor ordering.
     """
-    if pod_api is None:
-        pod_api = operator_core_api()
-    if redis_client is None:
-        redis_client = get_read_only_redis_client(config.redis_url)
     victims = _resque_matched_worker_pods(
         redis_client,
         pod_api,
@@ -639,13 +648,24 @@ def analysis_sla_monitor(
     decorator (issue #395) still observes the wall-clock duration on
     ``HANDLER_TICK_DURATION_SECONDS.labels(module="analysis_sla")`` in a
     ``finally`` — regardless of success or caught exception.
+
+    Issue #567 — the wire closure resolves the Redis client through the
+    secretRef-aware factory path (``secret_ref=config.redis_credentials
+    .secret_ref`` plus the CR's ``namespace`` every tick), so a
+    secretRef-only CR (``spec.redisUrl`` empty) gets a working client
+    instead of the pre-#567 ``ReadOnlyRedisClient("")`` ``ValueError``
+    that escaped the wrapper as an uncaught kopf handler error.
     """
 
     def wire(config: OperatorConfig) -> _SlaTimerClients:
         return _SlaTimerClients(
             client=get_openstudio_client(config.server_url),
             pod_api=operator_core_api(),
-            redis_client=get_read_only_redis_client(config.redis_url),
+            redis_client=get_read_only_redis_client(
+                config.redis_url,
+                secret_ref=config.redis_credentials.secret_ref,
+                namespace=namespace,
+            ),
         )
 
     def tick(

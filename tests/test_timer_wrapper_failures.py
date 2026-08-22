@@ -46,12 +46,17 @@ from kubernetes.config import ConfigException
 from prometheus_client import REGISTRY
 from urllib3.exceptions import LocationValueError
 
+from _fakes import FakeSecretsCoreV1Api, encode_secret_value
+from openstudio_operator import singleton
+from openstudio_operator.client_factory import get_read_only_redis_client
+from openstudio_operator.config import RedisSecretRef
 from openstudio_operator.handlers import (
     analysis_sla,
     datapoint_watchdog,
     web_background_monitor,
     worker_recycler,
 )
+from openstudio_operator.handlers.analysis_sla import SlaTickResult
 from openstudio_operator.openstudio_client import OpenStudioApiError
 from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.singleton import SingletonGuard
@@ -792,3 +797,225 @@ def test_each_wrapper_out_of_tuple_class_is_distinct_from_in_tuple_class() -> No
             f"the issue #249 negative-case tests would silently start "
             f"catching in-tuple exceptions."
         )
+
+
+# --- Issue #567 — secretRef-only CR through the Redis wire closures -------------
+#
+# The #463 factory gained ``(redis_url, secret_ref, namespace)`` but no
+# production call site passed ``secret_ref``: a secretRef-only CR
+# (``spec.redisUrl`` empty — AGENTS.md's "preferred production shape")
+# passed the singleton guard and stamped ``redis_url_set=1`` on the
+# posture gauge, then ``ReadOnlyRedisClient("")`` raised ``ValueError``
+# at wire time — deliberately NOT in ``SKIP_TICK_EXCEPTIONS``, so the
+# stall monitor and the SLA monitor crashed as uncaught kopf handler
+# errors on EVERY tick. #567 wires ``secret_ref`` + the CR namespace
+# through both wire closures; these tests drive a secretRef-only spec
+# through the REAL ``run_oscm_tick`` + ``wire`` path (only the per-module
+# ``run_*_tick`` is stubbed, to capture the resolved client) with a
+# faked Secret read, asserting the resolved client is used instead of a
+# raised ``ValueError``.
+
+SECRET_URL = "redis://:rotated-pw@queue.openstudio-server.svc.cluster.local:6379"
+SECRET_REF_NAME = "openstudio-redis"
+SECRET_REF_KEY = "redis-url"
+EXPECTED_SECRET_REF = RedisSecretRef(name=SECRET_REF_NAME, key=SECRET_REF_KEY)
+
+
+def _secret_ref_spec(*, redis_url: str = "") -> dict:
+    """A spec with ``spec.redisCredentials.secretRef`` set (issue #463 shape)."""
+    return {
+        "serverUrl": "http://web.test",
+        "redisUrl": redis_url,
+        "redisCredentials": {"secretRef": {"name": SECRET_REF_NAME, "key": SECRET_REF_KEY}},
+        "dryRun": True,
+    }
+
+
+@pytest.fixture
+def _fake_secret_reader(monkeypatch: pytest.MonkeyPatch) -> FakeSecretsCoreV1Api:
+    """Serve the #463 Secret read from ``singleton._operator_core_api``.
+
+    The REAL ``get_read_only_redis_client`` runs (no factory stub): the
+    lru_cache is cleared on setup/teardown so the resolution — and the
+    ``.calls`` assertion — is fresh for each case.
+    """
+    get_read_only_redis_client.cache_clear()
+    fake = FakeSecretsCoreV1Api({SECRET_REF_KEY: encode_secret_value(SECRET_URL)})
+    monkeypatch.setattr(singleton, "_operator_core_api", fake)
+    yield fake
+    get_read_only_redis_client.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "inline_redis_url",
+    ["", "redis://:stale-inline-pw@queue.test:6379"],
+    ids=["secret-ref-only", "secret-ref-wins-over-inline"],
+)
+def test_analysis_sla_monitor_wrapper_resolves_redis_client_from_secret_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+    _fake_secret_reader: FakeSecretsCoreV1Api,
+    inline_redis_url: str,
+) -> None:
+    """Issue #567: the SLA wire closure hands the tick a Secret-resolved client.
+
+    Pre-#567 the secretRef-only case raised ``ValueError`` out of the
+    wrapper (uncaught kopf handler error, every tick); the test completing
+    IS the no-crash assertion. The captured client must be built from the
+    Secret-held URL (preferred over any inline ``spec.redisUrl`` — the
+    #463 acceptance), and the Secret read must target the referenced
+    Secret in the CR's namespace.
+    """
+    # pod_api: any sentinel — run_sla_tick is stubbed below.
+    monkeypatch.setattr(analysis_sla, "operator_core_api", lambda: object())
+    captured: dict[str, object] = {}
+
+    def _capture(*_args: object, **kwargs: object) -> SlaTickResult:
+        captured["redis_client"] = kwargs["redis_client"]
+        return SlaTickResult(soft_stopped=[], escalated=[])
+
+    monkeypatch.setattr(analysis_sla, "run_sla_tick", _capture)
+
+    result = analysis_sla.analysis_sla_monitor(
+        body=BODY,
+        spec=_secret_ref_spec(redis_url=inline_redis_url),
+        namespace=NAMESPACE,
+        name=NAME,
+        logger=logging.getLogger("test"),
+    )
+
+    # The timer wrapper returns None by design (it logs rather than
+    # returns); the tick RAN iff the capture fired.
+    assert result is None
+    assert "redis_client" in captured, (
+        "the tick must RUN (not skip) — the wire resolved a working client. "
+        "See issue #567."
+    )
+    client = captured["redis_client"]
+    assert client._redis_url == SECRET_URL, (
+        f"run_sla_tick must receive the Secret-resolved client; got URL "
+        f"{client._redis_url!r}. See issue #567 — the wire closure must "
+        f"pass secret_ref + namespace to get_read_only_redis_client."
+    )
+    assert _fake_secret_reader.calls == [(SECRET_REF_NAME, NAMESPACE)], (
+        "the Secret read must target exactly the referenced Secret in "
+        "the CR's namespace (issue #567)"
+    )
+
+
+@pytest.mark.parametrize(
+    "inline_redis_url",
+    ["", "redis://:stale-inline-pw@queue.test:6379"],
+    ids=["secret-ref-only", "secret-ref-wins-over-inline"],
+)
+def test_web_background_monitor_wrapper_resolves_redis_client_from_secret_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_operator_k8s_client: None,
+    _fake_secret_reader: FakeSecretsCoreV1Api,
+    inline_redis_url: str,
+) -> None:
+    """Issue #567: the stall-monitor wire closure hands the tick a Secret-resolved client.
+
+    Same regression shape as the SLA case: pre-#567 the secretRef-only
+    spec raised ``ValueError`` at wire time on every tick. The #490
+    key-layout rider is no-op'd here (it has its own direct secretRef
+    coverage in ``tests/test_redis_client.py``) so this test stays
+    hermetic — without the patch the rider would run the REAL
+    ``validate_key_layout()`` against the resolved host.
+    """
+    # apps/pods sentinels — run_stall_tick is stubbed below.
+    monkeypatch.setattr(web_background_monitor, "operator_apps_api", lambda: object())
+    monkeypatch.setattr(web_background_monitor, "operator_core_api", lambda: object())
+    monkeypatch.setattr(
+        web_background_monitor,
+        "_maybe_revalidate_redis_key_layout",
+        lambda *a, **_k: None,
+    )
+    captured: dict[str, object] = {}
+
+    def _capture(*args: object, **_kwargs: object) -> bool:
+        captured["redis_client"] = args[0]  # first positional arg of run_stall_tick
+        return False
+
+    monkeypatch.setattr(web_background_monitor, "run_stall_tick", _capture)
+
+    result = web_background_monitor.web_background_monitor(
+        body=BODY,
+        spec=_secret_ref_spec(redis_url=inline_redis_url),
+        namespace=NAMESPACE,
+        name=NAME,
+        logger=logging.getLogger("test"),
+    )
+
+    assert result is None, "wrapper returns None on a non-firing (False) stall tick"
+    assert "redis_client" in captured, (
+        "the tick must RUN (not skip) — the wire resolved a working client. "
+        "See issue #567."
+    )
+    client = captured["redis_client"]
+    assert client._redis_url == SECRET_URL, (
+        f"run_stall_tick must receive the Secret-resolved client; got URL "
+        f"{client._redis_url!r}. See issue #567."
+    )
+    assert _fake_secret_reader.calls == [(SECRET_REF_NAME, NAMESPACE)]
+
+
+def test_web_background_monitor_wrapper_secret_ref_failure_counts_as_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _stub_operator_k8s_client: None,
+) -> None:
+    """Issue #567 D12 posture: an unresolvable secretRef SKIPS the tick, not crashes.
+
+    A missing Secret raises ``RedisCredentialResolutionError`` (a
+    ``RedisClientError`` subclass — an explicit ``SKIP_TICK_EXCEPTIONS``
+    member), so a secretRef-only CR whose Secret is not (yet) created
+    gets the counted skip-tick + retry-next-poll treatment — the Secret
+    created after the first attempt is picked up on the very next tick
+    (the factory never memoizes raised exceptions).
+    """
+    get_read_only_redis_client.cache_clear()
+    monkeypatch.setattr(
+        singleton,
+        "_operator_core_api",
+        FakeSecretsCoreV1Api(exc=ApiException(status=404, reason="Not Found")),
+    )
+    monkeypatch.setattr(web_background_monitor, "operator_apps_api", lambda: object())
+    monkeypatch.setattr(web_background_monitor, "operator_core_api", lambda: object())
+    monkeypatch.setattr(
+        web_background_monitor,
+        "_maybe_revalidate_redis_key_layout",
+        lambda *a, **_k: None,
+    )
+    stall_calls: list[object] = []
+    monkeypatch.setattr(
+        web_background_monitor,
+        "run_stall_tick",
+        lambda *a, **k: stall_calls.append(a) or False,
+    )
+
+    before = _counter("web_background_monitor", "RedisCredentialResolutionError")
+    with caplog.at_level(
+        logging.WARNING, logger="openstudio_operator.handlers.web_background_monitor"
+    ):
+        result = web_background_monitor.web_background_monitor(
+            body=BODY,
+            spec=_secret_ref_spec(),
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+    after = _counter("web_background_monitor", "RedisCredentialResolutionError")
+
+    assert result is None
+    assert not stall_calls, "the tick must not run when the Secret cannot be read"
+    assert after - before == 1.0, (
+        "HANDLER_TICK_FAILURES_TOTAL{module=web_background_monitor, "
+        "error_type=RedisCredentialResolutionError} must increment by "
+        f"exactly 1; observed delta {after - before}."
+    )
+    assert (
+        "web_background monitor tick skipped, retrying next poll "
+        "(RedisCredentialResolutionError" in caplog.text
+    )
+    get_read_only_redis_client.cache_clear()
