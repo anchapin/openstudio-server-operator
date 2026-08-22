@@ -288,6 +288,13 @@ queue to drain and watching the same. Live evidence in
    Prerequisites):
 
    ```bash
+   # Issue #498 — PSS `restricted` labels for the namespace (mirrors the
+   # #388 kind recipe plus `warn`). Metadata-only manifest: kubectl apply
+   # MERGES the labels onto the existing (helm-created) namespace and
+   # replaces nothing. Chart pods satisfy `restricted` (#388 proof); an
+   # environment running a workload that cannot comply must deliberately
+   # downgrade per-environment, not drop the labels.
+   kubectl apply -f deploy/namespace-labels.yaml
    kubectl apply -f deploy/crd.yaml
    kubectl apply -f deploy/rbac.yaml
    # Issue #293 — ValidatingAdmissionPolicy narrows the operator SA's
