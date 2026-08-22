@@ -751,11 +751,23 @@ def web_background_monitor(
     what bounds the ``redis_key_layout_status_fresh`` staleness gap. It
     runs at most once per ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` (5
     min) and never raises, so the stall semantics below are unchanged.
+
+    Issue #567 — the wire closure resolves the Redis client through the
+    secretRef-aware factory path: ``secret_ref=config.redis_credentials
+    .secret_ref`` plus the CR's ``namespace`` are passed on every tick,
+    so a secretRef-only CR (``spec.redisUrl`` empty — the #463 preferred
+    production shape) gets a working client instead of the pre-#567
+    ``ReadOnlyRedisClient("")`` ``ValueError`` that escaped the wrapper
+    as an uncaught kopf handler error every tick.
     """
 
     def wire(config: OperatorConfig) -> _StallTimerClients:
         return _StallTimerClients(
-            redis_client=get_read_only_redis_client(config.redis_url),
+            redis_client=get_read_only_redis_client(
+                config.redis_url,
+                secret_ref=config.redis_credentials.secret_ref,
+                namespace=namespace,
+            ),
             apps_api=operator_apps_api(),
             pods_api=operator_core_api(),
             tracker=_get_tracker(namespace, name, cr_cache.cr_uid(body)),

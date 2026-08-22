@@ -17,6 +17,7 @@ apply-semantics fourth copy.
 
 from __future__ import annotations
 
+import base64
 import copy
 from types import SimpleNamespace
 
@@ -28,6 +29,17 @@ from openstudio_operator.status_store import GROUP, PLURAL, VERSION
 
 NAME = "oscm"
 NAMESPACE = "openstudio-server"
+
+
+def encode_secret_value(value: str) -> str:
+    """Base64-encode a Secret ``data`` value the way the API server returns it.
+
+    The kubernetes client library does NOT decode Secret ``data``; the #463
+    resolution path in ``client_factory._resolve_redis_url`` does its own
+    ``base64.b64decode``. Fakes that seed a Secret therefore store the
+    encoded form.
+    """
+    return base64.b64encode(value.encode()).decode()
 
 
 def make_cr(
@@ -198,6 +210,32 @@ def make_emit():
         events.append((event_type, reason, message))
 
     return events, emit
+
+
+class FakeSecretsCoreV1Api:
+    """Just enough ``CoreV1Api`` for the #463 Secret read (issue #567).
+
+    Serves ``read_namespaced_secret`` only — the single bounded Secret
+    access ``client_factory._resolve_redis_url`` performs. Mirrors the
+    local copy in ``tests/test_client_factory.py`` (which predates the
+    sharing and is left local — refactoring that file is out of #567's
+    scope); the handler-wrapper tests added by #567 import this one so
+    the surface is defined once going forward. Records every read as a
+    ``(name, namespace)`` tuple in ``.calls`` so tests can assert the
+    factory asked for exactly the referenced Secret in the CR's
+    namespace.
+    """
+
+    def __init__(self, data: dict[str, str] | None = None, exc: Exception | None = None):
+        self._data = dict(data or {})
+        self._exc = exc
+        self.calls: list[tuple[str, str]] = []
+
+    def read_namespaced_secret(self, name: str, namespace: str):
+        self.calls.append((name, namespace))
+        if self._exc is not None:
+            raise self._exc
+        return SimpleNamespace(data=dict(self._data))
 
 
 def calls_to(suffix: str) -> int:
