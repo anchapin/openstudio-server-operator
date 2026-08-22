@@ -131,6 +131,19 @@ EXPECTED_COUNTER_FAMILIES = (
 #: ``dry_run_audit`` watch handler is consciously excluded (no cadence).
 #: Alert: ``time() - handler_last_tick_timestamp{module=...} > 3 *
 #: <interval>`` (per-module intervals in ``_constants.py``).
+#:
+#: Issue #492 — the four config-state posture gauges, each labelled by
+#: ``namespace`` + ``name`` (CR identity, the #311 convention; bounded
+#: by the singleton guard's one-CR-per-namespace invariant, D05):
+#: ``dry_run_active`` (1/0 — the D11 gate posture; flipped immediately
+#: on spec.dryRun transitions by ``dry_run_audit`` in addition to the
+#: per-tick stamp), ``server_url_set`` / ``redis_url_set`` (1/0 —
+#: whether the CR carried the respective URL source at config-parse
+#: time; redis counts the #463 secretRef as a source), and
+#: ``auto_soft_stop_enabled`` (1/0 — whether the SLA monitor is armed).
+#: Turn operator policy posture into a scrapeable fact: a quiet dry-run
+#: operator was previously indistinguishable from a quiet live one.
+#: Alert: ``dry_run_active == 1`` sustained beyond a migration window.
 EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_resque_workers_seen_max",
     "openstudio_operator_resque_queue_depth",
@@ -141,6 +154,11 @@ EXPECTED_GAUGE_FAMILIES = (
     "openstudio_operator_warnings_deferred_queue_depth",
     "openstudio_operator_metrics_server_bound",
     "openstudio_operator_handler_last_tick_timestamp",
+    # Issue #492 — config-state posture gauges (per-CR labelled).
+    "openstudio_operator_dry_run_active",
+    "openstudio_operator_server_url_set",
+    "openstudio_operator_redis_url_set",
+    "openstudio_operator_auto_soft_stop_enabled",
 )
 
 #: Issue #179 — per-tick count Histogram. The SLA monitor and the

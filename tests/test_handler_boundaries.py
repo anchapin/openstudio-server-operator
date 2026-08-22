@@ -632,3 +632,78 @@ def test_dry_run_toggle_audit_is_a_watch_handler_never_gated() -> None:
     from openstudio_operator import _oscm_handlers
 
     assert not _oscm_handlers.is_registered("dry_run_toggle_audit")
+
+
+def test_dry_run_toggle_flips_posture_gauge_immediately() -> None:
+    """Issue #492: a spec.dryRun transition flips ``dry_run_active``
+    IMMEDIATELY — the watch handler sets the gauge alongside the
+    DryRunToggled Event, so the posture is visible at /metrics without
+    waiting for the next timer tick (the per-tick stamp in
+    ``run_oscm_tick`` remains the backstop). Uses a dedicated CR name so
+    the process-global gauge sample cannot collide with the tick-runner
+    probes."""
+    from prometheus_client import REGISTRY
+
+    from openstudio_operator.handlers import dry_run_audit
+    from openstudio_operator.metrics import DRY_RUN_ACTIVE
+
+    dry_run_audit.reset_audit_state()
+    events, emit = _make_audit_sink()
+    name = "oscm-posture-flip"
+    labels = {"namespace": "openstudio-server", "name": name}
+
+    def gauge() -> float | None:
+        return REGISTRY.get_sample_value("openstudio_operator_dry_run_active", labels)
+
+    # Baseline observation — no transition, no Event; the gauge is NOT
+    # flipped here (transition-gated, matching the Event's noise gate;
+    # the next timer tick's stamp is the backstop for baselines).
+    assert (
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=False, name=name),
+            logger=_SENTINEL_LOGGER,
+            emit=emit,
+        )
+        is False
+    )
+    DRY_RUN_ACTIVE.labels(**labels).set(0.0)
+    assert gauge() == 0.0
+
+    # The transition false → true: Event emitted AND gauge flipped to
+    # 1.0 in the same call — no next-tick latency.
+    assert (
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=True, name=name),
+            logger=_SENTINEL_LOGGER,
+            emit=emit,
+        )
+        is True
+    )
+    assert gauge() == 1.0, "transition must flip dry_run_active immediately (#492)"
+
+    # Steady state after the flip — no re-emit; the gauge holds 1.0.
+    assert (
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=True, name=name),
+            logger=_SENTINEL_LOGGER,
+            emit=emit,
+        )
+        is False
+    )
+    assert gauge() == 1.0
+
+    # And back false → true→false: flips to 0.0 just as immediately.
+    assert (
+        dry_run_audit.record_dry_run_transition(
+            _make_oscm_body(dry_run=False, name=name),
+            logger=_SENTINEL_LOGGER,
+            emit=emit,
+        )
+        is True
+    )
+    assert gauge() == 0.0
+
+    assert len(_drain_dryruntoggled(events)) == 2, (
+        "the gauge flip must not change the Event cadence — exactly one "
+        "DryRunToggled per real transition, as #397 pinned"
+    )

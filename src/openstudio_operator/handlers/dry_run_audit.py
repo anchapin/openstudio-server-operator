@@ -43,6 +43,13 @@ Design points:
   fire. It calls :func:`kopf.event` directly, the same chokepoint the
   singleton guard's ``SingletonConflict``/``SingletonActive`` Events use
   (those also must not be suppressible by the very flag under audit).
+* **Posture gauge flip (issue #492).** On the same transition the handler
+  also sets ``metrics.DRY_RUN_ACTIVE{namespace,name}`` (1.0/0.0) — the
+  immediate, no-next-tick-latency stamp; the per-tick
+  ``run_oscm_tick`` stamp is the backstop. Transition-gated like the
+  Event (steady state re-stamps nothing), bypasses D11 like the Event
+  (recording posture is not a mutation), and covers loser CRs like the
+  Event.
 * **Fires for EVERY OSCM CR, winner or loser.** This handler is NOT wrapped
   by the singleton ``_gated`` wrapper (which only reaches kopf's
   ``registry._spawning`` timers/daemons) and is deliberately not registered
@@ -198,6 +205,21 @@ def record_dry_run_transition(
         "Normal",
         DRY_RUN_TOGGLED_EVENT,
         message,
+    )
+    # Issue #492 — flip the dry-run posture gauge immediately so a
+    # spec.dryRun transition is visible at /metrics without waiting for
+    # the next timer tick (the per-tick stamp in run_oscm_tick remains
+    # the backstop — it covers the baseline-on-miss case: a transition
+    # that happens while the operator is down is picked up by the next
+    # tick). Covers every OSCM CR, loser CRs included — matching this
+    # handler's audit-Event coverage — and deliberately NOT routed
+    # through the D11 gate: the gauge records posture, it does not
+    # mutate anything (the same reasoning that exempts the audit Event
+    # itself).
+    from openstudio_operator.metrics import DRY_RUN_ACTIVE
+
+    DRY_RUN_ACTIVE.labels(namespace=namespace, name=name).set(
+        1.0 if current else 0.0
     )
     return True
 

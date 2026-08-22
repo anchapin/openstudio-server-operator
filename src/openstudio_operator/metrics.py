@@ -390,6 +390,128 @@ HANDLER_LAST_TICK_TIMESTAMP = Gauge(
     labelnames=["module"],
 )
 
+# Issue #492 — config-state posture gauges. The operator's behavior is
+# steered by CR spec fields — dryRun (D11), serverUrl, redisUrl (+ the
+# #463 secretRef), analysisPolicy.autoSoftStop — but none of them were
+# represented at /metrics. An audit-only install (dryRun=true left on
+# after canary staging) was invisible in an idle cluster:
+# events_dry_run_suppressed_total only increments when an action is
+# ATTEMPTED, so a quiet dry-run operator and a quiet live operator
+# produced identical scrapes. The same held for a CR whose
+# autoSoftStop=false rendered the SLA monitor passive — the debug log
+# line was the only record. These four 1/0 gauges turn policy posture
+# into a fact Prometheus can alert on (e.g. dry_run_active == 1 for
+# longer than a migration window on a production cluster) — the standard
+# feature-gate/posture-gauge operator pattern, complementing the #237
+# emitted-vs-suppressed ratio which only helps once actions flow.
+#
+# Stamp sites (two, by design):
+#
+# * the shared tick-runner ``_oscm_handlers.run_oscm_tick`` stamps all
+#   four immediately after ``OperatorConfig.from_spec`` succeeds and
+#   BEFORE the idle check / guarded try — posture exists independent of
+#   tick success, so even idle ticks and wiring-failing ticks (#493)
+#   refresh the gauges. This is the backstop: worst-case latency is one
+#   timer interval (30 s for analysis_sla).
+# * the ``dry_run_audit`` watch handler (#397) flips dry_run_active
+#   immediately on a detected spec.dryRun transition — no next-tick
+#   latency for the one posture an attacker or a fat-fingered migration
+#   can flip between ticks. The other three fields have no event-driven
+#   transition detector; the per-tick stamp covers them.
+#
+# Labelled by ``namespace`` + ``name`` (CR identity, the #311 convention)
+# — cardinality bounded by the singleton guard's one-CR-per-namespace
+# invariant (D05), the same bound EVENTS_EMITTED_TOTAL etc. rely on.
+DRY_RUN_ACTIVE = Gauge(
+    "openstudio_operator_dry_run_active",
+    "Whether the active CR's ``spec.dryRun`` is true (D11 gate armed — "
+    "every mutating action suppressed, issue #492). 1.0 = the operator "
+    "is in dry-run mode; 0.0 = mutations are LIVE. Stamped per tick by "
+    "the shared tick-runner ``run_oscm_tick`` AND flipped immediately "
+    "on spec.dryRun transitions by the ``dry_run_audit`` watch handler "
+    "(#397) — a quiet dry-run operator is otherwise indistinguishable "
+    "from a quiet live one (events_dry_run_suppressed_total only "
+    "increments when an action is attempted). Alert on "
+    "``openstudio_operator_dry_run_active == 1`` sustained beyond a "
+    "migration window on a production cluster (the PrometheusRule ships "
+    "``OpenStudioOperatorDryRunActive`` with ``for: 1h``).",
+    labelnames=["namespace", "name"],
+)
+
+SERVER_URL_SET = Gauge(
+    "openstudio_operator_server_url_set",
+    "Whether the active CR carries a non-empty ``spec.serverUrl`` after "
+    "``OperatorConfig.from_spec`` parsing (issue #492). 1.0 = the "
+    "single authoritative config path (#3) has a server to poll; 0.0 = "
+    "the idle posture — every timer tick returns early (the "
+    "empty-serverUrl idle branch in ``run_oscm_tick``) and no analysis "
+    "state is read. ``0`` on a cluster expected to be working means the "
+    "CR spec is incomplete.",
+    labelnames=["namespace", "name"],
+)
+
+REDIS_URL_SET = Gauge(
+    "openstudio_operator_redis_url_set",
+    "Whether the active CR has a Redis URL resolvable at config-parse "
+    "time (issue #492): 1.0 when ``spec.redisUrl`` is non-empty OR the "
+    "#463 ``spec.redisCredentials.secretRef`` names the Secret key "
+    "holding the full ``redis://`` URL (the preferred production shape; "
+    "the ref wins over an inline URL when both are present); 0.0 = the "
+    "#116 posture — the operator refuses to operate and the per-CR "
+    "redis-URL guard emits its Warning Event. Distinct from "
+    "secret-resolution SUCCESS (the client_factory lru_cache owns "
+    "that); this gauge answers only \"did the CR carry a URL source at "
+    "all\".",
+    labelnames=["namespace", "name"],
+)
+
+AUTO_SOFT_STOP_ENABLED = Gauge(
+    "openstudio_operator_auto_soft_stop_enabled",
+    "Whether the active CR's ``analysisPolicy.autoSoftStop`` is true "
+    "(the CRD default, issue #492). 1.0 = the SLA monitor is armed to "
+    "soft-stop analyses past ``maxDurationMinutes``; 0.0 = the SLA "
+    "monitor is fully passive (a full stop — no soft-stop, no "
+    "escalation, no anchors written) and the debug log line was "
+    "previously the only record. Alert on an unexpected ``0`` on a "
+    "production cluster: someone disabled the analysis SLA.",
+    labelnames=["namespace", "name"],
+)
+
+
+def stamp_config_posture_gauges(
+    *,
+    namespace: str,
+    name: str,
+    dry_run: bool,
+    server_url_set: bool,
+    redis_url_set: bool,
+    auto_soft_stop: bool,
+) -> None:
+    """Set the four #492 config-state posture gauges for one CR.
+
+    The single stamp site used by the shared tick-runner
+    ``_oscm_handlers.run_oscm_tick`` (called immediately after
+    ``OperatorConfig.from_spec`` succeeds, before the idle check and
+    the guarded try — posture is stamped even on idle and
+    wiring-failing ticks). Takes pre-computed booleans so this module
+    stays decoupled from :mod:`openstudio_operator.config`; the
+    ``redis_url_set`` semantics (inline ``spec.redisUrl`` OR the #463
+    ``secretRef``) live at the caller, where the config is already
+    parsed. The ``dry_run_audit`` watch handler bypasses this helper —
+    it flips ONLY ``DRY_RUN_ACTIVE`` (the one field with an
+    event-driven transition detector) and only on real transitions.
+    """
+    DRY_RUN_ACTIVE.labels(namespace=namespace, name=name).set(1.0 if dry_run else 0.0)
+    SERVER_URL_SET.labels(namespace=namespace, name=name).set(
+        1.0 if server_url_set else 0.0
+    )
+    REDIS_URL_SET.labels(namespace=namespace, name=name).set(
+        1.0 if redis_url_set else 0.0
+    )
+    AUTO_SOFT_STOP_ENABLED.labels(namespace=namespace, name=name).set(
+        1.0 if auto_soft_stop else 0.0
+    )
+
 # Issue #255 — ``kopf.event`` emission failure counter. ``EventEmitter``
 # routes every Event through ``kopf.event`` (issue #164). When the
 # apiserver is unreachable, kopf's event posting raises; the exception

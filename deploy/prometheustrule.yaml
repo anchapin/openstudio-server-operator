@@ -199,7 +199,8 @@ spec:
 
     # ---------------------------------------------------------------------
     # Observability substrate — the metrics endpoint itself, the deferred-
-    # Warning-event sink, and the Redis key-layout validator.
+    # Warning-event sink, the Redis key-layout validator, and the
+    # operator's config posture (#492).
     # ---------------------------------------------------------------------
     - name: openstudio-operator.substrate
       rules:
@@ -272,6 +273,31 @@ spec:
               centralized Resque key constants do not match the live v3.11.0 layout —
               the stall-condition leg 2 is vacuously true and web_background restarts
               will fire while everything looks healthy.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py DRY_RUN_ACTIVE (#492) — the D11 posture gauge. The
+        # 1h `for` is a MIGRATION WINDOW, not a reaction SLO: dry-run is
+        # a legitimate canary-staging posture, so the alert fires only
+        # when it is LEFT ON. Labelled by (namespace, name) so a
+        # multi-CR namespace names the offending CR. A dry-run
+        # operator on a production cluster past its window means every
+        # mutating action is suppressed — analyses over SLA are not
+        # being stopped, zombies are not being requeued.
+        - alert: OpenStudioOperatorDryRunActive
+          expr: openstudio_operator_dry_run_active == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Operator is in dry-run mode ({{ $labels.namespace }}/{{ $labels.name }})
+            description: >-
+              openstudio_operator_dry_run_active == 1 for over an hour on CR
+              {{ $labels.namespace }}/{{ $labels.name }} — spec.dryRun is true and every
+              mutating action (soft-stops, requeues, pod evictions, restarts) is
+              suppressed (D11), emitted only as dry-run-marked Events. Dry-run during
+              canary staging is intentional; LEFT ON past the migration window it means
+              the operator is unarmed. Flip spec.dryRun to false (the DryRunToggled
+              audit Event, #397, records who flipped it last per managedFields).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------

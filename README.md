@@ -86,7 +86,7 @@ references a metric family missing from `tests/_metrics_inventory.py`.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
-versa) fails CI loudly. **Current shape: 20 counters + 9 gauges + 3 histograms
+versa) fails CI loudly. **Current shape: 20 counters + 13 gauges + 3 histograms
 (post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
@@ -98,7 +98,9 @@ backpressure drop counter + Queue depth gauge; post-#312 paired freshness
 timestamp gauges for `resque_queue_depth` and `stall_window_elapsed_seconds`;
 post-#403 singleton-guard loser per-tick skip counter; post-#393 metrics-server
 bind-outcome gauge; post-#471 REST retry-attempt counter; post-#469 handler
-last-tick scheduler-heartbeat gauge).**
+last-tick scheduler-heartbeat gauge; post-#492 config-state posture gauges —
+`dry_run_active`, `server_url_set`, `redis_url_set`,
+`auto_soft_stop_enabled`).**
 
 **Optional bearer-token authN (issue #401):** by default the endpoint is open
 plaintext behind the `openstudio-operator-metrics-ingress` NetworkPolicy
@@ -146,6 +148,15 @@ specific family:
   recent completed `run_oscm_tick` invocation; a flat gauge is the only
   "operator stopped working" signal (see the metrics table row for the
   staleness alert).
+- `openstudio_operator_dry_run_active` / `openstudio_operator_server_url_set`
+  / `openstudio_operator_redis_url_set` /
+  `openstudio_operator_auto_soft_stop_enabled` (gauges, #492) — the
+  config-state posture set, each 1/0 per `(namespace, name)`: is the CR in
+  dry-run (D11), did it carry a serverUrl / a Redis URL source (inline
+  `spec.redisUrl` or the #463 secretRef), and is `analysisPolicy.autoSoftStop`
+  armed. Turns "is this cluster's operator actually armed to mutate?" into a
+  scrapeable fact — a quiet dry-run operator was previously indistinguishable
+  from a quiet live one.
 
 | Family | Type | Module / issue origin | Meaning for an on-call |
 |---|---|---|---|
@@ -179,6 +190,10 @@ specific family:
 | `openstudio_operator_resque_queue_depth_fresh` | gauge | `web_background_monitor` (`_stall_condition_holds` post-`queue_depths()`) · #312 | Last-successful-update Unix timestamp for the `resque_queue_depth` data gauge. Set to `time.time()` immediately after every successful `queue_depths()` Redis call — NOT touched on the exception path (Redis unreachable, ApiException, etc.). The data gauge advances on success but is a static stale value on failure; without this freshness pair, a prior tick's value masquerades as a live reading while the operator has in fact lost visibility. Dashboard query: `time() - openstudio_operator_resque_queue_depth_fresh` — alert on a sustained gap (e.g. > 5× the sensing tick cadence). |
 | `openstudio_operator_stall_window_fresh` | gauge | `web_background_monitor` (`run_stall_tick` post-`tracker.observe()`) · #312 | Last-successful-update Unix timestamp for the `stall_window_elapsed_seconds` data gauge. Set to `time.time()` immediately after the `STALL_WINDOW_ELAPSED_SECONDS.set(...)` sequence on both the holding and broken paths. Unlabelled — one series (the reading site is unique, process-wide). Mirrors the `resque_queue_depth_fresh` round-trip pattern; the dashboard staleness computation `time() - fresh` works identically. Resetting only the freshness gauge (simulating "we lost visibility") leaves the data gauge holding its prior value — the exact failure mode #312 fixes. |
 | `openstudio_operator_handler_last_tick_timestamp{module}` | gauge (labelled) | all four timer wrappers via the shared tick-runner `_oscm_handlers.run_oscm_tick` (#473) · #469 | **The scheduler heartbeat** — generalizes the #312 freshness-pair idiom to the scheduler itself. Unix-epoch seconds of the most recent COMPLETED `run_oscm_tick` invocation, set to `time.time()` in a `finally` at the END of every invocation on EVERY terminal path: successful tick, caught skip-tuple failure (a failing-but-scheduled tick is alive; a flat gauge is not), the empty-`spec.serverUrl` idle return, and even a propagating uncaught exception — the heartbeat answers whether the scheduler is invoking this module's timer at all, not whether the tick is succeeding (that is `handler_tick_failures_total`'s job). Every other registry signal is event-driven and reads green while ticks are silently unscheduled (kopf registry internals shift so `install_singleton_guard` returns 0 and the timers are silently unwrapped — the documented kopf-pin failure mode; the CR is deleted; the kopf scheduling loop wedges). Labelled by `module` (`analysis_sla` \| `datapoint_watchdog` \| `worker_recycler` \| `web_background_monitor` — same vocabulary as the failure counter; 4 series). The event-driven `dry_run_audit` watch handler (`@kopf.on.event`, not a timer) is consciously EXCLUDED — no cadence, no staleness threshold. **Alert on the staleness gap: `time() - openstudio_operator_handler_last_tick_timestamp{module=...} > 3 * <interval>`** — per-module intervals live in `src/openstudio_operator/_constants.py`: `analysis_sla` 30 s → 90, `datapoint_watchdog` 60 s → 180, `worker_recycler` 300 s → 900, `web_background_monitor` 60 s → 180 (e.g. `time() - openstudio_operator_handler_last_tick_timestamp{module="analysis_sla"} > 90`). Transcribed into `deploy/prometheusrule.yaml` as `OpenStudioOperatorHandlerHeartbeatStale`. |
+| `openstudio_operator_dry_run_active{namespace,name}` | gauge (labelled) | shared tick-runner `_oscm_handlers.run_oscm_tick` (per-tick stamp) + `dry_run_audit` watch handler (immediate flip on spec.dryRun transitions, #397 wiring point) · #492 | **The D11 posture** — 1.0 when the CR's `spec.dryRun` is true (every mutating action suppressed, Events dry-run-marked), 0.0 when mutations are LIVE. `events_dry_run_suppressed_total` only increments when an action is attempted, so a quiet dry-run operator and a quiet live operator produce identical scrapes without this gauge. Flipped immediately on `spec.dryRun` transitions by the audit watcher (no next-tick latency) and re-stamped on every timer tick as the backstop — including idle and wiring-failing ticks (posture exists independent of tick success). **Alert: `dry_run_active == 1` sustained beyond a migration window on a production cluster** (shipped as `OpenStudioOperatorDryRunActive`, `for: 1h`) — the operator is unarmed: over-SLA analyses are not stopped, zombies not requeued. |
+| `openstudio_operator_server_url_set{namespace,name}` | gauge (labelled) | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) · #492 | 1.0 when the CR carries a non-empty `spec.serverUrl` (the authoritative config path, #3); 0.0 = the idle posture — every timer tick returns early at the empty-serverUrl branch and no analysis state is read. An unexpected 0 on a cluster that should be working means the CR spec is incomplete. |
+| `openstudio_operator_redis_url_set{namespace,name}` | gauge (labelled) | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) · #492 | 1.0 when the CR has a Redis URL source at config-parse time: non-empty inline `spec.redisUrl` OR the #463 `spec.redisCredentials.secretRef` naming the Secret key holding the full `redis://` URL (the preferred production shape — the ref wins when both are present). 0.0 = the #116 posture: the operator refuses to operate and the redis-URL guard emits its per-CR Warning Event. Distinct from secret-resolution success (client_factory's bounded secrets-get owns that); this answers only "did the CR carry a URL source at all". |
+| `openstudio_operator_auto_soft_stop_enabled{namespace,name}` | gauge (labelled) | shared tick-runner `_oscm_handlers.run_oscm_tick` (post-config-parse stamp) · #492 | 1.0 when `analysisPolicy.autoSoftStop` is true (the CRD default) — the SLA monitor is armed to soft-stop analyses past `maxDurationMinutes`. 0.0 = the SLA monitor is fully passive (a full stop — no soft-stop, no escalation, no anchors written); previously the debug log line was the only record. Alert on an unexpected 0 on production: someone disabled the analysis SLA. |
 | `openstudio_operator_warnings_deferred_queue_depth` | gauge | `events_sinks` (`QueuedKopfEventSink.defer_to_next_tick` / `flush`) · #310 | Current depth of the in-process QueuedKopfEventSink queue. Unlabelled (the queue is process-wide, not per-CR) — cardinality stays bounded regardless of CR count. Set on every `defer` / `flush` call. Sustained nonzero values mean the apiserver watch stream is stalled and Warning Events are piling up — a companion to `warnings_deferred_dropped_total` which fires when the cap (MAX_DEFERRED_WARNING_EVENTS = 1000) is exceeded. Alert when the depth approaches the cap (e.g. > 80% of 1000) so the drop path can be diagnosed before silent loss starts. |
 | `openstudio_operator_metrics_server_bound{addr,port}` | gauge (labelled) | `metrics` (`start_metrics_server` first bind attempt) · #393 | Outcome of the /metrics server's FIRST bind attempt: `1.0` on a successful bind, `0.0` on `OSError` (port already in use, unbindable address); never re-touched after the first attempt. Labelled by `addr` + `port` (the configured bind target — `0.0.0.0:9090` in the stock deployment, the same surface the `containerPort`, NetworkPolicy, and Prometheus scrape config reference). Covers the bind attempt in BOTH authN modes (open plaintext and the #401 bearer-token server share the single `except OSError` branch). **Alert on `== 0`: the canonical "Prometheus scrape is down because of US" signal** — it distinguishes "the metrics endpoint never bound" from "operator wedged / wrong scrape config" without log scraping for the `Cannot serve /metrics` WARNING. Self-referential edge: when the bind failed, this pod's `/metrics` is dead, so the `0.0` cannot be scraped from the pod itself — pair the alert with blackbox-exporter `up == 0` (the gauge is the durable record for post-mortems and confirms the operator-side cause). |
 
@@ -197,11 +212,16 @@ by `reason` (same 7 vocabulary as `events_emitted_total`),
 vocabulary is the four handler names, same as `handler_tick_failures_total`;
 the namespace × name cross-product is bounded by the singleton guard's
 one-winner-per-namespace invariant, D05), and
-`resque_queue_depth` by `queue` (2 — the two managed queues). The two
+`resque_queue_depth` by `queue` (2 — the two managed queues). The
 labelled gauges are `metrics_server_bound`, labelled by `(addr, port)`
 (1 series — the single first bind attempt; cardinality is fixed by design,
-not bounded by an invariant), and `handler_last_tick_timestamp`, labelled
-by `module` (4 series — the four OSCM timer wrappers). The labelled
+not bounded by an invariant), `handler_last_tick_timestamp`, labelled
+by `module` (4 series — the four OSCM timer wrappers), and the four
+#492 config-state posture gauges (`dry_run_active`, `server_url_set`,
+`redis_url_set`, `auto_soft_stop_enabled`), each labelled by
+`(namespace, name)` (bounded by the singleton guard's
+one-winner-per-namespace invariant, D05 — the same bound the
+`singleton_loser_skips_total` cross-product relies on). The labelled
 histograms (`handler_tick_duration_seconds`, `rest_request_duration_seconds`)
 follow the same convention — one labelled series per label combo. See each
 row for the vocabulary.
@@ -326,7 +346,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+9+3)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+13+3)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

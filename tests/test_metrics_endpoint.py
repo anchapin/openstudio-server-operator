@@ -207,6 +207,22 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.HANDLER_LAST_TICK_TIMESTAMP.labels(
         module="__metrics_test_sentinel__"
     ).set(0)
+    # Issue #492 — pre-touch the four config-state posture gauges so
+    # each family's sample series is exposed. All four are labelled by
+    # (namespace, name) — CR identity, the #311 convention; cardinality
+    # is bounded by the singleton guard (D05).
+    metrics.DRY_RUN_ACTIVE.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).set(0)
+    metrics.SERVER_URL_SET.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).set(0)
+    metrics.REDIS_URL_SET.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).set(0)
+    metrics.AUTO_SOFT_STOP_ENABLED.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).set(0)
     # Issue #310 — pre-touch the labelled drop Counter so the family
     # line is exposed. ``reason`` label vocabulary currently includes
     # ``queue_full`` (the only drop path today); a future second reason
@@ -366,6 +382,20 @@ def test_metrics_http_server_serves_all_declared_counters():
             assert (
                 'openstudio_operator_handler_last_tick_timestamp'
                 '{module="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name in {
+            # Issue #492 — the four config-state posture gauges share
+            # one shape: labelled by (namespace, name), exposition
+            # writes labels alphabetically (name < namespace).
+            "openstudio_operator_dry_run_active",
+            "openstudio_operator_server_url_set",
+            "openstudio_operator_redis_url_set",
+            "openstudio_operator_auto_soft_stop_enabled",
+        }:
+            assert (
+                f'{name}{{name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"}}'
                 in response.text
             )
         else:

@@ -7,10 +7,14 @@ canonical skip-tick exception tuple, the ``HANDLER_TICK_FAILURES_TOTAL``
 increment, and the single per-handler skip-tick warning. Since #469 it
 also pins the scheduler heartbeat: ``HANDLER_LAST_TICK_TIMESTAMP`` is
 stamped at the end of EVERY invocation (success, idle, caught failure).
-This file pins that ownership in one place; the per-wrapper behavior
-(each handler delegating through the runner) stays covered by the —
-unmodified — ``tests/test_timer_wrapper_failures.py`` and the
-per-handler suites.
+Since #492 it also owns the config-state posture stamp: the four
+1/0 gauges (dry_run_active / server_url_set / redis_url_set /
+auto_soft_stop_enabled) are set right after ``OperatorConfig.from_spec``
+succeeds — before the idle check and the guarded try, so posture
+survives idle and wiring-failing ticks. This file pins that ownership in
+one place; the per-wrapper behavior (each handler delegating through the
+runner) stays covered by the — unmodified —
+``tests/test_timer_wrapper_failures.py`` and the per-handler suites.
 """
 
 from __future__ import annotations
@@ -407,3 +411,122 @@ def test_run_oscm_tick_propagates_non_tuple_wiring_error(
         "heartbeat must advance even on a propagating wiring error (#469: "
         "the scheduler invoked the timer = alive)"
     )
+
+
+# --- Issue #492 — config-state posture gauges ------------------------------
+
+
+def _posture(family: str, name: str = NAME) -> float | None:
+    """Read one #492 posture gauge sample for the probe CR label set."""
+    return REGISTRY.get_sample_value(
+        family,
+        {"namespace": NAMESPACE, "name": name},
+    )
+
+
+def test_run_oscm_tick_stamps_config_posture_gauges() -> None:
+    """Issue #492: a successful tick stamps all four posture gauges 1/0.
+
+    ``SPEC`` carries dryRun=true, a non-empty serverUrl, a non-empty
+    redisUrl, and no analysisPolicy key (→ autoSoftStop CRD default
+    True) — so all four gauges must read exactly 1.0 after the tick.
+    """
+    # Force a posture flip first so the assertions prove the stamp
+    # overwrote the prior values (set() semantics, not inc()).
+    from openstudio_operator.metrics import DRY_RUN_ACTIVE
+
+    DRY_RUN_ACTIVE.labels(namespace=NAMESPACE, name=NAME).set(0.0)
+
+    def tick(*, config, store, emit, deps, now: datetime) -> str:
+        return "ran"
+
+    assert _run(tick) == "ran"
+
+    assert _posture("openstudio_operator_dry_run_active") == 1.0
+    assert _posture("openstudio_operator_server_url_set") == 1.0
+    assert _posture("openstudio_operator_redis_url_set") == 1.0
+    assert _posture("openstudio_operator_auto_soft_stop_enabled") == 1.0, (
+        "no analysisPolicy key in SPEC — the config.py / CRD default is "
+        "autoSoftStop=True, so the default posture must read 1.0"
+    )
+
+
+def test_run_oscm_tick_posture_tracks_spec_transitions() -> None:
+    """Issue #492: the gauges track spec transitions across ticks.
+
+    A minimal CR (dryRun absent → False, empty serverUrl, empty
+    redisUrl, no secretRef, autoSoftStop=false) must stamp all four
+    gauges to 0.0 — including on the IDLE path (empty serverUrl): the
+    stamp runs before the idle branch, and server_url_set=0 IS the
+    posture of an incomplete CR.
+    """
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise AssertionError("empty-serverUrl CR must never reach the tick closure")
+
+    minimal_spec = {
+        "serverUrl": "",
+        "redisUrl": "",
+        "analysisPolicy": {"autoSoftStop": False},
+    }
+    assert _run(tick, spec=minimal_spec) is None
+
+    assert _posture("openstudio_operator_dry_run_active") == 0.0
+    assert _posture("openstudio_operator_server_url_set") == 0.0
+    assert _posture("openstudio_operator_redis_url_set") == 0.0
+    assert _posture("openstudio_operator_auto_soft_stop_enabled") == 0.0
+
+
+def test_run_oscm_tick_redis_url_set_counts_secret_ref() -> None:
+    """Issue #492: redis_url_set=1 when the #463 secretRef carries the URL.
+
+    ``redisUrl`` empty + ``redisCredentials.secretRef{name,key}`` present
+    is the preferred production shape — the operator's Redis URL source
+    exists (resolved later by client_factory's bounded secrets-get), so
+    the posture gauge must read 1.0, not the #116 empty posture 0.0.
+    """
+
+    def tick(*, config, store, emit, deps, now: datetime) -> str:
+        return "ran"
+
+    secret_ref_spec = {
+        "serverUrl": "http://web.test",
+        "redisUrl": "",
+        "redisCredentials": {"secretRef": {"name": "redis-url", "key": "url"}},
+    }
+    assert _run(tick, spec=secret_ref_spec) == "ran"
+
+    assert _posture("openstudio_operator_redis_url_set") == 1.0, (
+        "the #463 secretRef is a Redis URL source — redis_url_set must "
+        "be 1.0 even with an empty inline spec.redisUrl"
+    )
+
+
+def test_run_oscm_tick_posture_stamp_survives_wiring_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #492: posture is stamped even when the tick fails wiring.
+
+    The stamp runs BEFORE the guarded try (#493), so a ConfigException
+    from the ``wire`` closure still leaves all four gauges at the CR's
+    posture — an operator that cannot reach the apiserver still answers
+    \"is this cluster's operator armed to mutate?\" at /metrics. The
+    #469 heartbeat interaction: the wiring-failing tick ALSO stamps the
+    heartbeat (scheduler alive) — posture + heartbeat + climbing
+    failure counter is the exact degraded-but-armed signature.
+    """
+
+    def wire(config: object) -> object:
+        raise ConfigException("no kubeconfig anywhere (#492 posture probe)")
+
+    def tick(*, config, store, emit, deps, now: datetime) -> object:
+        raise AssertionError("a wire failure must never reach the tick closure")
+
+    with caplog.at_level(logging.WARNING):
+        result = _run(tick, spec=SPEC, wire=wire)
+
+    assert result is None, "wiring failure must skip the tick (D12 / #493)"
+    assert _posture("openstudio_operator_dry_run_active") == 1.0
+    assert _posture("openstudio_operator_server_url_set") == 1.0
+    assert _posture("openstudio_operator_redis_url_set") == 1.0
+    assert _posture("openstudio_operator_auto_soft_stop_enabled") == 1.0
