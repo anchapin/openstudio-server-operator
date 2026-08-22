@@ -323,14 +323,30 @@ spec:
 # regression fence narrow: a future edit to the operator's allow-list
 # cannot accidentally widen the CronJob's, and vice versa.
 #
-# Same Prometheus-style allow-list as #166:
+# Same Prometheus-style allow-list as #166, hardened to the same bar by
+# #478 (the pruner's policy was originally shipped with a bare
+# ``podSelector: {}`` same-namespace peer — exactly the regression shape
+# #295 fixed for the operator's policy):
 #   * ``namespaceSelector.kubernetes.io/metadata.name: prometheus`` — the
 #     cluster's Prometheus is expected to run in a namespace labeled
 #     exactly so. Cluster admins running a different scraper (e.g.
 #     ``monitoring``, ``kube-prometheus-stack``) MUST edit the label match
 #     below — same opt-in noted in AGENTS.md.
-#   * ``podSelector: {}`` — same-namespace peer (e.g. a Prometheus
-#     sidecar, or a debug scraper in ``openstudio-server``).
+#   * ``podSelector: {matchLabels: {app.kubernetes.io/component:
+#     metrics-scraper}}`` — same-namespace peer that opted into being
+#     a scraper via the project label convention (#295). No helm-chart
+#     pod (``web``, ``web-background``, ``worker``, ``db``, ``redis``,
+#     ``queue``, NFS) carries that value, so none can scrape the
+#     pruner's plaintext /metrics — which reads
+#     ``analyses_archived_total`` / ``analyses_deleted_total`` /
+#     ``prune_tick_failures_total{reason}``, useful reconnaissance for
+#     timing retention deletes against conflict storms.
+#
+# #478 also ships the bearer-token parity: the CronJob manifest carries
+# the same (empty-by-default) ``OPENSTUDIO_METRICS_TOKEN_FILE`` env opt-in
+# as the operator Deployment (#401), and ``prune_entrypoint.main()`` calls
+# the shared ``metrics.start_metrics_server()`` so the fail-closed 401
+# gate applies here identically.
 #
 # Acceptance criterion (issue #306): policyTypes: [Ingress]; ingress
 # restricted to port 9090/TCP only; no other ports allowed.
@@ -345,9 +361,12 @@ metadata:
   annotations:
     energy.nrel.gov/description: |
       Restrict ingress to the storage-prune CronJob's /metrics endpoint
-      (port 9090). Mirrors the operator's metrics-ingress policy (#166):
-      allows Prometheus-style scrapers (prometheus-labeled namespace +
-      same-namespace peer). Issue #306 — the CronJob now exposes
+      (port 9090). Mirrors the operator's metrics-ingress policy (#166),
+      hardened to the same bar by #478: allows Prometheus-style scrapers
+      (prometheus-labeled namespace + same-namespace peers opted in via
+      the app.kubernetes.io/component: metrics-scraper label, #295) and
+      pairs with the CronJob's OPENSTUDIO_METRICS_TOKEN_FILE bearer-token
+      opt-in (#401 parity). Issue #306 — the CronJob exposes
       ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL, and the new
       PRUNE_TICK_FAILURES_TOTAL{reason} counter (bumped by the two
       skip-tick branches and the exit-3 empty-redisUrl guard #392 in
@@ -366,7 +385,13 @@ spec:
               # Cluster-admin opt-in: rename to match the scraper's
               # namespace label (e.g. `monitoring`, `kube-prometheus-stack`).
               kubernetes.io/metadata.name: prometheus
-        - podSelector: {}  # same-namespace peer (e.g. metrics sidecar)
+        - podSelector:
+            matchLabels:
+              # Project label convention (#295 / #478): only pods
+              # explicitly opting in to scraping may read /metrics —
+              # never a bare `podSelector: {}`, which would re-open the
+              # endpoint to every helm-chart pod.
+              app.kubernetes.io/component: metrics-scraper
       ports:
         - port: 9090
           protocol: TCP
