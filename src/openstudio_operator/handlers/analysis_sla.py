@@ -95,6 +95,7 @@ from typing import Protocol
 import kopf
 from kubernetes.client import ApiException
 
+from openstudio_operator._k8s import PodLister
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
     run_oscm_tick,
@@ -169,10 +170,14 @@ class SlaTickResult:
     escalated: list[str]
 
 
-class WorkerPodApi(Protocol):
-    """Structural type of ``CoreV1Api`` as used here — tests fake exactly this."""
+class WorkerPodApi(PodLister, Protocol):
+    """Structural type of ``CoreV1Api`` as used here — tests fake exactly this.
 
-    def list_namespaced_pod(self, namespace: str, **_: object) -> object: ...
+    Genuine surface extension (issue #505): the pod-listing slice is the
+    shared :class:`openstudio_operator._k8s.PodLister` (also imported by the
+    web_background stall monitor); this Protocol adds only the
+    eviction-path ``delete_namespaced_pod`` that no other handler needs.
+    """
 
     def delete_namespaced_pod(self, name: str, namespace: str, **_: object) -> object: ...
 
