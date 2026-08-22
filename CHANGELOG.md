@@ -21,7 +21,7 @@ blocks), the `#473` tick-runner extraction ending four-copy wrapper
 drift (completed by `#493` wiring-failure skip-tick), the `#475`
 exception-hierarchy fix, architecture consolidation (`#494` K8s
 factory helper, `#496` events alias unification, `#497` per-CR
-cache convention), the test-infrastructure waves (`#474`+`#531`
+cache convention, `#506` parse-wrapper dedup), the test-infrastructure waves (`#474`+`#531`
 shared fakes, `#482` config parsing, `#483` rolling-restart paths,
 `#485` deploy-inventory gate, `#501` EventEmitter coverage), and
 the documentation set (`#484` audit-policy index, `#487` ADR index,
