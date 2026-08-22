@@ -6,7 +6,9 @@ import subprocess
 import sys
 import textwrap
 from contextlib import closing
+from importlib.metadata import PackageNotFoundError, version
 
+import pytest
 import requests
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
@@ -232,6 +234,18 @@ def test_metrics_http_server_serves_all_declared_counters():
         name=SENTINEL_NAME,
         map_name="__metrics_test_sentinel__",
     ).set(0)
+    # Issue #504 — pre-touch the fleet-identity gauge's sentinel series
+    # (the #117 convention). The REAL series is already set at metrics
+    # import time — importlib.metadata resolves against the editable
+    # install in the dev/CI venv — so the family is exposed regardless;
+    # the sentinel keeps this test self-contained in a bare interpreter
+    # and the real series' label-key shape is pinned below via regex
+    # (its label VALUES are environment-dependent: distribution version
+    # + interpreter).
+    metrics.BUILD_INFO.labels(
+        version="__metrics_test_sentinel__",
+        python_version="__metrics_test_sentinel__",
+    ).set(1)
     # Issue #310 — pre-touch the labelled drop Counter so the family
     # line is exposed. ``reason`` label vocabulary currently includes
     # ``queue_full`` (the only drop path today); a future second reason
@@ -417,6 +431,19 @@ def test_metrics_http_server_serves_all_declared_counters():
                 f'namespace="{SENTINEL_NAMESPACE}"'
                 "}"
                 in response.text
+            )
+        elif name == "openstudio_operator_build_info":
+            # Issue #504 — fleet-identity gauge; the real series is set
+            # at metrics import time with environment-dependent label
+            # values (distribution version + interpreter), so pin the
+            # label KEYS (alphabetical: python_version < version) and
+            # the constant 1.0 via regex — the deterministic label-VALUE
+            # test lives in
+            # test_build_info_gauge_version_label_non_empty_when_installed.
+            assert re.search(
+                r"openstudio_operator_build_info"
+                r'\{python_version="[^"]+",version="[^"]+"\} 1\.0',
+                response.text,
             )
         else:
             assert f"\n{name} " in response.text
@@ -1285,3 +1312,31 @@ def test_metrics_server_bound_gauge_never_retouched_after_first_attempt():
         """
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# --- Issue #504 — build_info fleet-identity Gauge --------------------------------
+
+
+def test_build_info_gauge_version_label_non_empty_when_installed():
+    """Issue #504 acceptance: ``openstudio_operator_build_info`` carries a
+    non-empty ``version`` label WHEN the distribution is installed — the
+    dev/CI venv installs the package editable, so ``importlib.metadata``
+    resolves at test time and the import-time ``.labels(...).set(1)`` in
+    ``metrics.py`` stamps the real version into the exposition. The
+    ``unknown`` fallback only fires in a bare interpreter where the
+    distribution is absent; skipped there so this assertion is exactly
+    the issue's "non-empty WHEN installed" criterion."""
+    try:
+        installed = version("openstudio-server-operator")
+    except PackageNotFoundError:
+        pytest.skip("openstudio-server-operator distribution not installed")
+    assert installed != ""
+    exposition = generate_latest().decode()
+    # Labels are alphabetical (python_version < version); the python
+    # label is sys.version.split()[0] — read it the same way metrics.py
+    # does so the two cannot drift apart.
+    assert (
+        "openstudio_operator_build_info"
+        f'{{python_version="{sys.version.split()[0]}",version="{installed}"}} 1.0'
+        in exposition
+    )
