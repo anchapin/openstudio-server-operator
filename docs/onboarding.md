@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-1124 tests across 49 files (run `.venv/bin/pytest --collect-only` to
+1128 tests across 49 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
