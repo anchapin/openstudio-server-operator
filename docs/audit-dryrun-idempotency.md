@@ -217,7 +217,7 @@ was removed in favor of KEDA (`deploy/keda-scaledobject.yaml`).
 ## Appendix C — verification commands
 
 ```bash
-ruff check . && pytest                       # both green (1117 tests across 48 files, current count)
+ruff check . && pytest                       # both green (1120 tests across 48 files, current count)
 grep -rn -E 'soft_stop_analysis|stop_analysis|requeue_datapoint|delete_analysis|\
 delete_namespaced_pod|patch_namespaced_deployment|create_namespaced_job|\
 delete_namespaced_job|patch_namespaced_custom_object_status' src/                    # §1.1 table
@@ -231,7 +231,7 @@ delete_namespaced_job|patch_namespaced_custom_object_status' src/               
 Metrics live in `src/openstudio_operator/metrics.py`, are module-level
 singletons on `prometheus_client`'s default REGISTRY, and are served by
 `start_metrics_server()` on the conventional port `9090` (operator-pod-
-local; the scrape is in-cluster). The exhaustive inventory — **21 counters + 18 gauges + 5 histograms** — is asserted by the canonical
+local; the scrape is in-cluster). The exhaustive inventory — **20 counters + 18 gauges + 5 histograms** — is asserted by the canonical
 `EXPECTED_COUNTER_FAMILIES`, `EXPECTED_GAUGE_FAMILIES`, and
 `EXPECTED_HISTOGRAM_FAMILIES` tuples in `tests/_metrics_inventory.py`
 (#406; shared by `tests/test_metrics_endpoint.py` and
@@ -350,7 +350,6 @@ stays self-contained.
 | `openstudio_operator_workers_recycled_total` | `worker_recycler` (#11) | Recycle issued (or dry-run) | `status.lastRecycleAt` |
 | `openstudio_operator_worker_pods_evicted_total` | `analysis_sla` (#9) | Escalation eviction (decision counter; dry-run counts too) | `SoftStopRecord.escalated_at` |
 | `openstudio_operator_web_background_restarts_total` | `web_background_monitor` (#13) | web_background restart issued (or dry-run) | `status.lastWebBackgroundRestart` |
-| `openstudio_operator_web_background_restarts_ineffective_total` | `web_background_monitor` (#649) | Restart proven ineffective — a later restart fired while the predecessor anchor existed (stall re-sustained a full window past its cooldown); from the 3rd consecutive the `WebBackgroundRestartIneffective` Warning Event fires and the action backs off (4/6/8 stall-window total wait; dry-run counts too — the D11 pacing choice) | `status.webBackgroundIneffectiveRestarts` |
 | `openstudio_operator_analyses_archived_total` | `retention` (#16; prune CronJob since #78) | Archival Job observed Complete (adopted completions included) | `status.archivedAnalyses[id].verified_at` |
 | `openstudio_operator_analyses_deleted_total` | `retention` (#16; prune CronJob since #78) | `DELETE /analyses/{id}` issued post-verification (suppressed by `spec.dryRun`) | `status.archivedAnalyses[id].verified_at` |
 | `openstudio_operator_status_conflicts_total` | `status_store` (#119) | Per-attempt 409 from the K8s API Server inside `_mutate`'s except branch (one increment per 409, before the backoff sleep) | n/a — conflict counter, not a decision counter |
