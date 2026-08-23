@@ -78,6 +78,7 @@ Names are load-bearing — the operator targets them by fixed identifier
 | Deployment `web-background` | `scripts/manifests/05-web-background.yaml` | same command (`resque:workers` scaled by `COUNT`); `OS_SERVER_NUMBER_OF_WORKERS` tuned 30→2; mounts `nfs-pvc`; image **digest-pinned** to the same `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
 | Deployment `worker` (no HPA post-#77) | `scripts/manifests/06-worker.yaml` | scaled-minimal: replicas **1** (the ScaledObject scales it from 0–5 per Redis backlog; chart's HPA `worker-hpa` REMOVED — two autoscalers fight one Deployment, #77); `QUEUES=requeued,simulations`; emptyDir scratch at `/mnt/openstudio`; preStop hook + `terminationGracePeriodSeconds: 5200` kept; image **digest-pinned** to the same `sha256:de95093868fe2f7e382e29995a72936b2ab95627e653d8ac4a9df1bf3667a975` (#172) |
 | LoadBalancer, cluster-autoscaler, rserve, priority classes | — | intentionally omitted |
+| `deploy/` hardening + alerting artifacts (ResourceQuota/LimitRange #400; NetworkPolicy #112/#166; PrometheusRule + Grafana dashboard #468) | — | intentionally omitted — see [Approximations](#approximations-vs-production) and the work-cluster apply steps in [validation.md → Namespace hardening + alerting artifacts](validation.md#namespace-hardening--alerting-artifacts-issues-400--112--166--468) (#587) |
 
 ## Approximations vs production
 
@@ -97,6 +98,25 @@ Names are load-bearing — the operator targets them by fixed identifier
   ScaledObject's `value` expression reads `LLEN resque:queue:simulations`
   + `LLEN resque:queue:requeued` and scales `worker` 0→N (clamped to
   `maxReplicaCount: 5`).
+- **No NetworkPolicy enforcement (kindnet)** —
+  `deploy/network-policy.yaml` (#112/#166; apiserver peer fixed by #578)
+  is deliberately NOT applied by this recipe: kindnet does not enforce
+  NetworkPolicy, so the apply would be inert, and the recipe runs no
+  Prometheus for the metrics-ingress half to gate. Its enforcing-CNI
+  caveats — the #578 compound apiserver peer (+ the commented `ipBlock`
+  alternative hosted control planes need) and the #166
+  prometheus-namespace label edit — are work-cluster material:
+  [validation.md → Namespace hardening + alerting
+  artifacts](validation.md#namespace-hardening--alerting-artifacts-issues-400--112--166--468).
+- **No ResourceQuota / PrometheusRule / Grafana** — the recipe applies
+  neither `deploy/resource-quota.yaml` (#400, sized by #580's KEDA burst
+  envelope) nor the #468 alerting pair (`deploy/prometheustrule.yaml`,
+  `deploy/grafana-dashboard.json`): kind runs no kube-prometheus-stack /
+  kube-state-metrics to pick the rule or dashboard up, and quota sizing
+  is a work-cluster decision (the #580 arithmetic assumes the chart's
+  real requests). The same
+  [validation.md subsection](validation.md#namespace-hardening--alerting-artifacts-issues-400--112--166--468)
+  owns the apply steps and caveats (#587).
 - **Single node, no node-group labels** — the chart's affinity
   (`nodegroup: web-group|worker-group`) is dropped; everything co-schedules.
 - **web replicas pinned to 1, `strategy: Recreate`** — mirrors the
