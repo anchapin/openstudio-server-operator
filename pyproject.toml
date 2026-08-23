@@ -43,7 +43,17 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# Issue #576 — the backend is pinned EXACTLY, never floated. Unpinned build
+# requires make every ``pip install .`` (image build, editable install) fetch
+# and execute the LATEST hatchling from PyPI inside default build isolation —
+# unverified by any lockfile hash, with full wheel-build code execution. The
+# Dockerfile therefore installs hatchling from the hash-pinned
+# requirements.txt closure and builds with ``--no-build-isolation``; the
+# pair is drift-gated by ``tests/test_dependency_drift.py``
+# (build-system pin + hash-pinned-in-lockfile checks). Bump deliberately:
+# add the new version's hash set to BOTH lockfiles in the same PR (#479
+# pair rule).
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

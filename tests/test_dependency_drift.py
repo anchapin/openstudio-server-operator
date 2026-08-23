@@ -49,6 +49,24 @@ Both lockfiles are refreshed together by the commands documented in
 ``AGENTS.md`` (one ``pip-compile --extra=dev`` → ``requirements.lock``, one
 without → ``requirements.txt``).
 
+Build-backend pin (issue #576)
+------------------------------
+The Dockerfile builds the operator wheel with
+``pip install --no-deps --no-build-isolation .``, so the build backend named
+in ``[build-system]`` (hatchling) must ALREADY be installed in the image —
+which the Dockerfile does from the hash-pinned ``requirements.txt``. Two
+drift invariants guard that pair:
+
+* every ``[build-system].requires`` spec is an exact ``==`` pin (an unpinned
+  spec floats the backend to the PyPI latest wherever default build
+  isolation still applies — local editable installs, non-image builds), AND
+* every build-system package has a hash-pinned entry in BOTH lockfiles.
+  pip-compile does NOT compile ``[build-system].requires`` — the hatchling
+  closure was spliced into the lockfiles by hand — so a routine
+  ``pip-compile`` regeneration silently DELETES those blocks and breaks the
+  ``--no-build-isolation`` image build. This gate turns that deletion into
+  a loud CI failure instead of a release-time ``docker build`` error.
+
 When the test fires, the failure message tells the maintainer exactly which
 package is missing and the canonical remediation command (``pip-compile
 --extra=dev --generate-hashes --output-file=requirements.lock pyproject.toml``),
@@ -351,4 +369,86 @@ def test_runtime_lockfile_every_entry_has_a_hash() -> None:
     assert not unhashed, (
         f"requirements.txt entries missing --hash=sha256:... lines: {unhashed}. "
         "Re-run `pip-compile --generate-hashes` to re-assert the hash pins."
+    )
+
+
+# An exact PEP 508 pin: one ``name==version`` clause, no other operators
+# (``>=``, ``~=``, ``!=``, compound specs) — the only shape that cannot
+# float to a different PyPI release (#576).
+_EXACT_PIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?==[A-Za-z0-9.+!_-]+$")
+
+
+def test_build_system_requires_are_pinned_exactly() -> None:
+    """Every ``[build-system].requires`` entry is an exact ``==`` pin (issue #576).
+
+    The Dockerfile builds the operator wheel with ``--no-build-isolation``
+    and installs the backend from the hash-pinned ``requirements.txt``, but
+    the pyproject pin is what every OTHER build context (local editable
+    installs, ``pip wheel``, sdist builds) reads — an unpinned spec there
+    floats to the PyPI latest inside default build isolation, executing
+    unverified PyPI code with full wheel-build privileges. Bare names
+    (``hatchling``), floors (``hatchling>=1.26``), compatible releases
+    (``~=``), and compound specs all fail here: only ``name==version`` is
+    accepted.
+    """
+    with PYPROJECT.open("rb") as f:
+        data = tomllib.load(f)
+    requires = data.get("build-system", {}).get("requires", [])
+    assert requires, (
+        "pyproject.toml is missing [build-system].requires — the wheel "
+        "build backend must be declared AND pinned (#576)."
+    )
+    unpinned = [spec for spec in requires if not _EXACT_PIN_RE.match(spec)]
+    assert not unpinned, (
+        f"[build-system].requires entries are not exact '==' pins (#576): {unpinned}. "
+        "The build backend executes arbitrary code during wheel builds — pin it "
+        "exactly (e.g. 'hatchling==1.32.0'), add its closure hash-pinned to BOTH "
+        "lockfiles, and build with --no-build-isolation (see Dockerfile)."
+    )
+
+
+def test_build_backend_closure_is_hash_pinned_in_both_lockfiles() -> None:
+    """Every ``[build-system].requires`` package is hash-pinned in BOTH lockfiles (#576).
+
+    The Dockerfile relies on the runtime lockfile already containing the
+    build backend: ``pip install --require-hashes -r requirements.txt``
+    provides hatchling for the subsequent
+    ``pip install --no-deps --no-build-isolation .``. pip-compile does NOT
+    compile ``[build-system].requires``, so the closure lives in the
+    lockfiles as a hand-spliced block — and the next routine
+    ``pip-compile`` regeneration will DELETE it. This gate fails loudly the
+    moment that happens, instead of the release workflow discovering a
+    broken ``docker build`` (ModuleNotFoundError: No module named
+    'hatchling').
+    """
+    with PYPROJECT.open("rb") as f:
+        data = tomllib.load(f)
+    requires = data.get("build-system", {}).get("requires", [])
+    build_names = _dep_names(requires)
+    assert build_names, (
+        "No build-system requirements found in pyproject.toml — nothing "
+        "guards the build backend lockfile presence (#576)."
+    )
+
+    problems: list[str] = []
+    for label, path in (
+        ("requirements.txt", REQUIREMENTS_TXT),
+        ("requirements.lock", REQUIREMENTS_LOCK),
+    ):
+        blocks = _parse_lockfile(path.read_text())
+        missing = [n for n in build_names if n not in blocks]
+        unhashed = [n for n in build_names if n in blocks and not blocks[n]]
+        if missing:
+            problems.append(f"{label}: build backend missing entirely: {missing}")
+        if unhashed:
+            problems.append(f"{label}: build backend present without --hash lines: {unhashed}")
+
+    assert not problems, (
+        "pyproject.toml [build-system].requires drift detected vs the "
+        "lockfiles (#576):\n  - " + "\n  - ".join(problems) + "\n"
+        "The Dockerfile builds with --no-build-isolation, so the backend must "
+        "be hash-pinned in requirements.txt (and requirements.lock, per the "
+        "#479 pair rule). pip-compile omits [build-system].requires — the "
+        "closure is hand-spliced; re-add it with --generate-hashes output "
+        "after any regeneration."
     )
