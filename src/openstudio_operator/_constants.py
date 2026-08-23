@@ -91,7 +91,7 @@ WEB_BACKGROUND_POLL_INTERVAL_SECONDS: float = 60.0
 LAYOUT_WARNING_GRACE_SECONDS: timedelta = timedelta(seconds=60)
 
 #: Issue #490 — periodic Redis key-layout revalidation cadence. The #163
-#: boot-time check (``handlers/_check_redis_key_layout_for_cr`` behind the
+#: boot-time check (``handlers.redis_layout_check._check_redis_key_layout_for_cr`` behind the
 #: ``@kopf.on.event`` watch) only re-runs on OSCM watch events — the boot
 #: listing and CR edits — so a steady-state cluster generates none and a
 #: mid-flight Resque layout drift (helm chart upgrade to a different
