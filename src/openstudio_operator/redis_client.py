@@ -100,10 +100,15 @@ import os
 import re
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import redis
+
+# Issue #654 — heartbeat timestamps parse through the D12 single source of
+# truth (``_time.parse_iso_utc``); the domain re-raise wrapper is bound from
+# the #506 ``utc_parser`` factory so this module keeps its own exception type
+# and worker-id context prefix in the public contract.
+from ._time import utc_parser
 
 # Compat re-export (issue #475): ``OperatorConfigError`` now lives in
 # ``config.py`` and no longer subclasses ``RedisClientError`` — see the
@@ -146,25 +151,6 @@ WORKER_HEARTBEAT_HASH_KEY = "resque:workers:heartbeat"
 VALIDATE_SCAN_KEY_BUDGET = 1000
 
 
-def _parse_heartbeat(raw: str, worker_id: str) -> float:
-    """Parse a live heartbeat value (ISO8601 timestamp string) to an epoch float.
-
-    Live v3.11.0 format: ``2026-08-18T20:46:06+00:00`` (always carries a UTC
-    offset in practice). A naive string (no offset) is interpreted as UTC — the
-    Rails server writes UTC. Anything unparseable raises :class:`RedisClientError`
-    (registry garbage should be loud, never silently fresh).
-    """
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError as exc:
-        raise RedisClientError(
-            f"unparseable heartbeat for worker {worker_id!r}: {raw!r}"
-        ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.timestamp()
-
-
 def _redis_target_for_diagnostics(redis_url: str) -> str:
     """Strip credentials from ``redis://:password@host:port/db`` for error messages.
 
@@ -195,6 +181,35 @@ class RedisClientError(RuntimeError):
 # keep their historical type. New code should import from
 # ``openstudio_operator.config``. Callers that catch it must do so
 # explicitly — it is no longer reachable via ``except RedisClientError``.
+
+
+#: Issue #654 — the #506 seam binding the heartbeat parse to this module's
+#: domain error class: parse failures re-raise as ``RedisClientError``
+#: prefixed with the caller's worker-id context while the ISO-8601
+#: normalization itself stays in ``_time.parse_iso_utc`` (D12 single source
+#: of truth).
+_parse_heartbeat_utc = utc_parser(RedisClientError)
+
+
+def _parse_heartbeat(raw: str, worker_id: str) -> float:
+    """Parse a live heartbeat value (ISO8601 timestamp string) to an epoch float.
+
+    Live v3.11.0 format: ``2026-08-18T20:46:06+00:00`` (always carries a UTC
+    offset in practice). A naive string (no offset) is interpreted as UTC — the
+    Rails server writes UTC. Anything unparseable raises :class:`RedisClientError`
+    (registry garbage should be loud, never silently fresh).
+
+    Issue #654: the parse/normalize logic itself is
+    :func:`openstudio_operator._time.parse_iso_utc` (the D12 single source of
+    truth), reached through the :func:`openstudio_operator._time.utc_parser`
+    factory so failures re-raise as ``RedisClientError`` carrying the
+    ``unparseable heartbeat for worker ...`` context prefix. The trailing-``Z``
+    normalization now follows ``_time`` (this copy historically relied on
+    Python 3.11's native ``fromisoformat`` handling — behaviorally identical
+    for every live-format value, which always carries ``+00:00``).
+    """
+    context = f"unparseable heartbeat for worker {worker_id!r}"
+    return _parse_heartbeat_utc(raw, context).timestamp()
 
 
 _PEM_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"

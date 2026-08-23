@@ -16,12 +16,15 @@ through UTC, malformed-but-fromisoformat-friendly strings raise
 
 from __future__ import annotations
 
+import ast
 from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from openstudio_operator import _time
 from openstudio_operator._time import parse_iso_utc, utc_parser
 
 # --- None passthrough -----------------------------------------------------
@@ -447,3 +450,66 @@ def test_utc_parser_preserves_error_class_and_context_prefix():
     # Parse failures re-raise as the domain class with the context prefix.
     with pytest.raises(_FlavorError, match=r"ctx: unparseable timestamp"):
         parse("not-a-timestamp", "ctx")
+
+
+# --- Single parse-site convention (issue #654) -------------------------------
+
+
+def test_fromisoformat_call_sites_confined_to_time_module() -> None:
+    """Issue #654: production ``fromisoformat`` call sites live only in ``_time.py``.
+
+    Before #654, ``redis_client._parse_heartbeat`` hand-rolled
+    ``datetime.fromisoformat`` + naive→UTC assumption + a domain-error
+    re-wrap — semantically the exact contract ``_time.parse_iso_utc`` +
+    ``utc_parser`` already provide — an #66-era survivor that escaped the
+    #174 census of parser copies. Because the two implementations drifted
+    microscopically (the ``_time`` copy normalizes a trailing ``Z``, the
+    redis copy relied on Python 3.11's native handling), any future fix to
+    ``_time`` would silently not apply to Resque heartbeat parsing, which
+    feeds ``stale_workers`` and ultimately the web_background restart
+    decision.
+
+    This is the fence the issue asked for, mirroring the #305
+    kubeconfig-loader AST-gate shape: any ``fromisoformat(`` call in
+    ``src/openstudio_operator/`` outside ``_time.py`` — bare-name OR
+    attribute-shape — is a regression. New timestamp parsing must go
+    through ``parse_iso_utc`` (or an ``utc_parser``-bound wrapper).
+    """
+    src_root = Path(_time.__file__).parent
+    offenders: list[tuple[str, int]] = []
+    saw_canonical_call = False
+    for py in sorted(src_root.rglob("*.py")):
+        rel = str(py.relative_to(src_root))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_call = (
+                isinstance(func, ast.Name) and func.id == "fromisoformat"
+            ) or (isinstance(func, ast.Attribute) and func.attr == "fromisoformat")
+            if not is_call:
+                continue
+            if rel == "_time.py":
+                saw_canonical_call = True
+            else:
+                offenders.append((rel, node.lineno))
+    assert saw_canonical_call, (
+        "No ``fromisoformat(`` call site found in openstudio_operator/_time.py. "
+        "The SINGLE tz-aware UTC parser parse_iso_utc() must call "
+        "datetime.fromisoformat. See issue #654."
+    )
+    assert not offenders, (
+        f"Production code calls ``fromisoformat(`` outside "
+        f"openstudio_operator/_time.py: {offenders}. Every timestamp parse "
+        f"must go through openstudio_operator._time.parse_iso_utc — bind a "
+        f"domain wrapper with utc_parser(error_cls) if a module-specific "
+        f"exception/context prefix is needed (issue #654)."
+    )
+    # Sanity: the scan root must be the package — defensive in case the
+    # source-root heuristic ever drifts (the test would otherwise silently
+    # scan a wrong subtree and pass).
+    assert src_root.name == "openstudio_operator", (
+        f"AST scan root drifted: expected 'openstudio_operator', got "
+        f"{src_root.name!r}."
+    )
