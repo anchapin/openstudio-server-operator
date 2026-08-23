@@ -7,8 +7,27 @@ name: CI
 on:
   push:
     branches: [develop]
+    # Issue #588(c): `v*` tag pushes now carry their own independent
+    # provenance verification job (`cosign-verify-tag-image` below) —
+    # previously the only check on a tagged image was release.yml's
+    # in-workflow self-verification, the exact weakness issue #159
+    # called out for `:dev`.
+    tags:
+      - "v*"
   pull_request:
     branches: [develop, main]
+  # Issue #588(a): the `:dev` provenance verifier used to trigger on the
+  # same push that release.yml handles, racing its `Sign + attest` step —
+  # it could verify (and fail against) the fresh unsigned digest or
+  # vacuously pass against the PREVIOUS image; a failed release still
+  # left a green verification against the stale artifact. `workflow_run`
+  # fires only AFTER the Release workflow reaches a terminal state, so
+  # the gated verifier below deterministically sees the just-signed
+  # digest. The lint/test/audit jobs skip this event (their `if:` gates)
+  # so release completions don't double the CI surface.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
 
 permissions:
   contents: read
@@ -38,43 +57,111 @@ jobs:
           fi
 
   # Issue #159: independent CI gate on the published `:dev` image. The
-  # `Verify provenance exists` step in release.yml is a self-verification
-  # of the same workflow that just signed the image — a malicious edit to
-  # release.yml that removes the sign + attest steps would not be caught
-  # because the verify step is removed in the same edit. This job runs
-  # after every push to develop and (via the workflow-level
-  # `on.pull_request.branches: [develop, main]`) on every PR into develop
-  # or main, fetches the latest `:dev` digest from GHCR, and runs
-  # `cosign verify-attestation` against the published image. The job
-  # fails when the published `:dev` image lacks a SLSA provenance
-  # attestation signed by the pinned release workflow identity.
+  # `Verify provenance (digest-pinned)` step in release.yml is a
+  # self-verification of the same workflow that just signed the image —
+  # a malicious edit to release.yml that removes the sign + attest steps
+  # would not be caught because the verify step is removed in the same
+  # edit. This job is that independent gate (#588 restructure): it is
+  # `workflow_run`-triggered, so it starts only after the Release
+  # workflow run (the signer) reaches a terminal state — no more racing
+  # the `Sign + attest` step on the same push — and the `if:` gate
+  # requires a SUCCESSFUL completion, so a release whose sign step
+  # failed (or never published) can never yield a green verification
+  # against a stale artifact. With the release run complete, `:dev`
+  # deterministically resolves to the digest that run just signed; the
+  # job then runs `cosign verify-attestation` against that digest under
+  # the pinned release workflow identity.
   cosign-verify-dev-image:
     name: cosign verify :dev image provenance
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'Release' &&
+      github.event.workflow_run.head_branch == 'develop' &&
+      github.event.workflow_run.conclusion == 'success'
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Verify :dev image provenance
+      - name: Verify the digest the Release run just signed
+        env:
+          # Issue #574: workflow_run context values reach the shell only
+          # via env vars (head_sha / run id are attacker-influenced on
+          # dispatched runs); the `if:` gate above runs in expression
+          # context, never the shell.
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           # Issue #459: `imagetools inspect --raw` prints the raw manifest
           # (or image index) JSON, which has NO top-level `.digest` field —
-          # `jq -r '.digest'` was null by design and the job never passed.
-          # Read the digest from the descriptor instead.
+          # read the digest from the descriptor instead. Issue #588: the
+          # workflow_run gate guarantees the Release run (sign included)
+          # already completed successfully, so this resolution cannot race
+          # the signature — no stale-digest vacuous pass.
           DIGEST=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' ghcr.io/anchapin/openstudio-server-operator:dev)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
             echo "::error::could not resolve the :dev digest from GHCR (is the image published?)"
             exit 1
           fi
+          echo "Release run ${RELEASE_RUN_ID} (head ${RELEASE_HEAD_SHA}) published ${DIGEST}; verifying."
           cosign verify-attestation \
             --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/heads/develop" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type slsaprovenance \
             "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"
 
+  # Issue #588(c): independent provenance verification for `v*` tag
+  # images. release.yml's `Verify provenance exists` step on the tag path
+  # is the same-workflow self-verification issue #159 called out for
+  # `:dev`; this job runs in a SEPARATE workflow (this one), so a
+  # malicious edit to release.yml that drops its sign + verify steps
+  # cannot also silence this check. It triggers on the same tag push,
+  # resolves the tag's digest from GHCR, and verifies the attestation
+  # against the #169 tag identity (release.yml@refs/tags/v*). A tag push
+  # is always NEW — there is no previous digest to vacuously verify —
+  # and the Release workflow signs concurrently, so the loop below
+  # retries until the image AND its signature land; deliberately absent
+  # provenance exhausts the bounded retries and fails the job (the #588
+  # acceptance criterion).
+  cosign-verify-tag-image:
+    name: cosign verify v* tag image provenance
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify the tagged image's provenance
+        env:
+          # Issue #574: tag names may carry shell metacharacters — env
+          # indirection only (same shape as release.yml's tag verify).
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/anchapin/openstudio-server-operator:${TAG_NAME}"
+          for ATTEMPT in $(seq 1 30); do
+            DIGEST=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}" 2>/dev/null || true)
+            if [ -n "$DIGEST" ] && [ "$DIGEST" != "null" ]; then
+              if cosign verify-attestation \
+                  --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/tags/v*" \
+                  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                  --type slsaprovenance \
+                  "ghcr.io/anchapin/openstudio-server-operator@${DIGEST}"; then
+                echo "Verified provenance for ${TAG_NAME} (${DIGEST}) on attempt ${ATTEMPT}."
+                exit 0
+              fi
+            fi
+            echo "attempt ${ATTEMPT}/30: tag image or its provenance not ready yet; retrying in 30s"
+            sleep 30
+          done
+          echo "::error::could not verify provenance for ${IMAGE} after ~15 minutes — the Release workflow's Sign + attest step must complete first (issue #588)."
+          exit 1
+
+  # Issue #588: the workflow_run trigger exists solely for the gated
+  # provenance verifiers above; without this gate every Release run
+  # completion would re-run the full lint/test/audit surface on top of
+  # the push-event runs (doubling CI on every develop push).
   lint:
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,7 +260,9 @@ jobs:
           printf '%s\n' "$PR_BODY" > /tmp/pr_body.md
           bash scripts/check_pr_body_scope.sh --file /tmp/pr_body.md
 
+  # Issue #588: skip on workflow_run completions (same rationale as lint).
   test:
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -274,7 +363,9 @@ jobs:
   #       never pushed) with a CRITICAL,HIGH severity floor. Triaged
   #       exceptions live in .trivyignore. release.yml re-scans the
   #       pushed image with the same floor BEFORE the digest-pin commit.
+  # Issue #588: skip on workflow_run completions (same rationale as lint).
   audit:
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
