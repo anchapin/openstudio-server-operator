@@ -289,16 +289,26 @@ spec:
 #
 # This policy is cluster-scoped (ValidatingAdmissionPolicy lives at
 # cluster scope) but its `namespaceSelector` narrows it to the
-# `openstudio-server` namespace only. `failurePolicy: Fail` makes any
+# openstudio-server` namespace only. `failurePolicy: Fail` makes any
 # CEL evaluation error block the request — the same default-deny
 # stance the network policies use. The CEL expression uses `has()` to
 # guard the `object` vs `oldObject` fields that VAP exposes per
 # operation (CREATE has `object`, DELETE has `oldObject`, UPDATE has
 # both); without the guard, a CREATE would error on `oldObject`
 # evaluation and the policy would reject every legitimate archival Job.
-# GET is intentionally left unbound — Reads are not part of the
-# exfiltration path and constraining them would also block the prune
-# pod's own watch-by-deterministic-name lookup.
+# Since #680 each clause is ADDITIONALLY guarded by
+# `request.operation` (object-side by `!= 'DELETE'`, oldObject-side
+# by `!= 'CREATE'`): the apiserver binds `object` to null on DELETE
+# and `oldObject` to null on CREATE, so the bare `has()` guards only
+# made those paths error-free by accident of CEL's commutative
+# error-absorption — a prune-SA DELETE of a non-archival Job (or a
+# CREATE the object-clause rejects) errored with "no such key:
+# metadata" and denied via `failurePolicy: Fail` rather than via
+# policy logic: fail-closed but cryptic, the exact #680 class the
+# pod-delete policy was fixed for. GET is intentionally left
+# unbound — Reads are not part of the exfiltration path and
+# constraining them would also block the prune pod's own
+# watch-by-deterministic-name lookup.
 #
 # Issue #398 — the label match alone is spoofable by the very SA this
 # policy constrains: a compromised prune pod can stamp the two archival
@@ -404,18 +414,29 @@ spec:
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["jobs"]
   validations:
+    # Issue #680: the object-side clause is guarded by
+    # `request.operation != 'DELETE'` (object is null on DELETE
+    # admission) and the oldObject-side clause by
+    # `request.operation != 'CREATE'` (oldObject is null on CREATE
+    # admission), so neither binding is ever selected while null and
+    # every denial is a clean policy-logic rejection — the bare
+    # `has()` guards alone let a null binding error with "no such
+    # key: metadata" (absorbed into a cryptic failurePolicy deny).
     - expression: |
         request.userInfo.username !=
         'system:serviceaccount:openstudio-server:openstudio-storage-pruner-sa'
         ||
-        (has(object.metadata.labels) &&
-         object.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
-         object.metadata.labels["app.kubernetes.io/component"] == "archival" &&
-         object.metadata.name.startsWith("oscm-archive-")) ||
-        (has(oldObject.metadata.labels) &&
-         oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator" &&
-         oldObject.metadata.labels["app.kubernetes.io/component"] == "archival" &&
-         oldObject.metadata.name.startsWith("oscm-archive-"))
+        (request.operation != 'DELETE'
+         && has(object.metadata.labels)
+         && object.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator"
+         && object.metadata.labels["app.kubernetes.io/component"] == "archival"
+         && object.metadata.name.startsWith("oscm-archive-"))
+        ||
+        (request.operation != 'CREATE'
+         && has(oldObject.metadata.labels)
+         && oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "openstudio-operator"
+         && oldObject.metadata.labels["app.kubernetes.io/component"] == "archival"
+         && oldObject.metadata.name.startsWith("oscm-archive-"))
       message: >-
         openstudio-storage-pruner-sa may only create/update/delete
         Jobs named with the `oscm-archive-` prefix (the

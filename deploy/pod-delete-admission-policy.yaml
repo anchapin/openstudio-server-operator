@@ -34,7 +34,13 @@
 # destructive surface is narrowed. The `failurePolicy: Fail` setting
 # means a broken admission webhook (e.g. a CEL runtime error) rejects
 # the request rather than failing open; the alternative `Warn` would
-# silently re-open the gap.
+# silently re-open the gap. Issue #680 additionally branches the CEL
+# on `request.operation` and evaluates `oldObject` on the DELETE
+# path: the apiserver binds `object` to null for DELETE admissions,
+# so an unguarded `has(object.metadata.labels)` errored ("no such
+# key: metadata") and the deny came from failurePolicy absorbing a
+# CEL evaluation error — fail-closed, but cryptic and
+# policy-logic-independent. See the #680 comment at the validation.
 #
 # Apply order alongside the rest of the operator manifests (see
 # docs/kind-validation.md:218-219). The policy lives in the
@@ -65,12 +71,33 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: openstudio-server
   validations:
+    # Issue #680: on DELETE admission the apiserver binds `object` to
+    # null (K8s CEL admission docs: "the value is null for DELETE
+    # operations") — the pre-fix `has(object.metadata.labels)`
+    # guarded `metadata.labels` but NOT the `object` binding itself,
+    # so the field select `object.metadata` raised "no such key:
+    # metadata" (reproduced on k8s 1.33.1 with an impersonated
+    # server-dry-run DELETE) and the denial came from
+    # `failurePolicy: Fail` absorbing a CEL evaluation error instead
+    # of from policy logic. The expression now branches on
+    # `request.operation`: the DELETE branch (the only operation
+    # matchConstraints admits) reads `oldObject` — always populated
+    # on delete admission — and the non-DELETE branch (kept so the
+    # expression stays correct if matchConstraints ever broadens)
+    # reads the incoming `object`. Both label checks are unchanged:
+    # an operator-SA delete of a pod without `app=worker` now denies
+    # via clean policy logic, never via a CEL error.
     - expression: >
         request.userInfo.username !=
         'system:serviceaccount:openstudio-server:openstudio-operator-sa'
         ||
-        (has(object.metadata.labels) &&
-         object.metadata.labels['app'] == 'worker')
+        (request.operation != 'DELETE'
+         && has(object.metadata.labels)
+         && object.metadata.labels['app'] == 'worker')
+        ||
+        (request.operation == 'DELETE'
+         && has(oldObject.metadata.labels)
+         && oldObject.metadata.labels['app'] == 'worker')
       # Issue #565: the message MUST be a single line — the API server
       # rejects any validation message containing "\n" ("message must
       # not contain line breaks"). The folded `>-` scalar (strip-
