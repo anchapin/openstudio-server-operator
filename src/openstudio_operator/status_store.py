@@ -64,6 +64,7 @@ STARTED_SINCE = "startedSince"
 ARCHIVED_ANALYSES = "archivedAnalyses"
 LAST_RECYCLE_AT = "lastRecycleAt"
 LAST_WEB_BACKGROUND_RESTART_AT = "lastWebBackgroundRestart"
+STALL_WINDOW_STARTED_AT = "stallWindowStartedAt"
 DEFERRED_EVENTS = "deferredEvents"
 
 MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
@@ -728,6 +729,12 @@ class StatusStore:
 
     def set_last_web_background_restart_at(self, when: datetime | None) -> None:
         self._set_scalar(LAST_WEB_BACKGROUND_RESTART_AT, when)
+
+    def get_stall_window_started_at(self) -> datetime | None:
+        return self._get_scalar(STALL_WINDOW_STARTED_AT)
+
+    def set_stall_window_started_at(self, when: datetime | None) -> None:
+        self._set_scalar(STALL_WINDOW_STARTED_AT, when)
 
     # --- pruning ---------------------------------------------------------------
 
