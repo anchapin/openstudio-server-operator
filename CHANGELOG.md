@@ -1185,6 +1185,24 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   (three missing module rows, eight stale-symbol rows fixed) and now
   has a two-directional drift gate mirroring the #485 deploy-inventory
   gate: a new module without a README row (or a ghost row) fails CI.
+- **`#576`** — the image build no longer executes unpinned PyPI code:
+  `hatchling==1.32.0` pinned exactly, installed via the hash-pinned
+  `requirements.txt`, wheel built with `--no-build-isolation`
+  (docker-verified: no ephemeral backend fetch).
+- **`#577`** — CI tooling (`pip-audit`/`ruff`/`pyyaml`) installs from
+  the new hash-pinned `requirements-ci.txt` (the third lockfile,
+  riding the #479 pair's refresh); a structural fence fails any
+  workflow `pip install` without `--require-hashes`/exact pin.
+- **`#584`** — the Redis key-layout check moved to its own
+  `handlers/redis_layout_check.py`; the function-local deferred import
+  (the cycle that only failed at the first stall tick) is gone, and
+  the boundary fence now AST-walks handler modules at all nesting
+  depths for package-init reach-arounds.
+- **`#587`** — the runbooks cover the four undocumented hardening
+  artifacts (resource-quota burst envelope, network-policy traps incl.
+  the #166 prometheus-namespace footgun, PrometheusRule cluster-admin
+  scope + kube-state-metrics prerequisite, Grafana datasource binding)
+  with a kind-validation approximation note.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
