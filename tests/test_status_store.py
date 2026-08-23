@@ -290,6 +290,61 @@ def test_stall_window_started_at_round_trip_and_clear(store, api):
     assert body == {"status": {"stallWindowStartedAt": None}}
 
 
+# --- Issue #649 — ineffective-restart breaker int scalar ------------------------
+
+
+def test_ineffective_restarts_round_trip_and_default_zero(store, api):
+    """Issue #649 — the breaker's consecutive-count scalar round-trips as a
+    plain JSON integer; absent reads as ``0`` so pre-#649 CRs need no
+    migration (the breaker starts disarmed)."""
+    assert store.get_web_background_ineffective_restarts() == 0
+    assert "webBackgroundIneffectiveRestarts" not in api.obj["status"]
+
+    store.set_web_background_ineffective_restarts(3)
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 3
+    assert store.get_web_background_ineffective_restarts() == 3
+    body, _ = api.patches[-1]
+    assert body == {"status": {"webBackgroundIneffectiveRestarts": 3}}
+
+    store.set_web_background_ineffective_restarts(0)
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 0
+    assert store.get_web_background_ineffective_restarts() == 0
+
+
+def test_ineffective_restarts_same_value_writes_once(store, api):
+    """Idempotent write: re-setting the stored value is a no-op PATCH skip
+    (the same guard every scalar/map setter carries)."""
+    store.set_web_background_ineffective_restarts(2)
+    patch_calls_after_set = api.patch_calls
+    store.set_web_background_ineffective_restarts(2)
+    assert api.patch_calls == patch_calls_after_set
+
+
+def test_ineffective_restarts_retries_on_conflict(api, store, sleeps):
+    """409-safe like every other ``.status`` write (D04): the RMW cycle
+    re-reads and re-applies past synthetic conflicts, so a breaker count
+    update is never lost to contention."""
+    api.remaining_conflicts = 2
+    store.set_web_background_ineffective_restarts(5)
+    assert store.get_web_background_ineffective_restarts() == 5
+    assert api.conflicts_seen == 2
+    assert len(sleeps) == 2
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["3", 3.5, True, [3], {"count": 3}],
+)
+def test_ineffective_restarts_corrupt_value_raises(store, api, corrupt):
+    """Strict typing: only JSON integers parse (strings, floats, bools,
+    arrays, objects raise ``StatusStoreError``) — the same posture the
+    datetime scalars take via ``_parse_utc``; a silently coerced count
+    could mis-arm the backoff schedule."""
+    api.obj["status"]["webBackgroundIneffectiveRestarts"] = corrupt
+    with pytest.raises(StatusStoreError):
+        store.get_web_background_ineffective_restarts()
+
+
 # --- Conflict-safe RMW ----------------------------------------------------------
 
 

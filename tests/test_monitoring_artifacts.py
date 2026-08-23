@@ -47,6 +47,15 @@ a firing-scenario simulation over pod-down / crashloop / #166 modes, and
 (heartbeat, metrics-server bind, both #312 freshness gauges), while the
 #581 per-module threshold fence keeps guarding the series-present legs.
 
+Issue #649 adds the fifth invariant, scoped to the ineffective-restart
+circuit-breaker alert: the expr must key on
+``increase(openstudio_operator_web_background_restarts_ineffective_
+total[>=30m]) > 0`` — the backoff spaces the breaker's increments at
+least four stall windows apart, so the file-default 5m rate window can
+sit entirely between two increments and never fire — with warning
+severity and a description routing to the systemic-cause runbook (NFS
+full / Mongo down / broken image; README triage + docs/validation.md).
+
 Scope guard (#485): these tests deliberately do NOT pin the full deploy/
 file inventory — the deploy-inventory CI guard is owned by #485. Only the
 two #468 artifacts and their referenced families are covered here.
@@ -848,6 +857,115 @@ def test_liveness_alerts_carry_absence_arms():
             f"Prometheus lookback, #166 scrape-path loss) evaluates to "
             f"FIRING rather than silent resolution (found {expr!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #649 — ineffective-restart circuit-breaker alert drift gate.
+#
+# The breaker's Prometheus surface is one counter,
+# openstudio_operator_web_background_restarts_ineffective_total, incremented
+# once per PROVEN-ineffective restart — spaced at least FOUR stall windows
+# apart once the backoff engages (>= 40m at the default 10m window; the
+# total-wait schedule is 4/6/8 windows). The gate pins the
+# shipped alert to that shape: increase(...) over a 30m range (a 5m rate
+# window can sit entirely between two spaced increments and never see one),
+# warning severity (the operator has already self-limited the churn via
+# backoff; the page is "go run the systemic-cause triage"), and a
+# description that names the systemic causes + runbook so the on-call is
+# routed to the substrate checklist, not to restarting harder.
+# ---------------------------------------------------------------------------
+
+#: Name of the #649 breaker alert in deploy/prometheustrule.yaml.
+_BREAKER_ALERT_NAME = "OpenStudioOperatorWebBackgroundRestartIneffective"
+
+#: The canonical #649 shape: increase over the breaker counter with a
+#: captured 30m-scale range. Used with ``fullmatch`` so a hand-edited expr
+#: (a 5m rate that misses spaced increments, an absent() arm — this is an
+#: event-driven action counter, not a liveness family — or a rename) fails
+#: structurally.
+_BREAKER_EXPR_RE = re.compile(
+    r"increase\(openstudio_operator_web_background_restarts_ineffective_total"
+    r"\[(?P<range_minutes>[0-9]+)m\]\) > 0"
+)
+
+#: The #649 counter increments at most once per four stall windows once
+#: the backoff engages (>= 40m at the default 10m spec.stallWindowMinutes);
+#: the increase range must be at least 30m so a single spaced increment is
+#: always visible to the expression for a meaningful dwell.
+_BREAKER_MIN_RANGE_MINUTES = 30
+
+
+def _breaker_alert() -> dict:
+    """Return the (unique) #649 breaker rule."""
+    matches = [
+        alert
+        for alert in _prometheusrule_alerts()
+        if alert.get("alert") == _BREAKER_ALERT_NAME
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {_BREAKER_ALERT_NAME} rule in "
+        f"{PROMETHEUSRULE_PATH.name}, found {len(matches)} (issue #649)"
+    )
+    return matches[0]
+
+
+def test_breaker_alert_keys_on_ineffective_counter_with_visible_range():
+    """#649: the alert expr is ``increase(...[>=30m]) > 0`` on the new counter.
+
+    A ``rate(...[5m]) > 0`` shape (the file's default idiom) is the
+    regression this gate exists for: breaker increments are spaced at
+    least four stall windows apart once the backoff engages, so a 5m rate
+    window can sit entirely between two increments and the alert never
+    fires despite the operator having proven restarts ineffective. The
+    structural fullmatch also rejects an ``absent(...)`` arm — an
+    event-driven action counter is legitimately absent on a healthy
+    cluster (the #646 absence discipline applies to liveness families,
+    not action counters).
+    """
+    alert = _breaker_alert()
+    parsed = _BREAKER_EXPR_RE.fullmatch(alert["expr"])
+    assert parsed, (
+        f"{_BREAKER_ALERT_NAME} expr does not fullmatch the canonical #649 "
+        f"shape `increase(openstudio_operator_web_background_restarts_"
+        f"ineffective_total[Nm]) > 0`: {alert['expr']!r}"
+    )
+    assert int(parsed["range_minutes"]) >= _BREAKER_MIN_RANGE_MINUTES, (
+        f"increase range must be >= {_BREAKER_MIN_RANGE_MINUTES}m — breaker "
+        f"increments are spaced >= 4 stall windows (>= 40m at the default "
+        f"10m window), so a shorter range can miss every increment (#649)"
+    )
+    assert "absent(" not in alert["expr"], (
+        "the breaker counter is an event-driven action counter — it is "
+        "legitimately absent on a healthy cluster; an absence arm (#646 "
+        "idiom) would page on every healthy install"
+    )
+
+
+def test_breaker_alert_routes_to_systemic_cause_runbook():
+    """#649: warning severity + the description names the systemic causes.
+
+    The operator has already self-limited the churn (backoff skips restart
+    windows), so the page is a routing decision — severity warning, and
+    the description must name the systemic causes (NFS full / Mongo down /
+    broken image) and the runbook (README triage + docs/validation.md) so
+    the on-call triages the substrate instead of restarting harder.
+    """
+    alert = _breaker_alert()
+    assert alert.get("labels", {}).get("severity") == "warning", (
+        f"{_BREAKER_ALERT_NAME} must be severity warning — the backoff has "
+        f"already bounded the churn; the page routes a human to the "
+        f"systemic-cause triage (#649)"
+    )
+    description = alert.get("annotations", {}).get("description", "")
+    lowered = description.lower()
+    assert "nfs" in lowered and "mongo" in lowered and "image" in lowered, (
+        f"{_BREAKER_ALERT_NAME} description must name the systemic causes "
+        f"(NFS share full / MongoDB down / broken web-background image)"
+    )
+    assert "README" in description and "docs/validation.md" in description, (
+        f"{_BREAKER_ALERT_NAME} description must point at the runbook — "
+        f"README.md triage commands + docs/validation.md (#649)"
+    )
 
 
 def test_grafana_dashboard_parses_with_templated_datasource():

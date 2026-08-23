@@ -94,8 +94,8 @@ past the ~5m Prometheus lookback.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
- versa) fails CI loudly. **Current shape: 20 counters + 18 gauges + 5 histograms
-(post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
+ versa) fails CI loudly. **Current shape: 21 counters + 18 gauges + 5 histograms
+(post-#649 ineffective-restart circuit-breaker counter; post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
 Redis key-layout validation status gauge; post-#254 sustained-window elapsed
@@ -214,6 +214,7 @@ specific family:
 | `openstudio_operator_datapoints_requeue_exhausted_total` | counter | `datapoint_watchdog` (Module 2) · #10 | Datapoints abandoned after exceeding `maxAutoRequeues`. Should be near-zero in steady state; any nonzero rate means real jobs are dying past the auto-requeue budget. |
 | `openstudio_operator_workers_recycled_total{trigger}` | counter (labelled) | `worker_recycler` (Module 3) · #11, #309 | Worker Deployment rolling-restarts issued by the recycler. Spikes imply the worker fleet is misbehaving (CRASHLOOP, OOM); a steady cadence is normal. Labelled by `trigger` (`analysis-completed` \| `interval-elapsed`) so an SRE investigating a recycle spike can tell whether the interval-elapsed sweep or the analysis-completed edge fired. |
 | `openstudio_operator_web_background_restarts_total` | counter | `web_background_monitor` (Module 4) · #13 | `web_background` Deployment restarts after sustained queue stalls. Alert on any growth — Resque plumbing is broken or v3.11.0 key layout drifted (#44 / #87). |
+| `openstudio_operator_web_background_restarts_ineffective_total` | counter | `web_background_monitor` (Module 4) · #649 | web_background restarts PROVEN ineffective — the stall re-sustained a full window past the previous restart's cooldown (a new restart fired while the predecessor anchor existed). From the 3rd consecutive one the operator emits the `WebBackgroundRestartIneffective` Warning Event and backs the restart action off (total wait 4/6/8 stall windows; detection keeps running, only the action defers). Alert on `increase(...[30m]) > 0` (shipped as `OpenStudioOperatorWebBackgroundRestartIneffective`) — restarting is not fixing the stall; triage the systemic causes (NFS share full, MongoDB down, broken web-background image) per README triage + docs/validation.md. |
 | `openstudio_operator_analyses_archived_total` | counter | `retention` (storage pruner) · #16, #394 | Analyses whose archival Job passed rclone verification (including adopted completions). Steady growth = healthy storage archival. Adopted = the operator saw a Job completion it didn't start, counted anyway. **Wedged-pipeline alert (#394):** `rate(...) == 0` AND an in-flight archival Job's `status.active > age_seconds / ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS` — `ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS` is the upper bound the operator pins on every archival Job (6× the chart's worker `terminationGracePeriodSeconds`, currently `31200`s in `src/openstudio_operator/archival.py`); the kubelet hard-kills any rclone pod past it so the gate cannot be a hung-gate. |
 | `openstudio_operator_analyses_deleted_total{outcome}` | counter (labelled) | `retention` (storage pruner) · #16, #309 | Analyses deleted after verified archival. In healthy operation, this should track `analyses_archived_total` minus the in-progress backlog. `spec.dryRun` suppresses both the delete and the increment. Labelled by `outcome` (`deleted` is the only currently-exercised value; the label is pinned so future outcome splits are a one-line change). |
 | `openstudio_operator_status_conflicts_total` | counter | `status_store` (RMW helper) · #119 | Per-attempt 409 responses from the Kubernetes API Server during CR `.status` RMW cycles (incremented inside `_mutate` for each 409 before the backoff sleep). Sustained nonzero rate means multiple operators are racing; investigate the singleton guard (#14). |
@@ -413,7 +414,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05) + boot wrap-count/expected-handler gauge pair (#491, #570)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+18+5)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (21+18+5)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164); emission type aliases `TickEmitter`/`EventSink` + `emit_kopf_event` (#496)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

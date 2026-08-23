@@ -554,7 +554,7 @@ spec:
         # #166 scrape-path loss) per the #569/#645 absence idiom.
         - alert: OpenStudioOperatorStallWindowStale
           expr: time() - openstudio_operator_stall_window_fresh > 300
-            or absent(openstudio_operator_stall_window_fresh)
+             or absent(openstudio_operator_stall_window_fresh)
           labels:
             severity: warning
           annotations:
@@ -569,6 +569,41 @@ spec:
               when the series has no data at all — pod down / crashloop past the
               Prometheus lookback, or scrape-path loss (#166); cross-check
               OpenStudioOperatorScrapeTargetDown.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # metrics.py WEB_BACKGROUND_RESTARTS_INEFFECTIVE_TOTAL (#649) — the
+        # circuit-breaker signal: a web_background restart fired, its
+        # cooldown elapsed, and the stall condition re-sustained a full
+        # window anyway. Restarting is not fixing the stall — the cause is
+        # systemic (NFS share full, MongoDB down, broken web-background
+        # image) and each further restart destroys in-flight web_background
+        # work for nothing. From the 3rd consecutive ineffective restart
+        # the operator emits the WebBackgroundRestartIneffective Warning
+        # Event and backs the restart action off exponentially (total wait
+        # 4/6/8 stall windows — the natural cooldown + re-sustain cadence
+        # is already 2, so the schedule starts above it; detection keeps
+        # running), so increments are spaced at least four stall windows
+        # apart once the backoff engages (>= 40m at the default 10m
+        # window) — the 30m increase window (not a 5m rate) keeps each
+        # spaced increment visible to Prometheus instead of flashing past
+        # the range. No `for`: the alert IS the page; it resolves as the
+        # increase window slides past the last increment.
+        - alert: OpenStudioOperatorWebBackgroundRestartIneffective
+          expr: increase(openstudio_operator_web_background_restarts_ineffective_total[30m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: web_background restarts are not breaking the stall
+            description: >-
+              increase(openstudio_operator_web_background_restarts_ineffective_total[30m])
+              > 0 — a web_background restart was proven ineffective (the stall
+              re-sustained a full window past its cooldown; #649). Stop trusting the
+              restart loop and triage the systemic causes: NFS share full, MongoDB
+              down, or a broken web-background image. From 3 consecutive the operator
+              backs the restart action off (total wait 4/6/8 stall windows) and emits
+              the WebBackgroundRestartIneffective Warning Event on the OSCM CR —
+              correlate the two. Runbook: README.md triage commands +
+              docs/validation.md (systemic-cause checklist).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------
