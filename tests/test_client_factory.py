@@ -21,7 +21,6 @@ from __future__ import annotations
 import ast
 import base64
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from kubernetes.client import ApiException
@@ -326,34 +325,19 @@ OTHER_KEY_REF = RedisSecretRef(name="openstudio-redis", key="url")
 NAMESPACE = "openstudio-server"
 
 
-class FakeCoreV1Api:
-    """Just enough ``CoreV1Api`` for the factory's one Secret read."""
-
-    def __init__(self, data: dict[str, str] | None = None, exc: Exception | None = None):
-        self._data = data or {}
-        self._exc = exc
-        self.calls: list[tuple[str, str]] = []
-
-    def read_namespaced_secret(self, name: str, namespace: str):
-        self.calls.append((name, namespace))
-        if self._exc is not None:
-            raise self._exc
-        return SimpleNamespace(data=self._data)
-
-
 def _encoded(url: str) -> str:
     # The API server returns Secret ``data`` base64-encoded; the client
     # library does NOT decode it.
     return base64.b64encode(url.encode()).decode()
 
 
-def _install_secret_api(monkeypatch, fake: FakeCoreV1Api) -> None:
+def _install_secret_api(monkeypatch, fake: FakeSecretsCoreV1Api) -> None:
     monkeypatch.setattr(singleton, "_operator_core_api", fake)
 
 
 def test_secret_ref_resolves_url_from_secret(monkeypatch):
     """The client is built from the Secret-held URL (base64 ``data`` decoded)."""
-    fake = FakeCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
     _install_secret_api(monkeypatch, fake)
 
     client = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
@@ -366,7 +350,7 @@ def test_secret_ref_is_preferred_over_inline_url(monkeypatch):
     """Issue #463 acceptance: secretRef WINS when both are present — a
     grandfathered CR carrying a pre-#463 inline credential (or any inline
     URL) is superseded by the Secret value."""
-    fake = FakeCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
     _install_secret_api(monkeypatch, fake)
 
     client = get_read_only_redis_client(
@@ -381,7 +365,7 @@ def test_secret_ref_missing_secret_raises_and_is_not_cached(monkeypatch):
     because ``lru_cache`` never memoizes exceptions — the NEXT call re-reads
     the API, so a Secret created after the first attempt is picked up on the
     very next tick with no eviction hook."""
-    fake = FakeCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
+    fake = FakeSecretsCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
     _install_secret_api(monkeypatch, fake)
 
     with pytest.raises(RedisCredentialResolutionError, match="openstudio-redis"):
@@ -405,7 +389,7 @@ def test_secret_ref_403_message_names_rbac_remedy(monkeypatch):
     (key-layout "unreachable" log, counted tick-skip log, the singleton
     guard's Warning Event) tells the SRE exactly what to do."""
     custom_ref = RedisSecretRef(name="openstudio-redis-url", key="redis-url")
-    fake = FakeCoreV1Api(exc=ApiException(status=403, reason="Forbidden"))
+    fake = FakeSecretsCoreV1Api(exc=ApiException(status=403, reason="Forbidden"))
     _install_secret_api(monkeypatch, fake)
 
     with pytest.raises(RedisCredentialResolutionError) as excinfo:
@@ -422,7 +406,7 @@ def test_secret_ref_403_message_names_rbac_remedy(monkeypatch):
     assert "#606" in message
     # The 404 path (companion test above) must NOT grow the RBAC suffix —
     # only the RBAC-denied case names the remedy.
-    fake_404 = FakeCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
+    fake_404 = FakeSecretsCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
     _install_secret_api(monkeypatch, fake_404)
     with pytest.raises(RedisCredentialResolutionError) as excinfo_404:
         get_read_only_redis_client("", secret_ref=custom_ref, namespace=NAMESPACE)
@@ -433,7 +417,7 @@ def test_secret_ref_403_message_names_rbac_remedy(monkeypatch):
 
 
 def test_secret_ref_missing_key_raises(monkeypatch):
-    fake = FakeCoreV1Api({"password": _encoded("rotated-pw")})  # wrong key
+    fake = FakeSecretsCoreV1Api({"password": _encoded("rotated-pw")})  # wrong key
     _install_secret_api(monkeypatch, fake)
 
     with pytest.raises(RedisCredentialResolutionError, match="redis-url"):
@@ -443,7 +427,7 @@ def test_secret_ref_missing_key_raises(monkeypatch):
 def test_secret_ref_invalid_url_value_raises(monkeypatch):
     """The Secret VALUE is fence-checked too: the #390 in-cluster constraint
     must survive the move into the Secret (no off-cluster side door)."""
-    fake = FakeCoreV1Api({"redis-url": _encoded("redis://:pw@attacker.example.com:6379")})
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded("redis://:pw@attacker.example.com:6379")})
     _install_secret_api(monkeypatch, fake)
 
     with pytest.raises(RedisCredentialResolutionError, match="attacker.example.com"):
@@ -452,7 +436,7 @@ def test_secret_ref_invalid_url_value_raises(monkeypatch):
 
 def test_secret_ref_without_namespace_raises(monkeypatch):
     """Resolution needs the CR's namespace; refusing loudly beats guessing."""
-    fake = FakeCoreV1Api({"redis-url": _encoded(SECRET_URL)})
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
     _install_secret_api(monkeypatch, fake)
 
     with pytest.raises(RedisCredentialResolutionError, match="namespace"):
@@ -468,7 +452,7 @@ def test_secret_ref_identity_is_part_of_the_cache_key(monkeypatch):
     client object (one API read, one connection pool)."""
     _install_secret_api(
         monkeypatch,
-        FakeCoreV1Api({"redis-url": _encoded(SECRET_URL), "url": _encoded(OTHER_REDIS_URL)}),
+        FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL), "url": _encoded(OTHER_REDIS_URL)}),
     )
 
     first = get_read_only_redis_client(INLINE_CRED_FREE, secret_ref=REF, namespace=NAMESPACE)
@@ -485,7 +469,7 @@ def test_secret_ref_identity_is_part_of_the_cache_key(monkeypatch):
 def test_no_secret_ref_keeps_inline_path_byte_for_byte(monkeypatch):
     """``secret_ref=None`` (every pre-#463 call site) never touches the
     Secrets API — the inline URL is used unchanged."""
-    fake = FakeCoreV1Api({})
+    fake = FakeSecretsCoreV1Api({})
     _install_secret_api(monkeypatch, fake)
 
     client = get_read_only_redis_client(INLINE_CRED_FREE)
@@ -503,7 +487,7 @@ def test_secret_ref_resolves_rediss_tls_url_end_to_end_476(monkeypatch):
     from redis.connection import SSLConnection
 
     tls_url = "rediss://:rotated-pw@queue.openstudio-server.svc.cluster.local:6379"
-    fake = FakeCoreV1Api({"redis-url": _encoded(tls_url)})
+    fake = FakeSecretsCoreV1Api({"redis-url": _encoded(tls_url)})
     _install_secret_api(monkeypatch, fake)
 
     client = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
@@ -523,14 +507,10 @@ def test_secret_ref_resolves_rediss_tls_url_end_to_end_476(monkeypatch):
 # re-resolves the Secret on EVERY call and keys the client LRU by the
 # resolved URL, so a rotation is a new key ⇒ a fresh client on the very
 # next tick. These cases use the shared ``FakeSecretsCoreV1Api`` (extended
-# with ``resource_version`` + ``rotate()`` for #568) rather than the local
-# ``FakeCoreV1Api`` above.
+# with ``resource_version`` + ``rotate()`` for #568); since #653 the #463
+# cases above use the same shared fake (the local copy is gone).
 
 ROTATED_SECRET_URL = "redis://:new-rotated-pw@queue.openstudio-server.svc.cluster.local:6379"
-
-
-def _install_shared_secret_api(monkeypatch, fake: FakeSecretsCoreV1Api) -> None:
-    monkeypatch.setattr(singleton, "_operator_core_api", fake)
 
 
 def test_secret_rotation_yields_fresh_client_568(monkeypatch):
@@ -541,7 +521,7 @@ def test_secret_rotation_yields_fresh_client_568(monkeypatch):
     builds from the new credential — the in-band fix #568 demands (no
     operator restart, picked up within one tick)."""
     fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
-    _install_shared_secret_api(monkeypatch, fake)
+    _install_secret_api(monkeypatch, fake)
 
     stale = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
 
@@ -561,7 +541,7 @@ def test_unchanged_secret_keeps_cached_client_and_pool_568(monkeypatch):
     pool). The rotation probe costs one bounded ``secrets: get`` per call,
     but the pool only churns when the credential actually changes."""
     fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
-    _install_shared_secret_api(monkeypatch, fake)
+    _install_secret_api(monkeypatch, fake)
 
     first = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
     second = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
@@ -579,7 +559,7 @@ def test_resource_version_bump_without_content_change_keeps_client_568(monkeypat
     deliberate: any credential rotation changes the URL, while a
     content-less metadata touch must not churn the connection pool."""
     fake = FakeSecretsCoreV1Api({"redis-url": _encoded(SECRET_URL)})
-    _install_shared_secret_api(monkeypatch, fake)
+    _install_secret_api(monkeypatch, fake)
 
     first = get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
 

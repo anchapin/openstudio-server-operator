@@ -40,7 +40,7 @@ import pytest
 import responses
 from prometheus_client import REGISTRY, generate_latest
 
-from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, calls_to, make_emit
+from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, FakePodsCoreV1Api, calls_to, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import metrics
 from openstudio_operator._k8s import deployment_label_selector
@@ -183,32 +183,6 @@ def make_pod(name: str, ip: str | None = None, labels: dict | None = None):
         ),
         status=SimpleNamespace(pod_ip=ip),
     )
-
-
-class FakeCoreV1Api:
-    """CoreV1Api stand-in: pod list + recorded deletes (issue #83 D2).
-
-    The escalation path (issue #83 D2) consults the pod list to verify
-    that each Resque-resolved candidate pod name actually exists in the
-    namespace. The list is not used to find candidates (Resque does that)
-    — it is used to defend against stale Resque records claiming a pod
-    that has been deleted out-of-band.
-    """
-
-    def __init__(self, pods: list) -> None:
-        self.pods = pods
-        self.list_calls: list[dict] = []
-        self.deletes: list[dict] = []
-
-    def list_namespaced_pod(self, namespace, label_selector=None, **kwargs):
-        self.list_calls.append(
-            {"namespace": namespace, "label_selector": label_selector, "kwargs": kwargs}
-        )
-        return SimpleNamespace(items=list(self.pods))
-
-    def delete_namespaced_pod(self, name, namespace, **kwargs):
-        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
-        return {}
 
 
 class FakeRedisClient:
@@ -680,7 +654,7 @@ def test_grace_not_yet_elapsed_waits_even_after_restart():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
@@ -722,7 +696,7 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
@@ -775,7 +749,7 @@ def test_escalation_uses_resque_worker_identity_not_ip_matching():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api(
+    pod_api = FakePodsCoreV1Api(
         [
             make_pod("worker-a", "10.0.0.1"),  # victim
             make_pod("worker-b", "10.0.0.2"),  # different analysis, IP doesn't matter
@@ -827,7 +801,7 @@ def test_escalation_skips_workers_with_no_matching_pod_in_namespace():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-a")])  # only worker-a exists
+    pod_api = FakePodsCoreV1Api([make_pod("worker-a")])  # only worker-a exists
     redis_client = FakeRedisClient(
         {
             "worker-a:7:requeued,simulations": ["a1"],
@@ -869,7 +843,7 @@ def test_escalation_with_no_matching_workers_records_no_match():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient()  # empty Resque registry
 
     result, events = tick(
@@ -902,7 +876,7 @@ def test_default_delete_passes_no_grace_seconds():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
     result, events = tick(
@@ -939,7 +913,7 @@ def test_force_delete_passes_grace_zero():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
     result, events = tick(
@@ -973,7 +947,7 @@ def test_double_escalation_impossible():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
@@ -1008,7 +982,7 @@ def test_analysis_completed_during_grace_prunes_anchor_without_escalating():
     )
     register_analyses_index("a1")
     register_analysis_status("a1", status="completed")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
     result, events = tick(
@@ -1040,7 +1014,7 @@ def test_analysis_vanished_from_api_prunes_anchor():
     )
     register_analyses_index("a-other")  # a-gone vanished; a-other is unrelated
     register_analysis_status("a-other")  # for the a-other poll path (skipped — not anchored)
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient()
 
     result, events = tick(
@@ -1073,7 +1047,7 @@ def test_dry_run_suppresses_pod_deletes_and_marks_event():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
 
@@ -1116,7 +1090,7 @@ def test_escalated_anchor_skips_grace_phase_entirely():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
     result, events = tick(
@@ -1151,7 +1125,7 @@ def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    pod_api = FakeCoreV1Api([make_pod("worker-1")])
+    pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
     result, events = tick(
@@ -1193,7 +1167,7 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
     register_analysis_status("a1")
     pods = [make_pod("worker-1"), make_pod("worker-2")]
 
-    class PartialPodApi(FakeCoreV1Api):
+    class PartialPodApi(FakePodsCoreV1Api):
         def delete_namespaced_pod(self, name, namespace, **kwargs):
             if name == "worker-2":
                 from kubernetes.client import ApiException
@@ -1253,7 +1227,7 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
     )
     result2, events2 = tick(
         api2,
-        pod_api=FakeCoreV1Api(pods),
+        pod_api=FakePodsCoreV1Api(pods),
         redis_client=redis_client2,
     )
     assert result2.escalated == []
@@ -1288,7 +1262,7 @@ def test_escalation_with_all_pod_deletes_failing_re_raises_for_wrapper():
     register_analyses_index("a1")
     register_analysis_status("a1")
 
-    class AllFailPodApi(FakeCoreV1Api):
+    class AllFailPodApi(FakePodsCoreV1Api):
         def delete_namespaced_pod(self, name, namespace, **kwargs):
             raise ApiException(status=404, reason="Not Found")
 
@@ -1453,7 +1427,7 @@ def test_escalate_analysis_uses_redis_resolved_pod_set():
         )
     )
     store = StatusStore(NAMESPACE, NAME, api)
-    pod_api = FakeCoreV1Api(
+    pod_api = FakePodsCoreV1Api(
         [
             make_pod("worker-a"),
             make_pod("worker-b"),

@@ -20,7 +20,7 @@ import fakeredis
 import pytest
 from prometheus_client import REGISTRY
 
-from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit
+from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, FakePodsCoreV1Api, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE, RESTARTED_AT_ANNOTATION
 from openstudio_operator.config import OperatorConfig
@@ -93,18 +93,6 @@ def make_pod(phase: str = "Running", ready: bool = True) -> SimpleNamespace:
     )
 
 
-class FakeCoreV1Api:
-    """Serves a fixed pod list; records the label selectors used."""
-
-    def __init__(self, pods: list[SimpleNamespace]) -> None:
-        self.pods = pods
-        self.selectors: list[str | None] = []
-
-    def list_namespaced_pod(self, namespace, **kwargs):
-        self.selectors.append(kwargs.get("label_selector"))
-        return SimpleNamespace(items=list(self.pods))
-
-
 class ExplodingRedis:
     """Fails any sensing call — proves gated ticks never sense at all."""
 
@@ -173,7 +161,7 @@ def tick(
         store,
         config,
         apps if apps is not None else FakeAppsV1Api(),
-        pods if pods is not None else FakeCoreV1Api([make_pod(), make_pod()]),
+        pods if pods is not None else FakePodsCoreV1Api([make_pod(), make_pod()]),
         namespace=NAMESPACE,
         now=now,
         emit=emit,
@@ -196,7 +184,7 @@ def expected_patch(now: datetime = NOW) -> dict:
 def test_full_stall_sustained_fires_restart_once():
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     metric_before = restarts_total()
 
@@ -404,7 +392,7 @@ def test_unhealthy_worker_pods_no_trigger_even_sustained():
         tick(
             api,
             apps,
-            pods=FakeCoreV1Api([make_pod(ready=False), make_pod()]),
+            pods=FakePodsCoreV1Api([make_pod(ready=False), make_pod()]),
             now=NOW + minute(offset),
             tracker=tracker,
             redis=stall_redis(NOW + minute(offset)),
@@ -417,7 +405,7 @@ def test_pending_worker_pod_no_trigger():
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
     tracker = StallWindowTracker()
-    pods = FakeCoreV1Api([make_pod(phase="Pending")])
+    pods = FakePodsCoreV1Api([make_pod(phase="Pending")])
 
     for offset in (0, 5, 10, 15):
         tick(
@@ -436,7 +424,7 @@ def test_zero_worker_pods_no_trigger():
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
     tracker = StallWindowTracker()
-    pods = FakeCoreV1Api([])
+    pods = FakePodsCoreV1Api([])
 
     for offset in (0, 5, 10, 15):
         tick(
@@ -787,7 +775,7 @@ def test_backoff_defers_action_but_sensing_continues():
     # Sensing gate opens at 84 (73 + one window); the fresh window
     # sustains at 94 — but the 4-window backoff (count=3) defers the
     # action through minute 113 (113-73=40 <= 40 inclusive).
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     selectors_before = len(pods.selectors)
     for offset in (84, 94, 100, 113):
         fired, _ = tick(
@@ -1090,7 +1078,7 @@ def test_restart_mid_window_restores_elapsed_stall_window():
     Module-5 restart indefinitely."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     metric_before = restarts_total()
     tracker_a = StallWindowTracker()
 
@@ -1139,7 +1127,7 @@ def test_restore_honors_preexisting_anchor_older_than_threshold():
     status = {"stallWindowStartedAt": (NOW - minute(11)).isoformat()}
     api = FakeCustomObjectsApi(make_cr(status=status))
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
 
     fired, _ = tick(
         api, apps, pods, now=NOW, tracker=StallWindowTracker(), redis=stall_redis(NOW)
@@ -1306,7 +1294,7 @@ def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick(monkeypatc
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1350,7 +1338,7 @@ def test_stall_window_fresh_advances_on_holding_and_broken_paths(monkeypatch):
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1413,7 +1401,7 @@ def test_freshness_gauges_stale_on_redis_failure(monkeypatch):
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1608,7 +1596,7 @@ def test_delete_recreate_starts_fresh_stall_window() -> None:
     try:
         api = FakeCustomObjectsApi(make_cr())
         apps = FakeAppsV1Api()
-        pods = FakeCoreV1Api([make_pod(), make_pod()])
+        pods = FakePodsCoreV1Api([make_pod(), make_pod()])
         metric_before = restarts_total()
 
         # CR A (uid-a): stall holds at t=0 and t=9 — window not yet sustained.
@@ -1710,7 +1698,7 @@ def test_empty_registry_with_no_prior_heartbeats_warns_once_after_grace():
     """
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
     baseline_gauge = workers_seen_max()
@@ -1793,7 +1781,7 @@ def test_warning_does_not_fire_when_heartbeats_ever_observed():
     """If a heartbeat appears at any point, the safeguard clears the grace."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1828,7 +1816,7 @@ def test_warning_does_not_fire_during_grace_period():
     """Empty registry seen for less than the grace period → no warning."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1850,7 +1838,7 @@ def test_gauge_tracks_high_water_mark_of_workers_seen():
     """The gauge is monotonic: once workers seen, never drops."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1902,7 +1890,7 @@ def test_gauge_populates_on_idle_fleet_empty_queues():
     previously scraped an ambiguous 0.0)."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1935,7 +1923,7 @@ def test_gauge_correct_with_workers_and_backlog():
     (the pre-#87 queue-conditional behavior is preserved under load)."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -1963,7 +1951,7 @@ def test_gauge_untouched_when_redis_unreachable():
     skip) and the gauge is untouched — the scrape-error path is unchanged."""
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -2002,7 +1990,7 @@ def test_gauge_observable_via_metrics_endpoint():
     """
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
     epoch = NOW.timestamp()
@@ -2025,7 +2013,7 @@ def test_warning_does_not_fire_when_idle_no_queue_work():
     """
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
@@ -2067,7 +2055,7 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
     spec = {**SPEC, "dryRun": True}
     api = FakeCustomObjectsApi(make_cr(spec))
     apps = FakeAppsV1Api()
-    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    pods = FakePodsCoreV1Api([make_pod(), make_pod()])
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
