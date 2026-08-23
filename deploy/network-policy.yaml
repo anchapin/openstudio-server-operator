@@ -117,10 +117,38 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
-        # API server (the proper selector)
-        - podSelector:
+        # API server (issue #578).
+        #
+        # TRAP: a `to:` peer carrying ONLY a podSelector is NAMESPACE-LOCAL
+        # — it matches pods in `openstudio-server`, never in `kube-system`
+        # where kube-apiserver pods actually run. Pre-#578 this rule was
+        # exactly that bare podSelector, so it matched zero endpoints: on a
+        # CNI that enforces NetworkPolicy, paired with the
+        # `openstudio-operator-deny-egress` above, the operator's apiserver
+        # traffic (kubeconfig watches, StatusStore RMW) was blackholed.
+        # kindnet does not enforce NetworkPolicy, which is why the kind
+        # validation cluster never caught it.
+        #
+        # A namespaceSelector + podSelector pair in the SAME `to:` entry is
+        # a logical AND — pods labeled `component: kube-apiserver` in the
+        # `kube-system` namespace: the self-hosted API server shape
+        # (kubeadm / kind / self-managed control planes).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
             matchLabels:
               component: kube-apiserver
+        # Hosted control planes (EKS / GKE / AKS …) run the API server
+        # OUTSIDE the cluster — no pod carries the labels above, so the
+        # compound peer matches nothing there. The per-environment
+        # alternative is an ipBlock for the API endpoint CIDR (the
+        # control-plane / private-endpoint range, or the `kubernetes`
+        # Service VIP as a /32 of the service CIDR). Uncomment and set it
+        # per environment, as narrow as the endpoint allows — a wide
+        # ipBlock here reopens the exfil surface #112 closed. (issue #578)
+        # - ipBlock:
+        #     cidr: 203.0.113.10/32  # EXAMPLE — replace with YOUR API endpoint
       ports:
         - protocol: TCP
           port: 443
