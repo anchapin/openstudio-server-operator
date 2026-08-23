@@ -1204,6 +1204,21 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   the #166 prometheus-namespace footgun, PrometheusRule cluster-admin
   scope + kube-state-metrics prerequisite, Grafana datasource binding)
   with a kind-validation approximation note.
+- **`#585`** — consolidation residue removed: the test-only
+  `MERGE_PATCH_CONTENT_TYPE` re-exports and the `_parse_timestamp`
+  alias deleted; the constant lives in `_k8s` (its canonical home) and
+  `status_store` imports from the utility — the utility-to-domain
+  layering wrinkle reversed.
+- **`#589`** — `USER 1000` in the Dockerfile: the non-root default
+  travels with the image (docker run, the release dev-dep assert,
+  downstream embeds), matching the manifests' runAsUser semantics;
+  docker-verified in-image as UID 1000.
+- **`#606`** — the operator Role's `secrets: get` is bounded to the
+  canonical `openstudio-redis` name via RBAC `resourceNames` (the
+  #572 follow-up): a compromised operator pod can no longer read ANY
+  other Secret in the namespace. Custom-named secretRefs fail visibly
+  — a 403-specific message plus a one-time `RedisSecretRefForbidden`
+  Warning event naming both remedies.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
