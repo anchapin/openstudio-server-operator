@@ -65,7 +65,10 @@ existing handler module as a template, and start editing.
 
 Mocking dependencies are **pinned in `pyproject.toml`**: `responses` for
 the OpenStudio REST API, `fakeredis` for the read-only Redis client
-(`#12`). Do not add a second HTTP or Redis mocking library.
+(`#12`), and `hypothesis` for the D12 timestamp boundary property tests
+(`#246`). `hypothesis` is sanctioned for property-based boundary tests
+only — it is not a fourth HTTP/Redis mock. Do not add a second HTTP or
+Redis mocking library.
 
 ---
 
@@ -786,9 +789,9 @@ cross-cutting contracts:
 
 - **`docs/` typos and broken references.** Run
   `oma-docs verify` (or grep by hand) against the markdown files; fix
-  any stale links, dead anchors, or wrong commands. The "Update
-  protocol" section of `AGENTS.md` makes drift your problem if you do
-  not fix it.
+  any stale links, dead anchors, or wrong commands. The "Doc-drift
+  guards (CI fails the build if you forget)" section of `AGENTS.md`
+  makes drift your problem if you do not fix it.
 - **`tests/` gaps that do not require module changes.** Add an extra
   edge case to `tests/test_status_store.py` (e.g. a 409 burst that
   exhausts the retry budget), a fixture variant under
