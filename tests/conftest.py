@@ -58,19 +58,20 @@ from collections.abc import Generator
 import kubernetes.client
 import pytest
 
+from _cache_census import CACHE_BEARING_MODULES as _PER_CR_CACHE_MODULES
 from openstudio_operator import handlers, singleton
-from openstudio_operator.handlers import datapoint_watchdog, web_background_monitor
 
-# Issue #497 — the per-CR cache reset seams join the autouse reset. The two
-# cache-bearing handler modules (see the census in
-# ``openstudio_operator/_cr_cache.py``) expose uniform
-# ``reset_per_cr_caches()`` seams; dropping them here (pre AND post, like
-# the singleton/K8s-client resets above) keeps the suite hermetic against a
-# test that populates a per-CR cache and crashes mid-case. The cache-FREE
-# modules (analysis_sla, worker_recycler — memory lives in CR ``.status``,
-# D04) deliberately expose no seam; ``tests/test_cache_keying_convention.py``
-# fences the census in both directions.
-_PER_CR_CACHE_MODULES = (datapoint_watchdog, web_background_monitor)
+# Issue #497 — the per-CR cache reset seams join the autouse reset. Since
+# #652 the census of cache-bearing modules is SINGLE-SOURCED in
+# ``tests/_cache_census.py`` (imported above): this file, the convention
+# tests, and the AST fence in ``test_cache_keying_convention.py`` all
+# read the same tuple — no hand-maintained duplicate to drift. Dropping
+# every seam here (pre AND post, like the singleton/K8s-client resets
+# above) keeps the suite hermetic against a test that populates a per-CR
+# cache and crashes mid-case. The cache-FREE modules (analysis_sla,
+# worker_recycler — memory lives in CR ``.status``, D04 — plus
+# dry_run_audit / redis_layout_check) deliberately expose no seam; the
+# #652 AST fence fails any handler module in neither census tuple.
 
 # Issue #257 — test-suite duration budget.
 #
