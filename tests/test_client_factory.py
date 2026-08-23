@@ -379,8 +379,8 @@ def test_secret_ref_is_preferred_over_inline_url(monkeypatch):
 def test_secret_ref_missing_secret_raises_and_is_not_cached(monkeypatch):
     """A missing Secret (404) raises RedisCredentialResolutionError and —
     because ``lru_cache`` never memoizes exceptions — the NEXT call re-reads
-    the API, so a Secret created after the first attempt is picked up on
-    the very next tick with no eviction hook."""
+    the API, so a Secret created after the first attempt is picked up on the
+    very next tick with no eviction hook."""
     fake = FakeCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
     _install_secret_api(monkeypatch, fake)
 
@@ -394,6 +394,42 @@ def test_secret_ref_missing_secret_raises_and_is_not_cached(monkeypatch):
     with pytest.raises(RedisCredentialResolutionError):
         get_read_only_redis_client("", secret_ref=REF, namespace=NAMESPACE)
     assert len(fake.calls) == 2
+
+
+def test_secret_ref_403_message_names_rbac_remedy(monkeypatch):
+    """Issue #606 — a 403 is NOT a generic resolution failure: it means the
+    RBAC resourceNames fence bit (the CR names a pattern-legal Secret the
+    default Role does not grant). The raised message must name the RBAC
+    cause and both remedies — widen deploy/rbac.yaml resourceNames or
+    point the secretRef at a granted Secret — so every surface carrying it
+    (key-layout "unreachable" log, counted tick-skip log, the singleton
+    guard's Warning Event) tells the SRE exactly what to do."""
+    custom_ref = RedisSecretRef(name="openstudio-redis-url", key="redis-url")
+    fake = FakeCoreV1Api(exc=ApiException(status=403, reason="Forbidden"))
+    _install_secret_api(monkeypatch, fake)
+
+    with pytest.raises(RedisCredentialResolutionError) as excinfo:
+        get_read_only_redis_client("", secret_ref=custom_ref, namespace=NAMESPACE)
+
+    message = str(excinfo.value)
+    assert "403 Forbidden" in message
+    assert "openstudio-redis-url" in message
+    assert "resourceNames" in message and "rbac.yaml" in message, (
+        "the 403 message must name the RBAC resourceNames cause "
+        "(deploy/rbac.yaml), not just the status code (issue #606); got: "
+        f"{message!r}"
+    )
+    assert "#606" in message
+    # The 404 path (companion test above) must NOT grow the RBAC suffix —
+    # only the RBAC-denied case names the remedy.
+    fake_404 = FakeCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
+    _install_secret_api(monkeypatch, fake_404)
+    with pytest.raises(RedisCredentialResolutionError) as excinfo_404:
+        get_read_only_redis_client("", secret_ref=custom_ref, namespace=NAMESPACE)
+    assert "resourceNames" not in str(excinfo_404.value), (
+        "a 404 is a missing-Secret failure, not the RBAC fence — the "
+        "remedy suffix is 403-only (issue #606)"
+    )
 
 
 def test_secret_ref_missing_key_raises(monkeypatch):

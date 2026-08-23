@@ -53,23 +53,53 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch", "create", "patch"]
-  # Read ONE Secret by name for Redis connection info (issue #463).
+  # Read ONE Secret by name for Redis connection info (issue #463) —
+  # exact-name-bounded by RBAC resourceNames (issue #606).
   #
-  # TENSION with the "operator never reads secrets" rule, documented here on
-  # purpose: `spec.redisCredentials.secretRef` names a Secret whose key holds
-  # the full redis:// URL, and the acceptance criterion requires the operator
-  # itself to resolve it (client_factory._resolve_redis_url — the rclone-style
-  # envFrom hand-off is not available for an in-process client constructor).
-  # This is the bounded exception: `get` only (no list/watch/create/update),
-  # and the CRD pins the Secret name to the `openstudio-redis*` convention
-  # (issue #463, #240-style fence) so a CR-write principal cannot redirect
-  # the read at arbitrary Secrets. RBAC has no per-object-name slot — the
-  # name constraint lives in the CRD schema, not here. Issue #572: the
-  # admission-layer companion narrowing this SA's Secret surface to
-  # openstudio-redis* names lives in deploy/secret-read-admission-policy.yaml.
+  # TENSION with the "operator never reads secrets" rule, documented here
+  # on purpose: `spec.redisCredentials.secretRef` names a Secret whose key
+  # holds the full redis:// URL, and the acceptance criterion requires the
+  # operator itself to resolve it (client_factory._resolve_redis_url — the
+  # rclone-style envFrom hand-off is not available for an in-process
+  # client constructor). This is the bounded exception, fenced in layers:
+  #
+  #   1. RBAC exact-name (this rule, #606): `get` ONLY, and only on the
+  #      canonical Secret name(s) the shipped tooling creates —
+  #      `openstudio-redis` (deploy/redis-credentials-secret.yaml +
+  #      scripts/rotate_redis_password.sh). Pre-#606 the grant was
+  #      namespace-wide `get`, so a compromised operator pod could read
+  #      ANY Secret here (Mongo credentials, rclone cloud creds, TLS
+  #      bundles, metrics bearer tokens) — the exfiltration path #606
+  #      closes. resourceNames is an exact-name list; RBAC has no
+  #      pattern slot.
+  #   2. CRD pattern (#463): `^openstudio-redis[a-z0-9-]*$` on
+  #      spec.redisCredentials.secretRef.name — a CR-write principal
+  #      cannot redirect the read at arbitrary names at apply time.
+  #   3. Admission mutation-fence (#572):
+  #      deploy/secret-read-admission-policy.yaml narrows this SA's
+  #      Secret MUTATIONS to `openstudio-redis*` names (RBAC-drift
+  #      insurance; VAPs cannot intercept GET — admission runs on the
+  #      mutating path only).
+  #   4. Single AST-gated construction site: the operator's one
+  #      `secrets: get` call lives in client_factory._resolve_redis_url
+  #      (tests/test_singleton_registry_coverage.py).
+  #
+  # Trade-off (#606 Option 1, fail-visible variant): the CRD pattern
+  # allows any `openstudio-redis*` name, but this Role grants GET on the
+  # canonical name(s) ONLY. A CR naming a custom `openstudio-redis-*`
+  # Secret is apply-legal and fails at READ time: 403 →
+  # RedisCredentialResolutionError → key-layout "unreachable" + counted
+  # skip-ticks + a one-time RedisSecretRefForbidden Warning Event telling
+  # the SRE the two remedies (singleton guard, #606). To allow a custom
+  # name, a cluster admin adds it to resourceNames below — a deliberate,
+  # visible, reviewable RBAC change. (Narrowing the CRD pattern to one
+  # fixed name instead would make the field pointless and break existing
+  # CRs at their next spec update; exact-name enforcement belongs at the
+  # RBAC layer — the mechanism Kubernetes provides for exactly this.)
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
+    resourceNames: ["openstudio-redis"]
   # NOTE (#77): the autoscaling/horizontalpodautoscalers rule is GONE.
   # The custom HPA-floor adjuster (#18) was removed; autoscaling is now
   # owned by KEDA (deploy/keda-scaledobject.yaml) which runs under its own

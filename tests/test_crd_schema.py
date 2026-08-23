@@ -744,6 +744,35 @@ def test_redis_credentials_secret_ref_name_declares_convention_pattern():
     )
 
 
+def test_redis_credentials_secret_ref_name_description_documents_rbac_bound():
+    """Issue #606: the ``secretRef.name`` pattern deliberately stays WIDER
+    than the enforcement — the default operator Role grants secrets:get
+    only on the canonical name(s) via RBAC resourceNames, and a custom
+    ``openstudio-redis-*`` name is apply-legal here but fails at read time
+    (403). The field's description must SAY that (kubectl explain is the
+    CR author's surface): custom names require the deploy/rbac.yaml
+    resourceNames widening. The pattern itself stays untouched — pinning
+    it to one fixed name would make the field pointless and break
+    existing CRs at their next spec update."""
+    name_schema = (
+        SPEC_SCHEMA["properties"]["redisCredentials"]["properties"]["secretRef"]
+    )["properties"]["name"]
+    description = str(name_schema.get("description") or "")
+    assert "resourceNames" in description, (
+        "secretRef.name description must document the RBAC resourceNames "
+        "bound (issue #606); got: "
+        f"{description!r}"
+    )
+    assert "rbac.yaml" in description, (
+        "secretRef.name description must point at deploy/rbac.yaml as the "
+        f"widening surface (issue #606); got: {description!r}"
+    )
+    assert "openstudio-redis" in description, (
+        "secretRef.name description must name the default granted Secret "
+        f"(issue #606); got: {description!r}"
+    )
+
+
 def test_redis_credentials_secret_ref_requires_name_and_key():
     """Issue #463: the secretRef object declares ``required: [name, key]`` —
     a half-configured reference must fail apply-time validation instead of
