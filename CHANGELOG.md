@@ -1170,6 +1170,21 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   restart): an operator bounce no longer resets an accumulating stall
   window to zero, so sustained stalls can't be deferred indefinitely
   by frequent restarts (D04).
+- **`#581`** — the heartbeat staleness alert is drift-gated: the
+  module-label set and the 3×-interval thresholds in the PrometheusRule
+  expr are asserted against `_oscm_handlers.REGISTRY` + each module's
+  `POLL_INTERVAL_SECONDS` (labels AST-extracted from the handlers' own
+  `run_oscm_tick(module=...)` calls) — a fifth registered timer fails
+  CI until the alert is extended.
+- **`#583`** — the per-CR cache convention is executable:
+  `_cr_cache.PerCRCache` owns the lookup/evict/upgrade/reset mechanics
+  both handler modules hand-rolled (~90 duplicated lines collapsed to
+  one-line delegations); zero test modifications, all #364/#497/#582
+  fences pass untouched.
+- **`#586`** — README's src layout subtree is complete and current
+  (three missing module rows, eight stale-symbol rows fixed) and now
+  has a two-directional drift gate mirroring the #485 deploy-inventory
+  gate: a new module without a README row (or a ghost row) fails CI.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
