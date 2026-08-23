@@ -39,15 +39,19 @@ Sustained window — THE key design point: transient blips below
 ``webBackgroundPolicy.stallWindowMinutes`` NEVER trigger. The full
 condition must be observed holding CONTINUOUSLY: a per-CR
 :class:`StallWindowTracker` records the first tick that observed the whole
-condition and clears on any tick that observed it broken. Restart-safety:
-the tracker is in-memory (D04-clean cache, like the watchdog's
-``exhausted_seen`` — presentation-ish state, no CR status map may be
-abused for it), so an operator restart resets to fresh observation —
-CONSERVATIVE: a restart can only delay a restart, never false-trigger one.
-The window must also re-accumulate across sensing failures: a tick whose
-Redis/K8s reads raise resets the tracker (a blind gap is no evidence of
-continuity) before propagating, so the skip-and-retry (D12) starts the
-window over.
+condition and clears on any tick that observed it broken. Restart-safety
+(#582, D04): the window BEGIN is checkpointed to the CR-anchored scalar
+``status.stallWindowStartedAt`` — written when a stall begins, cleared
+when the window breaks, and restored into a fresh tracker on the first
+holding tick after an operator restart (liveness restart #391, node
+drain, Recreate rollout, OOM), so a genuine sustained stall survives
+process bounces instead of re-accumulating from scratch. A delete+
+recreate of the CR (#364) wipes ``.status`` along with the CR, so the
+recreated CR still earns a fresh window. The window must also
+re-accumulate across sensing failures: a tick whose Redis/K8s reads
+raise resets the tracker AND clears the persisted anchor (a blind gap is
+no evidence of continuity) before propagating, so the skip-and-retry
+(D12) starts the window over.
 
 Cooldown — the ACTION is rate-limited by the CR-anchored scalar
 ``status.lastWebBackgroundRestart`` (D04): the gate is the single decision
@@ -291,14 +295,18 @@ _RUNNING = "Running"
 
 
 class StallWindowTracker:
-    """In-memory sustained-window clock for one CR (conservative cache, D04).
+    """In-memory sustained-window clock for one CR (cache, D04; #582).
 
     Records the first tick the full stall condition was observed and clears
     on any tick it was not (or on :meth:`reset`), so acting requires the
     condition to have been observed holding continuously for the whole
-    window. An operator restart starts a fresh tracker: re-observation from
-    scratch can only DELAY a restart, never false-trigger one. The action
-    cooldown lives in the CR status instead and survives restarts.
+    window. Since #582 the window BEGIN is also checkpointed to the CR
+    scalar ``status.stallWindowStartedAt`` by :func:`run_stall_tick`
+    (written on stall-begin, cleared on window-break, restored into a
+    fresh tracker on the first holding tick after an operator restart),
+    so an accumulating window survives process bounces; the tracker here
+    remains the per-tick cache, never the source of truth. The action
+    cooldown lives in the CR status too and survives restarts.
     """
 
     def __init__(self) -> None:
@@ -609,6 +617,13 @@ def run_stall_tick(
 ) -> bool:
     """One stall evaluation. Returns whether a restart fired this tick.
 
+    Issue #582 — the sustained-window BEGIN is checkpointed to the CR
+    scalar ``status.stallWindowStartedAt``: written when a stall begins,
+    cleared when the window breaks (or a sensing failure blinds the tick,
+    or the restart fires and consumes it), and restored into a fresh
+    tracker on the first holding tick after an operator restart so the
+    elapsed window survives process bounces (D04).
+
     THE GATE is the single decision point and is checked first: while the
     ``status.lastWebBackgroundRestart`` cooldown (one stall window) holds,
     the tick returns before any Redis/Kubernetes read — nothing can bypass
@@ -642,6 +657,12 @@ def run_stall_tick(
         # fresh observation window and the gauge will advance from 0
         # again.
         STALL_WINDOW_ELAPSED_SECONDS.set(0.0)
+        # Issue #582 — the persisted window anchor must not survive a
+        # blind gap the in-memory clock ignores: clear it so the next
+        # holding tick cannot restore a window across the sensing gap.
+        # (Raise path: a status-store failure here propagates and skips
+        # the tick — the clear is re-attempted on the next poll.)
+        store.set_stall_window_started_at(None)
         raise
 
     # Issue #44 — leg-2 non-vacuity safeguard. Best-effort: a failure to
@@ -652,6 +673,19 @@ def run_stall_tick(
     except Exception as exc:  # noqa: BLE001 — defensive only (diagnostic emit)
         logger.debug("leg-2 safeguard emit failed: %s", exc)
 
+    # Issue #582 — checkpoint/restore the window begin (D04: the tracker
+    # is cache; the CR status anchor is the source of truth). A fresh
+    # tracker on a holding tick is either a brand-new window or the first
+    # tick after an operator restart — read the persisted anchor once;
+    # present means restore (the elapsed window survives the restart),
+    # absent means a genuine fresh begin. ``observe`` below keeps a
+    # non-None ``first_observed``, so seeding here makes the sustained
+    # computation run against the restored anchor.
+    window_began = holds and tracker.first_observed is None
+    if window_began:
+        persisted = store.get_stall_window_started_at()
+        if persisted is not None:
+            tracker.first_observed = persisted
     sustained = tracker.observe(holds, now, window)
     # Issue #254 — expose the tracker's accumulated state as a Gauge so
     # SREs have an early-warning signal between the first sustained
@@ -682,6 +716,15 @@ def run_stall_tick(
     # backwards; the freshness stamp does not need the guard (we want
     # the moment we last touched the gauge, not the underlying elapsed).
     STALL_WINDOW_FRESH.set(time.time())
+    # Issue #582 — keep the persisted anchor in lockstep with the tracker:
+    # write on begin (idempotent no-op patch when the restored value is
+    # unchanged), clear on break (explicit ``None`` — RFC 7386 removal).
+    # A failure here raises and skips the tick (D12) BEFORE any action can
+    # fire, so the anchor can never lag the window it checkpoints.
+    if window_began:
+        store.set_stall_window_started_at(tracker.first_observed)
+    elif not holds:
+        store.set_stall_window_started_at(None)
     if not sustained:
         return False
 
@@ -702,6 +745,14 @@ def run_stall_tick(
         message += " — patch suppressed (spec.dryRun)"
     emit("Warning", WEB_BACKGROUND_RESTARTED_EVENT, message)
     WEB_BACKGROUND_RESTARTS_TOTAL.inc()
+    # Issue #582 — consume the window anchor BEFORE advancing the cooldown
+    # anchor: once the restart fires, the window is spent, and a stale
+    # anchor must not let the first open-gate tick after the cooldown
+    # restore a "pre-accumulated" window and re-fire without re-sustaining.
+    # Clear-first ordering keeps the D12 race the accepted #11/#8 shape: if
+    # the clear succeeds but the restart-anchor write fails, the next tick
+    # re-issues one (harmless) extra rolling restart.
+    store.set_stall_window_started_at(None)
     # Advances in dry-run too — see module docstring (D11 pacing choice,
     # identical to #11). Patch before anchor: the accepted D12 re-attempt race.
     store.set_last_web_background_restart_at(now)

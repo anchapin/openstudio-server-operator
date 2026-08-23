@@ -326,6 +326,10 @@ spec:
                   type: string
                   format: date-time
                   description: "ISO-8601 UTC timestamp of the last web_background restart. No default; unset until the first restart."
+                stallWindowStartedAt:
+                  type: string
+                  format: date-time
+                  description: "ISO-8601 UTC timestamp when the current web_background stall window began (issue #582). Checkpointed when a stall begins, cleared when the window breaks or a restart fires, restored into the tracker on the first tick after an operator restart so a sustained stall survives process bounces (D04). Unset when no stall window is in progress."
                 deferredEvents:
                   type: array
                   description: "Pending deferred Warning Events (issue #402): entries the operator queued for emission on the next OSCM watch tick, mirrored from the in-process queue so an operator crash does not silently lose them. Drained (emitted then cleared) on the next watch tick; at-least-once."

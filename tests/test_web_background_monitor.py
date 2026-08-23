@@ -565,8 +565,11 @@ def test_operator_restart_mid_cooldown_honors_persisted_anchor():
 
 
 def test_operator_restart_after_cooldown_needs_fresh_sustained_window():
-    """Anchor expired + fresh process: still no instant re-fire — the in-memory
-    window reset is the documented conservative restart-safety choice."""
+    """Anchor expired + fresh process: still no instant re-fire. No
+    ``stallWindowStartedAt`` is persisted here (the window never began
+    before the restart), so the fresh tracker must accumulate the full
+    window from its first holding tick (#582 restore path reads the
+    anchor only when one was checkpointed)."""
     status = {"lastWebBackgroundRestart": (NOW - minute(11)).isoformat()}
     api = FakeCustomObjectsApi(make_cr(status=status))
     apps = FakeAppsV1Api()
@@ -581,6 +584,154 @@ def test_operator_restart_after_cooldown_needs_fresh_sustained_window():
     )
 
     assert (fired1, fired2, fired3) == (False, False, True)
+    assert len(apps.patches) == 1
+
+
+# --- Stall-window start persisted across operator restarts (issue #582, D04) ----
+
+
+def test_stall_begin_writes_window_started_at_status():
+    """The first holding tick checkpoints the window begin to the CR (#582)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    tick(api, apps, now=NOW, tracker=tracker, redis=stall_redis(NOW))
+
+    assert api.obj["status"]["stallWindowStartedAt"] == NOW.isoformat()
+
+
+def test_window_break_clears_window_started_at_status():
+    """Any tick that observes the condition broken clears the anchor (#582) —
+    the persisted window and the in-memory tracker reset in lockstep."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    tick(api, apps, now=NOW, tracker=tracker, redis=stall_redis(NOW))
+    assert "stallWindowStartedAt" in api.obj["status"]
+    tick(
+        api,
+        apps,
+        now=NOW + minute(1),
+        tracker=tracker,
+        redis=stall_redis(NOW + minute(1), queued=False),
+    )
+
+    assert "stallWindowStartedAt" not in api.obj["status"]
+
+
+def test_restart_mid_window_restores_elapsed_stall_window():
+    """Issue #582 acceptance — mirrors the recycler's
+    ``test_restart_mid_cooldown_honors_persisted_last_recycle_at``: a fresh
+    tracker (process state lost) plus the same persisted CR must keep the
+    elapsed window instead of restarting from zero. Without the checkpoint,
+    a degraded cluster that bounces the operator mid-stall could defer the
+    Module-5 restart indefinitely."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    metric_before = restarts_total()
+    tracker_a = StallWindowTracker()
+
+    # Process 1: stall holds at t=0/2/4 — 4 of the 10 required minutes,
+    # anchor checkpointed at the t=0 stall-begin tick.
+    for offset in (0, 2, 4):
+        fired, _ = tick(
+            api,
+            apps,
+            pods,
+            now=NOW + minute(offset),
+            tracker=tracker_a,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        assert fired is False
+    assert api.obj["status"]["stallWindowStartedAt"] == NOW.isoformat()
+    assert apps.patches == []
+
+    # Operator restart: FRESH tracker, same persisted CR (status survives).
+    fresh_tracker = StallWindowTracker()
+    fired, events = tick(
+        api,
+        apps,
+        pods,
+        now=NOW + minute(10),
+        tracker=fresh_tracker,
+        redis=stall_redis(NOW + minute(10)),
+    )
+
+    assert fired is True  # window measured from t=0 (restored), not t=10
+    # Restore proven by the outcome: a fresh observation at t=10 would need
+    # until t=20 to sustain; firing at t=10 is only possible if the tracker
+    # inherited the t=0 anchor. Post-fire the tracker resets (consumed).
+    assert fresh_tracker.first_observed is None
+    assert len(apps.patches) == 1
+    assert api.obj["status"]["lastWebBackgroundRestart"] == (NOW + minute(10)).isoformat()
+    assert "stallWindowStartedAt" not in api.obj["status"]  # consumed by the fire
+    assert restarts_total() - metric_before == 1
+    assert len(events) == 1 and events[0][1] == WEB_BACKGROUND_RESTARTED_EVENT
+
+
+def test_restore_honors_preexisting_anchor_older_than_threshold():
+    """A stall that predates the restart fires without re-accumulating
+    (#582): pre-seeded status (the exact shape a real restart reads), a
+    fresh tracker, and a first holding tick already past the threshold."""
+    status = {"stallWindowStartedAt": (NOW - minute(11)).isoformat()}
+    api = FakeCustomObjectsApi(make_cr(status=status))
+    apps = FakeAppsV1Api()
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+
+    fired, _ = tick(
+        api, apps, pods, now=NOW, tracker=StallWindowTracker(), redis=stall_redis(NOW)
+    )
+
+    assert fired is True
+    assert len(apps.patches) == 1
+    assert api.obj["status"]["lastWebBackgroundRestart"] == NOW.isoformat()
+    assert "stallWindowStartedAt" not in api.obj["status"]
+
+
+def test_sensing_failure_clears_persisted_window_start():
+    """Blind gaps break the persisted window too (#582): the documented
+    re-accumulate-across-sensing-failures semantics must survive the
+    checkpoint — a failed read is no evidence of continuity, so the next
+    holding tick may not restore across the gap."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    tick(api, apps, now=NOW, tracker=tracker, redis=stall_redis(NOW))
+    assert "stallWindowStartedAt" in api.obj["status"]
+
+    class FlakyRedis:
+        def worker_heartbeats(self) -> dict[str, float | None]:
+            raise RedisClientError("SMEMBERS failed: connection reset")
+
+        def queue_depths(self) -> dict[str, int]:
+            raise RedisClientError("LLEN failed: connection reset")
+
+    with pytest.raises(RedisClientError):
+        tick(api, apps, now=NOW + minute(1), tracker=tracker, redis=FlakyRedis())
+
+    assert "stallWindowStartedAt" not in api.obj["status"]
+    assert tracker.first_observed is None
+
+
+def test_fired_restart_consumes_window_start_anchor():
+    """The anchor is spent when the restart fires (#582): a stale anchor
+    must not let the first open-gate tick after the cooldown restore a
+    pre-accumulated window and re-fire without re-sustaining."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    stall_ticks(api, apps, tracker, 0, 5, 10)  # fires at +10
+    assert len(apps.patches) == 1
+    assert "stallWindowStartedAt" not in api.obj["status"]
+
+    # Gate re-opens at +21; the fresh tracker finds no anchor to restore
+    # and must earn a full new window (no second restart through +30).
+    stall_ticks(api, apps, tracker, 21, 25, 30)
     assert len(apps.patches) == 1
 
 
@@ -963,14 +1114,19 @@ def test_delete_recreate_starts_fresh_stall_window() -> None:
         )
 
         # Delete + recreate (#364): same (namespace, name), NEW uid — the
-        # uid mismatch must discard CR A's 9-minute accumulation.
+        # uid mismatch must discard CR A's 9-minute accumulation. The
+        # recreate also DESTROYS ``.status`` (so CR A's #582
+        # ``stallWindowStartedAt`` anchor dies with the CR): CR B ticks
+        # against a fresh CR object, exactly what the apiserver serves
+        # after a delete+recreate.
         tracker_b = wbm_module._get_tracker(NAMESPACE, NAME, uid="uid-b")
         assert tracker_b.first_observed is None  # fresh clock — no leak
+        api_b = FakeCustomObjectsApi(make_cr())
 
         # The recreated CR's first holding tick (t=10 — the timestamp that
         # WOULD have satisfied CR A's leaked window) must NOT restart.
         fired, events = tick(
-            api,
+            api_b,
             apps,
             pods,
             now=NOW + minute(10),
@@ -984,7 +1140,7 @@ def test_delete_recreate_starts_fresh_stall_window() -> None:
 
         # The recreated CR earns its OWN window from t=10 → sustained at t=20.
         fired, events = tick(
-            api,
+            api_b,
             apps,
             pods,
             now=NOW + minute(20),

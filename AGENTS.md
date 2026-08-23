@@ -42,7 +42,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; E402 enforced via [tool.ruff.lint] extend-select, #507; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 1013 tests across 46 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 1020 tests across 46 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
@@ -89,7 +89,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 ## Working rules (these bite if violated)
 
 - **Every mutating action is gated by `spec.dryRun`** (default `false`; when `true`, actions are suppressed and emitted as dry-run-marked Events) — D11.
-- **Operator memory lives in the CR `.status` subresource only** (maps `softStops`/`requeues`/`startedSince`/`archivedAnalyses` + scalars `lastRecycleAt`/`lastWebBackgroundRestart` + the `deferredEvents` array — the crash-surviving mirror of the deferred-Warning queue, #402); in-memory state is cache, never source of truth — D04. The status store handles 409 retries internally.
+- **Operator memory lives in the CR `.status` subresource only** (maps `softStops`/`requeues`/`startedSince`/`archivedAnalyses` + scalars `lastRecycleAt`/`lastWebBackgroundRestart`/`stallWindowStartedAt` + the `deferredEvents` array — the crash-surviving mirror of the deferred-Warning queue, #402); in-memory state is cache, never source of truth — D04. The status store handles 409 retries internally.
 - **Exactly one OSCM CR per namespace** — enforced passively via the singleton guard (oldest wins, Warning Event + loud log); zero CRs means idle — D05.
 - **Parse all API timestamps to tz-aware UTC at the client boundary** (`_time.parse_iso_utc`); retry REST calls 3× with jittered backoff inside the client, then raise — handlers skip the tick and retry naturally on the next poll (idempotency comes from the status anchors) — D12.
 - **Policy values belong in the CRD `spec` / `config.py`** — configuration, not hardcoded constants in handlers.

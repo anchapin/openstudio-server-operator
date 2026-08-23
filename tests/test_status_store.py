@@ -273,6 +273,23 @@ def test_scalar_clear_with_none_sends_null(store, api):
     assert body == {"status": {"lastRecycleAt": None}}
 
 
+def test_stall_window_started_at_round_trip_and_clear(store, api):
+    """Issue #582 — the sustained-window BEGIN checkpoint scalar: set (ISO
+    UTC at the boundary, parsed back tz-aware), then cleared with the
+    explicit-null merge patch (RFC 7386 removal) exactly like the other
+    status scalars."""
+    when = datetime(2026, 8, 18, 9, 30, 0, tzinfo=UTC)
+    store.set_stall_window_started_at(when)
+    assert api.obj["status"]["stallWindowStartedAt"] == when.isoformat()
+    assert store.get_stall_window_started_at() == when
+
+    store.set_stall_window_started_at(None)
+    assert "stallWindowStartedAt" not in api.obj["status"]
+    assert store.get_stall_window_started_at() is None
+    body, _ = api.patches[-1]
+    assert body == {"status": {"stallWindowStartedAt": None}}
+
+
 # --- Conflict-safe RMW ----------------------------------------------------------
 
 
