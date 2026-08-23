@@ -54,6 +54,21 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
 (`#582`).
 
 ### Changed
+- **`#652`** — the #497 per-CR cache census is single-sourced in
+  `tests/_cache_census.py` (conftest + the convention test import
+  it) and fenced by AST: every handler module must be classified
+  cache-bearing or cache-free exactly once; unclassified
+  module-level dict/set state fails CI.
+- **`#643`** — RBAC trims + a drift gate: `deploy/rbac.yaml` drops
+  the unservable `list`/`watch` (and dead `update`) from the OSCM
+  `/status` subresource and other dead verbs (deployments/pods/
+  events narrowed to their exercised sets), and
+  `tests/test_rbac_call_surface.py` AST-derives the granted-vs-
+  exercised surface so future verb widening is deliberate.
+- **`#654`** — `redis_client._parse_heartbeat` delegates to
+  `_time.parse_iso_utc` via the `utc_parser(RedisClientError)`
+  factory (the #174/#506 single-source rule), and an AST convention
+  test confines `fromisoformat(` to `_time.py`.
 - **`#497`** — one per-CR cache keying + reset convention for the
   handler modules' in-memory layer (the D04 "cache, never source of
   truth" tier), documented with a full census in the new
@@ -155,6 +170,20 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   census.
 
 ### Added
+- **`#649`** — ineffective-restart circuit breaker for sustained
+  web_background stalls: consecutive count persisted on
+  `status.webBackgroundIneffectiveRestarts` (D04), action-level
+  exponential backoff (3 ineffective -> 4 stall windows, 5 -> 6,
+  7+ -> 8 cap; sensing/#647 freshness/#582 anchors keep running),
+  `WebBackgroundRestartIneffective` Warning Event, and the
+  `openstudio_operator_web_background_restarts_ineffective_total`
+  counter + `OpenStudioOperatorWebBackgroundRestartIneffective`
+  alert.
+- **`#642`** — trivy CVE/freshness gate for the pinned rclone image:
+  the audit job emits `RCLONE_IMAGE` from `archival.py`
+  (single-source per #417) and trivy-scans it at the CRITICAL,HIGH
+  floor with `.trivyignore` triage + `ignore-unfixed`; first run
+  caught the stale 1.67.0 pin (see #686).
 - **`#490`** — `openstudio_operator_redis_key_layout_status_fresh`: the
   #312 freshness-pair idiom applied to the #253 key-layout status gauge.
   The status gauge was set only by the `@kopf.on.event` watch (boot
@@ -658,6 +687,14 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#686`** — the pinned rclone image refreshed `1.67.0@sha256:25a2…`
+  → `1.75.0@sha256:b06a…` (manifest-list digest) after the new
+  `#642` gate's first run surfaced the 2026 Go stdlib CVE crop
+  (CVE-2026-39820/39821/39822/39836, CVE-2026-42499/42504,
+  CVE-2026-56853/56858/56859/56860/56862) in the old build; the
+  `#641` CEL literal cross-fence + golden snapshots synced, and the
+  8 still-unfixed Go stdlib HIGHs in 1.75.0 triaged into
+  `.trivyignore` (justification + watch issue #689).
 - **`#650`** — `prune_entrypoint.py`'s private
   `_SKIP_TICK_EXCEPTIONS` fork is derived from the canonical
   `_oscm_handlers.SKIP_TICK_EXCEPTIONS` (+ the documented bare
@@ -668,6 +705,16 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   inside the guarded region: a malformed CR spec is now a clean,
   counted, logged exit 5 (per the exit-code table + `#475` rationale)
   instead of an uncaught traceback outside every documented exit code.
+- **`#647`** — both web_background freshness gauges are stamped
+  inside the stall-cooldown branch (before the early return), so
+  minutes 5-10 of a cooldown no longer guarantee false
+  `*Stale` pages; gauge docstrings state the honest "tick alive"
+  semantics, and the "gate closed: no sensing" invariant
+  (ExplodingRedis fence) is preserved.
+- **`#651`** — `events_sinks.QueuedKopfEventSink.flush_for` routes
+  through `events.emit_kopf_event()` (the #496 one-wrapper invariant,
+  restored), and a new AST gate confines `kopf.event(` call sites to
+  `events.py` (the #305 loader-gate pattern).
 - **`#641`** — the `openstudio-prune-job-scope` VAP in
   `deploy/storage-cronjob.yaml` gained a second `validations[]` entry
   fencing the archival-Job pod spec itself: the #294/#398 factors
@@ -779,6 +826,10 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Service + FQDN + auth, accepts empty default).
 
 ### Removed
+- **`#655`** — the unused ~30-line hand-rolled K8s label-selector
+  evaluator `_label_selector_term_matches` in
+  `tests/test_analysis_sla.py` (zero call sites; superseded by
+  `deployment_label_selector` assertions).
 - (none — the legacy sites retired by `#234` / `#235` / `#251` /
   `#252` are described inline within their Changed bullets above)
 
@@ -888,6 +939,14 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   D12). Test count 797 → 806 across the four claim locations.
 
 ### Docs
+- **`#660`** — onboarding.md's phantom "Update protocol" reference
+  points at AGENTS.md's actual "Doc-drift guards" section, and the
+  mocking-deps paragraph names `hypothesis` (#246) alongside
+  responses/fakeredis, matching AGENTS.md.
+- **`#689`** — watch issue for the 8 rclone 1.75.0 `.trivyignore`
+  entries: drop them when a release ships with Go >= 1.25.13/1.26.6
+  (the #642 gate re-surfaces staleness loudly on the weekly
+  Dependabot runs).
 - **`#661`** — `docs/architecture-plan.md` carries a historical-design
   staleness banner under the title: the doc is the original design plan,
   current wiring lives in AGENTS.md Layout + `docs/adr/`, and the two
