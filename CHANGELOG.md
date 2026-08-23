@@ -1236,6 +1236,17 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
 - **`#596`** — ADR-6 (dual lockfiles + build-toolchain pinning),
   ADR-7 (asymmetric audit floors + triage), ADR-8 (the #456→#500
   sign/verify chain) in the established shape, linked from the index.
+- **`#588`** — the provenance chain is ordered and independent: the
+  ci.yml verifier is workflow_run-gated on the Release run (no
+  stale-digest vacuous pass), publish-dev verifies the signed digest
+  BEFORE the pin commit lands (a sign failure can no longer pin an
+  unsigned digest into deploy/), and a new tag-triggered verify job
+  checks `v*` images under the release identity (closing the #159
+  self-verification gap for tags).
+- **`#591`** — the freshness-gauge tests run on a stepped fake wall
+  clock: exact stamp assertions replace the sleep-bridged orderings
+  (the tree's only real `time.sleep` calls), immune to NTP steps and
+  loaded runners.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
