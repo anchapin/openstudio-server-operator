@@ -189,7 +189,7 @@ def test_archival_job_disables_service_account_token_mount(backend: str) -> None
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_archival_job_image_pinned_by_digest(backend: str) -> None:
     """#124 — the rclone image is pinned by @sha256 digest. Floating
-    ``rclone/rclone:1.67.0`` would let a tag-mutation steer the image
+    ``rclone/rclone:1.75.0`` would let a tag-mutation steer the image
     between release.yml rebuild and the next refresh; the digest closes
     that window.
 
@@ -243,7 +243,7 @@ def test_job_mechanics() -> None:
     # asserts the tag form (for human readability) AND the digest pin
     # (the deploy-time guarantee) — see test_archival_job_image_pinned_by_digest.
     assert container["image"] == RCLONE_IMAGE
-    assert container["image"].startswith("rclone/rclone:1.67.0@")
+    assert container["image"].startswith("rclone/rclone:1.75.0@")
     assert container["command"][0:2] == ["/bin/sh", "-c"]
 
 

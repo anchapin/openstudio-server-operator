@@ -3047,7 +3047,7 @@ def test_prune_job_scope_vap_spec_fence_accepts_real_archival_job():
 def test_prune_job_scope_vap_spec_fence_rejects_foreign_image():
     """Issue #641 factor (a): every container image must equal the
     pinned RCLONE_IMAGE digest. A wrong tag/digest on the sole
-    container, a digest-stripped `rclone/rclone:1.67.0` (tag-mutation
+    container, a digest-stripped `rclone/rclone:1.75.0` (tag-mutation
     supply-chain window, #124), and a foreign sidecar container are
     each admission rejects — image identity is not spoofable by
     relabelling."""
@@ -3057,7 +3057,7 @@ def test_prune_job_scope_vap_spec_fence_rejects_foreign_image():
     assert _cel_allows(expression, obj=wrong_tag, old=None) is False
     no_digest = copy.deepcopy(_legit_archival_job())
     no_digest["spec"]["template"]["spec"]["containers"][0]["image"] = (
-        "rclone/rclone:1.67.0"
+        "rclone/rclone:1.75.0"
     )
     assert _cel_allows(expression, obj=no_digest, old=None) is False, (
         "the fence must require the @sha256 digest form (#124), not "
