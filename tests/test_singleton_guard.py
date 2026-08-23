@@ -856,6 +856,178 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
     assert any("could not list OSCM CRs" in r.getMessage() for r in caplog.records)
 
 
+# ---- Issue #590: status-only watch events skip the guard relist ----------------
+#
+# The operator's own StatusStore RMW writes (soft-stop anchors, requeue
+# anchors, startedSince bookkeeping, deferredEvents mirrors — several per
+# SLA tick) each fire a MODIFIED watch event, and pre-#590 every one of
+# them re-LISTed the namespace's CRs even though a .status patch can
+# never change the election: seniority is a function of immutable
+# metadata (creationTimestamp/name/uid) plus the SET of CRs, and any
+# change to that set arrives as its own ADDED/DELETED event, which is
+# never skipped. The skip requires: type == MODIFIED, a matching
+# policy-surface fingerprint (spec + uid/labels/annotations/
+# deletionTimestamp — NOT resourceVersion/managedFields/status), and a
+# guard that already resolved the namespace (fail-closed until then).
+
+_SPEC_590 = {"serverUrl": "http://a.test", "redisUrl": "redis://queue.test:6379"}
+
+
+def _wire_guard_590(monkeypatch, log, items):
+    """Install a fresh guard + sink + fresh one-shot caches over ``items``."""
+    api = ListOnlyFakeCustomObjectsApi(items=items)
+    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(api))
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "_redis_url_warned", set())
+    monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
+    monkeypatch.setattr(singleton, "_guard_last_seen_surface", {})
+    return api, events
+
+
+def _fire_guard_event(event_type, body, log, **overrides):
+    kwargs: dict = {
+        "body": body,
+        "namespace": NAMESPACE,
+        "name": body.get("metadata", {}).get("name", "alpha"),
+        "logger": log,
+        "patch": {},
+        "type": event_type,
+    }
+    kwargs.update(overrides)
+    singleton.singleton_guard_event(**kwargs)
+
+
+def _status_only_variant(cr: dict) -> dict:
+    """The same CR after a StatusStore RMW write: status subresource added,
+    resourceVersion/managedFields churned — everything the #590 fingerprint
+    covers (uid/spec/labels/annotations) unchanged."""
+    drifted = copy.deepcopy(cr)
+    drifted["status"] = {"softStops": {"a-1": "2026-08-23T00:00:00+00:00"}}
+    drifted["metadata"]["resourceVersion"] = "42"
+    drifted["metadata"]["managedFields"] = [
+        {"manager": "OpenAPI-Generator", "time": "2026-08-23T00:00:00Z"}
+    ]
+    return drifted
+
+
+def test_guard_event_skips_relist_on_status_only_update(caplog, log, monkeypatch):
+    """Issue #590 acceptance: a status-subresource-only MODIFIED event of a CR
+    the guard already resolved does NOT re-list the namespace's CRs."""
+    cr = make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SPEC_590)
+    api, events = _wire_guard_590(monkeypatch, log, [cr])
+
+    # Boot-shaped first event: full check, surface recorded.
+    with caplog.at_level(logging.DEBUG, logger="singleton-test"):
+        _fire_guard_event("ADDED", cr, log)
+    assert api.list_calls == 1
+
+    events.clear()
+    with caplog.at_level(logging.DEBUG, logger="singleton-test"):
+        _fire_guard_event("MODIFIED", _status_only_variant(cr), log)
+
+    assert api.list_calls == 1, (
+        f"Status-only update re-listed CRs (issue #590): list_calls went to "
+        f"{api.list_calls}. A .status patch cannot change the election — the "
+        f"relist is pure apiserver load."
+    )
+    assert events == [], "The skipped event must not emit anything either."
+    assert any("#590" in r.getMessage() and "relist skipped" in r.getMessage()
+               for r in caplog.records), (
+        "The skip should be observable at debug level for on-call triage."
+    )
+
+
+def test_guard_event_relists_on_spec_change_after_status_only_skip(caplog, log, monkeypatch):
+    """The skip is per-event, not sticky: after a skipped status-only event, a
+    MODIFIED event whose spec changed (redisUrl flipped) forces the relist."""
+    cr = make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SPEC_590)
+    api, _ = _wire_guard_590(monkeypatch, log, [cr])
+    _fire_guard_event("ADDED", cr, log)
+    _fire_guard_event("MODIFIED", _status_only_variant(cr), log)
+    assert api.list_calls == 1  # the #590 skip under test
+
+    spec_changed = copy.deepcopy(cr)
+    spec_changed["spec"]["redisUrl"] = "redis://other-queue.test:6379"
+    _fire_guard_event("MODIFIED", spec_changed, log)
+
+    assert api.list_calls == 2, (
+        f"A spec change must NOT be classified status-only (issue #590 + the "
+        f"#116/#606 guard events read spec). list_calls={api.list_calls}."
+    )
+
+
+def test_guard_event_never_skips_listing_or_added_events(caplog, log, monkeypatch):
+    """The #163 boot path (initial listing, ``type is None``) and ADDED events
+    always run the full check — even with an already-recorded identical
+    surface — and DELETED both relists and evicts the fingerprint."""
+    cr = make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SPEC_590)
+    api, _ = _wire_guard_590(monkeypatch, log, [cr])
+
+    _fire_guard_event("ADDED", cr, log)  # surface recorded here
+    assert api.list_calls == 1
+
+    _fire_guard_event(None, cr, log)  # initial-listing / resync shape
+    assert api.list_calls == 2, "type is None (listing/resync) must never skip."
+
+    _fire_guard_event("ADDED", cr, log)
+    assert api.list_calls == 3, "ADDED changes the CR set — must never skip."
+
+    _fire_guard_event("DELETED", cr, log)
+    assert api.list_calls == 4, "DELETED changes the CR set — must never skip."
+    assert ("openstudio-server", "alpha") not in singleton._guard_last_seen_surface, (
+        "DELETED must evict the fingerprint entry (a same-name recreation "
+        "starts fresh)."
+    )
+
+
+def test_guard_event_relists_when_uid_changes_delete_recreate(caplog, log, monkeypatch):
+    """#364 delete+recreate: a recreated CR carries a new uid, so the surface
+    fingerprint mismatches and the full relist runs — the skip can never mask
+    a recycled name."""
+    cr = make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SPEC_590)
+    api, _ = _wire_guard_590(monkeypatch, log, [cr])
+    _fire_guard_event("ADDED", cr, log)
+    _fire_guard_event("MODIFIED", _status_only_variant(cr), log)
+    assert api.list_calls == 1
+
+    recreated = copy.deepcopy(cr)
+    recreated["metadata"]["uid"] = "uid-recreated"
+    recreated["metadata"]["resourceVersion"] = "43"
+    _fire_guard_event("MODIFIED", recreated, log)
+
+    assert api.list_calls == 2, (
+        f"A uid change (delete+recreate, #364) must force the relist; got "
+        f"list_calls={api.list_calls}."
+    )
+
+
+def test_guard_event_status_only_skip_fails_closed_until_state_resolved(caplog, log, monkeypatch):
+    """Fail-closed: while the guard has never completed a resolution
+    (``_last_state`` is None — e.g. the initial relist failed), a
+    status-only event with a matching surface STILL runs the full check."""
+    cr = make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SPEC_590)
+    broken = SingletonGuard(ExplodingCustomObjectsApi(items=[cr]))
+    monkeypatch.setattr(singleton, "_process_guard", broken)
+    _events, emit = make_sink()
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
+    monkeypatch.setattr(singleton, "_guard_last_seen_surface", {})
+
+    # First event: the relist EXPLODES (swallowed warning), state unresolved,
+    # but the surface IS recorded — the worst case for the skip gate.
+    _fire_guard_event("ADDED", cr, log)
+
+    working_api = ListOnlyFakeCustomObjectsApi(items=[cr])
+    monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(working_api))
+
+    _fire_guard_event("MODIFIED", _status_only_variant(cr), log)
+
+    assert working_api.list_calls == 1, (
+        f"An unresolved guard (no successful enforce yet) must NOT skip the "
+        f"relist (issue #590 fail-closed); list_calls={working_api.list_calls}."
+    )
+
+
 # ---- Issue #606: the RBAC resourceNames fence is fail-visible ----------------
 #
 # The default operator Role grants secrets:get only on the canonical

@@ -12,6 +12,7 @@ Layers of read-only proof exercised here:
 import inspect
 import logging
 import re
+import time
 from datetime import UTC, datetime
 
 import fakeredis
@@ -23,7 +24,10 @@ import openstudio_operator.handlers as handlers_pkg
 from openstudio_operator import metrics as _metrics_module
 from openstudio_operator import redis_client
 from openstudio_operator.config import RedisSecretRef
-from openstudio_operator.handlers.redis_layout_check import _check_redis_key_layout_for_cr
+from openstudio_operator.handlers.redis_layout_check import (
+    _check_redis_key_layout_for_cr,
+    _redis_key_layout_check,
+)
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
     REQUEUED_QUEUE,
@@ -1308,6 +1312,150 @@ def test_redis_key_layout_check_stamps_freshness_gauge_on_non_ok_paths(
         f"The #490 pair must advance on EVERY validation run (fresh means "
         f"recently validated; the status gauge carries the result)."
     )
+
+
+# --- Issue #590 — watch path freshness-gated (status writes don't re-SCAN) -------
+#
+# The kopf watch delivers an event for EVERY OSCM write, including the
+# ``.status`` subresource RMW patches the operator's own StatusStore makes
+# several times per SLA tick — pre-#590 each one re-ran validate_key_layout()
+# (a Redis SCAN) even though the #490 cadence already bounds the layout
+# signal's freshness. The watch handler now skips when the #490 freshness
+# stamp (REDIS_KEY_LAYOUT_STATUS_FRESH — the stamp BOTH paths maintain) is
+# within REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL; the initial listing /
+# resync (``type is None``) validates unconditionally so the #163 boot
+# contract holds regardless of gauge residue.
+
+
+def _status_write_body() -> dict:
+    """A MODIFIED-event body shaped like the operator's own status RMW write.
+
+    Same spec/uid/labels/annotations as a boot body, plus a ``status``
+    subresource and the metadata churn a ``.status`` patch causes
+    (``resourceVersion`` bump, ``managedFields`` touch) — the exact noise
+    the #590 fingerprint must NOT mistake for a policy change.
+    """
+    return {
+        "metadata": {
+            "namespace": "test-ns",
+            "name": "test-osc",
+            "uid": "uid-1",
+            "resourceVersion": "42",
+            "managedFields": [
+                {"manager": "OpenAPI-Generator", "time": "2026-08-23T00:00:00Z"}
+            ],
+        },
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+        "status": {"softStops": {"a-1": "2026-08-23T00:00:00+00:00"}},
+    }
+
+
+def _recording_factory(fake, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch the layout-check factory to construct against ``fake``, recording calls."""
+    constructed: list[str] = []
+
+    def _factory(redis_url: str, **_kwargs: object) -> ReadOnlyRedisClient:
+        constructed.append(redis_url)
+        return ReadOnlyRedisClient(redis_url, connection=fake, now_fn=lambda: NOW)
+
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
+    )
+    return constructed
+
+
+def test_redis_key_layout_watch_skips_validation_when_freshness_stamp_recent(
+    fake, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #590 acceptance: a status-subresource-only event within the
+    interval does NOT invoke ``validate_key_layout`` — the #490 stamp is the
+    shared freshness budget, and a fresh stamp means a recent run already
+    carried the (process-wide) layout signal."""
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    constructed = _recording_factory(fake, monkeypatch)
+    # Stamp as the #490 periodic path would: wall-clock now → within the
+    # 5-minute REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL.
+    _metrics_module.REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
+
+    with caplog.at_level(logging.DEBUG, logger="openstudio_operator.handlers.redis_layout_check"):
+        _redis_key_layout_check(
+            name="test-osc",
+            namespace="test-ns",
+            body=_status_write_body(),
+            patch={},
+            type="MODIFIED",
+        )
+
+    assert constructed == [], (
+        f"validate_key_layout re-ran on a status-only event with a fresh "
+        f"#490 stamp (issue #590): factory calls={constructed!r}. The watch "
+        f"path must honor REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL."
+    )
+    assert "redis_key_layout=" not in caplog.text, (
+        f"The skip must be silent — no structured redis_key_layout status "
+        f"line may fire without a validation run. Got: {caplog.text!r}."
+    )
+
+
+def test_redis_key_layout_watch_boot_listing_validates_unconditionally(
+    fake, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #590/#163 acceptance: the initial listing (``type is None`` —
+    kopf marks list-replay events that way) still validates UNCONDITIONALLY —
+    even against a fresh stamp residue, so the boot-time assertion can never
+    be suppressed by gauge state from a prior process or test."""
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    constructed = _recording_factory(fake, monkeypatch)
+    # Worst case for the gate: a RECENT stamp — the boot path must not care.
+    _metrics_module.REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers.redis_layout_check"):
+        # No ``type`` kwarg: kopf delivers initial-listing events with
+        # ``type is None`` (same invocation shape as the registry-coverage
+        # test for the #163 callsite gate).
+        _redis_key_layout_check(
+            name="test-osc",
+            namespace="test-ns",
+            body=_status_write_body(),
+        )
+
+    assert constructed, (
+        "The #163 boot path (initial listing) must invoke validate_key_layout "
+        "unconditionally — see issue #590 acceptance."
+    )
+    assert "redis_key_layout=ok" in caplog.text
+
+
+def test_redis_key_layout_watch_revalidates_when_stamp_older_than_interval(
+    fake, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #590: the watch gate is an interval, not a hard off-switch — once
+    the #490 stamp is older than ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``,
+    the next watch event (a status-only one included) re-runs the check."""
+    from openstudio_operator._constants import REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL
+
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    constructed = _recording_factory(fake, monkeypatch)
+    stale = time.time() - (REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL.total_seconds() + 60.0)
+    _metrics_module.REDIS_KEY_LAYOUT_STATUS_FRESH.set(stale)
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers.redis_layout_check"):
+        _redis_key_layout_check(
+            name="test-osc",
+            namespace="test-ns",
+            body=_status_write_body(),
+            patch={},
+            type="MODIFIED",
+        )
+
+    assert constructed, (
+        f"A stamp older than the interval must NOT skip the watch-path "
+        f"validation (issue #590). Factory calls={constructed!r}."
+    )
+    assert "redis_key_layout=ok" in caplog.text
 
 
 # --- Issue #488 — Redis request-duration histogram -------------------------

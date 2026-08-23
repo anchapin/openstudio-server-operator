@@ -36,6 +36,26 @@ all, so a ``@kopf.on.startup`` handler performs the same check when
 ``POD_NAMESPACE`` is set (Downward API in the operator Deployment; absent in
 bare ``kopf run`` dev sessions, where the event path still covers CRs > 0).
 
+Issue #590 — the event path skips the CR relist for status-only updates.
+The operator's own StatusStore RMW writes (soft-stop anchors, requeue
+anchors, ``startedSince`` bookkeeping, ``deferredEvents`` mirrors — several
+per SLA tick) fire a ``MODIFIED`` watch event each, and every one of them
+re-listed the namespace's CRs even though a ``.status`` patch can never
+change the election (seniority is a function of immutable
+``metadata.creationTimestamp`` / ``name`` / ``uid`` plus the SET of CRs —
+and any change to that set arrives as its own ``ADDED`` / ``DELETED``
+event, which is never skipped). :func:`_skip_guard_relist` compares the
+event body's policy surface against the last-seen fingerprint for that CR
+(``spec`` + uid/labels/annotations/deletionTimestamp — deliberately NOT
+``resourceVersion`` / ``managedFields`` / ``status``, which churn on every
+write) and skips the relist only when the surface is unchanged AND the
+guard has already resolved the namespace at least once
+(``SingletonGuard._last_state`` — fail-closed: a failed initial relist
+keeps re-trying). The fingerprint cache is cache, never source of truth
+(D04): a process restart or watch resync (``type is None``) re-runs the
+full check, and a delete+recreate (#364) yields a different ``uid`` and
+therefore a fingerprint mismatch.
+
 Handler gating — central, not per-file: :func:`install_singleton_guard`
 post-processes the kopf registry AFTER the handler modules are imported (it
 is called from ``handlers/__init__.py``) and wraps every spawning handler
@@ -971,7 +991,115 @@ def singleton_guard_startup(logger: kopf.Logger, **_: object) -> None:
     _check(os.getenv("POD_NAMESPACE"), logger)
 
 
+#: Issue #590 — last-seen policy-surface fingerprint per CR, keyed
+#: ``(namespace, name)``. Cache, never source of truth (D04): it only
+#: classifies watch events ("did anything BUT ``.status`` change since the
+#: last event we fully processed?"), and every branch that doubts it
+#: falls back to the full relist. Entries are dropped on ``DELETED`` watch
+#: events so CR churn cannot grow it unboundedly (same lifecycle as
+#: ``dry_run_audit._last_dry_run``).
+_guard_last_seen_surface: dict[tuple[str, str], tuple] = {}
+
+
+def _cr_policy_surface(body: Mapping) -> tuple:
+    """Issue #590 — fingerprint of every CR field a guard relist reacts to.
+
+    ``enforce`` resolves seniority from ``metadata.creationTimestamp`` /
+    ``name`` / ``uid`` (all immutable), and the #116/#606 guard events read
+    ``spec.redisUrl`` / ``spec.redisCredentials``; labels/annotations and
+    ``deletionTimestamp`` round out the semantically-relevant metadata.
+    Deliberately EXCLUDED: ``resourceVersion``, ``managedFields``,
+    ``generation``, and the ``status`` subresource — exactly the fields a
+    ``.status``-subresource write churns, which is the noise #590 removes.
+    Comparing an unchanged fingerprint against a prior event therefore
+    means "only status/write-noise changed" — a relist cannot produce a
+    different election or guard-event outcome. Values compare
+    structurally (kopf ``Body``/``Meta`` mapping views implement
+    ``__eq__`` against plain dicts).
+    """
+    meta = _meta(body)
+
+    def _mapping_or_none(value: object) -> Mapping | None:
+        return value if isinstance(value, Mapping) else None
+
+    return (
+        str(meta.get("uid") or ""),
+        _mapping_or_none(body.get("spec")),
+        _mapping_or_none(meta.get("labels")),
+        _mapping_or_none(meta.get("annotations")),
+        str(meta.get("deletionTimestamp") or ""),
+    )
+
+
+def _skip_guard_relist(
+    body: object, namespace: str, name: str, event_type: object
+) -> bool:
+    """Issue #590 — whether this watch event may skip the CR relist in ``_check``.
+
+    True only when ALL hold:
+
+    * the event is a steady-state ``MODIFIED`` watch event — the kopf
+      watch's initial listing / resync carries ``type is None`` (kopf
+      marks list-replay events that way) and ``ADDED`` / ``DELETED``
+      change the CR set, so none of those ever skip;
+    * the guard has already resolved this namespace
+      (``SingletonGuard._last_state`` is set by a successful ``enforce``)
+      — a guard whose first relist failed keeps retrying (fail-closed);
+    * the CR's policy-surface fingerprint (see :func:`_cr_policy_surface`)
+      matches the last-seen entry recorded after the previous full check —
+      so a spec change, a label/annotation change, or a delete+recreate
+      (#364: new ``uid``) all mismatch and force the full relist.
+
+    A skip is exactly the case where re-running ``_check`` is provably a
+    no-op: election inputs are unchanged, ``enforce`` is state-deduped,
+    and the #116/#606 one-time guard events already fired when the
+    surface was first recorded.
+    """
+    if event_type != "MODIFIED":
+        return False
+    if not isinstance(body, Mapping):
+        return False
+    guard = _process_guard
+    if guard is None or guard._last_state is None:
+        return False
+    seen = _guard_last_seen_surface.get((str(namespace), str(name)))
+    return seen is not None and seen == _cr_policy_surface(body)
+
+
 @kopf.on.event(**CRD_SPEC)
-def singleton_guard_event(namespace: str, logger: kopf.Logger, **_: object) -> None:
-    """On every OSCM change (incl. the initial listing): re-resolve + enforce."""
+def singleton_guard_event(
+    namespace: str,
+    name: str,
+    body: kopf.Body,
+    logger: kopf.Logger,
+    **_kwargs: object,
+) -> None:
+    """On every OSCM change (incl. the initial listing): re-resolve + enforce.
+
+    Issue #590 — a ``MODIFIED`` event whose policy surface matches the
+    last-seen fingerprint for that CR (i.e. the operator's own
+    ``.status``-subresource RMW writes, which fire several watch events
+    per SLA tick) skips the CR relist when the guard already resolved the
+    namespace — see :func:`_skip_guard_relist`. Every other event type
+    (initial listing ``type is None``, ``ADDED``, ``DELETED``) runs the
+    full check exactly as before.
+    """
+    event_type = _kwargs.get("type")
+    key = (str(namespace), str(name))
+    if event_type == "DELETED":
+        # Evict the fingerprint: a same-name recreation (#364) starts fresh.
+        _guard_last_seen_surface.pop(key, None)
+        _check(namespace, logger)
+        return
+    if _skip_guard_relist(body, namespace, name, event_type):
+        logger.debug(
+            "singleton guard: status-only update for %s/%s — CR relist skipped (#590)",
+            namespace,
+            name,
+        )
+        return
     _check(namespace, logger)
+    # Record the surface ONLY after a full check ran for it — the entry
+    # asserts "this surface was processed by a real relist", which is the
+    # invariant ``_skip_guard_relist`` relies on.
+    _guard_last_seen_surface[key] = _cr_policy_surface(body)
