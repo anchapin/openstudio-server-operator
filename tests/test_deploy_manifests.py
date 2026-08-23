@@ -4483,3 +4483,41 @@ def test_deployment_patch_admission_cel_allows_managed_names_and_other_actors():
             f"non-operator actor {other_actor!r} must be exempt from the "
             "#573 policy (userInfo carve-out)"
         )
+
+
+def test_dockerfile_sets_non_root_user_matching_manifests():
+    """Issue #589: the Dockerfile carries its own non-root ``USER`` directive.
+
+    The deploy manifests have pinned ``runAsUser``/``fsGroup`` 1000 since
+    #115/#161, but a pod-level securityContext is a scheduler-side control
+    that does not travel with the image artifact: ``docker run`` of the
+    published image, the release.yml dev-dep assert (``docker run --rm
+    --entrypoint python``), and any downstream embed would otherwise
+    execute as root. This gate fails if the ``USER`` directive is dropped
+    or drifts away from the manifests' UID (file-ownership semantics must
+    stay identical).
+    """
+    dockerfile_text = (DEPLOY.parent / "Dockerfile").read_text()
+    user_directives = re.findall(r"(?im)^\s*USER\s+(\S+)\s*$", dockerfile_text)
+    assert user_directives, (
+        "Dockerfile has no USER directive — the image defaults to root "
+        "everywhere outside the deploy manifests (#589)."
+    )
+    # Dockerfile semantics: the LAST USER directive is the effective one.
+    effective_user = user_directives[-1]
+    assert effective_user.isdigit(), (
+        f"Dockerfile USER {effective_user!r} is not a numeric UID — a name "
+        "resolves against the image passwd at build time and can silently "
+        "drift across base-image refreshes (#589)."
+    )
+    uid = int(effective_user)
+    assert uid != 0, (
+        "Dockerfile USER is root (UID 0) — the #589 non-root default was "
+        "regressed."
+    )
+    assert uid == 1000, (
+        f"Dockerfile USER {uid} does not match the manifests' runAsUser/"
+        "fsGroup 1000 (deploy/operator-deployment.yaml:55-60, "
+        "deploy/storage-cronjob.yaml:151-156) — ownership semantics must "
+        "stay identical (#589)."
+    )
