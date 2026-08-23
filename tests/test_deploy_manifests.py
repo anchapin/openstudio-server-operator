@@ -3467,12 +3467,15 @@ def test_resource_quota_totals_leave_room_for_steady_state():
     the namespace can always schedule the steady state even if every
     pod relies entirely on the LimitRange defaults. A quota shrink
     below that product strands the documented stack. The limits-side
-    counterpart cannot use the same x7 product (7 x 2 CPU = 14 and
-    7 x 4Gi = 28Gi both intentionally exceed the quota — limit
-    defaults are burst ceilings, not reservations); instead the fence
-    asserts the issue's 2:1 limits:requests ratio (8 = 2x4,
-    16Gi = 2x8Gi), which guarantees every reserved request unit has a
-    matching burst unit of headroom above it."""
+    counterpart is fenced two ways: this test asserts the issue's
+    >=2:1 limits:requests ratio (every reserved request unit keeps a
+    matching burst unit of headroom above it), and the #580 companion
+    below — ``test_resource_quota_covers_keda_burst_envelope`` —
+    computes the real per-pod limits aggregate (LimitRange-injected
+    defaults included) at KEDA maxReplicaCount and asserts the quota
+    covers it. The companion is the stronger fence: the pre-#580
+    8 CPU limits quota sat below even the steady-state limits
+    aggregate (10.75 CPU)."""
     assert RESOURCE_QUOTA is not None
     hard = RESOURCE_QUOTA["spec"]["hard"]
     # Requests side: quota >= per-pod default x documented pod count.
@@ -3515,6 +3518,194 @@ def _mem_str(num_bytes):
     if num_bytes >= 1024**3:
         return f"{num_bytes / 1024**3:g}Gi"
     return f"{num_bytes / 1024**2:g}Mi"
+
+
+# ---- Issue #580: quota covers the KEDA maxReplicaCount burst envelope --
+#
+# The steady-state fence above counts ONE worker replica; KEDA's
+# ScaledObject allows maxReplicaCount worker pods. At burst the
+# namespace holds 4 chart pods + maxReplicaCount workers + operator
+# + prune pod, and EVERY container's requests AND limits count
+# against the aggregate quota — including the LimitRange-INJECTED
+# defaults for dimensions a container omits (the chart pods omit
+# limits.cpu, so each injects the 2 CPU default limit, and the
+# injected value counts exactly like a declared one). The envelope
+# below is therefore computed from the manifests at test time —
+# maxReplicaCount parsed from deploy/keda-scaledobject.yaml,
+# per-pod requests/limits parsed from scripts/manifests/ + deploy/,
+# no hardcoded 11-pod arithmetic — so drift in any direction (burst
+# up, quota down, chart requests up, LimitRange defaults up) fails
+# here. The single-replica, Recreate-strategy operator must never be
+# quota-rejected while KEDA is at burst: unlike node pressure (#414),
+# quota admission is NOT preempted by the PriorityClass.
+
+SCRIPTS_MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[1] / "scripts" / "manifests"
+)
+SCALED_OBJECT_DOCS = list(
+    yaml.safe_load_all((DEPLOY / "keda-scaledobject.yaml").read_text())
+)
+SCALED_OBJECT = next(
+    (d for d in SCALED_OBJECT_DOCS if d.get("kind") == "ScaledObject"),
+    None,
+)
+
+
+def _scaled_target_max_replicas():
+    """(kind, name, maxReplicaCount) from the ScaledObject — the burst
+    ceiling the quota must cover, plus the scaleTargetRef identity so
+    the replica substitution below stays tied to the workload KEDA
+    actually scales (issue #580)."""
+    assert SCALED_OBJECT is not None, (
+        "deploy/keda-scaledobject.yaml is missing a ScaledObject — the "
+        "worker burst ceiling (maxReplicaCount) cannot be determined "
+        "(issue #580)"
+    )
+    target = SCALED_OBJECT["spec"]["scaleTargetRef"]
+    max_replicas = SCALED_OBJECT["spec"].get("maxReplicaCount")
+    assert isinstance(max_replicas, int), (
+        f"ScaledObject must declare an integer maxReplicaCount, got "
+        f"{max_replicas!r} (issue #580)"
+    )
+    return target["kind"], target["name"], max_replicas
+
+
+def _burst_workload_pod_specs():
+    """Yield (source, kind, name, replicas, pod_spec) for every
+    request-bearing workload the quota must cover at max burst: the
+    chart overlay under scripts/manifests/ (db, queue, web,
+    web-background, worker — the NFS manifest ships only PV/PVC, no
+    pods) + the operator Deployment + the prune CronJob's job pod
+    (intermittently present; counted as ONE pod, matching the issue's
+    envelope arithmetic). The workload named by the ScaledObject
+    scaleTargetRef gets maxReplicaCount replicas; everything else its
+    declared replicas (default 1, matching the API server's default
+    for an omitted replicas field)."""
+    scaled_kind, scaled_name, max_replicas = _scaled_target_max_replicas()
+    sources = [
+        ("scripts/manifests/", sorted(SCRIPTS_MANIFESTS_DIR.glob("*.yaml"))),
+        (
+            "deploy/",
+            [
+                DEPLOY / "operator-deployment.yaml",
+                DEPLOY / "storage-cronjob.yaml",
+            ],
+        ),
+    ]
+    for prefix, paths in sources:
+        for path in paths:
+            for doc in yaml.safe_load_all(path.read_text()):
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                name = doc.get("metadata", {}).get("name", "<unnamed>")
+                if kind in {"Deployment", "StatefulSet", "DaemonSet"}:
+                    replicas = doc.get("spec", {}).get("replicas", 1)
+                    if kind == scaled_kind and name == scaled_name:
+                        replicas = max_replicas
+                    yield (
+                        f"{prefix}{path.name}",
+                        kind,
+                        name,
+                        replicas,
+                        doc["spec"]["template"]["spec"],
+                    )
+                elif kind == "CronJob":
+                    yield (
+                        f"{prefix}{path.name}",
+                        kind,
+                        name,
+                        1,
+                        doc["spec"]["jobTemplate"]["spec"]["template"]["spec"],
+                    )
+
+
+def _burst_envelope():
+    """The max-burst aggregate the namespace can hold, as a dict keyed
+    by quota dimension (requests.cpu in millicores, requests.memory in
+    bytes, limits.cpu, limits.memory), plus a per-workload breakdown
+    for assertion messages. Per-container effective values = declared
+    request/limit, else the LimitRange-injected default for that
+    section (admission injects defaultRequest for omitted requests and
+    default for omitted limits; both count against the aggregate
+    quota — issue #580)."""
+    container_entry = LIMIT_RANGE["spec"]["limits"][0]
+    zero = {
+        "requests.cpu": 0.0,
+        "requests.memory": 0,
+        "limits.cpu": 0.0,
+        "limits.memory": 0,
+    }
+    totals = dict(zero)
+    breakdown = []
+    for source, kind, name, replicas, pod_spec in _burst_workload_pod_specs():
+        per = dict(zero)
+        for container in pod_spec.get("containers", []):
+            resources = container.get("resources") or {}
+            for section in ("requests", "limits"):
+                declared = resources.get(section) or {}
+                lr_key = "defaultRequest" if section == "requests" else "default"
+                lr_defaults = container_entry.get(lr_key) or {}
+                for dimension in ("cpu", "memory"):
+                    value = declared.get(dimension)
+                    if value is None:
+                        value = lr_defaults[dimension]
+                    key = f"{section}.{dimension}"
+                    if dimension == "cpu":
+                        per[key] += _cpu_millis(value)
+                    else:
+                        per[key] += _mem_bytes(value)
+        for key in totals:
+            totals[key] += replicas * per[key]
+        breakdown.append((source, kind, name, replicas, per))
+    return totals, breakdown
+
+
+def test_resource_quota_covers_keda_burst_envelope():
+    """Issue #580: the quota totals cover the namespace at KEDA MAX
+    burst. The envelope is computed from the manifests (chart pods at
+    their REAL declared requests — web's 2Gi memory request included —
+    + maxReplicaCount workers + operator + prune pod, with the
+    LimitRange-injected defaults counted for every dimension a
+    container omits) and asserted <= the quota on all four
+    dimensions. The pre-#580 requests quota (4/8Gi) already covered
+    the real-request envelope; the pre-#580 LIMITS quota (8/16Gi) did
+    NOT — the injected 2 CPU default limit per chart pod aggregates to
+    18.75 CPU at maxReplicaCount=5 (and 10.75 CPU even at steady
+    state), so a rescheduled chart pod or the single-replica Recreate
+    operator could be quota-rejected until another pod terminated.
+    Raising maxReplicaCount or the chart requests without raising the
+    quota (or vice versa) fails here — the durable fence the issue's
+    acceptance criterion asks for."""
+    assert RESOURCE_QUOTA is not None
+    hard = RESOURCE_QUOTA["spec"]["hard"]
+    totals, breakdown = _burst_envelope()
+    pretty = "; ".join(
+        f"{kind}/{name} x{replicas} "
+        f"req {_cpu_str(per['requests.cpu'])}/"
+        f"{_mem_str(per['requests.memory'])} "
+        f"lim {_cpu_str(per['limits.cpu'])}/"
+        f"{_mem_str(per['limits.memory'])}"
+        for _source, kind, name, replicas, per in breakdown
+    )
+    checks = [
+        ("requests.cpu", _cpu_millis, _cpu_str),
+        ("requests.memory", _mem_bytes, _mem_str),
+        ("limits.cpu", _cpu_millis, _cpu_str),
+        ("limits.memory", _mem_bytes, _mem_str),
+    ]
+    for key, parse, render in checks:
+        quota = parse(hard[key])
+        envelope = totals[key]
+        assert quota >= envelope, (
+            f"{key} quota {render(quota)} does not cover the KEDA "
+            f"maxReplicaCount burst envelope {render(envelope)} "
+            f"(issue #580). Envelope: {pretty}. Either raise the "
+            f"quota in deploy/resource-quota.yaml to cover the burst "
+            f"envelope or lower maxReplicaCount in deploy/"
+            f"keda-scaledobject.yaml — the single-replica Recreate "
+            f"operator must never be quota-rejected at burst."
+        )
 
 
 def test_no_deploy_container_exceeds_limit_range_defaults():
