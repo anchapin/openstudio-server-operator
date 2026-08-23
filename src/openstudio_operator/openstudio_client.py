@@ -37,7 +37,6 @@ from __future__ import annotations
 import os
 import random
 import time
-from datetime import datetime
 from typing import Any
 
 import requests
@@ -97,14 +96,6 @@ def _resolve_tls_ca_bundle() -> bool | str:
             f"treat it as a CA bundle (issue #296)."
         )
     return ca_bundle
-
-
-# Single source of truth for ISO-8601 → tz-aware UTC parsing (D12 boundary,
-# issue #174). Re-exported under the historical name so the existing
-# ``tests/test_openstudio_client.py`` direct import keeps working unchanged.
-def _parse_timestamp(value: str | None) -> datetime | None:
-    """Backward-compatible alias for :func:`openstudio_operator._time.parse_iso_utc`."""
-    return parse_iso_utc(value)
 
 
 def _normalize_timestamps(obj: Any) -> Any:

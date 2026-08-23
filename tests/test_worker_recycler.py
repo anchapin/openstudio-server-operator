@@ -20,13 +20,15 @@ from prometheus_client import REGISTRY
 
 from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit, tick_failures_total
 from _fakes import make_cr as _shared_make_cr
+from openstudio_operator._k8s import (
+    DEFAULT_WORKER_DEPLOYMENT,
+    MERGE_PATCH_CONTENT_TYPE,
+    RESTARTED_AT_ANNOTATION,
+)
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers import worker_recycler as worker_recycler_module
 from openstudio_operator.handlers.worker_recycler import (
-    DEFAULT_WORKER_DEPLOYMENT,
-    MERGE_PATCH_CONTENT_TYPE,
-    RESTARTED_AT_ANNOTATION,
     TRIGGER_ANALYSIS_COMPLETED,
     TRIGGER_INTERVAL_ELAPSED,
     WORKER_RECYCLED_EVENT,
