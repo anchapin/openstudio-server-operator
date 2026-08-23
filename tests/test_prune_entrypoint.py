@@ -20,9 +20,12 @@ import responses
 from kubernetes.client import ApiException
 
 from _fakes import FakeCustomObjectsApi, calls_to
+from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS
 from openstudio_operator.archival import archival_job_name
+from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.prune_entrypoint import (
+    _SKIP_TICK_EXCEPTIONS,
     EVENT_SOURCE_COMPONENT,
     main,
 )
@@ -455,15 +458,20 @@ def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
     # inspecting the source of prune_entrypoint.main(). The
     # single-quoted strings in the constants ARE the strings at the
     # call sites (no `reason="..."` literal shadows the constants).
+    # Four call sites since #650: the config-phase from_spec guard adds
+    # a fourth branch REUSING reason="runtime_failure" (no new reason
+    # value — the vocabulary stays the three constants above).
     source = inspect.getsource(prune_entrypoint)
     branch_call_sites = [
         line for line in source.splitlines()
         if "PRUNE_TICK_FAILURES_TOTAL.labels" in line
     ]
-    assert len(branch_call_sites) == 3, (
+    assert len(branch_call_sites) == 4, (
         f"prune_entrypoint must call PRUNE_TICK_FAILURES_TOTAL.labels "
-        f"exactly three times (one per failure branch: CR-list skip, D12 "
-        f"runtime skip, exit-3 redisUrl guard #392), got {len(branch_call_sites)}:\n"
+        f"exactly four times (one per failure branch: CR-list skip, D12 "
+        f"runtime skip, exit-3 redisUrl guard #392, and the #650 "
+        f"config-phase from_spec guard reusing runtime_failure), "
+        f"got {len(branch_call_sites)}:\n"
         + "\n".join(branch_call_sites)
     )
     # Every call site must use the module-level constants, not inline
@@ -516,3 +524,88 @@ def test_entrypoint_serves_every_cloud_backend_spec(backend):
         code, _batch, _ = run_main(api)
 
     assert code == 0  # empty analyses: nothing due, clean exit per backend
+
+
+# --- Issue #650: skip-tick tuple derivation + config-phase guard ----------------
+
+
+def test_prune_skip_tick_tuple_derives_from_canonical():
+    """Issue #650 — prune's ``_SKIP_TICK_EXCEPTIONS`` is DERIVED from the
+    canonical ``_oscm_handlers.SKIP_TICK_EXCEPTIONS`` (pinned by
+    ``test_oscm_tick_runner.py``), not a frozen pre-#473 fork: the canonical
+    tuple must be a subset of the fork, and the fork's extras must be
+    EXACTLY the documented set (bare ``ValueError`` — the storagePolicy-enum
+    and spec.redisCredentials.secretRef parses). The next #475/#493-style
+    canonical widening fails HERE until a prune decision is recorded."""
+    canonical = set(SKIP_TICK_EXCEPTIONS)
+    fork = set(_SKIP_TICK_EXCEPTIONS)
+    assert canonical <= fork, (
+        f"prune's skip-tick fork must keep every canonical member "
+        f"(canonical-only: {sorted(c.__name__ for c in canonical - fork)}) — "
+        f"derive it as SKIP_TICK_EXCEPTIONS + documented deltas (#650)"
+    )
+    assert fork - canonical == {ValueError}, (
+        f"prune's fork extras must be exactly the documented set "
+        f"{{ValueError}}; got {sorted(c.__name__ for c in fork - canonical)} — "
+        f"new extras require a comment block + this test update (#650)"
+    )
+    assert len(_SKIP_TICK_EXCEPTIONS) == len(SKIP_TICK_EXCEPTIONS) + 1, (
+        "the fork must be the canonical tuple plus exactly one appended member"
+    )
+
+
+def test_malformed_cr_spec_is_clean_counted_exit_five():
+    """Issue #650 — a malformed CR spec raised by ``OperatorConfig.from_spec``
+    (bare ``ValueError`` from the spec.redisCredentials.secretRef parse) is a
+    clean, counted, documented exit 5 — matching #475's operator-side
+    rationale (counted, logged, retry next schedule) — not an uncaught
+    traceback exiting 1, a code the exit-code table never promised."""
+    from openstudio_operator import metrics
+
+    bad_spec = {
+        "serverUrl": BASE,
+        "redisUrl": "redis://queue:6379",
+        "redisCredentials": {"secretRef": "not-an-object"},
+    }
+    crs = [make_cr(spec=bad_spec)]
+    api = FakeCustomObjectsApi(crs[0], items=crs)
+
+    counter = metrics.PRUNE_TICK_FAILURES_TOTAL
+    baseline = _counter_value(counter, reason="runtime_failure")
+    code, batch, core = run_main(api)
+
+    assert code == 5
+    assert batch.creates == [] and core.events == []
+    assert _counter_value(counter, reason="runtime_failure") - baseline == 1.0, (
+        "the config-phase guard must bump PRUNE_TICK_FAILURES_TOTAL "
+        "{reason='runtime_failure'} exactly once"
+    )
+
+
+def test_client_construction_config_error_is_clean_counted_exit_five():
+    """Issue #650 / #475 — an ``OperatorConfigError`` escaping client
+    construction (TLS CA-bundle misconfiguration, the exact class #475
+    named) is a counted exit-5 skip: construction runs INSIDE the guarded
+    region, the #493 pattern the operator canonicalized — not an uncaught
+    traceback exiting 1."""
+    from openstudio_operator import metrics
+
+    crs = [make_cr(spec={"serverUrl": BASE, "redisUrl": "redis://queue:6379"})]
+    api = FakeCustomObjectsApi(crs[0], items=crs)
+
+    def raising_client_factory(url: str) -> OpenStudioClient:
+        raise OperatorConfigError("synthetic TLS CA-bundle misconfiguration (#650)")
+
+    counter = metrics.PRUNE_TICK_FAILURES_TOTAL
+    baseline = _counter_value(counter, reason="runtime_failure")
+    code = main(
+        NAMESPACE,
+        custom_api=api,
+        batch_api=FakeBatchV1Api(),
+        core_api=FakeCoreV1Api(),
+        client_factory=raising_client_factory,
+        now=NOW,
+    )
+
+    assert code == 5
+    assert _counter_value(counter, reason="runtime_failure") - baseline == 1.0
