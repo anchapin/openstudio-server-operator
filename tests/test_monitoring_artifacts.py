@@ -23,6 +23,17 @@ onboarding 5-step pattern, or an interval change in ``_constants.py``,
 fails CI until the alert is extended/retuned (the same doc-drift-guard
 discipline as the metrics inventory).
 
+Issue #645 adds the third invariant, scoped to the #569 prune
+absence-of-success alert: the expr must fullmatch the canonical
+CronJob-recency two-arm shape (recency on
+``kube_cronjob_status_last_successful_time`` + a never-succeeded
+``unless`` bootstrap arm) and must not accumulate
+``kube_job_status_succeeded`` — retained Job history (``successfulJobs
+HistoryLimit: 3``) pins that sum at >= 1 forever, deadening the alert in
+exactly the no-event modes it exists for. A scenario simulation evaluates
+the parsed arms, including the #645 regression ("3 retained successes,
+no new Job for 1h → MUST be armed").
+
 Scope guard (#485): these tests deliberately do NOT pin the full deploy/
 file inventory — the deploy-inventory CI guard is owned by #485. Only the
 two #468 artifacts and their referenced families are covered here.
@@ -431,6 +442,189 @@ def test_heartbeat_alert_thresholds_are_three_x_poll_intervals():
             f"{expected:g}s — retune the {module} clause in "
             f"{_HEARTBEAT_ALERT_NAME} (issue #581)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #645 — PruneJobNoSuccess CronJob-recency drift gate.
+#
+# The #569 absence-of-success expr accumulated Job objects:
+# ``sum(max_over_time(kube_job_status_succeeded[...])) or vector(0) < 1``.
+# But storage-cronjob.yaml sets ``successfulJobsHistoryLimit: 3``, KSM
+# keeps exporting succeeded=1 for every RETAINED Job object, and the
+# CronJob controller only GCs history when it creates a new Job — after
+# the first three successes the sum is permanently >= 1 and the alert
+# can NEVER fire, in exactly the no-event modes (#569: suspend, wrong
+# schedule, controller outage) it was built for. The gate below pins the
+# #645 rekey onto CronJob-level recency: the two-arm canonical shape
+# (fullmatch, so any hand-edited drift fails structurally — the same
+# discipline as the #581 heartbeat clause regex) plus a scenario
+# simulation that evaluates the parsed arms against synthetic series,
+# including the #645 regression ("3 retained successes, nothing new for
+# 1h") and the never-succeeded bootstrap edge case.
+# ---------------------------------------------------------------------------
+
+#: Name of the absence-of-success prune alert in deploy/prometheusrule.yaml.
+_PRUNE_NO_SUCCESS_ALERT_NAME = "OpenStudioOperatorPruneJobNoSuccess"
+
+#: The canonical two-arm #645 shape: recency on last_successful_time,
+#: ``or`` the never-succeeded bootstrap (schedule stale unless a success
+#: exists). Used with ``fullmatch`` — thresholds are captured so the
+#: scenario simulation derives its semantics from the manifest itself.
+_PRUNE_NO_SUCCESS_EXPR_RE = re.compile(
+    r"\(time\(\) - kube_cronjob_status_last_successful_time"
+    r'\{namespace="openstudio-server", cronjob="openstudio-storage-pruner"\}'
+    r" > (?P<success_threshold>[0-9]+)\)"
+    r" or \(\(time\(\) - kube_cronjob_status_last_schedule_time"
+    r'\{namespace="openstudio-server", cronjob="openstudio-storage-pruner"\}'
+    r" > (?P<schedule_threshold>[0-9]+)\)"
+    r" unless kube_cronjob_status_last_successful_time"
+    r'\{namespace="openstudio-server", cronjob="openstudio-storage-pruner"\}\)'
+)
+
+#: 1h = 6 missed */10 schedules (storage-cronjob.yaml), the #569 window.
+_PRUNE_NO_SUCCESS_WINDOW_SECONDS = 3600
+
+
+def _prune_no_success_expr() -> re.Match:
+    """Return the fullmatch of the (unique) absence-of-success alert expr."""
+    matches = [
+        alert["expr"]
+        for alert in _prometheusrule_alerts()
+        if alert.get("alert") == _PRUNE_NO_SUCCESS_ALERT_NAME
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {_PRUNE_NO_SUCCESS_ALERT_NAME} rule in "
+        f"{PROMETHEUSRULE_PATH.name}, found {len(matches)}"
+    )
+    parsed = _PRUNE_NO_SUCCESS_EXPR_RE.fullmatch(matches[0])
+    assert parsed, (
+        f"{_PRUNE_NO_SUCCESS_ALERT_NAME} expr does not fullmatch the "
+        f"canonical #645 CronJob-recency shape "
+        f"`(time() - kube_cronjob_status_last_successful_time{{...}} > N) "
+        f"or ((time() - kube_cronjob_status_last_schedule_time{{...}} > N) "
+        f"unless kube_cronjob_status_last_successful_time{{...}})`: "
+        f"{matches[0]!r}"
+    )
+    return parsed
+
+
+def _simulate_prune_no_success(
+    parsed: re.Match,
+    *,
+    last_successful_age: float | None,
+    last_schedule_age: float | None,
+) -> bool:
+    """Evaluate the parsed arms; ``None`` means the series is ABSENT.
+
+    Models PromQL semantics faithfully for the two arms: a ``time() - X``
+    comparison over an absent series produces no data (False), and the
+    ``unless`` RHS suppresses the bootstrap arm whenever a success series
+    exists — retained ``kube_job_status_succeeded`` Job history is
+    deliberately NOT an input, which is the whole point of #645.
+    """
+    arm_recency = (
+        last_successful_age is not None
+        and last_successful_age > float(parsed["success_threshold"])
+    )
+    arm_bootstrap = (
+        last_schedule_age is not None
+        and last_schedule_age > float(parsed["schedule_threshold"])
+        and last_successful_age is None
+    )
+    return arm_recency or arm_bootstrap
+
+
+def test_prune_no_success_expr_matches_cronjob_recency_canonical_shape():
+    """#645: the expr is the two-arm CronJob-recency shape, no Job accumulation.
+
+    ``kube_job_status_succeeded`` accumulation is the regression: retained
+    history pins that sum at >= 1 forever (the CronJob controller only GCs
+    on new-Job creation), so the fullmatch — which admits no variant
+    spelling — doubles as the "no Job-object accumulation" fence. Both
+    thresholds must equal the #569 1h window / 6 missed */10 schedules.
+    """
+    parsed = _prune_no_success_expr()
+    expr = parsed.group(0)
+    assert "kube_job_status_succeeded" not in expr, (
+        "PruneJobNoSuccess must not accumulate kube_job_status_succeeded "
+        "(issue #645): successfulJobsHistoryLimit (3) retains succeeded "
+        "Jobs in the no-event failure modes, pinning the sum at >= 1 so "
+        "the alert can never fire"
+    )
+    assert int(parsed["success_threshold"]) == _PRUNE_NO_SUCCESS_WINDOW_SECONDS
+    assert int(parsed["schedule_threshold"]) == _PRUNE_NO_SUCCESS_WINDOW_SECONDS, (
+        "both arms must use the 1h window (6 missed */10 schedules, "
+        "#569); a shorter bootstrap window would false-fire on fresh "
+        "installs, a longer one delays the suspend/no-event page"
+    )
+
+
+def test_prune_no_success_regression_three_retained_successes_still_arms():
+    """#645 acceptance criterion: 3 historical successes retained
+    (``successfulJobsHistoryLimit: 3``), no new Job scheduled for 1h —
+    the alert MUST be armed.
+
+    This is the scenario the old
+    ``sum(max_over_time(kube_job_status_succeeded[1h])) or vector(0) < 1``
+    could never fire in (the three retained successes pinned the sum at
+    >= 1). Under the CronJob-recency rekey the retained Job history is
+    not an input at all; the stale ``last_successful_time`` arms the
+    alert. The sibling states must NOT arm: healthy cadence, and the 1h
+    grace after a success (suspend-with-recent-success must not page
+    early).
+    """
+    parsed = _prune_no_success_expr()
+    # THE #645 regression: successes exist (3 retained Job objects keep
+    # kube_job_status_succeeded=1 exported forever), last success and last
+    # schedule are both >1h stale (suspended / controller outage).
+    assert _simulate_prune_no_success(
+        parsed, last_successful_age=2 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+        last_schedule_age=2 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+    ), "3 retained successes + nothing new for >1h must arm the alert (#645)"
+    # Healthy cadence: success 5 minutes ago (a */10 schedule that just ran).
+    assert not _simulate_prune_no_success(
+        parsed, last_successful_age=300, last_schedule_age=300,
+    ), "healthy */10 cadence must not arm the alert"
+    # Grace: suspended 30 minutes after a success — the 1h window has not
+    # elapsed; firing here would flap on every schedule boundary.
+    assert not _simulate_prune_no_success(
+        parsed, last_successful_age=0.5 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+        last_schedule_age=0.5 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+    ), "success inside the 1h window must not arm the alert"
+
+
+def test_prune_no_success_bootstrap_arm_covers_never_succeeded():
+    """#645 edge case: ``kube_cronjob_status_last_successful_time`` is
+    ABSENT until the CronJob's first success — ``time() - X`` over an
+    absent series is no-data, so without the ``unless`` bootstrap arm the
+    alert would silently never fire on a fresh install that never
+    succeeded (#569 precedent: TRUE absence must fire).
+
+    The bootstrap arm arms on schedule-stale + never-succeeded (suspend
+    from day one, wrong schedule, controller outage). It must stay quiet
+    on a fresh install still inside its first window, and the ``unless``
+    must hand semantics to the recency arm once any success exists (a
+    recent success suppresses the bootstrap arm even with a stale
+    schedule — the 1h grace).
+    """
+    parsed = _prune_no_success_expr()
+    # Never succeeded, scheduling stopped >1h ago (suspend / outage from
+    # day one): bootstrap arm must fire.
+    assert _simulate_prune_no_success(
+        parsed, last_successful_age=None,
+        last_schedule_age=2 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+    ), "never-succeeded + schedule stale >1h must arm (bootstrap arm, #645)"
+    # Fresh install inside its first window, never succeeded yet: quiet.
+    assert not _simulate_prune_no_success(
+        parsed, last_successful_age=None, last_schedule_age=300,
+    ), "first-hour grace must hold on a never-succeeded fresh install"
+    # Success exists but is recent while the schedule is stale (suspended
+    # right after a success): the unless suppresses the bootstrap arm and
+    # the recency arm honours the grace — no fire until the 1h elapses.
+    assert not _simulate_prune_no_success(
+        parsed, last_successful_age=300,
+        last_schedule_age=2 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
+    ), "recent success + stale schedule must not arm (unless keeps arms disjoint)"
 
 
 def test_grafana_dashboard_parses_with_templated_datasource():

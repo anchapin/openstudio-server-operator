@@ -315,13 +315,17 @@ operational caveats:
      not running the Prometheus Operator can transcribe the `expr`
      strings into static rule files — they are plain PromQL.
    - Scrape prerequisite: every expression assumes a scrape config on
-     the operator pod's plaintext `:9090/metrics` — ingress gated by
+     the      operator pod's plaintext `:9090/metrics` — ingress gated by
      artifact 2 above, so the scraper must satisfy the metrics-ingress
      policy or the alerts stay permanently empty. The prune group's two
-     Job alerts additionally require **kube-state-metrics** (standard
-     in kube-prometheus-stack): they key on `kube_job_status_failed`
-     and the #569 absence-of-success
-     `max_over_time(kube_job_status_succeeded …) or vector(0)`.
+     alerts additionally require **kube-state-metrics** (standard in
+     kube-prometheus-stack): they key on `kube_job_status_failed` and,
+     since #645, the CronJob-recency absence-of-success
+     `time() - kube_cronjob_status_last_successful_time …` (+ a
+     never-succeeded `unless` bootstrap arm) — which needs
+     kube-state-metrics **>= 2.5.0** (the series shipped in v2.5.0,
+     upstream PR #1732; older KSM degrades that alert to
+     schedule-staleness only).
 
 4. **Grafana dashboard — `deploy/grafana-dashboard.json` (#468)** —
    panels for the action counters, tick-duration histograms and Resque
