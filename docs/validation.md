@@ -57,7 +57,7 @@ referenced the deleted `handlers/storage_pruner.py`; those lines predate the
 | PriorityClass eviction protection (#414) | `deploy/priority-class.yaml` | **live** | Cluster-scoped `openstudio-operator-critical`, referenced via `priorityClassName` by BOTH `deploy/operator-deployment.yaml` and the prune CronJob — node-pressure eviction protection. Must exist before the Deployment (admission rejects pods naming a nonexistent PriorityClass); applied in Phase A step 1 |
 | ResourceQuota + LimitRange (#400) | `deploy/resource-quota.yaml` | **live** | Bounds the namespace's aggregate + per-container resource surface; sized by #580 to the full KEDA burst envelope (recomputed by `tests/test_deploy_manifests.py` so drift fails CI). Admission-time only — running pods untouched. Apply steps + caveats: [Namespace hardening subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
 | NetworkPolicy egress + metrics-ingress fence (#112/#166) | `deploy/network-policy.yaml` | **live** | Default-deny egress for the operator-owned pod surface (operator, storage-pruner, archival Jobs) plus label-scoped ingress lockdown of BOTH plaintext `/metrics` endpoints (operator #166; pruner parity #478; apiserver egress peer #578). The #166 scraper-namespace footgun and the #578 hosted-apiserver trap: [subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
-| Alerting surface (#468) | `deploy/prometheustrule.yaml` · `deploy/grafana-dashboard.json` | **live** | PrometheusRule alerts transcribed from the `metrics.py` docstrings (incl. prune Job failed + absence-of-success alerts #569, singleton-unwrap rekey #570) + Grafana dashboard for the `/metrics` surface (drift-gated by `tests/test_monitoring_artifacts.py`). Cluster-admin apply, `release: prometheus` pickup label — operator RBAC deliberately holds no `prometheusrules` verbs. See the [subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
+| Alerting + discovery surface (#468/#682) | `deploy/prometheustrule.yaml` · `deploy/service-metrics.yaml` · `deploy/servicemonitor-metrics.yaml` · `deploy/grafana-dashboard.json` | **live** | PrometheusRule alerts transcribed from the `metrics.py` docstrings (incl. prune Job failed + absence-of-success alerts #569, singleton-unwrap rekey #570) + the Service/ServiceMonitor discovery pair fronting the operator's named port `metrics` (:9090) so the alerts have a scrape target (#682) + Grafana dashboard for the `/metrics` surface (drift-gated by `tests/test_monitoring_artifacts.py`). Cluster-admin apply, `release: prometheus` pickup label on both the rule and the ServiceMonitor — operator RBAC deliberately holds no `prometheusrules`/`servicemonitors`/`services` verbs. See the [subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
 
 ## Ground rules (from AGENTS.md)
 
@@ -314,10 +314,32 @@ operational caveats:
      renamed (or the manifest's labels added to the selector); clusters
      not running the Prometheus Operator can transcribe the `expr`
      strings into static rule files — they are plain PromQL.
-   - Scrape prerequisite: every expression assumes a scrape config on
-     the      operator pod's plaintext `:9090/metrics` — ingress gated by
-     artifact 2 above, so the scraper must satisfy the metrics-ingress
-     policy or the alerts stay permanently empty. The prune group's two
+   - Scrape prerequisite (shipped since #682): every expression assumes
+     a scrape config on the operator pod's plaintext `:9090/metrics`.
+     Discovery is no longer hand-rolled — apply the shipped pair (a
+     ClusterIP Service fronting the Deployment's named port `metrics`
+     plus a ServiceMonitor wiring a Prometheus Operator scrape job to
+     it, validated on a live kube-prometheus-stack cluster: endpoints
+     populated → `up == 1` within one interval):
+
+     ```bash
+     # Issue #682 — cluster-admin apply (the operator Role deliberately
+     # holds no `services`/`servicemonitors` verbs); rename the
+     # `release:` label on the ServiceMonitor if your
+     # kube-prometheus-stack release is not the stock `prometheus`
+     # (same caveat as the PrometheusRule above).
+     kubectl apply -f deploy/service-metrics.yaml -f deploy/servicemonitor-metrics.yaml
+     ```
+
+     Ingress stays gated by artifact 2 above — the scrape comes from
+     the Prometheus server pod, which the metrics-ingress policy's
+     `prometheus`-namespace peer already allows on the stock shape
+     (only a differently-named Prometheus namespace needs the
+     NetworkPolicy edit); without that ingress the target stays
+     permanently down and the alerts remain empty. Clusters not
+     running the Prometheus Operator can point a static scrape config
+     at the Service's `openstudio-operator-metrics.openstudio-server.svc:9090`.
+     The prune group's two
      alerts additionally require **kube-state-metrics** (standard in
      kube-prometheus-stack): they key on `kube_job_status_failed` and,
      since #645, the CronJob-recency absence-of-success

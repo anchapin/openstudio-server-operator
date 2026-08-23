@@ -395,6 +395,8 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── resource-quota.yaml     # ResourceQuota + LimitRange for the openstudio-server namespace (#400)
 │   ├── namespace-labels.yaml   # PSS restricted labels for the openstudio-server Namespace — metadata-only, merge-safe apply onto the helm-created namespace (#498, mirrors the #388 kind recipe)
 │   ├── prometheustrule.yaml    # PrometheusRule alert definitions for the /metrics surface (#468)
+│   ├── service-metrics.yaml    # ClusterIP Service fronting the operator's named port `metrics` (:9090) — alert discovery half (#682)
+│   ├── servicemonitor-metrics.yaml  # ServiceMonitor wiring Prometheus Operator discovery to the metrics Service (#682; rename `release:` per install)
 │   └── grafana-dashboard.json  # Grafana dashboard JSON — action counters, tick histograms, Resque gauges (#468)
 ├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/, adr/, skill-snapshot/ (frozen wave-orchestrator skill copies, #379/#486)
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker + wave-orchestration tooling (wave-planner.js, auto_close_issues.py, render_orchestrator_snippet.py — #486)

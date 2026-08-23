@@ -1,0 +1,73 @@
+# ServiceMonitor wiring a Prometheus Operator scrape job to the
+# openstudio-operator-metrics Service (issue #682). Validated on a live
+# kube-prometheus-stack cluster: endpoints populated → `up == 1` within
+# one interval. The operator Deployment exposes /metrics on the named
+# port `metrics` (:9090); this manifest + deploy/service-metrics.yaml
+# make that target DISCOVERABLE so the 20 alerts in
+# deploy/prometheustrule.yaml fire out of the box.
+#
+# APPLY + PICKUP
+# --------------
+# Cluster-admin apply (kubectl apply -f deploy/), like
+# prometheustrule.yaml (#468): the operator Role (deploy/rbac.yaml)
+# holds no `servicemonitors` verbs, and the operator never creates or
+# mutates ServiceMonitor objects.
+#
+# Selector label: kube-prometheus-stack's default Prometheus
+# `serviceMonitorSelector` matches `release: <helm-release-name>`; the
+# stock release name is `prometheus`, so that label is shipped below
+# for default pickup. If your Prometheus was installed under a
+# different release name (e.g. `kube-prometheus-stack` or
+# `monitoring`), change the label to match your
+# `serviceMonitorSelector.matchLabels` — the SAME per-cluster edit
+# prometheustrule.yaml documents for its `ruleSelector`. A Prometheus
+# with an empty serviceMonitorSelector (select-all) needs no edit.
+#
+# INGRESS (no per-cluster edit on the stock shape)
+# ------------------------------------------------
+# The scrape request comes FROM the Prometheus server pod, so ingress
+# is decided by the `openstudio-operator-metrics-ingress` NetworkPolicy
+# (#166): its namespaceSelector peer already allows a Prometheus
+# running in the `prometheus` namespace. No label on THIS object
+# affects the NetworkPolicy — the policy is pod-label-scoped and this
+# ServiceMonitor is not a pod (the #295 `metrics-scraper` label
+# convention applies to same-namespace scraper PODS, not to discovery
+# objects). If your Prometheus runs in a differently-named namespace
+# (`monitoring`, `kube-prometheus-stack`, `observability`, …), edit the
+# NetworkPolicy's namespaceSelector label match (see AGENTS.md
+# Working-rules /metrics ingress bullet), not this manifest.
+#
+# AUTH OPT-IN (#401)
+# ------------------
+# The endpoint is plaintext by default. If the operator Deployment's
+# OPENSTUDIO_METRICS_TOKEN_FILE bearer-token opt-in is enabled, the
+# Prometheus scrape needs the token too — add a `bearerTokenSecret` ref
+# to the endpoint below. Unlike
+# the kubelet probes (which must switch to /healthz because the kubelet
+# cannot present an Authorization header), Prometheus attaches headers
+# to every scrape request, so /metrics itself stays scrapeable.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: openstudio-operator-metrics
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/name: openstudio-operator
+    app.kubernetes.io/part-of: openstudio-server
+    # kube-prometheus-stack default serviceMonitorSelector match (see
+    # header). Rename to your release if it is not `prometheus`.
+    release: prometheus
+spec:
+  # The Service lives in the operator's namespace; matchNames (not
+  # Any: true) keeps the discovery surface explicit and single-namespace.
+  namespaceSelector:
+    matchNames:
+      - openstudio-server
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openstudio-operator
+  endpoints:
+    - port: metrics # named Service port → 9090 (service-metrics.yaml)
+      path: /metrics
+      interval: 30s
