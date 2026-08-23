@@ -144,12 +144,30 @@ spec:
                           # convention (deploy/redis-credentials-secret.yaml and
                           # rotations of it); the CEL rule gives a readable
                           # apply-time message for the same constraint.
+                          #
+                          # Issue #606: the pattern deliberately stays WIDER
+                          # than the enforcement. The DEFAULT operator Role
+                          # (deploy/rbac.yaml) grants secrets:get only on the
+                          # canonical name(s) via RBAC resourceNames
+                          # (['openstudio-redis']); a custom `openstudio-redis-*`
+                          # name is apply-legal here and fails at READ time
+                          # (403 → RedisCredentialResolutionError → key-layout
+                          # "unreachable" + counted skip-ticks + a one-time
+                          # RedisSecretRefForbidden Warning from the singleton
+                          # guard). Narrowing this pattern to one fixed name
+                          # would make the field pointless and break existing
+                          # CRs at their next spec update — exact-name
+                          # enforcement belongs at the RBAC layer (resourceNames),
+                          # the mechanism Kubernetes provides for it. A cluster
+                          # admin allows a custom name by adding it to the
+                          # Role's resourceNames (deliberate, visible,
+                          # reviewable).
                           maxLength: 253
                           pattern: '^openstudio-redis[a-z0-9-]*$'
                           x-kubernetes-validations:
                             - rule: "self.startsWith('openstudio-redis')"
                               message: "spec.redisCredentials.secretRef.name must match '^openstudio-redis[a-z0-9-]*$' (issue #463)."
-                          description: "Name of a Secret in this namespace. Must match the openstudio-redis* naming convention (issue #463)."
+                          description: "Name of a Secret in this namespace. Must match the openstudio-redis* naming convention (issue #463). The DEFAULT operator Role (deploy/rbac.yaml) grants secrets:get only on the canonical name(s) via resourceNames (default: 'openstudio-redis', issue #606) — a custom name requires adding it there and fails at read time (403) until the Role is widened."
                         key:
                           type: string
                           # Secret keys are [-._a-zA-Z0-9] per the K8s API; this

@@ -4206,6 +4206,112 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
 
 
 # ---------------------------------------------------------------------------
+# Issue #606 — the operator Role's secrets:get grant is exact-name-bounded
+# by RBAC resourceNames (the GET-path fence #572's admission layer could
+# not provide: VAPs run on the mutating path only, and RBAC authz precedes
+# admission regardless). Pre-#606 the grant was namespace-wide get, so a
+# compromised operator pod could read ANY Secret in openstudio-server
+# (Mongo credentials, rclone cloud creds, TLS bundles, metrics bearer
+# tokens). The fence is fail-visible by design: the CRD pattern stays
+# wider (any openstudio-redis* name is apply-legal), so a CR naming a
+# custom Secret is denied at READ time (403 →
+# RedisCredentialResolutionError → key-layout "unreachable" + counted
+# skip-ticks + a one-time RedisSecretRefForbidden Warning from the
+# singleton guard). A cluster admin allows a custom name by adding it to
+# the rule's resourceNames — a deliberate, visible, reviewable RBAC
+# change. The tests below pin the rule shape and its consistency with
+# the shipped tooling + the CRD convention.
+# ---------------------------------------------------------------------------
+
+#: The canonical Secret name(s) the shipped tooling creates — the exact
+#: set the default Role grants. Derived from deploy/redis-credentials-
+#: secret.yaml (the committed manifest) and scripts/rotate_redis_password.
+#: sh (SECRET_NAME — the live-Secret rotation path), NOT hand-invented:
+#: if the ecosystem ever ships a second canonical name, both this tuple
+#: and deploy/rbac.yaml must grow together (the first test fails loudly
+#: on the manifest side of that drift).
+_CANONICAL_REDIS_SECRET_NAMES = ["openstudio-redis"]
+
+
+def _operator_role_secrets_rule():
+    """Return the operator Role's single ``secrets`` rule (issue #606)."""
+    matches = [
+        rule
+        for rule in OPERATOR_ROLE["rules"]
+        if rule["apiGroups"] == [""] and rule["resources"] == ["secrets"]
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one secrets rule in the operator Role, got "
+        f"{matches!r} (issue #606)"
+    )
+    return matches[0]
+
+
+def test_operator_role_secrets_get_bounded_to_canonical_resourcenames():
+    """Issue #606 acceptance: the secrets rule is `verbs: [get]` ONLY and
+    carries `resourceNames` exactly equal to the canonical set the shipped
+    tooling creates — the deploy manifest's Secret name and the rotation
+    script's SECRET_NAME must both be members (the grant can never be
+    narrower than what we ship), and nothing else may be granted (the
+    exfiltration path stays closed)."""
+    rule = _operator_role_secrets_rule()
+    assert rule["verbs"] == ["get"], (
+        f"secrets rule must stay get-only; got {rule['verbs']!r} (issues "
+        "#463/#606)"
+    )
+    granted = rule.get("resourceNames")
+    assert granted == _CANONICAL_REDIS_SECRET_NAMES, (
+        "secrets rule must carry resourceNames exactly equal to the "
+        f"canonical set {_CANONICAL_REDIS_SECRET_NAMES!r} — the #606 "
+        f"exact-name RBAC fence; got {granted!r}"
+    )
+    # The canonical set is derived, never invented: every name in it must
+    # be created by the committed Secret manifest AND by the rotation
+    # script's live-Secret path.
+    deploy_secret_doc = next(
+        d
+        for d in yaml.safe_load_all((DEPLOY / "redis-credentials-secret.yaml").read_text())
+        if d and d.get("kind") == "Secret"
+    )
+    manifest_name = deploy_secret_doc["metadata"]["name"]
+    rotate_script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "rotate_redis_password.sh"
+    ).read_text()
+    for name in granted:
+        assert name == manifest_name, (
+            f"resourceNames entry {name!r} is not the Secret name the "
+            f"committed manifest creates ({manifest_name!r}) — the grant "
+            "and the shipped tooling have drifted (issue #606)"
+        )
+        assert f'SECRET_NAME="{name}"' in rotate_script, (
+            f"resourceNames entry {name!r} is not the Secret name "
+            "scripts/rotate_redis_password.sh rotates — the grant and the "
+            "shipped tooling have drifted (issue #606)"
+        )
+
+
+def test_operator_role_secrets_resourcenames_follow_crd_convention():
+    """Cross-fence consistency: every name granted via resourceNames must
+    satisfy the CRD's `^openstudio-redis[a-z0-9-]*$` secretRef pattern —
+    the RBAC exact-name fence and the schema fence must name the same
+    convention (mirrors the #572 prefix cross-check)."""
+    rule = _operator_role_secrets_rule()
+    crd_text = (DEPLOY / "crd.yaml").read_text()
+    assert f"^{_REDIS_SECRET_NAME_PREFIX}[a-z0-9-]*$" in crd_text, (
+        "deploy/crd.yaml must keep the secretRef.name convention pattern "
+        "(checked in depth by tests/test_crd_schema.py; issue #606)"
+    )
+    pattern = re.compile(rf"^{_REDIS_SECRET_NAME_PREFIX}[a-z0-9-]*$")
+    for name in rule["resourceNames"]:
+        assert pattern.fullmatch(name), (
+            f"resourceNames entry {name!r} violates the "
+            f"{_REDIS_SECRET_NAME_PREFIX}* convention the CRD pins — the "
+            "RBAC fence would grant a name a CR could never legally "
+            "reference (issue #606)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Issue #573 — the fourth ValidatingAdmissionPolicy: the operator SA's
 # Deployment mutating surface narrowed to the two managed names,
 # `worker` and `web-background`.
