@@ -29,8 +29,23 @@ COPY src ./src
 # rebuilds the image twice produces two byte-identical `pip freeze`
 # outputs. requirements.lock (--extra=dev) remains the CI test-env
 # lockfile; refresh both together (see AGENTS.md).
+#
+# The same install provides the pinned BUILD backend (#576): hatchling
+# (plus its packaging / pathspec / pluggy / tomlkit / trove-classifiers
+# closure) is hash-pinned inside requirements.txt, so the wheel-build
+# toolchain is verified by the same --require-hashes gate as the runtime
+# deps. pyproject.toml pins the backend exactly
+# (`requires = ["hatchling==1.32.0"]`); the pin pair is drift-gated by
+# tests/test_dependency_drift.py.
+#
+# `--no-build-isolation` (#576): default isolation would silently
+# re-download the (unpinned-latest) build backend from PyPI into an
+# ephemeral env — executing unverified PyPI code inside the image build
+# and defeating both the digest-pin (#124) and the hash-pin provenance
+# (cosign/SLSA prove who built, not that the toolchain was clean).
+# `--no-deps` stays: the runtime closure is fully satisfied above.
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
- && pip install --no-cache-dir --no-deps .
+ && pip install --no-cache-dir --no-deps --no-build-isolation .
 
 # Kopf watches the namespace given at runtime; RBAC + CRD live in deploy/.
 CMD ["kopf", "run", "--module", "openstudio_operator.handlers", "--namespace", "openstudio-server"]
