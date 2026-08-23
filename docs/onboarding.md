@@ -101,7 +101,7 @@ tests/<file>` will show you the names. Use them.
 
 ### Full suite
 
-1004 tests across 45 files (run `.venv/bin/pytest --collect-only` to
+1011 tests across 45 files (run `.venv/bin/pytest --collect-only` to
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.
@@ -371,7 +371,7 @@ documents the why; do not delete it during a "cleanup" pass.
 ### Operator memory lives in `CR .status` only (D04)
 
 Maps `softStops`/`requeues`/`startedSince`/`archivedAnalyses` plus
-scalars `lastRecycleAt`/`lastWebBackgroundRestart`. In-memory state is
+scalars `lastRecycleAt`/`lastWebBackgroundRestart`/`stallWindowStartedAt` (#582). In-memory state is
 cache, never source of truth. The status store handles 409 retries
 internally — do not build a parallel retry path on top of it.
 
