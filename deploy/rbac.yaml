@@ -12,30 +12,40 @@ metadata:
   name: openstudio-operator-role
   namespace: openstudio-server
 rules:
-  # Manage Custom Resources — #228 enumerated verbs (drop wildcard).
+  # Manage Custom Resources — #228 enumerated verbs (drop wildcard);
+  # #643 trimmed dead verbs to the exercised + kopf-framework set (see
+  # tests/test_rbac_call_surface.py — the RBAC-vs-client-calls drift gate).
   # The CR itself is read-only from the operator: the singleton guard polls
-  # list_namespaced_custom_object, so get+list+watch is sufficient. The
-  # status subresource additionally needs patch+update for the StatusStore
-  # read-modify-write helper (get_namespaced_custom_object_status +
-  # patch_namespaced_custom_object_status). No delete/deletecollection/
-  # create/bind — a compromised operator pod cannot wholesale-delete the
-  # OSCM CR and bypass the singleton guard.
+  # list_namespaced_custom_object; kopf's streaming machinery additionally
+  # needs get+watch (framework allowlist, no call site in src/). The status
+  # subresource needs exactly get+patch for the StatusStore read-modify-write
+  # helper (get_namespaced_custom_object_status +
+  # patch_namespaced_custom_object_status) — #643 dropped list/watch (not
+  # servable on a subresource) and update (no call site; the RMW patches).
+  # No delete/deletecollection/create/bind — a compromised operator pod
+  # cannot wholesale-delete the OSCM CR and bypass the singleton guard.
   - apiGroups: ["energy.nrel.gov"]
     resources: ["openstudioclustermanagers"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["energy.nrel.gov"]
     resources: ["openstudioclustermanagers/status"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "patch"]
   # Manage Worker Deployments & Pod Restarts. Issue #573: the grant is
   # namespace-wide (RBAC has no workable per-name slot for a
   # CR-configurable target); the admission-layer companion narrowing
-  # this SA's Deployment patch/update surface to the `worker` and
+  # this SA's Deployment patch surface to the `worker` and
   # `web-background` names lives in
   # deploy/deployment-patch-admission-policy.yaml.
+  # #643: get+patch only — the code calls read_namespaced_deployment and
+  # patch_namespaced_deployment (_k8s.py); list/watch/update had no call
+  # sites.
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "patch"]
   # Read pods; delete for surgical escalation of zombie datapoint workers (#9).
+  # #643: list+delete only — the code calls list_namespaced_pod
+  # (analysis_sla / web_background_monitor) and delete_namespaced_pod
+  # (analysis_sla zombie eviction); get/watch had no call sites.
   # Issue #293: native RBAC has no label-selector slot, so the
   # `pods/delete` verb is unconstrained in this manifest — any pod in
   # the namespace is deletable by the operator SA. The defense-in-depth
@@ -48,11 +58,15 @@ rules:
   # pod-delete access; only this SA's destructive surface is narrowed.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
-  # Emit Kubernetes Events (soft-stop / recycle / dry-run markers)
+    verbs: ["list", "delete"]
+  # Emit Kubernetes Events (soft-stop / recycle / dry-run markers).
+  # #643: create only — Events are posted exclusively through kopf.event
+  # (kopf internally calls create_namespaced_event; framework allowlist in
+  # tests/test_rbac_call_surface.py); get/list/watch/patch had no call
+  # sites in the operator process.
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["get", "list", "watch", "create", "patch"]
+    verbs: ["create"]
   # Read ONE Secret by name for Redis connection info (issue #463) —
   # exact-name-bounded by RBAC resourceNames (issue #606).
   #

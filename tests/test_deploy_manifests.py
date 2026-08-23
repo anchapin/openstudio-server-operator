@@ -109,12 +109,16 @@ def test_operator_role_oscm_verbs_are_enumerated_subset():
     enumerate a least-privilege subset of {get, list, watch, patch,
     update}. The CR itself is read-only from the operator (singleton
     guard polls list_namespaced_custom_object) — get+list+watch is
-    sufficient. The status subresource additionally needs patch+update
-    for the StatusStore read-modify-write helper
-    (get_namespaced_custom_object_status +
-    patch_namespaced_custom_object_status)."""
+    sufficient (get+watch also serve kopf's streaming machinery; see the
+    framework allowlist in tests/test_rbac_call_surface.py). The status
+    subresource needs exactly get+patch for the StatusStore read-modify-
+    write helper (get_namespaced_custom_object_status +
+    patch_namespaced_custom_object_status) — #643 trimmed list/watch
+    (unservable on a subresource) and update (no call site; the RMW
+    patches). The #643 drift gate derives the floor from call sites;
+    this test remains the #228 static cap."""
     allowed_for_cr = {"get", "list", "watch"}
-    allowed_for_status = {"get", "list", "watch", "patch", "update"}
+    allowed_for_status = {"get", "patch"}
     offenders = []
     for rule in OPERATOR_ROLE["rules"]:
         if "energy.nrel.gov" not in rule["apiGroups"]:
