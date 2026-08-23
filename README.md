@@ -79,6 +79,14 @@ action counters, the tick-duration histograms, the Resque queue gauges
 templated as `${DS_PROMETHEUS}`).
 `tests/test_monitoring_artifacts.py` fails CI if either artifact
 references a metric family missing from `tests/_metrics_inventory.py`.
+Since #646 the PrometheusRule also ships the
+`OpenStudioOperatorScrapeTargetDown` companion
+(`up{job="openstudio-operator"} == 0 or absent(...)`, `for: 5m`) and
+trailing `or absent(...)` arms on the liveness alerts (heartbeat, bind
+gauge, both freshness gauges), so scrape-target loss — pod down,
+crashloop, or the #166 wrong-namespace NetworkPolicy mode — is itself
+alerting instead of silently resolving every operator-liveness alert
+past the ~5m Prometheus lookback.
 
 **Source of truth:** the family names below mirror
 `tests/_metrics_inventory.py` — the canonical `EXPECTED_COUNTER_FAMILIES`,

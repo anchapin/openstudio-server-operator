@@ -970,6 +970,26 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   finally (wiring-failing-but-scheduled reads ALIVE + climbing, the
   signature SREs need). Non-tuple wiring errors (e.g. `RuntimeError`)
   still propagate fail-closed.
+- **`#646`** — target loss is itself alerting. New critical companion
+  `OpenStudioOperatorScrapeTargetDown`:
+  `up{job="openstudio-operator"} == 0 or
+  absent(openstudio_operator_handler_last_tick_timestamp)`, `for: 5m` —
+  the `up` arm is the sub-lookback fast path (fires within ~2 scrape
+  intervals of a configured-but-failing target; the job label is the
+  one implied by the manifest's `app.kubernetes.io/name` label, inert
+  if the scrape config names it differently), the `absent` arm is the
+  label-independent fallback covering no-target-configured and the
+  documented `#166` wrong-namespace NetworkPolicy mode where the series
+  never existed from boot. The liveness family gains trailing
+  `or absent(...)` arms (the `#569`/`#645` "TRUE absence must fire"
+  idiom) so NO DATA evaluates to FIRING instead of silent resolution
+  past the ~5m Prometheus lookback: the `#469` heartbeat
+  (per-module 3x thresholds unchanged — `#581` still fences them), the
+  `#393` metrics-server bind gauge, and both `#312` freshness gauges.
+  Covered modes documented per alert: pod-down, crashloop, and
+  NetworkPolicy-misconfig scrape loss. Drift-gated by the `#646` section
+  of `tests/test_monitoring_artifacts.py` (companion canonical-shape
+  fullmatch + firing-scenario simulation + absence-arm inventory).
 
 ### Added
 - **`#394`** — `ARCHIVAL_JOB_ACTIVE_DEADLINE_SECONDS` (6× the chart's

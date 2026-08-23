@@ -34,6 +34,19 @@ exactly the no-event modes it exists for. A scenario simulation evaluates
 the parsed arms, including the #645 regression ("3 retained successes,
 no new Job for 1h → MUST be armed").
 
+Issue #646 adds the fourth invariant: target loss must itself be
+alerting. Every operator-liveness alert keyed on an operator-exported
+series self-resolved once the series fell out of Prometheus's ~5m
+lookback (pod down / crashloop) or never existed (#166 wrong-namespace
+NetworkPolicy scrape loss). The gates below pin (a) the
+``OpenStudioOperatorScrapeTargetDown`` companion — canonical two-arm
+shape (``up{job="openstudio-operator"} == 0`` fast path + the
+label-independent ``absent(handler_last_tick_timestamp)`` fallback) plus
+a firing-scenario simulation over pod-down / crashloop / #166 modes, and
+(b) the trailing ``or absent(...)`` absence arms on the liveness family
+(heartbeat, metrics-server bind, both #312 freshness gauges), while the
+#581 per-module threshold fence keeps guarding the series-present legs.
+
 Scope guard (#485): these tests deliberately do NOT pin the full deploy/
 file inventory — the deploy-inventory CI guard is owned by #485. Only the
 two #468 artifacts and their referenced families are covered here.
@@ -275,6 +288,13 @@ _HEARTBEAT_CLAUSE_RE = re.compile(
 #: docstring in metrics.py.
 _HEARTBEAT_THRESHOLD_MULTIPLIER = 3
 
+#: The #646 absence leg — the canonical trailing arm that keeps the
+#: heartbeat FIRING when the family has NO series at all (pod down /
+#: crashloop past the ~5m Prometheus lookback, or #166 scrape-path loss
+#: so the series never existed). Exact-match (not a pattern): the leg is
+#: a fixed idiom, and a hand-edited variant must fail structurally.
+_HEARTBEAT_ABSENCE_LEG = "absent(openstudio_operator_handler_last_tick_timestamp)"
+
 
 def _heartbeat_alert_expr() -> str:
     """Return the expr of the (unique) heartbeat alert rule."""
@@ -293,17 +313,24 @@ def _heartbeat_alert_expr() -> str:
 def _heartbeat_alert_clauses() -> dict[str, float]:
     """Parse the heartbeat expr into ``{module_label: threshold_seconds}``.
 
-    Every ``or``-separated leg must ``fullmatch`` the canonical staleness
-    shape, so the parse doubles as a structure check: an edited expr that
-    no longer consists solely of per-module staleness legs fails here.
+    Every ``or``-separated leg except the optional trailing #646 absence
+    leg must ``fullmatch`` the canonical staleness shape, so the parse
+    doubles as a structure check: an edited expr that no longer consists
+    solely of per-module staleness legs (plus at most the absence arm)
+    fails here.
     """
+    legs = [leg.strip() for leg in _heartbeat_alert_expr().split(" or ")]
+    if legs and legs[-1] == _HEARTBEAT_ABSENCE_LEG:
+        legs = legs[:-1]
     clauses: dict[str, float] = {}
-    for leg in _heartbeat_alert_expr().split(" or "):
-        match = _HEARTBEAT_CLAUSE_RE.fullmatch(leg.strip())
+    for leg in legs:
+        match = _HEARTBEAT_CLAUSE_RE.fullmatch(leg)
         assert match, (
             f"heartbeat alert leg does not match the canonical "
             f"per-module staleness shape "
-            f"`time() - ...handler_last_tick_timestamp{{module=\"X\"}} > N`: {leg!r}"
+            f"`time() - ...handler_last_tick_timestamp{{module=\"X\"}} > N` "
+            f"(or, as the final leg, the #646 absence arm "
+            f"{_HEARTBEAT_ABSENCE_LEG!r}): {leg!r}"
         )
         clauses[match["module"]] = float(match["threshold"])
     return clauses
@@ -625,6 +652,202 @@ def test_prune_no_success_bootstrap_arm_covers_never_succeeded():
         parsed, last_successful_age=300,
         last_schedule_age=2 * _PRUNE_NO_SUCCESS_WINDOW_SECONDS,
     ), "recent success + stale schedule must not arm (unless keeps arms disjoint)"
+
+
+# ---------------------------------------------------------------------------
+# Issue #646 — target-down companion + absence-proofed liveness alerts.
+#
+# Every operator-liveness alert keyed on an operator-exported series
+# (heartbeat, metrics-server bind, both #312 freshness gauges)
+# self-resolved on scrape loss: past the ~5m Prometheus lookback the
+# staleness/`== 0` expressions return NO DATA and the alert goes quiet
+# exactly while the operator is dead — and in the documented #166 mode
+# (Prometheus in a namespace the metrics NetworkPolicy does not allow)
+# the series never existed from boot, so the #469 heartbeat never fired
+# at all. The gates below pin the #646 fix: the
+# OpenStudioOperatorScrapeTargetDown companion (canonical two-arm shape +
+# firing-scenario simulation, the #645 discipline) and the trailing
+# ``or absent(...)`` arms on the liveness family (the #569/#645 "TRUE
+# absence must fire" idiom applied to the operator's own critical
+# scheduler-liveness signals).
+# ---------------------------------------------------------------------------
+
+#: Name of the target-down companion alert in deploy/prometheustrule.yaml.
+_TARGET_DOWN_ALERT_NAME = "OpenStudioOperatorScrapeTargetDown"
+
+#: The canonical two-arm #646 shape: the fast scrape-failure path on the
+#: `up` series for the operator's scrape job (the job label implied by
+#: the manifest's `app.kubernetes.io/name` label), `or` the
+#: label-independent absence fallback on the heartbeat family — no
+#: series at all covers "no scrape target configured", a renamed job
+#: label, and the #166 never-scraped-from-boot mode. Used with
+#: ``fullmatch`` so a hand-edited drift fails structurally.
+_TARGET_DOWN_EXPR_RE = re.compile(
+    r'up\{job="openstudio-operator"\} == 0'
+    r" or absent\(openstudio_operator_handler_last_tick_timestamp\)"
+)
+
+#: The liveness alerts that MUST carry a trailing absence arm (#646):
+#: alert name -> (canonical series-present prefix, absence-proofed family).
+_ABSENCE_PROOFED_LIVENESS_ALERTS = {
+    "OpenStudioOperatorMetricsServerUnbound": (
+        "openstudio_operator_metrics_server_bound == 0",
+        "openstudio_operator_metrics_server_bound",
+    ),
+    "OpenStudioOperatorResqueQueueDepthStale": (
+        "time() - openstudio_operator_resque_queue_depth_fresh > 300",
+        "openstudio_operator_resque_queue_depth_fresh",
+    ),
+    "OpenStudioOperatorStallWindowStale": (
+        "time() - openstudio_operator_stall_window_fresh > 300",
+        "openstudio_operator_stall_window_fresh",
+    ),
+}
+
+
+def test_heartbeat_alert_carries_absence_arm():
+    """#646: the heartbeat expr ends with the canonical absence leg.
+
+    Without it the #469 alert RESOLVED once the family fell out of the
+    ~5m Prometheus lookback (pod down / crashloop) and never fired at all
+    in the #166 never-scraped mode — the single most severe failure class
+    handled worst. The per-module staleness legs keep their series-present
+    semantics (fenced by the #581 tests above); this gate pins the
+    trailing arm and its position (last, so every module leg is tried
+    before absence is concluded).
+    """
+    legs = [leg.strip() for leg in _heartbeat_alert_expr().split(" or ")]
+    assert legs[-1] == _HEARTBEAT_ABSENCE_LEG, (
+        f"{_HEARTBEAT_ALERT_NAME} must end with the #646 absence arm "
+        f"`or {_HEARTBEAT_ABSENCE_LEG}` so NO DATA (pod down / crashloop "
+        f"past the Prometheus lookback, #166 scrape-path loss) evaluates "
+        f"to FIRING rather than silent resolution — found final leg "
+        f"{legs[-1]!r}"
+    )
+
+
+def _target_down_alert() -> dict:
+    """Return the (unique) target-down companion rule."""
+    matches = [
+        alert
+        for alert in _prometheusrule_alerts()
+        if alert.get("alert") == _TARGET_DOWN_ALERT_NAME
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {_TARGET_DOWN_ALERT_NAME} rule in "
+        f"{PROMETHEUSRULE_PATH.name}, found {len(matches)} (issue #646)"
+    )
+    return matches[0]
+
+
+def test_scrape_target_down_companion_matches_canonical_shape():
+    """#646: the companion exists, is the two-arm shape, and dwells 5m.
+
+    The ``up`` arm is the sub-lookback fast path (fires within ~2 scrape
+    intervals of a configured-but-failing target); the ``absent`` arm is
+    the label-independent fallback. A companion keyed on the operator's
+    own series ONLY (no ``up`` arm) or on a bare ``up`` without the
+    absence fallback silently misses one of the two halves. The 5m
+    ``for`` dwells past a single missed scrape / a normal single-replica
+    Recreate restart.
+    """
+    alert = _target_down_alert()
+    expr = alert["expr"]
+    assert _TARGET_DOWN_EXPR_RE.fullmatch(expr), (
+        f"{_TARGET_DOWN_ALERT_NAME} expr does not fullmatch the canonical "
+        f"#646 two-arm shape `up{{job=\"openstudio-operator\"}} == 0 or "
+        f"absent(openstudio_operator_handler_last_tick_timestamp)`: "
+        f"{expr!r}"
+    )
+    assert alert.get("for") == "5m", (
+        f"{_TARGET_DOWN_ALERT_NAME} must carry `for: 5m` (dwell past one "
+        f"missed scrape / a Recreate restart; sustained loss pages)"
+    )
+    assert alert.get("labels", {}).get("severity") == "critical", (
+        f"{_TARGET_DOWN_ALERT_NAME} is the target-level liveness page — "
+        f"severity must stay critical"
+    )
+    description = alert.get("annotations", {}).get("description", "")
+    assert "#166" in description and "crashloop" in description.lower(), (
+        f"{_TARGET_DOWN_ALERT_NAME} description must document the covered "
+        f"modes: pod-down, crashloop, and #166 NetworkPolicy-misconfig "
+        f"scrape loss"
+    )
+
+
+def test_scrape_target_down_companion_covers_target_loss_scenarios():
+    """#646 acceptance: each target-loss mode MUST arm the companion.
+
+    Scenario simulation over the parsed arms (the #645 discipline):
+    ``up_value`` None means the ``up`` series is ABSENT (no scrape target
+    under the documented job label — including the #166
+    never-scraped-from-boot mode); ``heartbeat_present`` False means the
+    heartbeat family has no series (past the ~5m lookback, or never
+    ingested). The regression direction: pre-#646, every scenario except
+    the first left ALL operator-liveness alerts silently resolved.
+    """
+
+    def simulate(*, up_value: float | None, heartbeat_present: bool) -> bool:
+        arm_up = up_value is not None and up_value == 0
+        arm_absent = not heartbeat_present
+        return arm_up or arm_absent
+
+    # Crashloop / pod-down with the target still configured: up==0 fires
+    # within ~2 scrape intervals — BEFORE the lookback GCs the series.
+    assert simulate(up_value=0, heartbeat_present=True), (
+        "configured-but-failing target (up==0) must arm (crashloop / "
+        "pod-down fast path)"
+    )
+    # Pod down past the lookback: up==0 AND the family GC'd — both arms.
+    assert simulate(up_value=0, heartbeat_present=False), (
+        "pod down past the Prometheus lookback must arm"
+    )
+    # THE #166 regression: scraper in a disallowed namespace (or no
+    # scrape target / renamed job at all) — no up series, no heartbeat
+    # series, ever. Pre-#646 nothing fired from boot.
+    assert simulate(up_value=None, heartbeat_present=False), (
+        "never-scraped mode (#166 wrong-namespace NetworkPolicy / no "
+        "target configured) must arm via the absence fallback"
+    )
+    # Healthy: scrape succeeding and the family present — quiet.
+    assert not simulate(up_value=1, heartbeat_present=True), (
+        "healthy scrape must not arm the companion"
+    )
+    # Renamed job label (up absent) with a fresh heartbeat — the
+    # absence fallback stays quiet: renaming the job does not
+    # false-positive.
+    assert not simulate(up_value=None, heartbeat_present=True), (
+        "absent up series with a live heartbeat family must not arm "
+        "(renamed job label is not target loss)"
+    )
+
+
+def test_liveness_alerts_carry_absence_arms():
+    """#646: the bind gauge + both #312 freshness alerts end with the arm.
+
+    Same self-resolve bug as the heartbeat: past the lookback (or in the
+    #166 never-scraped mode) the series-present expression returns NO
+    DATA and the alert went quiet while the operator was dead. The
+    series-present prefix is pinned too — the absence arm must be
+    ADDITIVE, not a rewrite that drops the staleness/`== 0` semantics.
+    """
+    alerts = {
+        alert.get("alert"): alert["expr"] for alert in _prometheusrule_alerts()
+    }
+    for alert_name, (prefix, family) in _ABSENCE_PROOFED_LIVENESS_ALERTS.items():
+        expr = alerts.get(alert_name)
+        assert expr is not None, f"{alert_name} missing from the PrometheusRule"
+        expected_arm = f"or absent({family})"
+        assert expr.startswith(prefix), (
+            f"{alert_name} must keep its series-present semantics — the "
+            f"expr must start with {prefix!r} (found {expr!r})"
+        )
+        assert expr.endswith(expected_arm), (
+            f"{alert_name} must end with the #646 absence arm "
+            f"`{expected_arm}` so NO DATA (pod down / crashloop past the "
+            f"Prometheus lookback, #166 scrape-path loss) evaluates to "
+            f"FIRING rather than silent resolution (found {expr!r})"
+        )
 
 
 def test_grafana_dashboard_parses_with_templated_datasource():
