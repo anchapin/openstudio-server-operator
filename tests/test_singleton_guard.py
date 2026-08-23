@@ -17,7 +17,9 @@ import pytest
 from kubernetes.client import ApiException, CustomObjectsApi
 from kubernetes.config import ConfigException
 
+from _fakes import FakeSecretsCoreV1Api, encode_secret_value
 from openstudio_operator import singleton
+from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.singleton import (
     SINGLETON_ACTIVE_EVENT,
     SINGLETON_CONFLICT_EVENT,
@@ -750,7 +752,13 @@ def test_url_guard_silent_when_secret_ref_present(caplog, log, monkeypatch):
     ``spec.redisCredentials.secretRef`` is the RECOMMENDED production shape
     (the URL resolves from the Secret at client-construction time), so the
     #116 ``RedisUrlEmpty`` Warning must NOT fire for it. The fence stays
-    armed for an empty URL with NO secretRef (the companion tests above)."""
+    armed for an empty URL with NO secretRef (the companion tests above).
+
+    Since #606 the guard also PROBES the secretRef resolution once per CR
+    (the fail-visible RBAC fence); a resolvable Secret yields no event, so
+    this test doubles as the probe's success-path silence pin — the fake
+    Secret API keeps it hermetic (no live read on a kubeconfig-bearing
+    host)."""
     secret_ref_spec = {
         "serverUrl": "http://a.test",
         "redisUrl": "",
@@ -762,24 +770,39 @@ def test_url_guard_silent_when_secret_ref_present(caplog, log, monkeypatch):
         )
     )
     monkeypatch.setattr(singleton, "_process_guard", guard)
+    fake_secret = FakeSecretsCoreV1Api(
+        {"redis-url": encode_secret_value("redis://:pw@queue.openstudio-server.svc.cluster.local:6379")}
+    )
+    monkeypatch.setattr(singleton, "_operator_core_api", fake_secret)
+    monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
     events, emit = make_sink()
     monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
 
-    singleton.singleton_guard_event(
-        body=make_cr("alpha", OLD_TS, spec=secret_ref_spec),
-        namespace=NAMESPACE,
-        name="alpha",
-        logger=log,
-        patch={},
-        type="ADDED",
-    )
+    get_read_only_redis_client.cache_clear()
+    try:
+        singleton.singleton_guard_event(
+            body=make_cr("alpha", OLD_TS, spec=secret_ref_spec),
+            namespace=NAMESPACE,
+            name="alpha",
+            logger=log,
+            patch={},
+            type="ADDED",
+        )
+    finally:
+        get_read_only_redis_client.cache_clear()
 
     url_events = [t for t in event_triples(events) if t[2] == "RedisUrlEmpty"]
     assert url_events == [], (
         f"RedisUrlEmpty must not fire when spec.redisCredentials.secretRef "
         f"is populated (issue #463 — Secret-sourced URL is the recommended "
         f"shape for an empty spec.redisUrl). Got: {url_events!r}."
+    )
+    forbidden = [t for t in event_triples(events) if t[2] == "RedisSecretRefForbidden"]
+    assert forbidden == [], (
+        f"a RESOLVABLE secretRef must not fire RedisSecretRefForbidden "
+        f"(issue #606 — only the RBAC-denied 403 case does); got "
+        f"{forbidden!r}"
     )
 
 
@@ -814,8 +837,9 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
 
     assert ("alpha", "Warning", "RedisUrlEmpty") in event_triples(events)
 
-
-
+    # Second scenario in the same test (pre-existing, kept verbatim): the
+    # guard's CR LIST exploding must not crash the event wrapper — the
+    # #116/#606 emit paths run after the list try/except returns.
     monkeypatch.setattr(singleton, "_process_guard", SingletonGuard(ExplodingCustomObjectsApi(items=[])))
     events, emit = make_sink()
     monkeypatch.setattr(singleton, "emit_kopf_event", emit)
@@ -830,6 +854,140 @@ def test_url_guard_fires_when_secret_ref_is_malformed(caplog, log, monkeypatch):
     )
     assert events == []
     assert any("could not list OSCM CRs" in r.getMessage() for r in caplog.records)
+
+
+# ---- Issue #606: the RBAC resourceNames fence is fail-visible ----------------
+#
+# The default operator Role grants secrets:get only on the canonical
+# Secret name(s) (deploy/rbac.yaml resourceNames — default
+# 'openstudio-redis'); the CRD pattern stays wider, so a CR naming a
+# custom openstudio-redis-* Secret is apply-legal and DENIED at read time
+# (403). The guard probes the secretRef resolution once per CR and, on
+# the 403, emits a one-time RedisSecretRefForbidden Warning naming the
+# RBAC cause and both remedies (widen resourceNames / fix the secretRef).
+# These tests fake the Secret read at singleton._operator_core_api (the
+# same seam tests/test_client_factory.py uses) so nothing touches a live
+# cluster.
+
+_SECRET_REF_SPEC_606 = {
+    "serverUrl": "http://a.test",
+    "redisUrl": "",
+    # Pattern-legal (CRD) but NOT in the default Role's resourceNames —
+    # the exact custom-name scenario #606's fail-visible variant owns.
+    "redisCredentials": {
+        "secretRef": {"name": "openstudio-redis-url", "key": "redis-url"}
+    },
+}
+
+
+def _guard_with_secret_ref_cr(fake_secret):
+    """Wire ``_process_guard`` to one CR naming a custom redis Secret."""
+    return SingletonGuard(
+        ListOnlyFakeCustomObjectsApi(
+            items=[make_cr("alpha", OLD_TS, uid="uid-alpha", spec=_SECRET_REF_SPEC_606)]
+        )
+    )
+
+
+def _run_guard_event(monkeypatch, log, fake_secret):
+    """Fire one singleton_guard_event with the #606 probe fakes installed."""
+    monkeypatch.setattr(singleton, "_process_guard", _guard_with_secret_ref_cr(fake_secret))
+    monkeypatch.setattr(singleton, "_operator_core_api", fake_secret)
+    events, emit = make_sink()
+    monkeypatch.setattr(singleton, "emit_kopf_event", emit)
+    get_read_only_redis_client.cache_clear()
+    try:
+        singleton.singleton_guard_event(
+            body=make_cr("alpha", OLD_TS, spec=_SECRET_REF_SPEC_606),
+            namespace=NAMESPACE,
+            name="alpha",
+            logger=log,
+            patch={},
+            type="ADDED",
+        )
+    finally:
+        get_read_only_redis_client.cache_clear()
+    return events
+
+
+def test_secret_ref_403_emits_forbidden_warning_naming_rbac_remedy(log, monkeypatch):
+    """Issue #606 acceptance: a 403 on the secretRef Secret read emits a
+    Warning Event attached to the CR that names the RBAC resourceNames
+    cause and BOTH remedies — not a generic resolution failure."""
+    fake_secret = FakeSecretsCoreV1Api(exc=ApiException(status=403, reason="Forbidden"))
+    monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
+
+    events = _run_guard_event(monkeypatch, log, fake_secret)
+
+    forbidden = [e for e in events if e[2] == "RedisSecretRefForbidden"]
+    assert len(forbidden) == 1, (
+        f"expected exactly one RedisSecretRefForbidden Warning on a 403 "
+        f"secretRef read (issue #606); got {event_triples(events)!r}"
+    )
+    obj, event_type, _reason, message = forbidden[0]
+    assert event_type == "Warning"
+    assert obj["metadata"]["name"] == "alpha"
+    for token in (
+        "openstudio-redis-url",
+        "403 Forbidden",
+        "resourceNames",
+        "rbac.yaml",
+        "openstudio-redis",
+        "#606",
+    ):
+        assert token in message, (
+            f"the RedisSecretRefForbidden message must name {token!r} so "
+            f"the SRE knows either widening step to take (issue #606); "
+            f"got: {message!r}"
+        )
+    # The probe read exactly the referenced Secret, in the CR's namespace.
+    assert fake_secret.calls == [("openstudio-redis-url", NAMESPACE)]
+
+
+def test_secret_ref_403_warning_fires_once_per_cr(log, monkeypatch):
+    """The probe is at-most-once per CR per operator restart (the
+    ``_redis_secret_ref_forbidden_warned`` cache, mirroring
+    ``_redis_url_warned``): a re-fire on every watch event would spam the
+    Event stream AND re-read a Secret the Role denies forever."""
+    fake_secret = FakeSecretsCoreV1Api(exc=ApiException(status=403, reason="Forbidden"))
+    monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
+
+    events_first = _run_guard_event(monkeypatch, log, fake_secret)
+    events_second = _run_guard_event(monkeypatch, log, fake_secret)
+
+    assert len([e for e in events_first if e[2] == "RedisSecretRefForbidden"]) == 1
+    assert [e for e in events_second if e[2] == "RedisSecretRefForbidden"] == [], (
+        "second guard pass on the same CR must NOT re-fire "
+        "RedisSecretRefForbidden (issue #606 once-per-(ns,name) cache in "
+        "singleton._redis_secret_ref_forbidden_warned)"
+    )
+    assert len(fake_secret.calls) == 1, (
+        "the known-403 CR must not be re-probed on subsequent watch "
+        "events (issue #606)"
+    )
+
+
+def test_secret_ref_missing_secret_no_forbidden_event_and_reprobes(log, monkeypatch):
+    """A 404 (missing Secret) is NOT the RBAC case — no event — and the CR
+    stays UNMARKED so the next watch event re-probes: missing-Secret is a
+    transient condition (the Secret may be created later), unlike the
+    static RBAC mismatch."""
+    fake_secret = FakeSecretsCoreV1Api(exc=ApiException(status=404, reason="Not Found"))
+    monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
+
+    events_first = _run_guard_event(monkeypatch, log, fake_secret)
+    events_second = _run_guard_event(monkeypatch, log, fake_secret)
+
+    for events in (events_first, events_second):
+        assert [e for e in events if e[2] == "RedisSecretRefForbidden"] == [], (
+            "a 404 is a missing-Secret failure (#567 surfaces), not the "
+            "RBAC fence — RedisSecretRefForbidden must stay silent "
+            "(issue #606)"
+        )
+    assert len(fake_secret.calls) == 2, (
+        "non-403 resolution failures leave the CR unmarked so the next "
+        "watch event re-probes (issue #606)"
+    )
 
 
 def test_startup_wrapper_zero_crs_logs_idle_once(caplog, log, monkeypatch):

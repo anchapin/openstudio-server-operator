@@ -73,6 +73,7 @@ from kubernetes.config import ConfigException
 from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_SPEC, CRD_VERSION
 from openstudio_operator._k8s import apply_request_timeout, load_operator_kube_config
 from openstudio_operator._time import utc_parser
+from openstudio_operator.config import RedisSecretRef
 from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.metrics import (
     HANDLER_TICK_FAILURES_TOTAL,
@@ -740,14 +741,42 @@ def _check(namespace: str | None, logger: logging.Logger) -> None:
     # Issue #116 — emit a one-time Warning per CR whose ``spec.redisUrl``
     # is empty. The operator cannot service Modules 3/5 (worker
     # recycling, web_background stall) without a Redis URL, and the
-    # historical default ``redis://:openstudio@queue...`` was a
+    # historical default `redis://:openstudio@queue...` was a
     # secret-leak that the empty default now explicitly rejects. The
     # single-callback cache is keyed on ``(namespace, name)`` so the
     # message is at most once per CR per operator restart.
     _emit_redis_url_guard_events(items, logger=logger)
+    # Issue #606 — the RBAC resourceNames fence is fail-visible: probe the
+    # Secret read once per CR so a 403 (custom secretRef name outside the
+    # Role's canonical grant) surfaces as a Warning Event naming the RBAC
+    # cause, not just as counted skip-ticks.
+    _emit_redis_secret_ref_forbidden_events(items, logger=logger)
 
 
 _redis_url_warned: set[tuple[str, str]] = set()
+
+
+def _redis_secret_ref_of(spec: dict) -> RedisSecretRef | None:
+    """Extract a well-formed ``secretRef`` from a raw spec (issues #463, #606).
+
+    Tolerant shape check (the CRD enforces ``{name, key}`` strings; this
+    runs on raw watch bodies, so it must not raise on hand-crafted specs):
+    returns a :class:`~openstudio_operator.config.RedisSecretRef` only when
+    ``spec.redisCredentials.secretRef`` carries non-empty string ``name``
+    and ``key``; anything else (absent, half-configured, wrong types)
+    yields ``None``.
+    """
+    credentials = spec.get("redisCredentials")
+    if not isinstance(credentials, dict):
+        return None
+    secret_ref = credentials.get("secretRef")
+    if not isinstance(secret_ref, dict):
+        return None
+    name = secret_ref.get("name")
+    key = secret_ref.get("key")
+    if not isinstance(name, str) or not isinstance(key, str) or not name or not key:
+        return None
+    return RedisSecretRef(name=name, key=key)
 
 
 def _has_redis_secret_ref(spec: dict) -> bool:
@@ -757,13 +786,7 @@ def _has_redis_secret_ref(spec: dict) -> bool:
     runs on raw watch bodies, so it must not raise on hand-crafted specs):
     any dict carrying non-empty ``name`` and ``key`` counts as set.
     """
-    credentials = spec.get("redisCredentials")
-    if not isinstance(credentials, dict):
-        return False
-    secret_ref = credentials.get("secretRef")
-    if not isinstance(secret_ref, dict):
-        return False
-    return bool(secret_ref.get("name")) and bool(secret_ref.get("key"))
+    return _redis_secret_ref_of(spec) is not None
 
 
 def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
@@ -838,6 +861,101 @@ def _emit_redis_url_guard_events(items, *, logger: logging.Logger) -> None:
                     "`openstudio` and has been removed."
                 ),
             )
+
+
+_redis_secret_ref_forbidden_warned: set[tuple[str, str]] = set()
+
+
+def _emit_redis_secret_ref_forbidden_events(items, *, logger: logging.Logger) -> None:
+    """Issue #606 — one-time ``RedisSecretRefForbidden`` Warning per CR whose
+    secretRef names a Secret the operator Role cannot read.
+
+    The #606 fence is the RBAC ``resourceNames`` contract in
+    ``deploy/rbac.yaml``: the operator SA's ``secrets: get`` grant covers
+    only the canonical Secret name(s) the shipped tooling creates (default:
+    ``openstudio-redis``). The CRD pattern stays wider (any
+    ``openstudio-redis*`` name is apply-legal), so a CR naming a custom
+    Secret is denied at READ time — pre-#606 that surfaced only as counted
+    skip-ticks and a key-layout ``"unreachable"`` log line carrying a bare
+    ``403 Forbidden``. This probe makes it fail-visible: once per CR, the
+    guard resolves the secretRef through the SAME factory path the ticks
+    use and, on a 403 (detected via the ``__cause__`` ApiException the
+    factory chains), emits a Warning Event naming the RBAC cause and both
+    remedies — widen the Role's ``resourceNames`` or point the secretRef
+    at a granted Secret.
+
+    Semantics:
+
+    * **403** — mark ``(namespace, name)`` as warned (at-most-once per CR
+      per operator restart, mirroring ``_redis_url_warned``), log loudly,
+      and emit the Event. Re-probing a known-403 on every watch event
+      would only re-read a Secret the Role denies forever.
+    * **Success** — mark and stay silent (the probe doubles as a warm-up
+      of the factory's client LRU).
+    * **Any other resolution failure** (404 missing Secret, missing key,
+      bad value, no kubeconfig / connectivity) — stay silent AND stay
+      unmarked: those are the #567 surfaces (key-layout status, counted
+      skip-ticks) and may be transient, so the next watch event re-probes
+      once the condition clears.
+
+    The probe must never crash the guard: every failure mode is caught
+    (broad-except by design — a boot-time probe outranking the operator's
+    own boot would be its own incident). The factory import is
+    function-local because ``client_factory`` imports
+    ``operator_core_api`` from THIS module — a module-level import would
+    be a cycle; deferred to call time it is the standard break.
+    """
+    from openstudio_operator.client_factory import get_read_only_redis_client
+
+    for item in items:
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
+        ns = str(meta.get("namespace") or "")
+        nm = str(meta.get("name") or "")
+        if not ns or not nm:
+            continue
+        if (ns, nm) in _redis_secret_ref_forbidden_warned:
+            continue
+        spec = item.get("spec") or {}
+        ref = _redis_secret_ref_of(spec) if isinstance(spec, dict) else None
+        if ref is None:
+            continue
+        try:
+            get_read_only_redis_client("", secret_ref=ref, namespace=ns)
+        except Exception as exc:  # noqa: BLE001 — the probe must never crash the guard
+            cause = exc.__cause__
+            if not (isinstance(cause, ApiException) and cause.status == 403):
+                continue
+            _redis_secret_ref_forbidden_warned.add((ns, nm))
+            logger.warning(
+                "OSCM %s/%s: Secret read for spec.redisCredentials."
+                "secretRef %r DENIED (403 Forbidden, issue #606): the "
+                "operator Role grants secrets:get only on the canonical "
+                "name(s) in deploy/rbac.yaml resourceNames (default: "
+                "'openstudio-redis'). Either add %r to the Role's "
+                "resourceNames (a deliberate, reviewable RBAC change) or "
+                "point the secretRef at a granted Secret. Until then every "
+                "Redis-dependent tick skips with a counted failure.",
+                ns, nm, ref.name, ref.name,
+            )
+            emit_kopf_event(
+                {"metadata": {"namespace": ns, "name": nm}},
+                "Warning",
+                "RedisSecretRefForbidden",
+                (
+                    f"Secret read for spec.redisCredentials.secretRef "
+                    f"{ref.name!r} was denied (403 Forbidden, issue #606): "
+                    f"the default operator Role (deploy/rbac.yaml) grants "
+                    f"secrets:get only on the canonical name(s) via "
+                    f"resourceNames (default: 'openstudio-redis'). Either "
+                    f"add {ref.name!r} to the Role's resourceNames (a "
+                    f"deliberate, reviewable RBAC change) or point "
+                    f"spec.redisCredentials.secretRef at a granted Secret. "
+                    f"Redis-dependent ticks skip with counted failures "
+                    f"until resolved."
+                ),
+            )
+        else:
+            _redis_secret_ref_forbidden_warned.add((ns, nm))
 
 
 @kopf.on.startup()

@@ -77,9 +77,16 @@ This is the operator's ONE bounded exception to "never reads Secrets": a
 acceptance criterion explicitly demands the operator resolve in-process
 (rclone ``envFrom`` mounting is not available here — the Redis client needs
 the URL as a constructor argument). The grant is namespaced ``get``-only in
-``deploy/rbac.yaml``; the CRD pins the Secret name to the
-``openstudio-redis*`` convention (#240-style fence) so a CR-write principal
-cannot point the operator at arbitrary Secrets.
+``deploy/rbac.yaml`` and, since #606, exact-name-bounded by RBAC
+``resourceNames`` (the canonical Secret name(s) the shipped tooling creates
+— default ``openstudio-redis``); the CRD additionally pins the Secret name
+to the ``openstudio-redis*`` convention (#240-style fence) so a CR-write
+principal cannot point the operator at arbitrary Secrets. A CR naming a
+non-granted Secret fails visible: 403 →
+:class:`~openstudio_operator.redis_client.RedisCredentialResolutionError`
+(below) → key-layout ``"unreachable"`` + counted skip-ticks, plus a
+one-time ``RedisSecretRefForbidden`` Warning Event from the singleton
+guard.
 
 Cache semantics on the Secret path (issues #463, #568): the Secret is
 re-resolved on EVERY call — one bounded ``secrets: get`` per secret-path
@@ -230,9 +237,13 @@ def _resolve_redis_url(
     is the bounded exception issue #463's acceptance criterion demands —
     the client needs the URL as a constructor argument, so the rclone-style
     ``envFrom`` hand-off is not available for this consumer. The RBAC grant
-    is namespaced ``get``-only on Secrets (``deploy/rbac.yaml``), and the
-    CRD pins the Secret name to the ``openstudio-redis*`` convention so a
-    CR-write principal cannot make the operator read arbitrary Secrets.
+    is namespaced ``get``-only on Secrets and, since #606, exact-name-bounded
+    by ``resourceNames`` in ``deploy/rbac.yaml`` (canonical name(s) only —
+    default ``openstudio-redis``); the CRD additionally pins the Secret
+    name to the ``openstudio-redis*`` convention so a CR-write principal
+    cannot make the operator read arbitrary Secrets. A 403 on this read
+    (a CR naming a non-granted Secret) raises with the RBAC remedy in the
+    message — the fail-visible contract of #606.
     Since #568 this resolution runs on every secret-path call (the rotation
     probe): this one ``get`` is the whole added cost, and the client LRU
     keyed on its result absorbs it whenever nothing rotated.
@@ -248,11 +259,29 @@ def _resolve_redis_url(
     try:
         secret = operator_core_api().read_namespaced_secret(secret_ref.name, namespace)
     except ApiException as exc:
-        raise RedisCredentialResolutionError(
+        message = (
             f"cannot read Secret {namespace}/{secret_ref.name} (key "
             f"{secret_ref.key!r}, spec.redisCredentials.secretRef, issue #463): "
             f"{exc.status} {exc.reason}"
-        ) from exc
+        )
+        if exc.status == 403:
+            # Issue #606 — the RBAC resourceNames fence bit: the Role grants
+            # secrets:get only on the canonical name(s), so a CR naming a
+            # custom openstudio-redis-* Secret is apply-legal and denied at
+            # read time. Name the cause and both remedies so every surface
+            # carrying this message (key-layout "unreachable" log, counted
+            # tick-skip log, the singleton guard's Warning Event) tells the
+            # SRE exactly what to do — not a generic resolution failure.
+            message += (
+                " — denied by RBAC: the operator Role's secrets:get grant is "
+                "exact-name-bounded (deploy/rbac.yaml resourceNames, issue "
+                "#606); either add "
+                f"{secret_ref.name!r} to the Role's resourceNames (a "
+                "deliberate, reviewable RBAC change) or point "
+                "spec.redisCredentials.secretRef at a granted Secret "
+                "(default: 'openstudio-redis')"
+            )
+        raise RedisCredentialResolutionError(message) from exc
     data = getattr(secret, "data", None) or {}
     raw = data.get(secret_ref.key)
     if raw is None:
