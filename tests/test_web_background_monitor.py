@@ -28,10 +28,15 @@ from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers import web_background_monitor as _wbm
 from openstudio_operator.handlers import web_background_monitor as wbm_module
 from openstudio_operator.handlers.web_background_monitor import (
+    BACKOFF_WINDOW_SCHEDULE,
     DEFAULT_WEB_BACKGROUND_DEPLOYMENT,
+    INEFFECTIVE_RESTART_EVENT_THRESHOLD,
+    NATURAL_REARM_WINDOWS,
     RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
+    WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT,
     WEB_BACKGROUND_RESTARTED_EVENT,
     StallWindowTracker,
+    _backoff_windows,
     run_stall_tick,
 )
 from openstudio_operator.handlers.web_background_monitor import (
@@ -624,6 +629,377 @@ def test_freshness_gauges_never_stale_across_full_cooldown(monkeypatch):
         prev_stall_fresh = stall_window_fresh()
         assert prev_queue_fresh == clock.now  # re-stamped this tick
         assert prev_stall_fresh == clock.now
+
+
+# --- Issue #649 — ineffective-restart circuit breaker ----------------------------
+
+
+def ineffective_total() -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "openstudio_operator_web_background_restarts_ineffective_total"
+        )
+        or 0.0
+    )
+
+
+def fire_minutes(apps) -> list[int]:
+    """Minutes (relative to NOW) of each issued restart patch, in order."""
+    return [
+        int(
+            (
+                datetime.fromisoformat(
+                    patch["body"]["spec"]["template"]["metadata"]["annotations"][
+                        RESTARTED_AT_ANNOTATION
+                    ]
+                )
+                - NOW
+            ).total_seconds()
+            // 60
+        )
+        for patch in apps.patches
+    ]
+
+
+def test_backoff_windows_schedule():
+    """The #649 backoff total: the natural 2-window re-arm cadence below
+    the first threshold, then the schedule's totals (3 → 4, 5 → 6, 7 → 8
+    cap), monotonic in between. Totals MUST exceed the natural cadence —
+    a total at or below 2 is a no-op gate (the arithmetic trap
+    ``NATURAL_REARM_WINDOWS`` exists to name)."""
+    assert _backoff_windows(0) == NATURAL_REARM_WINDOWS
+    assert _backoff_windows(1) == NATURAL_REARM_WINDOWS
+    assert _backoff_windows(2) == NATURAL_REARM_WINDOWS
+    assert _backoff_windows(3) == 4
+    assert _backoff_windows(4) == 4
+    assert _backoff_windows(5) == 6
+    assert _backoff_windows(6) == 6
+    assert _backoff_windows(7) == 8
+    assert _backoff_windows(50) == 8  # capped
+    # Schedule sanity: strictly increasing thresholds and totals, all
+    # above the natural cadence so the gate actually bites.
+    thresholds = [t for t, _ in BACKOFF_WINDOW_SCHEDULE]
+    totals = [w for _, w in BACKOFF_WINDOW_SCHEDULE]
+    assert thresholds == sorted(set(thresholds))
+    assert totals == sorted(set(totals))
+    assert min(totals) > NATURAL_REARM_WINDOWS
+    assert thresholds[0] == INEFFECTIVE_RESTART_EVENT_THRESHOLD
+
+
+def test_never_breaking_stall_bounded_restarts_with_backoff():
+    """Issue #649 acceptance — a stall that NEVER breaks produces a
+    bounded, backoff-paced restart sequence, not one restart per cooldown
+    cycle forever.
+
+    Minute-by-minute simulation over 4 hours (window 10 m): fires land at
+    minutes 10, 31, 52, 73 (one per natural cooldown cycle while the
+    count builds 0 → 3), then the backoff spaces them 114, 155 (4-window
+    total wait), 216 (6-window) — 7 restarts where the pre-#649 design
+    would have issued 11, with the gap widening toward the 8-window cap.
+    The 4th restart (count 3) is the first to emit
+    ``WebBackgroundRestartIneffective``; every later detection re-emits
+    it. The count persists on the CR and the counter increments once per
+    detection (6 total).
+    """
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+    metric_before = ineffective_total()
+
+    ineffective_events: list[tuple[str, str, str]] = []
+    for offset in range(241):  # 4 hours of minute ticks
+        _, events = tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        ineffective_events.extend(
+            e for e in events if e[1] == WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT
+        )
+
+    assert fire_minutes(apps) == [10, 31, 52, 73, 114, 155, 216]
+    # Pre-#649 cadence fires every ~21 min — 11 restarts by minute 220.
+    # The backoff holds it to 7 with the last gaps at 41 and 61 min
+    # (4- and 6-window totals), widening toward the 8-window cap.
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 6
+    assert ineffective_total() - metric_before == 6.0
+    assert len(ineffective_events) == 4  # counts 3, 4, 5, 6
+    assert all(e[0] == "Warning" for e in ineffective_events)
+    first = ineffective_events[0][2]
+    assert "3 consecutive" in first
+    assert api.obj["status"]["lastWebBackgroundRestart"] == (
+        NOW + minute(216)
+    ).isoformat()
+
+
+def test_ineffective_event_message_names_systemic_cause_runbook():
+    """The #649 Warning Event routes the on-call to the systemic-cause
+    triage (NFS full / MongoDB down / broken image) and the runbook
+    (README.md triage + docs/validation.md) — restarting cannot fix a
+    systemic stall, and the event must say so."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    events: list[tuple[str, str, str]] = []
+    for offset in range(74):  # fires at 10, 31, 52, 73 — count hits 3
+        _, tick_events = tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        events.extend(tick_events)
+
+    ineffective = [e for e in events if e[1] == WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT]
+    assert len(ineffective) == 1
+    message = ineffective[0][2]
+    lowered = message.lower()
+    assert "nfs" in lowered and "mongo" in lowered and "image" in lowered
+    assert "README.md" in message and "docs/validation.md" in message
+    assert "back off" in lowered or "backs off" in lowered
+    # The WebBackgroundRestarted event still fires alongside (the action
+    # happened); the new event is additive escalation, not a replacement.
+    assert any(e[1] == WEB_BACKGROUND_RESTARTED_EVENT for e in events)
+
+
+def test_backoff_defers_action_but_sensing_continues():
+    """Issue #649 — only the ACTION defers: on sustained-but-deferred
+    ticks the stall sensing still runs (the worker-fleet pod list is
+    read) and no patch is issued until the backoff expires."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    for offset in range(74):  # build to count=3, anchor at minute 73
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert len(apps.patches) == 4
+
+    # Sensing gate opens at 84 (73 + one window); the fresh window
+    # sustains at 94 — but the 4-window backoff (count=3) defers the
+    # action through minute 113 (113-73=40 <= 40 inclusive).
+    pods = FakeCoreV1Api([make_pod(), make_pod()])
+    selectors_before = len(pods.selectors)
+    for offset in (84, 94, 100, 113):
+        fired, _ = tick(
+            api,
+            apps,
+            pods=pods,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        assert fired is False
+    assert len(pods.selectors) == selectors_before + 4  # sensing ran every tick
+    assert len(apps.patches) == 4
+
+    # Minute 114: 114-73=41 > 40 — the backoff expires and the still-
+    # sustained stall fires immediately (the window was earned during the
+    # deferral; no re-accumulation).
+    fired, _ = tick(
+        api,
+        apps,
+        pods=pods,
+        now=NOW + minute(114),
+        tracker=tracker,
+        redis=stall_redis(NOW + minute(114)),
+    )
+    assert fired is True
+    assert len(apps.patches) == 5
+
+
+def test_clean_window_resets_breaker_and_anchor():
+    """Issue #649 — one FULL window with no stall condition concludes the
+    cycle: the count resets to 0 and the restart anchor is cleared, so a
+    later fresh episode's first restart starts the breaker from scratch
+    (genuinely separate episodes never accumulate toward the backoff)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    # Fires at 10 and 31 → count=1.
+    for offset in range(32):
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 1
+
+    # Stall clears at 42 (first open-gate tick after the 31-anchored
+    # cooldown): the clean window sustains at 52 — count and anchor reset.
+    for offset in range(42, 53):
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset), queued=False),
+        )
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 0
+    assert "lastWebBackgroundRestart" not in api.obj["status"]
+
+    # Fresh episode from 53: fires at 63 with NO predecessor anchor — the
+    # detection does not increment (count stays 0), no ineffective event.
+    for offset in range(53, 64):
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert len(apps.patches) == 3
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 0
+    assert api.obj["status"]["lastWebBackgroundRestart"] == (NOW + minute(63)).isoformat()
+
+
+def test_blip_below_clean_window_does_not_reset_breaker():
+    """A break shorter than a full window does NOT reset the count (#649's
+    sustained-clean discipline — the mirror of the stall side's transient
+    blip rule): the restart anchor survives, so the next fire still
+    counts the predecessor as ineffective."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    for offset in range(32):  # fires at 10, 31 → count=1
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    # Blip: condition broken for 3 ticks (< the 10-minute window)…
+    for offset in (42, 43, 44):
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset), queued=False),
+        )
+    # …then the stall returns and re-sustains: fires at 55 with the
+    # minute-31 anchor still present ⇒ count=2.
+    for offset in range(45, 56):
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert len(apps.patches) == 3
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 2
+
+
+def test_breaker_state_survives_operator_restart():
+    """D04 — the backoff keys on the CR-anchored count, not process state:
+    a fresh tracker (simulated process bounce) mid-backoff honors the
+    persisted count and defers exactly like the pre-restart process would
+    (fire at minute 114, not 94 — the natural cadence — because the
+    persisted count=3 holds the 4-window total wait)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    pre_restart_tracker = StallWindowTracker()
+
+    for offset in range(85):  # count=3, anchor minute 73, window began 84
+        tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=pre_restart_tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert len(apps.patches) == 4
+
+    # Operator restart: everything in-memory is gone; only the CR status
+    # (count=3, restart anchor 73, window anchor 84) survives. The #582
+    # restore re-earns the sustained window across the bounce, and the
+    # persisted count drives the same 4-window backoff: deferred through
+    # minute 113, fire at 114.
+    fresh_tracker = StallWindowTracker()
+    for offset in (90, 100, 113):
+        fired, _ = tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=fresh_tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        assert fired is False  # 113-73=40 <= 4 windows — backoff holds
+    fired, _ = tick(
+        api,
+        apps,
+        now=NOW + minute(114),
+        tracker=fresh_tracker,
+        redis=stall_redis(NOW + minute(114)),
+    )
+    assert fired is True
+    assert fire_minutes(apps) == [10, 31, 52, 73, 114]
+
+
+def test_breaker_counts_in_dry_run_pacing_like_real_run():
+    """D11 pacing choice — the breaker detection counts dry-run fires too
+    (the anchor already advances in dry-run; the count must pace with it,
+    or a dry-run simulation would under-report the backoff a real run
+    would apply). The Warning Event flows through the EventEmitter, so a
+    dry-run flip suppresses/marks it per D11 — the count write is a plain
+    D04 status write, not a gated mutation."""
+    spec = {**SPEC, "dryRun": True}
+    api = FakeCustomObjectsApi(make_cr(spec))
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    for offset in range(32):  # dry-run fires at 10, 31 → count=1
+        tick(
+            api,
+            apps,
+            spec=spec,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+    assert apps.patches == []  # mutations suppressed (D11)
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 1
+
+
+def test_breaker_inert_below_threshold():
+    """Below 3 consecutive ineffective restarts the operator behaves
+    exactly as pre-#649: one restart per cooldown cycle, no ineffective
+    Event, no backoff (the cooldown cadence test next door already covers
+    the two-restart shape; this pins the observability surface)."""
+    api = FakeCustomObjectsApi(make_cr())
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+    metric_before = ineffective_total()
+
+    for offset in range(53):  # fires at 10, 31, 52 → counts 1, 2
+        _, events = tick(
+            api,
+            apps,
+            now=NOW + minute(offset),
+            tracker=tracker,
+            redis=stall_redis(NOW + minute(offset)),
+        )
+        assert not any(
+            e[1] == WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT for e in events
+        )
+    assert api.obj["status"]["webBackgroundIneffectiveRestarts"] == 2
+    assert ineffective_total() - metric_before == 2.0
+    assert fire_minutes(apps) == [10, 31, 52]  # no backoff below the threshold
 
 
 # --- Cooldown honored across operator restarts (D04) ----------------------------

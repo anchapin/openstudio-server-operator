@@ -66,6 +66,7 @@ ARCHIVED_ANALYSES = "archivedAnalyses"
 LAST_RECYCLE_AT = "lastRecycleAt"
 LAST_WEB_BACKGROUND_RESTART_AT = "lastWebBackgroundRestart"
 STALL_WINDOW_STARTED_AT = "stallWindowStartedAt"
+WEB_BACKGROUND_INEFFECTIVE_RESTARTS = "webBackgroundIneffectiveRestarts"
 DEFERRED_EVENTS = "deferredEvents"
 
 # Issue #585 — the merge-patch media type's canonical home is ``_k8s``
@@ -504,6 +505,33 @@ class StatusStore:
 
         self._mutate(build_patch)
 
+    def _get_int(self, field: str) -> int:
+        """Read an integer ``.status`` scalar; absent reads as ``0``.
+
+        Issue #649 — the web_background ineffective-restart counter is the
+        first integer status field (the existing scalar helpers are
+        datetime-typed). Strict-typed: a non-integer stored value (a string,
+        a float, a bool — JSON round-trips all three) raises
+        :class:`StatusStoreError` rather than coercing silently, the same
+        posture the datetime scalars take via ``_parse_utc``. The default-0
+        convention means pre-#649 CRs (no such key) parse as "no ineffective
+        restarts" without a migration.
+        """
+        raw = self._read_status().get(field)
+        if raw is None:
+            return 0
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise StatusStoreError(f"status.{field}: expected integer, got {type(raw).__name__}")
+        return raw
+
+    def _set_int(self, field: str, value: int) -> None:
+        def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            if status.get(field) == value:
+                return None
+            return {"status": {field: value}}
+
+        self._mutate(build_patch)
+
     # --- softStops ----------------------------------------------------------
 
     def get_soft_stops(self) -> dict[str, SoftStopRecord]:
@@ -738,6 +766,23 @@ class StatusStore:
 
     def set_stall_window_started_at(self, when: datetime | None) -> None:
         self._set_scalar(STALL_WINDOW_STARTED_AT, when)
+
+    def get_web_background_ineffective_restarts(self) -> int:
+        """Read ``status.webBackgroundIneffectiveRestarts`` (#649) — the
+        consecutive-ineffective-restart count the circuit breaker keys on.
+
+        Absent reads as ``0`` (pre-#649 CRs need no migration); corrupt
+        non-integer values raise :class:`StatusStoreError`.
+        """
+        return self._get_int(WEB_BACKGROUND_INEFFECTIVE_RESTARTS)
+
+    def set_web_background_ineffective_restarts(self, count: int) -> None:
+        """Write ``status.webBackgroundIneffectiveRestarts`` (#649).
+
+        Conflict-safe RMW like every other ``.status`` write (D04); writing
+        the value already stored is a no-op (no apiserver PATCH).
+        """
+        self._set_int(WEB_BACKGROUND_INEFFECTIVE_RESTARTS, count)
 
     # --- pruning ---------------------------------------------------------------
 

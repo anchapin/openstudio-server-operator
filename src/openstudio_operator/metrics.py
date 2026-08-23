@@ -127,6 +127,46 @@ WEB_BACKGROUND_RESTARTS_TOTAL = Counter(
     "(incremented by the web_background monitor, #13)",
 )
 
+# Issue #649 — ineffective-restart circuit-breaker counter. The cooldown
+# design (one restart per stall window, #13) bounds the restart RATE but
+# not the total: a systemic stall (NFS share full, MongoDB down, a broken
+# web-background image) re-sustains after every restart, so the operator
+# churns the Deployment once per two windows forever while in-flight
+# web_background work is destroyed each time. This counter increments each
+# time a restart is PROVEN ineffective — a new restart fired while a
+# predecessor anchor existed, meaning the stall re-sustained a full window
+# past the predecessor's cooldown (the detection lives at the fire site in
+# ``web_background_monitor.run_stall_tick``). At 3 consecutive the operator
+# emits the ``WebBackgroundRestartIneffective`` Warning Event and engages
+# the exponential backoff (total wait 4/6/8 stall windows — the natural
+# cooldown + re-sustain cadence is already 2, so the schedule starts above
+# it; detection keeps running, only the ACTION defers). Increments are
+# therefore spaced at least four stall windows apart once the backoff
+# engages (40 min at the default 10-minute window) — the alert uses
+# ``increase(...[30m]) > 0`` so a single spaced increment stays visible to
+# Prometheus for half an hour instead of flashing past a 5m rate window.
+# Alert on ``increase(openstudio_operator_web_background_restarts_
+# ineffective_total[30m]) > 0`` (shipped as
+# ``OpenStudioOperatorWebBackgroundRestartIneffective``) — restarting is
+# not fixing the stall; a human must run the systemic-cause triage.
+WEB_BACKGROUND_RESTARTS_INEFFECTIVE_TOTAL = Counter(
+    "openstudio_operator_web_background_restarts_ineffective_total",
+    "web_background restarts proven ineffective — the stall condition "
+    "re-sustained a full window past the previous restart's cooldown "
+    "(issue #649). Incremented at the restart fire site in "
+    "``web_background_monitor.run_stall_tick`` each time a restart fires "
+    "while a predecessor anchor exists; from the 3rd consecutive "
+    "ineffective restart the operator emits the "
+    "``WebBackgroundRestartIneffective`` Warning Event and backs the "
+    "restart action off (total wait 4/6/8 stall windows — the natural "
+    "cooldown + re-sustain cadence is already two, so the schedule starts "
+    "above it) while detection keeps running. Alert on "
+    "``increase(openstudio_operator_web_background_restarts_"
+    "ineffective_total[30m]) > 0`` — once the backoff engages increments "
+    "are spaced >= 4 stall windows apart, so a 30m increase window (not a "
+    "5m rate) keeps each one visible to Prometheus.",
+)
+
 ANALYSES_ARCHIVED_TOTAL = Counter(
     "openstudio_operator_analyses_archived_total",
     "Analyses whose archival Job passed rclone verification "
@@ -971,7 +1011,8 @@ PRUNE_TICK_FAILURES_TOTAL = Counter(
 # mirroring the warning-event reason vocabulary
 # (``AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued`` |
 # ``DatapointRequeueExhausted`` | ``WorkerRecycled`` |
-# ``WebBackgroundRestarted`` | ``ResqueKeyLayoutUnknown``) so a dashboard can
+# ``WebBackgroundRestarted`` | ``WebBackgroundRestartIneffective`` (#649) |
+# ``ResqueKeyLayoutUnknown``) so a dashboard can
 # tell WHICH action the dry-run gate intercepted, not just that it did.
 # Companion emitted counter below lets ``rate(emitted) / rate(suppressed)``
 # be derived without log parsing — the dry-run ratio is the headline SLO for

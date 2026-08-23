@@ -75,6 +75,16 @@ EXPECTED_COUNTER_FAMILIES = (
     # Labelled by ``method`` only (no CR-identity labels — the client
     # is CR-agnostic, matching the sibling duration histogram).
     "openstudio_operator_rest_retries_total",
+    # Issue #649 — ineffective-restart circuit-breaker counter: increments
+    # each time a web_background restart is PROVEN ineffective (a later
+    # restart fired while the predecessor anchor existed — the stall
+    # re-sustained a full window past its cooldown). From the 3rd
+    # consecutive one the operator emits WebBackgroundRestartIneffective
+    # and backs the restart action off (total wait 4/6/8 stall windows —
+    # the natural cooldown + re-sustain cadence is already 2). Alert on
+    # increase(...[30m]) > 0 (shipped as
+    # OpenStudioOperatorWebBackgroundRestartIneffective).
+    "openstudio_operator_web_background_restarts_ineffective_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87

@@ -85,6 +85,32 @@ deliberate choice as #11: a dry-run simulation paces exactly like a real
 run (cooldown cadence observable, Event not re-emitted every tick), and
 flipping ``spec.dryRun`` back to false changes only the mutation.
 
+Ineffective-restart circuit breaker (issue #649): the cooldown bounds the
+restart RATE, not the TOTAL. A systemic stall (NFS share full, MongoDB
+down, a broken web-background image) re-sustains after every restart, so
+the monitor would churn the Deployment once per two windows forever,
+destroying in-flight web_background work at that cadence. The breaker
+counts CONSECUTIVE ineffective restarts on the CR-anchored int scalar
+``status.webBackgroundIneffectiveRestarts`` (D04 — survives operator
+restarts and paces a fresh process): a restart is *ineffective* when a
+LATER restart fires while its anchor still exists, i.e. the stall
+re-sustained a full window past its cooldown. Each detection increments
+``WEB_BACKGROUND_RESTARTS_INEFFECTIVE_TOTAL``; from the 3rd consecutive
+one a distinct Warning Event ``WebBackgroundRestartIneffective`` names
+the systemic-cause runbook (README triage + docs/validation.md), and the
+ACTION gate backs off exponentially — the natural re-arm cadence is
+already TWO windows (one cooldown + one re-sustained window), so the
+schedule counts TOTAL windows past the anchor and starts above that:
+after 3 consecutive ineffective restarts the next action waits 4 windows
+total (2 skipped beyond the cadence), after 5 six, after 7 the cap of
+eight — while the detection machinery (sensing, window accumulation,
+freshness gauges) keeps running; only the restart itself is deferred.
+One full window with NO stall condition concludes the cycle:
+the count resets to 0 and the restart anchor is cleared, so genuinely
+separate stall episodes never accumulate toward the backoff (D04-clean:
+the reset is a plain status write, and an operator restart mid-clean-
+window merely re-earns the clean window from scratch — conservative).
+
 Issue #490 — this timer is also the carrier for the periodic Redis
 key-layout revalidation: every tick first offers
 :func:`_maybe_revalidate_redis_key_layout` the chance to re-run
@@ -145,6 +171,7 @@ from openstudio_operator.metrics import (
     RESQUE_WORKERS_SEEN_MAX,
     STALL_WINDOW_ELAPSED_SECONDS,
     STALL_WINDOW_FRESH,
+    WEB_BACKGROUND_RESTARTS_INEFFECTIVE_TOTAL,
     WEB_BACKGROUND_RESTARTS_TOTAL,
     observe_duration,
 )
@@ -177,6 +204,82 @@ DEFAULT_WEB_BACKGROUND_DEPLOYMENT = "web-background"
 # call sites; tests import them from ``_k8s`` directly since issue #585).
 
 WEB_BACKGROUND_RESTARTED_EVENT = "WebBackgroundRestarted"
+
+#: Issue #649 — distinct Warning Event emitted (through the EventEmitter,
+#: so D11 dry-run gating applies) once ``INEFFECTIVE_RESTART_EVENT_
+#: THRESHOLD`` consecutive restarts have failed to break the stall. The
+#: message names the systemic-cause runbook (NFS share full / MongoDB
+#: down / broken web-background image — README.md triage +
+#: docs/validation.md): restarting cannot fix a systemic stall, and the
+#: event is the "restarting is not fixing this" escalation to a human.
+WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT = "WebBackgroundRestartIneffective"
+
+#: Issue #649 — consecutive ineffective restarts before the Warning Event
+#: fires and the backoff engages. 3 matches the issue's ">= 3 restarts
+#: while the condition re-sustains each time" acceptance criterion: two
+#: re-sustained stalls after a restart is strong evidence the restart is
+#: not the fix; the third pages a human and starts deferring the churn.
+#: Operator-behavior constant (not cluster policy): it bounds the
+#: operator's OWN action loop, like the status-store retry bounds —
+#: policy knobs stay in the CRD ``webBackgroundPolicy``.
+INEFFECTIVE_RESTART_EVENT_THRESHOLD = 3
+
+#: Issue #649 — the natural re-arm cadence in stall windows, when the
+#: breaker is NOT engaged: one window of cooldown (the sensing gate) plus
+#: one re-sustained window the machinery always requires. A backoff total
+#: at or below this number is a NO-OP — the schedule values must exceed
+#: it for the action gate to bite (the arithmetic trap this constant
+#: exists to name).
+NATURAL_REARM_WINDOWS = 2
+
+#: Issue #649 — exponential backoff schedule for the restart ACTION:
+#: ``(consecutive ineffective restarts, TOTAL stall windows the next
+#: action waits from the previous restart anchor)``. After 3 consecutive
+#: ineffective restarts the next restart waits 4 windows total — 2 beyond
+#: the natural cadence; after 5, six total (4 beyond); after 7 the cap
+#: of eight (6 beyond — 80 minutes beyond the natural cadence at the
+#: default 10-minute window, the hard bound on churn a systemic stall
+#: can cause). Windows, not wall-clock minutes, so a cluster that tunes
+#: ``stallWindowMinutes`` scales the backoff with its own cadence.
+#: Detection keeps running through the backoff — only the restart action
+#: is deferred.
+BACKOFF_WINDOW_SCHEDULE: tuple[tuple[int, int], ...] = ((3, 4), (5, 6), (7, 8))
+
+
+def _backoff_windows(ineffective_restarts: int) -> int:
+    """TOTAL stall windows the next restart action must wait (issue #649).
+
+    :data:`NATURAL_REARM_WINDOWS` (the plain cooldown + re-sustain
+    cadence, unchanged pre-#649 behavior) below the first schedule
+    threshold; the largest threshold's window count at or below the
+    consecutive count, so the schedule composes monotonically.
+    """
+    total = NATURAL_REARM_WINDOWS
+    for threshold, scheduled in BACKOFF_WINDOW_SCHEDULE:
+        if ineffective_restarts >= threshold:
+            total = scheduled
+    return total
+
+
+def _ineffective_breaker_message(consecutive: int) -> str:
+    """Warning Event text for ``WebBackgroundRestartIneffective`` (#649).
+
+    Names the count, the engaged backoff, and the systemic-cause runbook —
+    the three things an on-call needs to stop trusting the restart loop
+    and start triaging the substrate.
+    """
+    windows = _backoff_windows(consecutive)
+    skipped = windows - NATURAL_REARM_WINDOWS
+    return (
+        f"{consecutive} consecutive web_background restarts have failed to "
+        f"break the queue stall — the stall condition re-sustained a full "
+        f"window after each restart's cooldown. The cause is likely systemic "
+        f"and restarting cannot fix it: NFS share full, MongoDB down, or a "
+        f"broken web-background image. Restart actions now back off (next "
+        f"waits {windows} stall windows — {skipped} beyond the usual "
+        f"cadence); detection keeps running. Runbook: README.md triage "
+        f"commands + docs/validation.md (systemic-cause checklist)."
+    )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Emitted ONCE
 #: per operator process when an empty worker registry has been observed for
@@ -338,15 +441,36 @@ class StallWindowTracker:
         which is what enforces the one-CR-per-namespace rule).
         """
         self.first_observed: datetime | None = None
+        #: Issue #649 — first tick of the CURRENT unbroken clean period
+        #: (stall condition absent), the breaker-reset clock. In-memory
+        #: cache like ``first_observed``; the count it eventually resets
+        #: (``status.webBackgroundIneffectiveRestarts``) is the D04
+        #: source of truth, so losing this to an operator restart merely
+        #: re-earns the clean window from scratch — conservative, never
+        #: resets the breaker early.
+        self.first_clean: datetime | None = None
 
     def reset(self) -> None:
         self.first_observed = None
+        self.first_clean = None
 
     def observe(self, holds: bool, now: datetime, window: timedelta) -> bool:
-        """Feed one tick's verdict; return whether the window is sustained."""
+        """Feed one tick's verdict; return whether the window is sustained.
+
+        Issue #649 — also mirrors the window logic for the CLEAN side:
+        ``first_clean`` records the first tick of an unbroken no-stall
+        period and clears on any holding tick, so :func:`run_stall_tick`
+        can reset the ineffective-restart breaker only after the
+        condition has been absent a FULL window (not on a single
+        broken tick — the same sustained-window discipline the stall
+        side enforces).
+        """
         if not holds:
             self.first_observed = None
+            if self.first_clean is None:
+                self.first_clean = now
             return False
+        self.first_clean = None
         if self.first_observed is None:
             self.first_observed = now
         return now - self.first_observed >= window
@@ -640,6 +764,14 @@ def run_stall_tick(
     tick (D12); an unanchored restart is re-attempted next poll (the
     tracker only resets once the anchor is written), an anchored one never
     re-fires within the window.
+
+    Issue #649 — a second, ACTION-level gate sits between the sustained
+    window and the restart: when ``status.webBackgroundIneffectiveRestarts``
+    has engaged the backoff schedule, sustained-but-deferred ticks return
+    without firing (detection continues; only the action waits), and a
+    restart that fires with a predecessor anchor counts that predecessor
+    as ineffective (CR-anchored count + counter + threshold Warning Event;
+    one full clean window resets the cycle — see the module docstring).
     """
     window = timedelta(minutes=config.web_background_policy.stall_window_minutes)
     last_restart = store.get_last_web_background_restart_at()
@@ -743,8 +875,59 @@ def run_stall_tick(
         store.set_stall_window_started_at(tracker.first_observed)
     elif not holds:
         store.set_stall_window_started_at(None)
+    # Issue #649 — clean-window breaker reset: one FULL window with no
+    # stall condition concludes the previous restart cycle. The stall
+    # cleared and stayed clear, so any predecessor restart eventually did
+    # its job (or the stall was never the restart's to fix): zero the
+    # consecutive-ineffective count AND clear the restart anchor, so a
+    # LATER fresh episode's first restart does not inherit this cycle's
+    # count (the anchor-exists detection at the fire site stays exact).
+    # Both writes are plain D04 status writes (not D11-gated mutations);
+    # no-op when the cycle was never armed (count 0, no anchor — the
+    # common healthy-cluster path writes nothing). ``last_restart`` is
+    # the same tick's fresh gate read (D04), reused rather than re-read.
+    if (
+        not holds
+        and tracker.first_clean is not None
+        and now - tracker.first_clean >= window
+        and (last_restart is not None or store.get_web_background_ineffective_restarts() > 0)
+    ):
+        store.set_web_background_ineffective_restarts(0)
+        if last_restart is not None:
+            store.set_last_web_background_restart_at(None)
     if not sustained:
         return False
+
+    # Issue #649 — ineffective-restart circuit breaker, ACTION gate: once
+    # consecutive ineffective restarts have engaged the backoff, the
+    # restart itself is deferred until the backoff windows elapse past the
+    # previous anchor. Detection keeps running — this branch is reached
+    # only on sensing ticks with a sustained window (the sensing gate
+    # above already handled the first cooldown window), and the tracker,
+    # gauges, and anchors all keep advancing, so the moment the backoff
+    # expires the (still-sustained) stall fires immediately. Returning
+    # without action is behavior, not a mutation — nothing to dry-run-gate.
+    # The ``> NATURAL_REARM_WINDOWS`` guard keeps the engaged path exact:
+    # below the first schedule threshold the natural cooldown + re-sustain
+    # cadence already spaces restarts two windows apart, so a gate at or
+    # below that number would be a no-op — the schedule values start
+    # above it precisely so the backoff BITES.
+    if last_restart is not None:
+        ineffective_now = store.get_web_background_ineffective_restarts()
+        backoff_windows = _backoff_windows(ineffective_now)
+        if (
+            backoff_windows > NATURAL_REARM_WINDOWS
+            and now - last_restart <= window * backoff_windows
+        ):
+            logger.debug(
+                "web_background restart deferred — %d consecutive ineffective "
+                "restarts, backoff %d stall windows (window sustained at %s; "
+                "detection continues) (#649)",
+                ineffective_now,
+                backoff_windows,
+                now.isoformat(),
+            )
+            return False
 
     deployment = config.target_web_background_deployment or DEFAULT_WEB_BACKGROUND_DEPLOYMENT
     dry_run = config.dry_run
@@ -774,6 +957,29 @@ def run_stall_tick(
     # Advances in dry-run too — see module docstring (D11 pacing choice,
     # identical to #11). Patch before anchor: the accepted D12 re-attempt race.
     store.set_last_web_background_restart_at(now)
+    # Issue #649 — ineffective-restart detection: reaching the fire site
+    # with a predecessor anchor (``last_restart is not None``) means the
+    # stall re-sustained a full window past the PREVIOUS restart's
+    # cooldown — that restart was proven ineffective. Count it on the CR
+    # (D04 — a fresh operator process resumes the exact backoff state),
+    # increment the counter, and from the threshold-th consecutive one
+    # emit the distinct Warning Event naming the systemic-cause runbook
+    # (through the EventEmitter, so D11 dry-run gating applies). Counted
+    # in dry-run too — the pacing simulation treats every fire as real
+    # (the same D11 choice the anchor above makes). Failure ordering
+    # follows the accepted D12 race: if the count write fails after the
+    # anchor landed, the next tick re-issues one extra restart and
+    # re-detects — never undercounts.
+    if last_restart is not None:
+        ineffective = store.get_web_background_ineffective_restarts() + 1
+        store.set_web_background_ineffective_restarts(ineffective)
+        WEB_BACKGROUND_RESTARTS_INEFFECTIVE_TOTAL.inc()
+        if ineffective >= INEFFECTIVE_RESTART_EVENT_THRESHOLD:
+            emit(
+                "Warning",
+                WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT,
+                _ineffective_breaker_message(ineffective),
+            )
     # Only now is the action fully recorded — the NEXT restart must
     # re-sustain a fresh full window once the cooldown re-opens the gate.
     tracker.reset()
