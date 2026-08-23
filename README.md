@@ -390,26 +390,29 @@ on failed Jobs; treat the counter as best-effort.
 ├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/, adr/, skill-snapshot/ (frozen wave-orchestrator skill copies, #379/#486)
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker + wave-orchestration tooling (wave-planner.js, auto_close_issues.py, render_orchestrator_snippet.py — #486)
 ├── src/openstudio_operator/
-│   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace); single source of truth — policy values do NOT live here (#165)
-│   ├── _time.py                # tz-aware UTC parser (`parse_utc`); None-safe; replaces three byte-equivalent duplicates (#174)
-│   ├── _k8s.py                 # Shared Kubernetes API helpers (`DeploymentReader`, `deployment_label_selector`); neutral home for cross-handler K8s surface (#236, #250)
-│   ├── _oscm_handlers.py       # Python-level OSCM handler registry; new handlers call `register_fn(fn)` at import (id = fn.__name__, #407); singleton guard cross-checks against the kopf registry at gate time (#250)
+│   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace, K8S_REQUEST_TIMEOUT_SECONDS #579); owns the canonical CRD identity CRD_GROUP/CRD_VERSION/CRD_PLURAL/CRD_SPEC (#495); single source of truth — policy values do NOT live here (#165)
+│   ├── _cr_cache.py            # per-CR cache convention (#497): every handler-module cache keyed (namespace, name) + uid-validated at lookup (cr_uid/uid_is_stale — a #364 delete+recreate yields fresh state, no deletion hook); uniform reset_per_cr_caches() seams
+│   ├── _time.py                # tz-aware UTC parser (`parse_iso_utc`), None-safe; replaces three byte-equivalent duplicates (#174); `utc_parser(error_cls)` factory absorbs the per-module re-raise wrappers (#506)
+│   ├── _k8s.py                 # Shared Kubernetes surface: DeploymentReader/DeploymentManager/PodLister Protocols (#505), `deployment_label_selector`, `rolling_restart_deployment`, `load_operator_kube_config` (the single public kubeconfig loader, #305), BoundedK8sRequest + `apply_request_timeout` (#579); neutral home for cross-handler K8s (#236, #250)
+│   ├── _retry.py               # shared `_sleep` retry-backoff test seam (#416): openstudio_client + status_store import their backoff sleep from here — monkeypatch the seam, don't re-define `_sleep`
+│   ├── _oscm_handlers.py       # Python-level OSCM handler registry; new handlers call `register_fn(fn)` at import (id = fn.__name__, #407); singleton guard cross-checks against the kopf registry at gate time (#250); hosts `run_oscm_tick` + SKIP_TICK_EXCEPTIONS, the shared tick-runner (#473, #493)
 │   ├── config.py               # CRD spec → typed settings (defaults mirror deploy/crd.yaml)
 │   ├── openstudio_client.py    # OpenStudio REST client (verified against v3.11.0)
 │   ├── client_factory.py       # `lru_cache`-keyed factories for `OpenStudioClient` + `ReadOnlyRedisClient`; a mutated `spec.serverUrl` / `spec.redisUrl` invalidates by a different key (#168, #235)
-│   ├── status_store.py         # CR .status RMW helper (D04 durable store, 409-safe)
+│   ├── status_store.py         # CR .status RMW helper (D04 durable store, 409-safe) incl. the `deferredEvents` crash-surviving mirror (#402)
 │   ├── redis_client.py         # read-only Redis client (queue depths + Resque liveness)
 │   ├── archival.py             # rclone archival Job manifest generator (backend-agnostic)
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
-│   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05)
+│   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05) + boot wrap-count/expected-handler gauge pair (#491, #570)
 │   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (20+18+5)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
-│   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164)
+│   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164); emission type aliases `TickEmitter`/`EventSink` + `emit_kopf_event` (#496)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py
+│       ├── dry_run_audit.py    # pure @kopf.on.event watch handler — DryRunToggled audit Event on spec.dryRun flips (#397; NOT an OSCM timer)
 │       ├── worker_recycler.py
 │       └── web_background_monitor.py
 │       # (storage_pruner moved to the prune CronJob in #78;
