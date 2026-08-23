@@ -36,6 +36,21 @@
 # CronJob exposes the same families on its own pod; the prune group below
 # alerts on kube-state-metrics Job status (the durable signal — see the
 # group comment).
+#
+# TARGET-DOWN COMPANION (issue #646)
+# ----------------------------------
+# Every operator-liveness alert in this file keys on series the operator
+# ITSELF exports — when the pod is down, crashlooping, or the scraper
+# cannot reach port 9090 (the #166 wrong-namespace NetworkPolicy mode),
+# those series go stale after Prometheus's ~5-minute lookback, the
+# expressions return NO DATA, and the alerts RESOLVE (or never fire from
+# boot) exactly while the operator is dead. Issue #646 closes that two
+# ways: the OpenStudioOperatorScrapeTargetDown companion (substrate group)
+# makes target loss itself a critical page, and the liveness alerts in the
+# handler / substrate / stall groups carry trailing `or absent(...)`
+# arms — the #569/#645 "TRUE absence must fire" idiom — so NO DATA
+# evaluates to FIRING rather than silent. Covered modes, documented per
+# alert: pod-down, crashloop, and NetworkPolicy-misconfig scrape loss.
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -170,11 +185,31 @@ spec:
         # interval (per-module cadences in _constants.py: analysis_sla
         # 30s, datapoint_watchdog 60s, worker_recycler 300s,
         # web_background_monitor 60s).
+        #
+        # Issue #646 — the trailing `or absent(...)` arm absence-proofs
+        # the family (the #569/#645 "TRUE absence must fire" idiom).
+        # While the series sit inside Prometheus's ~5-minute lookback
+        # the staleness legs carry the alert (pod dies → timestamps stop
+        # advancing → `time() - X > T` fires within the threshold).
+        # Once the lookback GCs the series — pod down or crashlooping
+        # past ~5m — the staleness legs return NO DATA and previously
+        # the alert RESOLVED while the operator was dead; in the
+        # documented #166 mode (scraper in a namespace the metrics
+        # NetworkPolicy does not allow) the series never existed from
+        # boot and the alert never fired at all. The absent() leg fires
+        # in exactly those no-data states. Series-present semantics are
+        # UNCHANGED (#581 fences the per-module 3x thresholds); a
+        # boot-time absence (before the first tick lands and is
+        # scraped) fires briefly by design — an honest signal on a
+        # single-replica Recreate deployment, and the zero-CR idle boot
+        # (D05) pages too: "operator does nothing → page" is this
+        # alert's stated purpose (#469).
         - alert: OpenStudioOperatorHandlerHeartbeatStale
           expr: time() - openstudio_operator_handler_last_tick_timestamp{module="analysis_sla"} > 90
             or time() - openstudio_operator_handler_last_tick_timestamp{module="datapoint_watchdog"} > 180
             or time() - openstudio_operator_handler_last_tick_timestamp{module="worker_recycler"} > 900
             or time() - openstudio_operator_handler_last_tick_timestamp{module="web_background_monitor"} > 180
+            or absent(openstudio_operator_handler_last_tick_timestamp)
           labels:
             severity: critical
           annotations:
@@ -187,7 +222,12 @@ spec:
               the pod is running, the OSCM CR still exists, and (after a kopf upgrade)
               tests/test_singleton_registry_coverage.py against the deployed kopf
               version — silently unwrapped timers are the documented kopf-pin failure
-              mode this alert exists to catch.
+              mode this alert exists to catch. The trailing absent() arm (#646) keeps
+              this alert FIRING when the heartbeat family has no series at all — pod
+              down or crashlooping past the Prometheus lookback, or scrape-path loss
+              (#166 wrong-namespace NetworkPolicy) so the series never existed: target
+              loss is itself alerting. Cross-check
+              OpenStudioOperatorScrapeTargetDown (the target-level companion).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------
@@ -288,13 +328,76 @@ spec:
     # ---------------------------------------------------------------------
     - name: openstudio-operator.substrate
       rules:
+        # Issue #646 — the target-down companion. Every operator-liveness
+        # alert in this manifest keys on a series the operator itself
+        # exports; when the pod is down, crashlooping, or the scraper
+        # cannot reach port 9090, those series go stale after the ~5m
+        # Prometheus lookback and the expressions return NO DATA — the
+        # #469 heartbeat and the #312 freshness pair would RESOLVE while
+        # the operator is non-functional, and in the documented #166
+        # failure mode (Prometheus in a differently-named namespace so
+        # `openstudio-operator-metrics-ingress` never allows the scrape)
+        # the series never exist from boot and nothing fires at all. Two
+        # arms, following the #569/#645 "TRUE absence must fire"
+        # precedent:
+        #   1. TARGET — `up{job="openstudio-operator"} == 0`: the scrape
+        #      target exists but every scrape is FAILING (pod down,
+        #      crashloop, NetworkPolicy block). Fires within ~2 scrape
+        #      intervals — BEFORE the lookback GCs the series, i.e.
+        #      faster than any staleness expression can see the loss.
+        #      The job label is the one implied by this manifest's
+        #      `app.kubernetes.io/name: openstudio-operator` label; if
+        #      your scrape config names the job differently this arm is
+        #      inert (it matches nothing) — rename it here or rely on
+        #      arm 2, which is label-independent.
+        #   2. ABSENCE — `absent(handler_last_tick_timestamp)`: the
+        #      heartbeat family has NO series at all. Covers arm 1's
+        #      blind spots: no scrape target configured, a renamed job
+        #      label, and the #166 never-scraped-from-boot mode.
+        # The `for: 5m` dwells past a single missed scrape / a normal
+        # single-replica Recreate restart; sustained loss (the three
+        # documented modes: pod-down, crashloop, NetworkPolicy
+        # misconfig) pages.
+        - alert: OpenStudioOperatorScrapeTargetDown
+          expr: up{job="openstudio-operator"} == 0
+            or absent(openstudio_operator_handler_last_tick_timestamp)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Operator /metrics scrape target is down or absent
+            description: >-
+              up{job="openstudio-operator"} == 0, or the heartbeat family
+              openstudio_operator_handler_last_tick_timestamp has no series at all —
+              the operator's /metrics surface is not being scraped. Covered modes
+              (#646): pod down, crashlooping, or scrape-path loss — including the
+              documented #166 failure mode where Prometheus runs in a namespace the
+              openstudio-operator-metrics-ingress NetworkPolicy does not allow, so
+              the series never exist from boot. Without this companion every
+              operator-liveness alert silently resolves exactly when the operator is
+              dead. Triage: kubectl get pods -n openstudio-server (operator pod
+              Running? CrashLoopBackOff?), then the NetworkPolicy namespaceSelector
+              vs your Prometheus namespace (#166 — rename the `prometheus` namespace
+              match or label an in-namespace scraper metrics-scraper, #295), then
+              the scrape config's job label vs this rule's. The liveness alerts
+              (heartbeat, freshness pair, bind gauge) firing alongside this one is
+              EXPECTED post-#646: they carry absence arms and stay firing across
+              the lookback handoff.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
         # metrics.py METRICS_SERVER_BOUND (#393) — the canonical "Prometheus
-        # scrape is down because of US" signal. Pair with blackbox-exporter
-        # up==0: when the bind failed this pod's /metrics is dead, so the
+        # scrape is down because of US" signal. Pair with the
+        # ScrapeTargetDown companion above (and blackbox-exporter up==0):
+        # when the bind failed this pod's /metrics is dead, so the
         # 0.0 cannot be scraped from the pod itself on the SAME restart —
-        # the gauge is the durable record for post-mortems.
+        # the gauge is the durable record for post-mortems. The trailing
+        # `or absent(...)` arm (#646) keeps the alert firing when the
+        # gauge has no series at all (pod down past the lookback, or
+        # scrape-path loss so it was never ingested); the `== 0` arm
+        # remains the series-present bind-failure case.
         - alert: OpenStudioOperatorMetricsServerUnbound
           expr: openstudio_operator_metrics_server_bound == 0
+            or absent(openstudio_operator_metrics_server_bound)
           labels:
             severity: critical
           annotations:
@@ -304,7 +407,11 @@ spec:
               first bind attempt raised OSError on {{ $labels.addr }}:{{ $labels.port }}
               (port already in use or unbindable address). The operator keeps running
               with /metrics dead; only the WARNING log and this gauge record it.
-              Restart the pod after freeing the port.
+              Restart the pod after freeing the port. The trailing absent() arm
+              (#646) fires when the gauge itself cannot be scraped — pod down /
+              crashloop past the Prometheus lookback, or scrape-path loss (#166);
+              cross-check OpenStudioOperatorScrapeTargetDown for the target-level
+              signal and to separate the two modes.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
         # metrics.py WARNINGS_DEFERRED_DROPPED_TOTAL (#310) — Warning Events
@@ -416,8 +523,14 @@ spec:
         # only signal that the operator has LOST visibility (Redis
         # unreachable, ApiException) while the last depth reading
         # masquerades as live. 300s = 5 missed sensing ticks (cadence 60s).
+        # The trailing `or absent(...)` arm (#646) covers the no-data
+        # modes the staleness arithmetic cannot see: pod down /
+        # crashlooping past the ~5m Prometheus lookback, or scrape-path
+        # loss (#166) so the series never existed — without it this alert
+        # RESOLVED exactly while the operator was dead.
         - alert: OpenStudioOperatorResqueQueueDepthStale
           expr: time() - openstudio_operator_resque_queue_depth_fresh > 300
+            or absent(openstudio_operator_resque_queue_depth_fresh)
           labels:
             severity: warning
           annotations:
@@ -428,14 +541,20 @@ spec:
               60s). The resque_queue_depth gauge is holding a stale value: the operator
               has lost visibility into the queue fabric (Redis unreachable or the read
               path raising). Do not trust the depth gauges until freshness recovers.
+              The trailing absent() arm (#646) fires when the series has no data at
+              all — pod down / crashloop past the Prometheus lookback, or scrape-path
+              loss (#166); cross-check OpenStudioOperatorScrapeTargetDown.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
         # metrics.py STALL_WINDOW_FRESH (#312) — the same staleness idiom for
         # the stall-window gauge: a stale nonzero value masquerades as a
         # continuing stall across a blind gap (tracker.reset() on the
-        # exception path).
+        # exception path). The trailing `or absent(...)` arm (#646) covers
+        # the no-data modes (pod down / crashloop past the lookback,
+        # #166 scrape-path loss) per the #569/#645 absence idiom.
         - alert: OpenStudioOperatorStallWindowStale
           expr: time() - openstudio_operator_stall_window_fresh > 300
+            or absent(openstudio_operator_stall_window_fresh)
           labels:
             severity: warning
           annotations:
@@ -446,7 +565,10 @@ spec:
               stall_window_elapsed_seconds gauge may be showing a stale accumulated
               window across a blind gap (RedisClientError / ApiException path).
               Investigate the web_background monitor's downstreams before trusting (or
-              acting on) the stall display.
+              acting on) the stall display. The trailing absent() arm (#646) fires
+              when the series has no data at all — pod down / crashloop past the
+              Prometheus lookback, or scrape-path loss (#166); cross-check
+              OpenStudioOperatorScrapeTargetDown.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
     # ---------------------------------------------------------------------
