@@ -19,6 +19,16 @@
 #                            a production cluster you may want minReplicaCount: 1
 #                            to keep one worker warm.
 #   maxReplicaCount: 5     — bounded; raise for production traffic.
+#                          NOTE (#580): maxReplicaCount is COUPLED to the
+#                          namespace ResourceQuota (deploy/
+#                          resource-quota.yaml). Every replica reserves
+#                          250m/512Mi (requests) + counts 2 CPU/2Gi of
+#                          LimitRange-defaulted limits against the
+#                          aggregate, and the burst envelope is fenced at
+#                          CI level — raising maxReplicaCount without
+#                          raising the quota fails
+#                          tests/test_deploy_manifests.py::
+#                          test_resource_quota_covers_keda_burst_envelope.
 #   pollingInterval: 15    — KEDA's Redis query cadence. Lower = faster
 #                            scale-up at the cost of more Redis reads.
 #   cooldownPeriod: 60     — seconds to wait before scaling down after
