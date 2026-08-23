@@ -185,35 +185,6 @@ def make_pod(name: str, ip: str | None = None, labels: dict | None = None):
     )
 
 
-def _label_selector_term_matches(labels: dict, term: str) -> bool:
-    """AND-intersection of every term in the label selector.
-
-    Honors the subset of the Kubernetes label-selector grammar that the
-    issue #44 ``deployment_label_selector`` helper emits: ``k=v``,
-    ``k in (v1,v2)``, ``k notin (v1,v2)``, bare ``k`` (Exists), and
-    ``!k`` (DoesNotExist). Other terms (e.g. ``Gt``, ``Lt``) silently drop
-    in the fake — the helper falls back to matchLabels-only in that case
-    anyway, so the test surface stays small.
-    """
-    term = term.strip()
-    if not term:
-        return True
-    if term.startswith("!"):
-        return term[1:] not in labels
-    if " notin " in term:
-        key, _, rest = term.partition(" notin ")
-        vs = rest.strip().strip("()").split(",")
-        return labels.get(key) not in vs
-    if " in " in term:
-        key, _, rest = term.partition(" in ")
-        vs = rest.strip().strip("()").split(",")
-        return labels.get(key) in vs
-    if "=" in term:
-        key, _, value = term.partition("=")
-        return labels.get(key) == value
-    return term in labels
-
-
 class FakeCoreV1Api:
     """CoreV1Api stand-in: pod list + recorded deletes (issue #83 D2).
 
