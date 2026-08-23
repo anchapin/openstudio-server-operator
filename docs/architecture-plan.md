@@ -1,5 +1,13 @@
 # **OpenStudio Server Kubernetes Operator: Architectural Blueprint & Implementation Plan**
 
+> **Historical design document** — kept for decision provenance, not current
+> wiring. The authoritative module layout is [`AGENTS.md`](../AGENTS.md)'s
+> Layout section plus [`docs/adr/`](adr/). Two boxes in the §2 diagram are
+> superseded: the in-process "Storage & Artifact Pruner" moved to the
+> `deploy/storage-cronjob.yaml` CronJob (#78), and the "KEDA / HPA
+> Controller" is deleted — autoscaling is KEDA-only, no operator HPA code
+> (#77).
+
 ## **1\. Executive Summary & Objectives**
 
 OpenStudio Server is a distributed energy simulation platform running on Ruby/Rails (web), background orchestrators (web\_background), database engines (MongoDB), and simulation compute nodes (worker). Running OpenStudio Server on Kubernetes via Helm provides baseline orchestration, but long-running, resource-heavy simulation workloads frequently suffer from:
