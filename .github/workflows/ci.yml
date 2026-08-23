@@ -410,4 +410,56 @@ jobs:
           exit-code: 1
           trivyignores: .trivyignore
           ignore-unfixed: true
+      # Issue #642: CVE/freshness gate for the digest-pinned rclone sidecar
+      # (archival.py RCLONE_IMAGE, pinned by #124/#417). The scan above
+      # covers only the operator image; the rclone container — the one that
+      # holds live S3/GCS/Azure credentials via envFrom and egresses to
+      # 0.0.0.0/0:443 — was invisible to every gate: Dependabot's docker
+      # ecosystem sees Dockerfile FROM lines only (.github/dependabot.yml
+      # section (c)), so the pin had immutability but no scanning. A digest
+      # pin freezes the artifact, not its CVE record: the same frozen
+      # digest accumulates gate-visible findings as advisories publish.
+      #
+      # Rides the audit job (not a separate `schedule:` trigger): the
+      # weekly Dependabot pass (#480) opens bump PRs that run this job at
+      # least weekly, so freshness is covered without doubling the
+      # lint/test surface on a timer.
+      #
+      # The reference is EMITTED from openstudio_operator.archival (stdlib-
+      # only import chain, hence PYTHONPATH=src with no install) so the pin
+      # stays single-source (#417) — the digest must never be hardcoded in
+      # this workflow. tests/test_rclone_image_ci_gate.py fences that.
+      - name: Emit RCLONE_IMAGE from archival.py (issue #642)
+        id: emit-rclone-image
+        run: |
+          set -euo pipefail
+          RCLONE_IMAGE=$(PYTHONPATH=src python3 -c "from openstudio_operator.archival import RCLONE_IMAGE; print(RCLONE_IMAGE)")
+          if ! printf '%s' "$RCLONE_IMAGE" | grep -qE '^rclone/rclone:[^@[:space:]]+@sha256:[0-9a-f]{64}$'; then
+            echo "::error::RCLONE_IMAGE from archival.py is not a digest-pinned rclone/rclone reference: ${RCLONE_IMAGE}"
+            exit 1
+          fi
+          echo "Scanning ${RCLONE_IMAGE}"
+          echo "rclone-image=${RCLONE_IMAGE}" >> "$GITHUB_OUTPUT"
+      # Same floor + triage conventions as the operator-image scan above:
+      # CRITICAL,HIGH, exit-code 1, ignore-unfixed, shared .trivyignore
+      # (new entries need a justification comment + follow-up issue).
+      #
+      # Refresh runbook (when this gate fires on the frozen digest):
+      #   1. docker buildx imagetools inspect rclone/rclone:<new-ver>
+      #      → copy the new sha256 digest;
+      #   2. update RCLONE_IMAGE in src/openstudio_operator/archival.py
+      #      (the ONLY pin to edit — the digest constant is derived, #417);
+      #   3. the CEL string literal in deploy/storage-cronjob.yaml must be
+      #      refreshed in the same commit — the #641 cross-fence test
+      #      (tests/test_deploy_manifests.py) compares the CEL literal
+      #      against archival.RCLONE_IMAGE and FAILS CI if the CEL update
+      #      is missed, so a partial refresh cannot land green.
+      - name: Trivy scan the pinned rclone image (issue #642)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.emit-rclone-image.outputs.rclone-image }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          trivyignores: .trivyignore
+          ignore-unfixed: true
 
