@@ -11,13 +11,41 @@
 #
 # The two objects bound the surface at different levels:
 #
-#   * ResourceQuota caps the AGGREGATE — requests.cpu=4 /
-#     limits.cpu=8, requests.memory=8Gi / limits.memory=16Gi. This is
-#     the actual blast-radius bound: nothing in the namespace can
-#     reserve more than these totals, so the operator's 100m/128Mi
-#     reservation always has documented headroom (steady-state
-#     arithmetic fenced by tests/test_deploy_manifests.py::
-#     test_resource_quota_totals_leave_room_for_steady_state).
+#   * ResourceQuota caps the AGGREGATE. This is the actual
+#     blast-radius bound: nothing in the namespace can reserve more
+#     than these totals, so the operator's 100m/128Mi reservation
+#     always has documented headroom. Sizing (#580, extending #400):
+#
+#       - requests.cpu=4 / requests.memory=8Gi COVER the KEDA burst
+#         envelope unchanged. The envelope is computed at REAL
+#         requests (not the LimitRange defaults — every chart pod
+#         declares requests): db 250m/512Mi + queue 100m/128Mi +
+#         web 500m/2Gi + web-background 250m/1Gi + maxReplicaCount=5
+#         workers x 250m/512Mi + operator 100m/128Mi + prune pod
+#         50m/128Mi = 2.5 CPU / 6.375Gi. #580's "11 x 500m = 5.5
+#         CPU" premise assumed default-riding pods; the real-request
+#         arithmetic leaves 1.5 CPU / 1.625Gi of headroom.
+#       - limits.cpu=20 / limits.memory=20Gi (raised from 8/16Gi).
+#         The chart's pods declare limits.memory but NOT limits.cpu,
+#         so admission injects the LimitRange default limit (2 CPU /
+#         4Gi ceiling) per container — and those injected limits
+#         COUNT against the quota. At maxReplicaCount the aggregate
+#         is 18.75 CPU / 19Gi; the pre-#580 8/16Gi sat BELOW even
+#         the steady-state aggregate (10.75 CPU), so any rescheduled
+#         chart pod — or the single-replica, Recreate-strategy
+#         operator itself — would be quota-rejected until something
+#         else terminated. 20/20Gi covers the burst envelope with
+#         ~1.25 CPU / 1Gi headroom; the per-container ceiling stays
+#         bounded by the LimitRange below.
+#
+#     Both fences are CI-level, computed from the manifests at test
+#     time (tests/test_deploy_manifests.py::
+#     test_resource_quota_totals_leave_room_for_steady_state and
+#     test_resource_quota_covers_keda_burst_envelope — maxReplicaCount
+#     parsed from deploy/keda-scaledobject.yaml, per-pod requests and
+#     limits parsed from scripts/manifests/ + deploy/), so drift in
+#     either direction (burst up, quota down, chart requests up)
+#     fails the build.
 #   * LimitRange supplies the PER-CONTAINER defaults — containers
 #     that omit resources are defaulted to requests 500m/512Mi and
 #     limits 2 CPU/4Gi. The defaults are load-bearing, not cosmetic:
@@ -25,7 +53,9 @@
 #     containers omit limits, and the helm chart's pods (web,
 #     web-background, worker) declare limits.memory but NOT
 #     limits.cpu — without the LimitRange default the quota would
-#     make those pods inadmissible.
+#     make those pods inadmissible. The injected 2 CPU default limit
+#     is also why the aggregate limits quota must be 20 CPU: see the
+#     sizing comment above (#580).
 #
 # Deliberately NO LimitRange `max`: the chart's pods legitimately
 # declare limits.memory up to the 4Gi ceiling the issue documents,
@@ -51,10 +81,19 @@ metadata:
   namespace: openstudio-server
 spec:
   hard:
+    # Sizing rationale (#580, extending #400): the burst envelope at
+    # REAL requests is 2.5 CPU / 6.375Gi (4 chart pods + 5 workers at
+    # maxReplicaCount + operator + prune pod, every one declaring its
+    # requests); the limits-side aggregate — with the LimitRange
+    # injecting the 2 CPU default limit into the chart pods that omit
+    # limits.cpu — is 18.75 CPU / 19Gi. 4/8Gi/20/20Gi cover both with
+    # headroom; full arithmetic in the header comment above and in
+    # tests/test_deploy_manifests.py (the envelope is computed from
+    # the manifests at test time, so any drift fails CI).
     requests.cpu: "4"
     requests.memory: 8Gi
-    limits.cpu: "8"
-    limits.memory: 16Gi
+    limits.cpu: "20"
+    limits.memory: 20Gi
 ---
 apiVersion: v1
 kind: LimitRange
