@@ -1027,6 +1027,111 @@ def test_crd_identity_literals_live_only_in_constants() -> None:
     )
 
 
+def _find_kopf_event_calls() -> list[tuple[str, int, str]]:
+    """Return ``(relative_path, lineno, dotted)`` for every ``kopf.event`` call site.
+
+    Walks ``src/openstudio_operator/`` and locates ``ast.Call`` nodes whose
+    function resolves to kopf's ``event`` in either import shape (issue
+    #651):
+
+    * attribute-shape — ``kopf.event(...)`` or a module-alias form like
+      ``k.event(...)``: an :class:`ast.Attribute` whose ``attr`` is
+      ``event`` and whose ``value`` is a plain :class:`ast.Name`. The
+      value-is-Name restriction is load-bearing: the ``@kopf.on.event(...)``
+      decorators used by four handler modules are ALSO ``Attribute`` nodes
+      with ``attr == "event"``, but their value is an ``Attribute``
+      (``kopf.on``), so they are deliberately not flagged.
+    * bare-name shape — ``from kopf import event`` then ``event(...)``:
+      an :class:`ast.Name` with id ``event``. AST parsing naturally skips
+      comments and docstrings, so prose mentions of ``kopf.event(``
+      cannot trip the fence — only real call nodes are collected.
+    """
+    src_root = Path(singleton.__file__).parent
+    found: list[tuple[str, int, str]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            rel = str(py.relative_to(src_root.parent))
+            if isinstance(func, ast.Name) and func.id == "event":
+                found.append((rel, node.lineno, func.id))
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "event"
+                and isinstance(func.value, ast.Name)
+            ):
+                dotted = f"{func.value.id}.{func.attr}"
+                found.append((rel, node.lineno, dotted))
+    return found
+
+
+def test_kopf_event_call_sites_live_only_in_events_module() -> None:
+    """Issue #651: direct ``kopf.event`` calls live only in ``events.py``.
+
+    AGENTS.md (since #496) declares
+    :func:`openstudio_operator.events.emit_kopf_event` "the one shared
+    direct ``kopf.event`` wrapper", yet ``QueuedKopfEventSink.flush_for``
+    called ``kopf.event(...)`` directly at two sites — the chokepoint
+    invariant had already drifted, and nothing structural prevented a
+    third direct call site. This matters to D11: the ``EventEmitter``
+    dry-run gate only protects events that flow through it, and while
+    ``emit_kopf_event`` is deliberately un-gated for guard/audit
+    Events, an unfenced chokepoint means the next handler that reaches
+    for ``kopf.event`` directly silently escapes ``dryRun`` suppression
+    with no CI signal.
+
+    The fix (#651) routes the two ``flush_for`` sites through
+    ``emit_kopf_event`` (behavior unchanged) and adds this AST gate,
+    mirroring ``test_only_one_kubeconfig_loader_call_site`` (#305): any
+    production-source ``kopf.event(`` call site (bare-name or
+    attribute shape) outside ``openstudio_operator/events.py`` is a
+    regression and fails the CI gate loudly.
+
+    Note: a bare ``event(`` name match is intentionally conservative —
+    any production callable named ``event`` collides with kopf's event
+    API surface and should be renamed rather than exempted.
+    """
+    found = _find_kopf_event_calls()
+    assert found, (
+        "No ``kopf.event(`` call site found in src/openstudio_operator/. "
+        "The shared wrapper openstudio_operator.events.emit_kopf_event() "
+        "must call kopf.event directly — if the wrapper moved, update "
+        "this test in lockstep. See issue #651."
+    )
+    offenders = [
+        (path, lineno, dotted)
+        for path, lineno, dotted in found
+        if not path.endswith("openstudio_operator/events.py")
+    ]
+    assert not offenders, (
+        f"Production code calls ``kopf.event`` outside "
+        f"openstudio_operator/events.py: {offenders}. Every direct "
+        f"``kopf.event`` call must live in the shared wrapper "
+        f"openstudio_operator.events.emit_kopf_event() (issue #496); "
+        f"handler paths that need the D11 dry-run gate use "
+        f"openstudio_operator.events.EventEmitter instead, and "
+        f"non-callback deferrals use "
+        f"openstudio_operator.events_sinks.QueuedKopfEventSink "
+        f"(issue #651)."
+    )
+    # Sanity: the two allowed sites inside events.py are the wrapper
+    # itself and the EventEmitter.emit post — pin that the canonical
+    # module still owns at least one direct call so the fence above can
+    # never pass vacuously after a refactor moves the wrapper.
+    events_module_sites = [
+        (path, lineno, dotted)
+        for path, lineno, dotted in found
+        if path.endswith("openstudio_operator/events.py")
+    ]
+    assert events_module_sites, (
+        "openstudio_operator/events.py no longer calls ``kopf.event`` "
+        "directly — emit_kopf_event and/or EventEmitter.emit must keep "
+        "their direct calls (issue #651)."
+    )
+
+
 # --- Issue #250 — Python-level registry cross-check ----------------------------
 #
 # Issue #250: ``EXPECTED_OSCM_TIMER_HANDLER_IDS`` (the frozenset above) was
