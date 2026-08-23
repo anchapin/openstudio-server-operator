@@ -599,7 +599,8 @@ def test_cronjob_job_template_has_active_deadline_seconds():
 
 
 def test_prometheusrule_prune_group_pins_failure_and_absence_of_success():
-    """Issue #569 — the prune alert pair: failed Jobs AND no success in ~1h.
+    """Issues #569 + #645 — the prune alert pair: failed Jobs AND CronJob
+    recency.
 
     The failed-Job alert is event-driven (it needs a Job to reach Failed
     — the activeDeadlineSeconds from
@@ -608,12 +609,20 @@ def test_prometheusrule_prune_group_pins_failure_and_absence_of_success():
     the modes that produce no events at all — suspended CronJob, schedule
     mutated wrong, Jobs never scheduled — where every operator-process
     signal stays green (the heartbeat and tick counters belong to the
-    operator, not the pruner). The expression shape is load-bearing:
-    ``max_over_time`` (NOT increase()/changes() — a seconds-long tick can
-    first appear scraped already at succeeded=1 with no observed 0->1
-    transition for increase() to count) and ``or vector(0)`` (an empty
-    selector after successfulJobsHistoryLimit GC must evaluate to 0 and
-    fire, not vacuously match nothing).
+    operator, not the pruner).
+
+    Since #645 the absence alert keys on CronJob-level recency
+    (``time() - kube_cronjob_status_last_successful_time``), NOT on
+    Job-object accumulation: the #569
+    ``sum(max_over_time(kube_job_status_succeeded[...]))`` shape was
+    permanently pinned >= 1 by the three succeeded Jobs
+    ``successfulJobsHistoryLimit`` retains (the CronJob controller only
+    GCs history when it creates a NEW Job), so it could never fire in
+    exactly the no-event modes it was built for. The canonical shape and
+    the firing scenarios are fenced in
+    ``tests/test_monitoring_artifacts.py`` (#645 drift gate); this test
+    pins the structural essentials here beside the rest of the prune
+    manifest checks.
     """
     docs = list(yaml.safe_load_all((DEPLOY / "prometheustrule.yaml").read_text()))
     rule = next(d for d in docs if d and d["kind"] == "PrometheusRule")
@@ -630,16 +639,23 @@ def test_prometheusrule_prune_group_pins_failure_and_absence_of_success():
         "event-driven failed alert cannot see a suspended/starved CronJob"
     )
     expr = no_success["expr"]
-    assert "kube_job_status_succeeded" in expr
-    assert "max_over_time" in expr and "[1h]" in expr, (
-        "absence-of-success must be max_over_time over a 1h window (~6 "
-        "missed */10 schedules, issue #569), not increase()/changes() — a "
-        "seconds-long tick can first appear scraped at succeeded=1"
+    assert "kube_job_status_succeeded" not in expr, (
+        "absence-of-success must not accumulate kube_job_status_succeeded "
+        "(issue #645): successfulJobsHistoryLimit (3) retains succeeded Job "
+        "objects forever in the no-event modes, pinning the sum at >= 1 so "
+        "the alert can never fire"
     )
-    assert "or vector(0)" in expr, (
-        "absence-of-success must keep firing on an empty selector (job "
-        "history GC'd) — TRUE absence evaluates to 0, it must not "
-        "vacuously match nothing"
+    assert 'time() - kube_cronjob_status_last_successful_time{' in expr, (
+        "absence-of-success must key on CronJob-level recency "
+        "(issue #645), not Job-object accumulation"
+    )
+    assert 'cronjob="openstudio-storage-pruner"' in expr
+    assert "kube_cronjob_status_last_schedule_time" in expr and " unless " in expr, (
+        "absence-of-success needs the never-succeeded bootstrap arm "
+        "(schedule-stale unless successful-time-exists): "
+        "kube_cronjob_status_last_successful_time is ABSENT until the "
+        "first success, so time() - X alone is no-data on a fresh install "
+        "and would silently never fire (#569 TRUE-absence precedent)"
     )
     assert no_success["labels"]["severity"] == "warning"
 

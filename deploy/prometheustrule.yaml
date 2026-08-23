@@ -501,34 +501,91 @@ spec:
         # suspended (spec.suspend), schedule mutated wrong, controller
         # outage, Jobs never scheduled — produce nothing for it to key on
         # while the archival backlog grows toward an NFS-full outage
-        # (#470). Expression shape is load-bearing: max_over_time, NOT
-        # increase()/changes() — the prune tick runs seconds, so a Job can
-        # appear, succeed and be scraped for the first time already at
-        # succeeded=1 with no observed 0->1 transition for increase() to
-        # count; and ``sum(...) or vector(0)`` keeps the expression
-        # non-empty when successfulJobsHistoryLimit (3) has GC'd every
-        # matching series — TRUE absence must evaluate to 0 and fire, not
-        # vacuously match nothing. 1h window = 6 missed */10 schedules.
-        # Requires kube-state-metrics like the sibling failed-Job alert.
+        # (#470).
+        #
+        # Issue #645 — the expression keys on CRONJOB-LEVEL RECENCY, not
+        # Job-object accumulation. The #569 shape
+        # (sum(max_over_time(kube_job_status_succeeded[...])) or vector(0))
+        # was dead-on-arrival after day one: successfulJobsHistoryLimit (3)
+        # in storage-cronjob.yaml retains the three newest succeeded Job
+        # OBJECTS, kube-state-metrics keeps exporting succeeded=1 for every
+        # retained object, and the CronJob controller only GCs history
+        # when it creates a NEW Job — so in exactly the no-event modes
+        # this alert exists for (suspend / wrong schedule / controller
+        # outage / never scheduled) the three old successes sit there
+        # forever pinning the sum at >= 1 and the alert can NEVER fire.
+        # The #569 "TRUE absence must evaluate to 0 and fire" claim only
+        # held until the first three successes existed.
+        #
+        # Two arms, both on the CronJob object (a single series the
+        # retained Job history cannot pin). Threshold 3600s = 1h = 6
+        # missed */10 schedules (the #569 window):
+        #   1. RECENCY — time() - last_successful_time > 3600: no
+        #      completed success in the last hour. Covers every mode once
+        #      any success exists, including suspend (successes simply
+        #      stop and the timestamp ages past the window).
+        #   2. BOOTSTRAP (never-succeeded) — EDGE CASE: the series
+        #      kube_cronjob_status_last_successful_time is ABSENT until
+        #      the CronJob's first success; time() - X over an absent
+        #      series is no-data, so arm 1 alone would silently never
+        #      fire on a fresh install that never succeeded (#569
+        #      precedent: TRUE absence must fire, not vacuously match
+        #      nothing). The `or (... unless ...)` arm fires when
+        #      last_schedule_time EXISTS and is older than 3600s AND no
+        #      success has ever been recorded. The `unless` keeps the
+        #      arms disjoint: once any success exists arm 2 is suppressed
+        #      and arm 1 owns the semantics — a success followed by
+        #      suspension gets the full 1h grace, not an immediate
+        #      bootstrap false-fire.
+        # Residual gap (documented, accepted): a Job scheduled recently
+        # but never starting (unschedulable pod pinned Pending forever)
+        # keeps last_schedule_time fresh and records no success, so
+        # neither arm fires until the schedule itself stalls; the
+        # failed-Job sibling cannot see it either (the Job never reaches
+        # Failed). Narrower than every mode the old expr missed after
+        # three successes — catch via the kubectl triage below.
+        #
+        # kube-state-metrics floor: the series
+        # kube_cronjob_status_last_successful_time shipped in KSM v2.5.0
+        # (upstream PR #1732); the companion last_schedule_time has been
+        # exported since the v1.x line. On
+        # KSM < 2.5 the successful_time series is never exported, so arm
+        # 1 matches nothing and arm 2's `unless` never suppresses: the
+        # alert degrades to "last_schedule_time older than 1h" — still
+        # catches suspend / schedule mutation / controller outage, but
+        # NOT scheduled-and-never-succeeding (the v1.x fallback; those
+        # clusters should lean on the PruneJobFailed sibling and/or the
+        # newest-Job kube_job_status_start_time alternative from #645).
         - alert: OpenStudioOperatorPruneJobNoSuccess
-          expr: (sum(max_over_time(kube_job_status_succeeded{namespace="openstudio-server", job_name=~"openstudio-storage-pruner-.+"}[1h])) or vector(0)) < 1
+          expr: >-
+            (time() - kube_cronjob_status_last_successful_time{namespace="openstudio-server",
+            cronjob="openstudio-storage-pruner"} > 3600) or ((time() -
+            kube_cronjob_status_last_schedule_time{namespace="openstudio-server",
+            cronjob="openstudio-storage-pruner"} > 3600) unless
+            kube_cronjob_status_last_successful_time{namespace="openstudio-server",
+            cronjob="openstudio-storage-pruner"})
           for: 15m
           labels:
             severity: warning
           annotations:
-            summary: No successful storage-prune Job in over an hour
+            summary: No successful storage-prune run in over an hour
             description: >-
-              No kube_job_status_succeeded=1 for an openstudio-storage-pruner-*
-              Job in the last hour (6 missed */10 schedules) — the retention
-              pipeline has not completed a tick. Either the CronJob is
-              suspended / mis-scheduled, Jobs are never created, or (pre-#569
-              manifests) a hung pod is pinning the Running Job under
-              concurrencyPolicy: Forbid — post-#569 that pod is
-              DeadlineExceeded-killed at 1800s and surfaces as
-              OpenStudioOperatorPruneJobFailed, so cross-check that alert.
-              The archival backlog grows while this fires; NFS fill (#470) is
-              the end state. Triage: kubectl get cronjob
-              openstudio-storage-pruner -n openstudio-server (suspend flag?
-              lastScheduleTime?), kubectl get jobs -n openstudio-server -l
-              app.kubernetes.io/component=storage-pruner, then the Job pod logs.
+              The openstudio-storage-pruner CronJob has not recorded a
+              successful run in over an hour (6 missed */10 schedules) —
+              keyed on kube_cronjob_status_last_successful_time recency, or,
+              if it has never succeeded, on a last_schedule_time older than
+              1h with no success ever recorded (#645: the previous
+              sum-of-retained-Jobs expr was permanently pinned >= 1 by the
+              three successes successfulJobsHistoryLimit retains). Either
+              the CronJob is suspended / mis-scheduled, Jobs are never
+              created, or every created Job is failing — cross-check
+              OpenStudioOperatorPruneJobFailed (post-#569 a hung pod is
+              DeadlineExceeded-killed at 1800s and surfaces there). The
+              archival backlog grows while this fires; NFS fill (#470) is
+              the end state. Requires kube-state-metrics >= 2.5.0
+              (kube_cronjob_status_last_successful_time). Triage: kubectl
+              get cronjob openstudio-storage-pruner -n openstudio-server
+              (suspend flag? lastScheduleTime?), kubectl get jobs -n
+              openstudio-server -l app.kubernetes.io/component=storage-pruner,
+              then the Job pod logs.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
