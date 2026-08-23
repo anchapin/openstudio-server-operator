@@ -47,5 +47,16 @@ COPY src ./src
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
  && pip install --no-cache-dir --no-deps --no-build-isolation .
 
+# Issue #589: image-level non-root default. The deploy manifests have pinned
+# runAsUser/fsGroup 1000 since #115/#161, but a manifest is a scheduler-side
+# control — it does not travel with the artifact. Everything that runs the
+# image outside those manifests (docker run, the release.yml dev-dep assert,
+# kind-recipe debugging, downstream embeds) would execute as root. USER 1000
+# matches the manifests' UID so file-ownership semantics stay identical; the
+# operator writes nothing to disk (status lives in the CR subresource), and
+# the Deployment's emptyDir /tmp covers any scratch need under
+# readOnlyRootFilesystem.
+USER 1000
+
 # Kopf watches the namespace given at runtime; RBAC + CRD live in deploy/.
 CMD ["kopf", "run", "--module", "openstudio_operator.handlers", "--namespace", "openstudio-server"]

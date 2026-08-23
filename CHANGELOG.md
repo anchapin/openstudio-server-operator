@@ -658,6 +658,7 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#589`** — the Dockerfile now sets `USER 1000`: the image-level non-root default travels with the artifact (`docker run`, the release dev-dep assert, downstream embeds), matching the manifests' `runAsUser`/`fsGroup` 1000.
 - **`#391`** — operator Deployment gained `livenessProbe` + `readinessProbe`
   against the named `metrics` port (containerPort 9090). Liveness
   (initialDelay 60s, period 30s, timeout 5s, failureThreshold 3) restarts a
