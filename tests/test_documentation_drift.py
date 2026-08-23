@@ -35,6 +35,17 @@ manifest (added to ``deploy/`` but missing from a doc) and a phantom entry
 (doc names a manifest that no longer exists) both fail the build, with the
 offending file(s) and doc named in the failure message.
 
+Issue #586 applies the same two-directional shape to the src/ package:
+every top-level module under ``src/openstudio_operator/`` (minus
+``__init__.py``, which the README subtree has never listed) must appear in
+README.md's Repository-layout ``src/openstudio_operator/`` subtree, and every
+module-shaped entry in that subtree must exist on disk. The subtree drifted
+exactly because no gate watched it: ``_cr_cache.py`` (#497) and ``_retry.py``
+(#416) shipped with no rows, and the ``_time.py`` row named a nonexistent
+``parse_utc`` symbol — a doc that misnames a function actively misroutes
+contributors. The nested ``handlers/`` sub-entries are indented one level
+deeper and are deliberately NOT part of this top-level module inventory.
+
 Historical capture logs are the one legitimate home for the literal: a capture
 transcribed before #150 is authentic evidence and may keep it — but only when
 the block is explicitly introduced by a leading ``PRE-#150`` marker line so no
@@ -433,3 +444,110 @@ def test_onboarding_cross_links_audit_policy_doc() -> None:
         "docs/onboarding.md must cross-link docs/audit-policy.md (issue #399) "
         "— keep it next to the kind-validation row in 'Pointers to other docs'."
     )
+
+
+# Issue #586 — the src/ inventory drift gate. README.md's hand-maintained
+# ``src/openstudio_operator/`` subtree is the only place the package's module
+# map is written for contributors; nothing else kept it honest, so it drifted
+# the week #416 and #497 landed (missing rows, a nonexistent `parse_utc`
+# symbol in the `_time.py` row). Mirrors the #485 deploy gate: the inventory
+# is globbed from disk at test time and compared in BOTH directions.
+SRC_PACKAGE_DIR = REPO_ROOT / "src" / "openstudio_operator"
+README_SRC_PACKAGE_LINE = "├── src/openstudio_operator/"
+# Depth-1 entries only: ``│   ├── name.py`` (│ + exactly three spaces). The
+# nested handlers/ sub-subtree indents one level deeper (``│       ├── ...``)
+# and must NOT be collected as top-level module names; the trailing ``.py``
+# requirement also keeps the ``handlers/`` directory row itself out.
+README_SRC_MODULE_ENTRY = re.compile(r"^│   [├└]──\s*(\S+\.py)")
+
+
+def src_package_module_names() -> set[str]:
+    """Every top-level module under ``src/openstudio_operator/``, globbed at
+    test time (issue #586) — the inventory is derived from disk, never
+    hardcoded. ``__init__.py`` is excluded: the README subtree documents the
+    package's modules, not its packaging marker, and has never listed it."""
+    return {
+        path.name for path in SRC_PACKAGE_DIR.glob("*.py") if path.name != "__init__.py"
+    }
+
+
+def readme_src_subtree_entry_names(lines: list[str]) -> set[str]:
+    """Return the depth-1 ``*.py`` entry names in a Repository-layout tree's
+    ``src/openstudio_operator/`` subtree (issue #586). Pure over the tree
+    lines.
+
+    Scoping to the subtree — the ``├── src/openstudio_operator/`` line down
+    to the next top-level ``├──``/``└──`` entry — means a module mentioned
+    elsewhere in the README (a test command, a runbook pointer) cannot mask
+    inventory drift, and the nested ``handlers/`` sub-entries are not
+    mistaken for top-level modules.
+    """
+    start = next(
+        (i for i, line in enumerate(lines) if README_SRC_PACKAGE_LINE in line), None
+    )
+    assert start is not None, (
+        "README.md's Repository-layout tree must contain a "
+        f"`{README_SRC_PACKAGE_LINE}` directory line (issue #586)."
+    )
+    names: set[str] = set()
+    for line in lines[start + 1 :]:
+        if line.startswith(("├──", "└──")):
+            break
+        match = README_SRC_MODULE_ENTRY.match(line)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def assert_src_inventory_matches(documented: set[str], doc: str) -> None:
+    """Issue #586 acceptance: the module names a doc lists for
+    ``src/openstudio_operator/*.py`` must equal the on-disk top-level modules
+    exactly — both directions, with the offending file(s) and the doc named
+    in the failure message."""
+    on_disk = src_package_module_names()
+    undocumented = sorted(on_disk - documented)
+    phantom = sorted(documented - on_disk)
+    assert not undocumented and not phantom, (
+        f"{doc} src/openstudio_operator/ module inventory drifted from "
+        f"src/openstudio_operator/ on disk (issue #586). "
+        f"Module(s) missing from {doc}: {undocumented}. "
+        f"Phantom entrie(s) in {doc} naming no on-disk module: {phantom}. "
+        "Update the doc tree and the module together — the inventory is "
+        "derived from `ls src/openstudio_operator/*.py`, never hardcoded here."
+    )
+
+
+def test_readme_layout_lists_every_src_module() -> None:
+    """Issue #586: the README layout tree must enumerate every top-level
+    module under ``src/openstudio_operator/`` so shared-utility seams
+    (``_cr_cache.py`` #497, ``_retry.py`` #416) are not invisible to
+    contributors. The directory is globbed at test time, so a future module
+    that ships undocumented fails here until the README catches up — and a
+    phantom row naming a deleted module fails too."""
+    assert_src_inventory_matches(
+        readme_src_subtree_entry_names(
+            README_DOC.read_text(encoding="utf-8").splitlines()
+        ),
+        "README.md",
+    )
+
+
+def test_readme_src_subtree_names_from_synthetic_tree() -> None:
+    lines = [
+        "```",
+        "├── deploy/                     # CRD, RBAC, alerting",
+        "│   └── crd.yaml                # CRD",
+        "├── src/openstudio_operator/",
+        "│   ├── _constants.py           # constants (#165)",
+        "│   ├── phantom_module.py       # listed but never shipped",
+        "│   └── handlers/               # handlers",
+        "│       ├── analysis_sla.py     # nested — not a top-level module",
+        "│       └── worker_recycler.py  # nested too",
+        "├── tests/                      # tests",
+        "└── pyproject.toml",
+        "```",
+    ]
+    assert readme_src_subtree_entry_names(lines) == {
+        "_constants.py",
+        "phantom_module.py",
+    }
