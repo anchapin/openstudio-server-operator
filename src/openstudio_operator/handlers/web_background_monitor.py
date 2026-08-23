@@ -58,7 +58,10 @@ Cooldown — the ACTION is rate-limited by the CR-anchored scalar
 point, checked FIRST — before any Redis or Kubernetes read — and blocks
 for one full stall window (``stallWindowMinutes`` is the only policy knob;
 "never restart more than once per stall window"). Gated ticks return
-without observing, so after a restart fires, a persisting stall must
+without sensing — since #647 they still stamp both #312 freshness
+gauges ("tick alive", not "queue read") so the 300 s staleness alerts
+cannot false-page during a cooldown that outlasts their threshold — so
+after a restart fires, a persisting stall must
 re-sustain for a fresh full window once the gate re-opens: sustained
 windows qualify the CONDITION, the cooldown qualifies the ACTION, and both
 are the same length. A fresh operator process reading the persisted CR
@@ -629,7 +632,11 @@ def run_stall_tick(
     THE GATE is the single decision point and is checked first: while the
     ``status.lastWebBackgroundRestart`` cooldown (one stall window) holds,
     the tick returns before any Redis/Kubernetes read — nothing can bypass
-    it. Raises on Redis/K8s/status-store failure so the caller skips the
+    it. Issue #647 — the gated branch still stamps both #312 freshness
+    gauges with ``time.time()`` (tick-alive heartbeat, not a queue read),
+    so the 300 s staleness alerts stay quiet through a cooldown that is
+    longer than their threshold. Raises on Redis/K8s/status-store failure
+    so the caller skips the
     tick (D12); an unanchored restart is re-attempted next poll (the
     tracker only resets once the anchor is written), an anchored one never
     re-fires within the window.
@@ -637,6 +644,15 @@ def run_stall_tick(
     window = timedelta(minutes=config.web_background_policy.stall_window_minutes)
     last_restart = store.get_last_web_background_restart_at()
     if last_restart is not None and now - last_restart <= window:
+        # Issue #647 — gated ticks still stamp BOTH #312 freshness gauges
+        # so the 300 s staleness alerts never false-page during a cooldown
+        # that is one full stall window (default 10 min > the threshold).
+        # During the gate the stamps mean "tick alive", not "queue read" —
+        # the depth/elapsed gauges deliberately hold their pre-restart
+        # values. No Redis/Kubernetes read happens here: the "no sensing"
+        # invariant (and its ExplodingRedis fence test) is unchanged.
+        RESQUE_QUEUE_DEPTH_FRESH.set(time.time())
+        STALL_WINDOW_FRESH.set(time.time())
         return False  # gate closed: no sensing, no observation, no action
 
     try:

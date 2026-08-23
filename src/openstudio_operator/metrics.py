@@ -193,13 +193,17 @@ RESQUE_QUEUE_DEPTH_FRESH = Gauge(
     "in ``web_background_monitor._stall_condition_holds``. The "
     "``RESQUE_QUEUE_DEPTH`` Gauge advances on success but is NOT "
     "touched on the exception path (Redis unreachable, ApiException, "
-    "etc.) — so a stale value can masquerade as a live reading while the "
-    "operator has in fact lost visibility. Dashboards should compute "
+    "etc.) — so a stale value can masquerade as a live reading while "
+    "the operator has in fact lost visibility. Dashboards should compute "
     "staleness as ``time() - openstudio_operator_resque_queue_depth_"
     "fresh`` and alert on a sustained gap, the same idiom as the rest of "
     "the Prometheus ecosystem's ``_created`` series. Set on EVERY "
     "sensing tick that successfully reads Redis (the unconditional-"
-    "advance pattern from issue #87).",
+    "advance pattern from issue #87). Issue #647 — during the stall "
+    "cooldown gate the tick stamps this gauge WITHOUT reading Redis: "
+    "there the stamp means ``tick alive`` (the deliberately paused "
+    "cooldown), not ``queue read`` — the depth gauge holds its "
+    "pre-restart value by design.",
 )
 
 # Issue #239 — singleton-guard election outcomes. The guard (D05, issue #14)
@@ -482,7 +486,11 @@ STALL_WINDOW_FRESH = Gauge(
     "in fact lost visibility. Dashboards should compute staleness as "
     "``time() - openstudio_operator_stall_window_fresh`` and alert on "
     "a sustained gap (the same idiom as the rest of the Prometheus "
-    "ecosystem's ``_created`` series).",
+    "ecosystem's ``_created`` series). Issue #647 — during the stall "
+    "cooldown gate the tick stamps this gauge WITHOUT sensing: there "
+    "the stamp means ``tick alive`` (the deliberately paused cooldown), "
+    "not an elapsed-window update — the elapsed gauge holds its "
+    "pre-restart value by design.",
 )
 
 # Issue #469 — every runtime signal in the registry is EVENT-DRIVEN:
