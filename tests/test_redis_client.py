@@ -234,9 +234,10 @@ def test_module_source_contains_no_write_command_call_syntax():
 
 
 def test_allowlist_is_exactly_the_reads_and_intersects_no_write_command():
-    """Issue #83 D2 added GET for the per-worker record read; assert the
-    canonical allowlist is exactly the read-only set."""
-    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"}
+    """Issue #83 D2 added GET for the per-worker record read; issue #688
+    added EXISTS for the layout validator's O(1) verdict probes; assert
+    the canonical allowlist is exactly the read-only set."""
+    assert READ_ONLY_COMMANDS == {"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN", "EXISTS"}
     assert READ_ONLY_COMMANDS & WRITE_COMMANDS == set()
 
 
@@ -279,6 +280,96 @@ def test_validate_key_layout_raises_when_registry_key_missing(fake, client):
     fake.set("resque:other_thing:w1", "12345.6")
     with pytest.raises(OperatorConfigError, match="not found"):
         client.validate_key_layout()
+
+
+# --- Issue #688 — EXISTS-first verdict; honest SCAN-budget exhaustion -----
+#
+# The live failure (cluster openstudio-server-azimuth-openstack): DBSIZE
+# 2405 > VALIDATE_SCAN_KEY_BUDGET 1000, both required keys present
+# (EXISTS → 2, SCARD resque:workers → 929), yet the pre-#688 SCAN-membership
+# verdict read the budget-exhausted sample as "key absent" → false drift →
+# OpenStudioOperatorRedisKeyLayoutInvalid firing permanently.
+
+
+def test_validate_key_layout_ok_when_keyspace_exceeds_scan_budget(fake, client):
+    """Issue #688 acceptance: keyspace > VALIDATE_SCAN_KEY_BUDGET with the
+    required keys present is NOT drift — the owner's live shape (DBSIZE
+    2405 vs budget 1000). Decoy keys are seeded BEFORE the registry keys
+    so a budget-exhausted SCAN could never visit the required ones — the
+    exact ordering that produced the false verdict on the live fleet."""
+    for i in range(2403):
+        fake.set(f"resque:analysis:decoy-{i:04d}", "x")
+    fake.sadd("resque:workers", "w1", "w2")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    fake.hset("resque:workers:heartbeat", "w2", "2026-08-18T20:46:16+00:00")
+    # Must NOT raise: EXISTS confirms both required keys, so a SCAN that
+    # would exhaust its budget before visiting them is irrelevant.
+    client.validate_key_layout()
+
+
+def test_validate_key_layout_verdict_is_exists_first_without_scan():
+    """Issue #688: the ok path issues exactly the two EXISTS probes and NO
+    SCAN at all — the verdict is anchored on O(1) point lookups, so SCAN
+    coverage can never decide it (and steady-state validation gets
+    cheaper: no keyspace traversal on a healthy fleet)."""
+    fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    recorder = RecordingRedis(fake)
+    validating = ReadOnlyRedisClient(
+        "redis://:pw@queue.test:6379", connection=recorder, now_fn=lambda: NOW
+    )
+    fake.sadd("resque:workers", "w1")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+
+    validating.validate_key_layout()
+
+    assert recorder.commands.count("EXISTS") == 2, (
+        f"Expected exactly two EXISTS verdict probes; got {recorder.commands!r}"
+    )
+    assert "SCAN" not in recorder.commands, (
+        "The ok path must not SCAN at all (issue #688 EXISTS-first verdict) — "
+        f"issued: {recorder.commands!r}"
+    )
+
+
+def test_validate_key_layout_drift_message_labels_partial_sample_on_budget_exhaustion(
+    fake, client, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #688: budget exhaustion is surfaced HONESTLY. When the
+    diagnostic SCAN trips VALIDATE_SCAN_KEY_BUDGET before the cursor loop
+    completes, the drift error labels the observed-keys sample PARTIAL —
+    an operator reading the event can tell the drift verdict (EXISTS-
+    anchored, definitive) from the sample's coverage (budget-smaller-than-
+    keyspace), and a truncated sample is never presented as the whole
+    keyspace."""
+    monkeypatch.setattr(redis_client, "VALIDATE_SCAN_KEY_BUDGET", 100)
+    # 250 decoys > budget 100 > one SCAN batch (count=100): the loop breaks
+    # on the budget with a non-zero cursor — the incomplete-view shape.
+    for i in range(250):
+        fake.set(f"resque:analysis:decoy-{i:03d}", "x")
+
+    from openstudio_operator import metrics
+
+    before_scan = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    with pytest.raises(OperatorConfigError, match="PARTIAL"):
+        client.validate_key_layout()
+    after_scan = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    # #488 still holds on the diagnostic path: the SCAN loop is timed.
+    assert after_scan - before_scan >= 1
+
+
+def test_validate_key_layout_complete_scan_sample_is_not_labeled_partial(
+    fake, client, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #688 converse: when the diagnostic SCAN's cursor loop completes
+    (full iteration, well under the budget), the drift error carries NO
+    PARTIAL marker — the honesty label must mean something."""
+    monkeypatch.setattr(redis_client, "VALIDATE_SCAN_KEY_BUDGET", 100)
+    for i in range(50):
+        fake.set(f"resque:analysis:decoy-{i:03d}", "x")
+
+    with pytest.raises(OperatorConfigError, match="not found") as excinfo:
+        client.validate_key_layout()
+    assert "PARTIAL" not in str(excinfo.value)
 
 
 def test_operator_config_error_is_config_reexport_and_not_a_redis_error():
@@ -833,6 +924,46 @@ def test_redis_key_layout_check_emits_ok_log_line(
     assert "name=test-osc" in caplog.text
 
 
+def test_redis_key_layout_check_ok_on_keyspace_beyond_scan_budget(
+    fake, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #688 acceptance at the handler ladder: the owner's live shape
+    (DBSIZE 2405 > VALIDATE_SCAN_KEY_BUDGET 1000, both required keys
+    present — EXISTS → 2) must return ``ok`` and set
+    ``openstudio_operator_redis_key_layout_status`` to 1.0. Pre-#688 the
+    budget-exhausted SCAN sample read as drift, pinning the gauge to 0.0
+    and firing the critical ``OpenStudioOperatorRedisKeyLayoutInvalid``
+    alert permanently on a healthy production fleet. Decoys are seeded
+    BEFORE the registry keys so a truncated scan could never reach them."""
+    for i in range(2403):
+        fake.set(f"resque:analysis:decoy-{i:04d}", "x")
+    fake.sadd("resque:workers", "w1", "w2")
+    fake.hset("resque:workers:heartbeat", "w1", "2026-08-18T20:46:06+00:00")
+    fake.hset("resque:workers:heartbeat", "w2", "2026-08-18T20:46:16+00:00")
+
+    _patched_client_factory(fake, monkeypatch)
+
+    item = {
+        "metadata": {"namespace": "test-ns", "name": "test-osc"},
+        "spec": {"redisUrl": "redis://:pw@queue.test:6379"},
+    }
+
+    with caplog.at_level(logging.INFO, logger="openstudio_operator.handlers"):
+        status = _check_redis_key_layout_for_cr(
+            item, logger=logging.getLogger("openstudio_operator.handlers")
+        )
+
+    assert status == "ok", (
+        f"Expected status='ok' on the >budget keyspace with required keys "
+        f"present; got {status!r}. Captured: {caplog.text!r}. See issue #688."
+    )
+    assert "redis_key_layout=ok" in caplog.text
+    assert _metrics_module.REDIS_KEY_LAYOUT_STATUS._value.get() == 1.0, (
+        "The #253 gauge must read 1.0 — the pre-#688 false verdict pinned it "
+        "to 0.0 and the critical alert fired permanently. See issue #688."
+    )
+
+
 def test_redis_key_layout_check_emits_degraded_log_line(
     fake, client, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -921,10 +1052,11 @@ def test_redis_key_layout_check_emits_unreachable_log_line(
                 "Connection refused at boot"
             )
 
-        # SCAN is the very first call validate_key_layout() makes; forcing
-        # it to raise with a real RedisError reproduces the "server
-        # unreachable at boot" path. ReadOnlyRedisClient wraps that as
-        # RedisClientError, which the check catches.
+        # Post-#688 the verdict probes (EXISTS) run first; on the empty
+        # fake they both miss, so the diagnostic SCAN still runs next —
+        # forcing IT to raise with a real RedisError reproduces the
+        # "server unreachable at boot" path. ReadOnlyRedisClient wraps
+        # that as RedisClientError, which the check catches.
         monkeypatch.setattr(fake, "scan", _boom)
         return client
 
@@ -1502,16 +1634,17 @@ def test_worker_heartbeats_observe_smembers_duration(fake, client):
     assert after - before >= 2
 
 
-def test_validate_key_layout_observe_scan_duration(fake, client):
-    """Issue #488 acceptance: the ``validate_key_layout`` happy path observes
-    under the ``scan`` operation label (the whole SCAN loop is the timed
-    network surface)."""
+def test_validate_key_layout_observe_exists_duration(fake, client):
+    """Issue #488 acceptance (post-#688 shape): the ``validate_key_layout``
+    happy path observes under the ``exists`` operation label — the verdict
+    surface is now the two O(1) EXISTS probes; the bounded SCAN loop runs
+    only on the failure path (asserted in the #688 drift tests below)."""
     from openstudio_operator import metrics
 
     seed_workers(fake, {"worker-1:1:simulations": NOW - 5})
-    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    before = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="exists")
     client.validate_key_layout()
-    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="scan")
+    after = _sample_count(metrics.REDIS_REQUEST_DURATION_SECONDS, operation="exists")
     assert after - before >= 1
 
 

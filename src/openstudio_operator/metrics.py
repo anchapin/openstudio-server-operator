@@ -1180,17 +1180,18 @@ REST_RETRIES_TOTAL = Counter(
 
 # Issue #488 — Redis request-duration Histogram. The read-only Redis client
 # (queue_depths LLENs, worker_heartbeats SMEMBERS + the stale_workers
-# delegation, validate_key_layout scans, the #83 D2 workers_for_analysis
-# read) runs on every web_background tick with no latency telemetry of its
-# own — a slowing Redis (fork stalls, persistence pauses, network degrade)
-# previously showed up only as an inflated HANDLER_TICK_DURATION bucket
-# that could not be attributed to Redis vs REST vs kube. This Histogram
-# observes the wall-clock duration of each wrapped client method — a
-# method issuing multiple commands is timed once under its dominant
-# operation label — on BOTH success and failure paths (duration is
-# duration; the error counters elsewhere own failure counting). Labelled
-# by ``operation`` with the issue-pinned vocabulary llen | smembers |
-# scan (the HGETALL/GET calls ride inside worker_heartbeats /
+# delegation, validate_key_layout EXISTS probes + diagnostic scans (#688),
+# the #83 D2 workers_for_analysis read) runs on every web_background tick
+# with no latency telemetry of its own — a slowing Redis (fork stalls,
+# persistence pauses, network degrade) previously showed up only as an
+# inflated HANDLER_TICK_DURATION bucket that could not be attributed to
+# Redis vs REST vs kube. This Histogram observes the wall-clock duration of
+# each wrapped client method — a method issuing multiple commands is timed
+# once under its dominant operation label — on BOTH success and failure
+# paths (duration is duration; the error counters elsewhere own failure
+# counting). Labelled by ``operation`` with the vocabulary llen | smembers |
+# scan | exists (issue #688 added exists for the layout validator's
+# O(1) verdict probes; the HGETALL/GET calls ride inside worker_heartbeats /
 # workers_for_analysis under their dominant label). Buckets match the
 # #308 REST set — see ``_DEPENDENCY_REQUEST_BUCKETS``.
 REDIS_REQUEST_DURATION_SECONDS = Histogram(
@@ -1199,9 +1200,10 @@ REDIS_REQUEST_DURATION_SECONDS = Histogram(
     "observed at the END of each method on BOTH success and failure "
     "paths — duration is duration; error COUNTING lives on the existing "
     "tick-failure counters, so this family never double-counts errors. "
-    "Labelled by ``operation`` (llen | smembers | scan — the issue-pinned "
-    "vocabulary; a method issuing multiple commands is timed once under "
-    "its dominant operation label). Makes a slowing Redis (fork stalls, "
+    "Labelled by ``operation`` (llen | smembers | scan | exists — "
+    "exists is the #688 layout-validator verdict probe; a method issuing "
+    "multiple commands is timed once under its dominant operation "
+    "label). Makes a slowing Redis (fork stalls, "
     "persistence pauses, network degrade) separable from a REST or "
     "kube-apiserver degrade — the three dependency histograms share the "
     "#308 bucket set so they render on one dashboard axis.",

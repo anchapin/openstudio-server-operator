@@ -101,8 +101,10 @@ LAYOUT_WARNING_GRACE_SECONDS: timedelta = timedelta(seconds=60)
 #: minutes — half the default ``stallWindowMinutes`` (10), so drift is
 #: revalidated and surfaced on ``redis_key_layout_status{,_fresh}``
 #: before the FIRST vacuous restart window can complete; matches the
-#: worker-recycler 300 s precedent for a low-frequency Redis-side scan
-#: cadence (per-run cost bounded by ``VALIDATE_SCAN_KEY_BUDGET``).
+#: worker-recycler 300 s precedent for a low-frequency Redis-side cadence
+#: (ok-path per-run cost is two O(1) EXISTS probes — issue #688; the
+#: diagnostic SCAN sample on the failure path stays bounded by
+#: ``VALIDATE_SCAN_KEY_BUDGET``).
 REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL: timedelta = timedelta(minutes=5)
 
 # -----------------------------------------------------------------------------

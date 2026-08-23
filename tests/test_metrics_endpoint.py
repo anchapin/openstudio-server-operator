@@ -1217,16 +1217,17 @@ def test_handler_tick_duration_histogram_uses_issue_308_bucket_set():
 def test_redis_request_duration_histogram_exposes_per_operation_series():
     """Issue #488 acceptance: ``openstudio_operator_redis_request_duration_
     seconds`` Histogram exposes one labelled series per ``operation``. The
-    vocabulary is the issue-pinned three-value set (llen | smembers |
-    scan) — pinned here so a future refactor that drops the label (or
-    invents a fourth value without expanding the pin) is caught at CI.
-    The call-site integration (fakeredis happy paths asserting real
-    observation) lives in ``tests/test_redis_client.py``."""
+    vocabulary is the pinned four-value set (llen | smembers | scan |
+    exists — exists added by issue #688 for the layout validator's
+    O(1) verdict probes) — pinned here so a future refactor that drops
+    the label (or invents a fifth value without expanding the pin) is
+    caught at CI. The call-site integration (fakeredis happy paths
+    asserting real observation) lives in ``tests/test_redis_client.py``."""
     histogram = metrics.REDIS_REQUEST_DURATION_SECONDS
-    for operation in ("llen", "smembers", "scan"):
+    for operation in ("llen", "smembers", "scan", "exists"):
         histogram.labels(operation=operation).observe(0.1)
     exposition = generate_latest().decode()
-    for operation in ("llen", "smembers", "scan"):
+    for operation in ("llen", "smembers", "scan", "exists"):
         # Labels are alphabetical (``le`` < ``operation``); pin the shape
         # so a label rename is caught here, not on the on-call's board.
         assert (
