@@ -416,6 +416,54 @@ def test_secret_url_validation_error_names_the_secret_and_key():
     assert "attacker.example.com" in message  # host diagnostics stay visible
 
 
+def test_secret_url_validation_rejects_two_label_public_hostnames_575():
+    """Issue #575 headline case: ``redis://:pw@evil.com:6379`` matched the
+    pre-#575 :data:`SECRET_REDIS_URL_PATTERN` because the optional second
+    host label was unconstrained — the #463 Secret-sourced path would hand
+    the queue password to any attacker-controlled two-label domain. With
+    and without ``@creds``, with and without ports, both schemes, and the
+    retired bare service.namespace form are all rejected."""
+    from openstudio_operator.redis_client import (
+        RedisCredentialResolutionError,
+        redis_url_from_secret_value,
+    )
+
+    for bad in (
+        "redis://:pw@evil.com:6379",
+        "redis://evil.com",
+        "redis://exfil.io:6379",
+        "redis://user:pass@attacker.dev:6379",
+        "rediss://:pw@evil.com:6379",
+        "rediss://evil.com",
+        # Retired pre-#575 legal shape: bare service.namespace, no .svc.
+        "redis://:pw@queue.openstudio-server:6379",
+        # Non-svc multi-label chains.
+        "redis://:pw@a.b.c.d.e:6379",
+    ):
+        with pytest.raises(RedisCredentialResolutionError):
+            redis_url_from_secret_value(bad, secret_name="s", secret_key="k")
+
+
+def test_secret_url_validation_accepts_svc_short_forms_575():
+    """Issue #575: the tightened grammar keeps every ``.svc``-terminated
+    in-cluster shape the helm recipe and docs use — the short two-label
+    ``service.svc`` form, the short FQDN ``service.svc.cluster.local``,
+    and the namespaced ``service.namespace.svc[.cluster.local]`` chain,
+    credentialed (the point of the Secret) and credential-free, returned
+    unchanged."""
+    from openstudio_operator.redis_client import redis_url_from_secret_value
+
+    for good in (
+        "redis://:pw@queue.svc:6379",
+        "redis://:pw@queue.svc.cluster.local:6379",
+        "redis://:pw@queue.openstudio-server.svc:6379",
+        "redis://user:pass@queue.openstudio-server.svc.cluster.local:6379/1",
+        "rediss://:pw@queue.svc:6379",
+        "redis://queue.svc:6379",  # credential-free stays legal (no-auth dev)
+    ):
+        assert redis_url_from_secret_value(good, secret_name="s", secret_key="k") == good
+
+
 def test_redis_credential_resolution_error_subclasses_client_error():
     """Existing ``except RedisClientError:`` call sites keep handling the
     Secret-path failures (D12 posture: skip the tick, retry next poll)."""
