@@ -145,7 +145,11 @@ from openstudio_operator.metrics import (
     WEB_BACKGROUND_RESTARTS_TOTAL,
     observe_duration,
 )
-from openstudio_operator.redis_client import ReadOnlyRedisClient, RedisClientError
+from openstudio_operator.redis_client import (
+    WORKER_REGISTRY_KEY,
+    ReadOnlyRedisClient,
+    RedisClientError,
+)
 from openstudio_operator.singleton import (
     operator_apps_api,
     operator_core_api,
@@ -589,7 +593,7 @@ def _maybe_warn_resque_layout_unknown(
     message = (
         f"Resque worker registry has been empty for {elapsed}s while a "
         f"non-zero queue depth is observed. The centralized Resque key "
-        f"constants (WORKER_REGISTRY_KEY='resque:workers') may not match "
+        f"constants (WORKER_REGISTRY_KEY={WORKER_REGISTRY_KEY!r}) may not match "
         f"the live v3.11.0 Redis layout; the stall condition's "
         f"'nobody is processing' leg is vacuously true and could periodic-"
         f"restart web_background. Run docs/kind-validation.md Resque layout "

@@ -74,7 +74,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, TypeVar
 
 import urllib3.exceptions
-from kubernetes.client import ApiException, AppsV1Api
+from kubernetes.client import ApiException
 
 from openstudio_operator._constants import K8S_REQUEST_TIMEOUT_SECONDS
 from openstudio_operator.metrics import KUBE_API_REQUEST_DURATION_SECONDS, observe_duration
@@ -264,7 +264,7 @@ MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
 
 
 def rolling_restart_deployment(
-    apps_api: AppsV1Api,
+    apps_api: DeploymentManager,
     *,
     deployment: str,
     namespace: str,
@@ -283,8 +283,10 @@ def rolling_restart_deployment(
     preserves sibling annotations.
 
     Args:
-        apps_api: Kubernetes AppsV1Api client (or a structural fake with
-            ``patch_namespaced_deployment``).
+        apps_api: Kubernetes client typed against the
+            :class:`DeploymentManager` Protocol (issue #592) — the real
+            ``AppsV1Api`` and any structural fake providing
+            ``patch_namespaced_deployment`` satisfy it alike.
         deployment: Name of the Deployment to restart.
         namespace: Namespace of the Deployment.
         now: Timestamp to use for the restart annotation value (UTC).

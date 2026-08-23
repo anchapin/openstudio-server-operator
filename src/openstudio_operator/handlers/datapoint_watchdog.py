@@ -1,7 +1,7 @@
 """Module 2 (plan Phase 2): zombie datapoint watchdog & bounded auto-requeue (issue #10, D06).
 
 Verified against the v3.11.0 REST contract
-(``.agents/skills/_shared/api-contracts/openstudio-server-v3.11.0-rest.md``):
+(``docs/contracts/openstudio-server-v3.11.0-rest.md``):
 
 * every 60 s (plan-mandated poll cadence — deliberately not a CRD field),
   ``GET /data_points/status?status=1&jobs=started`` — the LIGHT view. The
