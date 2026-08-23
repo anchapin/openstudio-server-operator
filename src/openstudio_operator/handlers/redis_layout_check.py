@@ -44,8 +44,9 @@ Issue #590 — the watch path is freshness-gated. The kopf watch delivers
 an event for EVERY OSCM write, including the ``.status`` subresource
 patches the operator's own StatusStore RMW makes several times per SLA
 tick — so pre-#590 every status write re-ran ``validate_key_layout()``
-(a Redis SCAN) for zero signal: the #490 cadence already bounds how
-fresh the layout signal needs to be, and the gauges this module sets are
+(two O(1) EXISTS probes plus, only on the failure path, a bounded
+diagnostic SCAN — issue #688) for zero signal: the #490 cadence already
+bounds how fresh the layout signal needs to be, and the gauges this module sets are
 documented process-wide (no per-CR labels). The watch handler now skips
 when the #490 freshness stamp (``REDIS_KEY_LAYOUT_STATUS_FRESH``, set in
 lockstep by :func:`_set_redis_key_layout_status` — the SAME stamp the
@@ -191,6 +192,16 @@ def _check_redis_key_layout_for_cr(
     ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``) — that cadence is what
     bounds the freshness gap a dashboard's ``time() - fresh`` computation
     alerts on.
+
+    Issue #688 — the ``degraded`` verdict underneath is EXISTS-anchored:
+    ``validate_key_layout()`` decides drift via direct O(1) ``EXISTS``
+    probes of the two required Resque keys, so a ``degraded`` status
+    always means an EXISTS-verified absence — NEVER a SCAN sample that
+    was too small for the keyspace (the pre-#688 false-verdict class that
+    pinned this gauge to 0.0 and fired the critical
+    ``OpenStudioOperatorRedisKeyLayoutInvalid`` alert permanently on
+    production-scale fleets). The bounded diagnostic SCAN runs only on
+    the failure path, to build the error-message evidence.
     """
     if not isinstance(item, dict):
         _set_redis_key_layout_status(0.0)
@@ -300,8 +311,10 @@ def _redis_key_layout_check(
     """Run ``validate_key_layout()`` per CR at boot (initial listing) and on every change.
 
     The kopf watch's initial listing fires this for every existing CR — that
-    IS the boot path. Idempotent: ``validate_key_layout()`` is reentrant and
-    capped at ``VALIDATE_SCAN_KEY_BUDGET`` keys. A queued Warning Event is
+    IS the boot path. Idempotent: ``validate_key_layout()`` is reentrant;
+    its ok path is two O(1) EXISTS probes (issue #688) and its diagnostic
+    SCAN sample stays capped at ``VALIDATE_SCAN_KEY_BUDGET`` keys. A queued
+    Warning Event is
     drained on the next tick by the package-level
     :func:`openstudio_operator.handlers._drain_queued_warning_events`
     (the registration lives here since #584; ``handlers/__init__.py``

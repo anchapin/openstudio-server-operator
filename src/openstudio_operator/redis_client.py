@@ -29,11 +29,21 @@ Why each read is present (and nothing else):
               ``resque:worker:{worker_id}`` as a JSON STRING whose ``payload``
               sub-object carries the running job's class and args. ``GET`` is
               strictly a read.
-    SCAN      one-shot key-prefix probe for the startup layout validator
-              (:meth:`validate_key_layout`, issue #44). SCAN is non-blocking,
-              read-only, and never used outside the validator — the steady-state
-              registry discovery still goes through the fixed ``SMEMBERS`` of
-              ``WORKER_REGISTRY_KEY`` (no traversal).
+    EXISTS    O(1) point-lookup presence probes for the startup layout
+              validator's VERDICT keys (issue #688). The drift verdict is
+              anchored on direct EXISTS of the two constants below
+              (``resque:workers`` / ``resque:workers:heartbeat``) — a
+              definitive answer independent of keyspace size — so a
+              budget-exhausted SCAN sample can never be misread as
+              "key absent" on a production-scale fleet.
+    SCAN      bounded key-prefix sample for the startup layout validator's
+              DIAGNOSTICS (:meth:`validate_key_layout`, issue #44). Since
+              #688 it runs only on the EXISTS-failure path, building the
+              "observed prefix keys" evidence inside the drift error
+              message — it never decides the verdict. SCAN is non-blocking,
+              read-only, and never used outside the validator — the
+              steady-state registry discovery still goes through the fixed
+              ``SMEMBERS`` of ``WORKER_REGISTRY_KEY`` (no traversal).
 
 Key layout (LIVE-VERIFIED 2026-08-18 on the kind validation cluster running
 ``nrel/openstudio-server:3.11.0`` — Resque 2.x, see ``docs/kind-validation.md``
@@ -121,7 +131,9 @@ from .config import OperatorConfigError
 # and failure paths; see REDIS_REQUEST_DURATION_SECONDS in metrics.py.
 from .metrics import REDIS_REQUEST_DURATION_SECONDS, observe_duration
 
-READ_ONLY_COMMANDS: frozenset[str] = frozenset({"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN"})
+READ_ONLY_COMMANDS: frozenset[str] = frozenset(
+    {"LLEN", "SMEMBERS", "HGETALL", "GET", "SCAN", "EXISTS"}
+)
 
 #: Queue-depth keys. Live-verified on kind/v3.11.0 (issue #67): Resque 2.x
 #: stores queue payloads at ``resque:queue:<name>`` — the bare names the
@@ -146,8 +158,15 @@ WORKER_HEARTBEAT_HASH_KEY = "resque:workers:heartbeat"
 #: processing which analysis (payload.args carries the analysis id for the
 #: ``RunSimulateDataPoint`` job class).
 
-#: Hard cap on how many keys :meth:`validate_key_layout` will SCAN before giving
-#: up; protects against accidental full-DB traversal on a misconfigured prefix.
+#: Hard cap on how many keys the DIAGNOSTIC sample inside
+#: :meth:`validate_key_layout` will SCAN before giving up. Issue #688: the
+#: drift verdict itself is EXISTS-anchored (O(1) point lookups), so this
+#: bounds only the "observed prefix keys" evidence list in the error
+#: message — never the verdict; it still protects against accidental
+#: full-DB traversal on a misconfigured prefix. When the cap trips before
+#: the SCAN cursor loop completes, the diagnostic error message labels the
+#: sample PARTIAL — budget exhaustion is surfaced honestly and can never
+#: masquerade as "key absent".
 VALIDATE_SCAN_KEY_BUDGET = 1000
 
 
@@ -422,40 +441,65 @@ class ReadOnlyRedisClient:
     def validate_key_layout(self) -> None:
         """One-shot probe of the Resque key layout — call at operator startup.
 
-        Uses ``SCAN MATCH resque:*`` to walk the keyspace without blocking the
-        Redis server, then asserts the centralized constants are consistent with
-        what the live v3.11.0 server actually writes. Raises
-        :class:`OperatorConfigError` (issue #475: defined in
+        Issue #688 — the verdict is EXISTS-first: presence of the two
+        required keys (``WORKER_REGISTRY_KEY`` / ``WORKER_HEARTBEAT_HASH_KEY``)
+        is decided by direct O(1) ``EXISTS`` probes, NOT by SCAN coverage.
+        On a production-scale keyspace (the live evidence: DBSIZE 2405 vs
+        ``VALIDATE_SCAN_KEY_BUDGET`` 1000, 929 registered workers) the bounded
+        SCAN sample may never visit the registry bucket, and the pre-#688
+        membership check misread that exhausted sample as "key absent" — a
+        false layout-drift verdict with ``OpenStudioOperatorRedisKeyLayoutInvalid``
+        firing permanently on a perfectly healthy fleet. When EXISTS confirms
+        both keys, this method returns ok immediately without any SCAN at
+        all; the bounded ``SCAN MATCH resque:*`` runs ONLY on the
+        EXISTS-failure path, purely to build the "observed prefix keys"
+        diagnostic evidence in the drift error message.
+
+        Raises :class:`OperatorConfigError` (issue #475: defined in
         :mod:`openstudio_operator.config`, re-exported here; NOT a
         ``RedisClientError`` subclass — catch it explicitly)
         when the layout diverges, so a misconfiguration fails LOUD at boot
         rather than silently at the first stall-condition evaluation.
 
         Designed to be called ONCE per operator process; subsequent calls are
-        idempotent (re-probe, no caching). The probe is capped at
-        :data:`VALIDATE_SCAN_KEY_BUDGET` keys so a misconfigured prefix cannot
-        turn the startup probe into a full-keyspace traversal.
+        idempotent (re-probe, no caching). The diagnostic SCAN is capped at
+        :data:`VALIDATE_SCAN_KEY_BUDGET` keys so a misconfigured prefix
+        cannot turn the startup probe into a full-keyspace traversal; if the
+        cap trips before the SCAN cursor loop completes, the error message
+        labels the observed-keys sample PARTIAL — budget exhaustion is an
+        incomplete VIEW, never evidence that a key is absent (that is what
+        the EXISTS probes decide).
 
         Failure modes (each → :class:`OperatorConfigError`):
 
         * zero ``resque:*`` keys exist — the DB is empty or the operator is
           pointing at the wrong Redis DB (``redis_url`` selects a different
           logical DB than the server writes; the most common footgun);
-        * ``resque:*`` keys exist but ``WORKER_REGISTRY_KEY`` is absent — the
-          live Resque version uses a different registry prefix;
-        * the registry is present but ``WORKER_HEARTBEAT_HASH_KEY`` is absent —
-          the live Resque version stores heartbeats somewhere else (pre-live
-          code assumed Resque 1.x per-worker keys; the live v3.11.0 layout is
-          the heartbeat HASH — live-verified issue #66).
+        * ``resque:*`` keys exist but an EXISTS probe says a required key is
+          absent — the live Resque version uses a different registry prefix /
+          heartbeat layout (pre-live code assumed Resque 1.x per-worker keys;
+          the live v3.11.0 layout is the registry SET + heartbeat HASH —
+          live-verified issue #66).
 
-        Steady state (Resque workers present and heartbeating) passes trivially:
-        the registry SET and the heartbeat HASH are both present whenever the
-        queue fabric is live. A cold start before workers register will trip
-        this; that's the intended LOUD behavior — fix the configuration, don't
-        paper over it.
+        Steady state (Resque workers present and heartbeating) passes on the
+        EXISTS short-circuit alone — two O(1) probes, no keyspace traversal.
+        A cold start before workers register will trip this; that's the
+        intended LOUD behavior — fix the configuration, don't paper over it.
         """
+        required = (WORKER_REGISTRY_KEY, WORKER_HEARTBEAT_HASH_KEY)
+        # Issue #688 — EXISTS-first verdict: O(1) point lookups, definitive
+        # regardless of keyspace size. EXISTS is in READ_ONLY_COMMANDS.
+        with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="exists"):
+            missing = [key for key in required if not self._execute("exists", key)]
+        if not missing:
+            return
+
+        # Diagnostic-only bounded SCAN (issue #688): runs ONLY because an
+        # EXISTS probe failed, to gather the "observed prefix keys" evidence
+        # for the error message below. Its sample NEVER decides the verdict.
         seen: set[str] = set()
         cursor: int | str = 0
+        scan_completed = False
         # Issue #488 — time the SCAN loop (the network surface); the
         # post-scan layout validation below is pure computation.
         with observe_duration(REDIS_REQUEST_DURATION_SECONDS, operation="scan"):
@@ -468,7 +512,10 @@ class ReadOnlyRedisClient:
                         count=100,
                     )
                     seen.update(batch)
-                    if int(cursor) == 0 or len(seen) >= VALIDATE_SCAN_KEY_BUDGET:
+                    if int(cursor) == 0:
+                        scan_completed = True
+                        break
+                    if len(seen) >= VALIDATE_SCAN_KEY_BUDGET:
                         break
             except redis.RedisError as exc:
                 raise RedisClientError(f"SCAN failed: {exc}") from exc
@@ -483,22 +530,33 @@ class ReadOnlyRedisClient:
                 f"`redis-cli -u <redis_url> KEYS 'resque:*'` and update "
                 f"WORKER_REGISTRY_KEY in src/openstudio_operator/redis_client.py."
             )
-        missing: list[str] = [
-            key
-            for key in (WORKER_REGISTRY_KEY, WORKER_HEARTBEAT_HASH_KEY)
-            if key not in seen
-        ]
-        if missing:
-            sample = sorted(seen)[:5]
-            raise OperatorConfigError(
-                f"Expected Resque key(s) {missing} not found at "
-                f"{self._redis_target}; observed prefix keys: "
-                f"{sample}{'...' if len(seen) > 5 else ''}. The centralized "
-                f"constants in src/openstudio_operator/redis_client.py "
-                f"(WORKER_REGISTRY_KEY / WORKER_HEARTBEAT_HASH_KEY) do not match "
-                f"the live layout — see the live-capture procedure in "
-                f"docs/kind-validation.md (#44/#66)."
+        sample = sorted(seen)[:5]
+        # Issue #688 — honest incompleteness: a budget-truncated sample is
+        # labeled PARTIAL, never presented as the whole keyspace. The drift
+        # verdict stays anchored on the EXISTS probes above (definitive);
+        # this label exists so an operator reading the event can tell
+        # "drift" from "sample smaller than the keyspace".
+        completeness = (
+            ""
+            if scan_completed
+            else (
+                f" NOTE: the observed-keys sample is PARTIAL — the SCAN "
+                f"budget ({VALIDATE_SCAN_KEY_BUDGET} keys) exhausted before "
+                f"the cursor loop completed, so more 'resque:*' keys exist "
+                f"than listed (issue #688); the missing-key verdict above is "
+                f"anchored on direct EXISTS probes, not on this sample."
             )
+        )
+        raise OperatorConfigError(
+            f"Expected Resque key(s) {missing} not found at "
+            f"{self._redis_target}; observed prefix keys: "
+            f"{sample}{'...' if len(seen) > 5 else ''}.{completeness} The "
+            f"centralized "
+            f"constants in src/openstudio_operator/redis_client.py "
+            f"(WORKER_REGISTRY_KEY / WORKER_HEARTBEAT_HASH_KEY) do not match "
+            f"the live layout — see the live-capture procedure in "
+            f"docs/kind-validation.md (#44/#66)."
+        )
 
     # --- Queue depths (LLEN) ----------------------------------------------
 

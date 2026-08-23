@@ -267,10 +267,11 @@ EXPECTED_GAUGE_FAMILIES = (
 #: Issue #488 — Redis request-duration Histogram. Every
 #: ``ReadOnlyRedisClient`` read method (queue_depths LLENs,
 #: worker_heartbeats SMEMBERS + the stale_workers delegation,
-#: validate_key_layout scans, the #83 D2 workers_for_analysis read)
-#: observes its wall-clock duration on BOTH success and failure, labelled
-#: by ``operation`` (llen | smembers | scan — the issue-pinned
-#: vocabulary; multi-command methods timed once under their dominant
+#: validate_key_layout EXISTS probes + diagnostic scans (#688), the
+#: #83 D2 workers_for_analysis read) observes its wall-clock duration on
+#: BOTH success and failure, labelled by ``operation``
+#: (llen | smembers | scan | exists — exists is the #688 layout-verdict
+#: probe; multi-command methods timed once under their dominant
 #: label). Companion to the REST histogram above: attributes an inflated
 #: tick-duration bucket to Redis vs REST vs kube.
 #:

@@ -2180,9 +2180,11 @@ def test_key_layout_revalidation_skips_within_interval(
 ) -> None:
     """Ticks inside REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL do not re-run the check.
 
-    The rider must not turn the 60 s stall cadence into a 60 s SCAN cadence
-    — the interval gate is the cost bound (per-run cost capped by
-    VALIDATE_SCAN_KEY_BUDGET, but still a Redis round-trip set).
+    The rider must not turn the 60 s stall cadence into a 60 s Redis-probe
+    cadence — the interval gate is the cost bound (ok-path per-run cost is
+    two O(1) EXISTS probes, issue #688; the failure-path diagnostic SCAN
+    sample is capped by VALIDATE_SCAN_KEY_BUDGET — but still a Redis
+    round-trip set).
     """
     _reset_revalidation()
     recorder = _record_check(monkeypatch)
