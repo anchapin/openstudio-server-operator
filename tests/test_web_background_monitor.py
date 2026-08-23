@@ -11,7 +11,6 @@ cluster, no dependencies beyond the ``[dev]`` extra.
 """
 
 import logging as _logging
-import time as _time
 import types
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -786,8 +785,10 @@ def _reset_freshness_gauges() -> None:
 
     Both gauges are process-level Prometheus singletons — without the
     reset, an earlier test that touched them leaks the value into the
-    next test's ``time.time() > stale`` assertion. Mirrors
-    :func:`wbm_module.reset_leg2_safeguard_state` for the leg-2 gauge.
+    next test's freshness-stamp assertions (e.g. a regression that stops
+    stamping would read a prior test's stamp instead of failing).
+    Mirrors :func:`wbm_module.reset_leg2_safeguard_state` for the leg-2
+    gauge.
     """
     from openstudio_operator import metrics as _metrics
 
@@ -795,18 +796,52 @@ def _reset_freshness_gauges() -> None:
     _metrics.STALL_WINDOW_FRESH.set(0.0)
 
 
-def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick():
+class SteppedWallClock:
+    """Deterministic ``time.time`` replacement for the #312 stamp sites (#591).
+
+    The freshness gauges stamp ``time.time()`` (wall time is the right
+    choice for Prometheus staleness math), which used to force the tests
+    below into real ``time.sleep`` bridges and strict wall-clock ordering
+    assertions — classic low-frequency CI flakes when the runner clock
+    steps backwards (NTP) or a loaded runner stretches the sleep. This
+    clock serves ``self.now`` for every ``time.time()`` call and advances
+    only when the test calls :meth:`step`, making stamp ordering exact
+    and deterministic. The domain ``now=`` datetimes driving the stall
+    math stay pinned separately (the file's ``make_redis``/``tick``
+    clocks), so only the gauge-stamp surface moves.
+    """
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def step(self, seconds: float) -> None:
+        """Advance the served wall time by ``seconds`` (no real sleep)."""
+        self.now += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick(monkeypatch):
     """Issue #312 acceptance: the freshness stamp for ``RESQUE_QUEUE_DEPTH``
     advances on every sensing tick that successfully reads Redis, BEFORE
     any leg evaluation runs (the same unconditional-advance pattern
     from issue #87 / #238). The stamp is the ``time.time()`` value at
-    the moment ``queue_depths()`` returned — a monotonic timestamp
-    that dashboards use to compute staleness. Verified end-to-end via
-    the full ``run_stall_tick`` path (a normal sensing tick that
-    doesn't fire a restart still has to advance the freshness stamp).
+    the moment ``queue_depths()`` returned — a timestamp that dashboards
+    use to compute staleness. Verified end-to-end via the full
+    ``run_stall_tick`` path (a normal sensing tick that doesn't fire a
+    restart still has to advance the freshness stamp).
+
+    Issue #591 — the stamp site reads the wall clock, so the test pins
+    ``time.time`` to a :class:`SteppedWallClock` instead of bracketing
+    the tick with ``time.time()`` captures: the assertion is exact (the
+    stamp IS the served instant) and immune to a runner clock step
+    backwards between capture and stamp.
     """
     from openstudio_operator import metrics as _metrics
 
+    clock = SteppedWallClock(NOW.timestamp())
+    monkeypatch.setattr("time.time", clock)
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
@@ -814,7 +849,6 @@ def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick():
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
-    before = _time.time()
     tick(
         api,
         apps,
@@ -823,14 +857,16 @@ def test_resque_queue_depth_fresh_advances_on_successful_sensing_tick():
         tracker=tracker,
         redis=make_redis(NOW, simulations=2),
     )
-    after = _time.time()
 
     fresh = queue_depth_fresh()
-    assert before <= fresh <= after
+    # Stamped at exactly the served wall instant (not left at the 0.0
+    # reset) — the clock-step-tolerant form of the old
+    # ``before <= fresh <= after`` bracket.
+    assert fresh == NOW.timestamp()
     assert _metrics.RESQUE_QUEUE_DEPTH_FRESH._value.get() == fresh
 
 
-def test_stall_window_fresh_advances_on_holding_and_broken_paths():
+def test_stall_window_fresh_advances_on_holding_and_broken_paths(monkeypatch):
     """Issue #312 acceptance: the freshness stamp for
     ``STALL_WINDOW_ELAPSED_SECONDS`` advances on BOTH the holding path
     (condition held, ``elapsed`` is set) and the broken path (condition
@@ -839,9 +875,17 @@ def test_stall_window_fresh_advances_on_holding_and_broken_paths():
     increases across both — same site as the data gauge, so the
     freshness/value pair stays locked together for the dashboard's
     staleness computation.
+
+    Issue #591 — the strict ``fresh_after_break > fresh_after_hold``
+    ordering used to ride a real ``time.sleep(0.01)`` between the ticks;
+    it is now driven by a :class:`SteppedWallClock` pinned over the
+    stamp site's ``time.time``, so the ordering is exact and
+    deterministic — no wall-clock coupling, no sleep.
     """
     from openstudio_operator import metrics as _metrics
 
+    clock = SteppedWallClock(NOW.timestamp())
+    monkeypatch.setattr("time.time", clock)
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
@@ -851,19 +895,17 @@ def test_stall_window_fresh_advances_on_holding_and_broken_paths():
 
     # Holding tick (full stall condition): the elapsed-gauge is set to
     # the elapsed seconds since first_observed (here 0 since NOW == NOW).
-    before_hold = _time.time()
     tick(api, apps, pods, now=NOW, tracker=tracker, redis=stall_redis(NOW))
-    after_hold = _time.time()
     fresh_after_hold = stall_window_fresh()
-    assert before_hold <= fresh_after_hold <= after_hold
+    assert fresh_after_hold == NOW.timestamp()
     assert _metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() >= 0.0
 
-    # Small sleep so the second timestamp strictly differs from the
-    # first (the gauge uses real-time ``time.time()``).
-    _time.sleep(0.01)
+    # Advance the fake wall clock so the second stamp strictly differs
+    # from the first — the deterministic replacement for the old
+    # 10 ms real sleep (the gauge stamps the served instant).
+    clock.step(0.01)
 
     # Broken tick (queues drained): the elapsed-gauge is set to 0.0.
-    before_break = _time.time()
     tick(
         api,
         apps,
@@ -872,15 +914,15 @@ def test_stall_window_fresh_advances_on_holding_and_broken_paths():
         tracker=tracker,
         redis=stall_redis(NOW + minute(1), queued=False),
     )
-    after_break = _time.time()
     fresh_after_break = stall_window_fresh()
-    assert before_break <= fresh_after_break <= after_break
+    assert fresh_after_break == NOW.timestamp() + 0.01
     assert _metrics.STALL_WINDOW_ELAPSED_SECONDS._value.get() == 0.0
-    # Broken path strictly newer than holding path.
+    # Broken path strictly newer than holding path — exact under the
+    # stepped clock, no real-time sleep required.
     assert fresh_after_break > fresh_after_hold
 
 
-def test_freshness_gauges_stale_on_redis_failure():
+def test_freshness_gauges_stale_on_redis_failure(monkeypatch):
     """Issue #312 acceptance: the freshness stamp MUST NOT advance on
     the exception path — a Redis/K8s-sensing failure must leave the
     stamp untouched so dashboards can compute
@@ -896,9 +938,17 @@ def test_freshness_gauges_stale_on_redis_failure():
     regression fence: a future refactor that wraps the gauge writes in
     a try/finally or bumps the freshness on exception would silently
     unmask the failure and is caught here).
+
+    Issue #591 — the fence used to need a real ``time.sleep(0.05)``
+    before the flaky tick so a failure-path stamp would read a strictly
+    newer ``time.time()``; a :class:`SteppedWallClock` pinned over the
+    stamp sites now advances deterministically instead, so the equality
+    fence cannot pass by clock coincidence — and no sleep is required.
     """
     from openstudio_operator import metrics as _metrics
 
+    clock = SteppedWallClock(NOW.timestamp())
+    monkeypatch.setattr("time.time", clock)
     _reset_freshness_gauges()
     api = FakeCustomObjectsApi(make_cr())
     apps = FakeAppsV1Api()
@@ -906,21 +956,25 @@ def test_freshness_gauges_stale_on_redis_failure():
     tracker = StallWindowTracker()
     wbm_module.reset_leg2_safeguard_state()
 
-    # Good tick: both freshness gauges advance to ~NOW.
+    # Good tick: both freshness gauges advance to the served instant.
     good_redis = make_redis(NOW, simulations=2)
     tick(api, apps, pods, now=NOW, tracker=tracker, redis=good_redis)
     queue_fresh_before = queue_depth_fresh()
     stall_fresh_before = stall_window_fresh()
-    assert queue_fresh_before > 0.0
-    assert stall_fresh_before > 0.0
+    assert queue_fresh_before == NOW.timestamp()
+    assert stall_fresh_before == NOW.timestamp()
     # Note: in the good tick the condition doesn't hold (heartbeats are
     # missing but the worker registry is empty — leg A holds but leg B
     # holds vacuously; the stall will start to accumulate on the next
     # tick). We don't depend on the data gauge here — only on the
-    # freshness stamps being non-zero after a successful tick.
+    # freshness stamps carrying the served instant after a successful
+    # tick.
 
-    # Allow some real time to pass so ``time.time()`` strictly advances.
-    _time.sleep(0.05)
+    # Advance the fake wall clock: any failure-path stamp below would
+    # read this NEWER instant, so the equality fence cannot pass by
+    # clock coincidence (deterministic replacement for the old 50 ms
+    # real sleep).
+    clock.step(0.05)
 
     # Flaky tick: the sensing raises — both freshness gauges must stay
     # pinned at their pre-tick values.
