@@ -47,6 +47,7 @@ from openstudio_operator.handlers.web_background_monitor import (
 from openstudio_operator.redis_client import (
     REQUEUED_QUEUE,
     SIMULATIONS_QUEUE,
+    WORKER_REGISTRY_KEY,
     ReadOnlyRedisClient,
     RedisClientError,
 )
@@ -1245,6 +1246,32 @@ def test_empty_registry_with_no_prior_heartbeats_warns_once_after_grace():
     assert fired2 is False
     assert events2 == []
     assert restarts_total() - metric_before == 0  # safeguard is diagnostic only
+
+
+def test_resque_layout_warning_message_names_current_worker_registry_key(monkeypatch):
+    """Issue #594: the ResqueKeyLayoutUnknown Warning must name the CURRENT
+    ``WORKER_REGISTRY_KEY`` value — the message is interpolated from the
+    ``redis_client`` constant, never a string literal, so an SRE following
+    the runbook verifies with redis-cli against the key the operator
+    actually reads. If the registry key is ever corrected again (the #66
+    live validation moved worker heartbeats once already), the message
+    tracks it instead of silently naming a dead key.
+    """
+    wbm_module.reset_leg2_safeguard_state()
+    # Grace window opened 61 s ago (past the 60 s grace), never saw a worker.
+    monkeypatch.setattr(wbm_module, "_empty_registry_since", NOW - timedelta(seconds=61))
+    events, emit = make_emit()
+
+    wbm_module._maybe_warn_resque_layout_unknown(
+        now=NOW, emit=emit, logger=_logging.getLogger(__name__)
+    )
+
+    assert len(events) == 1
+    event_type, reason, message = events[0]
+    assert event_type == "Warning"
+    assert reason == RESQUE_KEY_LAYOUT_UNKNOWN_EVENT
+    assert "WORKER_REGISTRY_KEY" in message
+    assert WORKER_REGISTRY_KEY in message
 
 
 def test_warning_does_not_fire_when_heartbeats_ever_observed():
