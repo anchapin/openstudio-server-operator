@@ -39,6 +39,21 @@ Redis surface, so it lives here, imports ONLY neutral domain modules
 ``redis_client``) — never sibling handler modules — and handler modules
 may import IT (the boundary gate in ``tests/test_handler_boundaries.py``
 allowlists this module as shared support, #584).
+
+Issue #590 — the watch path is freshness-gated. The kopf watch delivers
+an event for EVERY OSCM write, including the ``.status`` subresource
+patches the operator's own StatusStore RMW makes several times per SLA
+tick — so pre-#590 every status write re-ran ``validate_key_layout()``
+(a Redis SCAN) for zero signal: the #490 cadence already bounds how
+fresh the layout signal needs to be, and the gauges this module sets are
+documented process-wide (no per-CR labels). The watch handler now skips
+when the #490 freshness stamp (``REDIS_KEY_LAYOUT_STATUS_FRESH``, set in
+lockstep by :func:`_set_redis_key_layout_status` — the SAME stamp the
+periodic path maintains) is within
+``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``, except on the kopf watch's
+initial listing / resync (``type is None``), which validates
+unconditionally — that IS the #163 boot path, and it must not depend on
+gauge residue from a prior process or test.
 """
 
 from __future__ import annotations
@@ -48,7 +63,10 @@ import time
 
 import kopf
 
-from openstudio_operator._constants import CRD_SPEC
+from openstudio_operator._constants import (
+    CRD_SPEC,
+    REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL,
+)
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.config import OperatorConfig, OperatorConfigError
 from openstudio_operator.events_sinks import get_default_sink
@@ -100,6 +118,29 @@ def _set_redis_key_layout_status(value: float) -> None:
     """
     REDIS_KEY_LAYOUT_STATUS.set(value)
     REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
+
+
+def _key_layout_validation_is_fresh(*, now: float | None = None) -> bool:
+    """Issue #590 — whether the #490 freshness stamp is within the cadence.
+
+    Reads the SAME stamp the #490 periodic path maintains
+    (:data:`openstudio_operator.metrics.REDIS_KEY_LAYOUT_STATUS_FRESH`,
+    set in lockstep with the status gauge by
+    :func:`_set_redis_key_layout_status` on every terminal path of the
+    check — ``ok`` included), so the watch path and the periodic rider
+    share one freshness budget: a validation run by EITHER path within
+    ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` (5 min) suppresses the
+    other. The gauge defaults to ``0.0`` (never validated this process),
+    which reads as maximally stale — exactly the fresh-boot posture — so
+    the first watch event of a process never skips.
+
+    ``now`` defaults to :func:`time.time` and is injectable for tests.
+    The ``Gauge._value.get()`` read is the repo's established direct-read
+    seam (same as the test suite's gauge assertions).
+    """
+    current = time.time() if now is None else now
+    last = float(REDIS_KEY_LAYOUT_STATUS_FRESH._value.get())  # type: ignore[attr-defined]
+    return (current - last) < REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL.total_seconds()
 
 
 def _check_redis_key_layout_for_cr(
@@ -266,5 +307,25 @@ def _redis_key_layout_check(
     (the registration lives here since #584; ``handlers/__init__.py``
     imports this module in its aggregate block so the decorator runs at
     operator load).
+
+    Issue #590 — steady-state watch events (``type`` is not ``None``) are
+    freshness-gated: when the #490 stamp is within
+    ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` the validation is skipped —
+    a ``.status`` subresource patch (the operator's own StatusStore RMW,
+    several per SLA tick under analysis churn) carries zero layout signal
+    the cadence has not already bounded. Initial-listing / resync events
+    (``type is None`` — kopf marks the watch's list-replay events this
+    way, see ``kopf._core.reactor.processing``) bypass the gate and
+    validate unconditionally, preserving the #163 boot contract.
     """
+    if _kwargs.get("type") is not None and _key_layout_validation_is_fresh():
+        logger.debug(
+            "redis_key_layout watch skip (#590): validation fresh within "
+            "REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL (%ss) — not re-running "
+            "for %s/%s",
+            REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL.total_seconds(),
+            namespace,
+            name,
+        )
+        return
     _check_redis_key_layout_for_cr(body, logger=logger)
