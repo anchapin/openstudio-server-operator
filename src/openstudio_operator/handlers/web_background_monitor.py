@@ -151,10 +151,7 @@ from openstudio_operator.singleton import (
     operator_core_api,
     operator_custom_objects_api,
 )
-from openstudio_operator.status_store import (
-    MERGE_PATCH_CONTENT_TYPE,  # noqa: F401 — re-export: tests import it from this module
-    StatusStore,
-)
+from openstudio_operator.status_store import StatusStore
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +166,8 @@ DEFAULT_WEB_BACKGROUND_DEPLOYMENT = "web-background"
 
 # Issue #395 — DEFAULT_WORKER_DEPLOYMENT and RESTARTED_AT_ANNOTATION were
 # declared here AND in worker_recycler.py; both now live once in
-# :mod:`openstudio_operator._k8s` (imported above) and are re-exported by
-# this module so existing test imports keep resolving.
+# :mod:`openstudio_operator._k8s` (imported above for this module's own
+# call sites; tests import them from ``_k8s`` directly since issue #585).
 
 WEB_BACKGROUND_RESTARTED_EVENT = "WebBackgroundRestarted"
 

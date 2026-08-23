@@ -11,11 +11,11 @@ from prometheus_client import generate_latest
 from responses import matchers
 
 from openstudio_operator import metrics
+from openstudio_operator._time import parse_iso_utc
 from openstudio_operator.config import OperatorConfigError
 from openstudio_operator.openstudio_client import (
     OpenStudioApiError,
     OpenStudioClient,
-    _parse_timestamp,
 )
 from openstudio_operator.redis_client import RedisClientError
 
@@ -38,31 +38,31 @@ def sleeps(monkeypatch):
 
 
 def test_parse_timestamp_converts_zone_offset_to_utc():
-    assert _parse_timestamp("2026-08-18T08:00:00-06:00") == datetime(
+    assert parse_iso_utc("2026-08-18T08:00:00-06:00") == datetime(
         2026, 8, 18, 14, 0, 0, tzinfo=UTC
     )
 
 
 def test_parse_timestamp_accepts_z_suffix():
-    assert _parse_timestamp("2026-08-18T12:34:56Z") == datetime(
+    assert parse_iso_utc("2026-08-18T12:34:56Z") == datetime(
         2026, 8, 18, 12, 34, 56, tzinfo=UTC
     )
 
 
 def test_parse_timestamp_handles_fractional_seconds():
-    parsed = _parse_timestamp("2026-08-18T12:34:56.789+00:00")
+    parsed = parse_iso_utc("2026-08-18T12:34:56.789+00:00")
     assert parsed == datetime(2026, 8, 18, 12, 34, 56, 789000, tzinfo=UTC)
 
 
 def test_parse_timestamp_naive_input_assumed_utc():
-    parsed = _parse_timestamp("2026-08-18T12:34:56")
+    parsed = parse_iso_utc("2026-08-18T12:34:56")
     assert parsed.tzinfo is not None
     assert parsed.utcoffset().total_seconds() == 0
 
 
 def test_parse_timestamp_invalid_raises_valueerror():
     with pytest.raises(ValueError, match="unparseable timestamp"):
-        _parse_timestamp("not-a-timestamp")
+        parse_iso_utc("not-a-timestamp")
 
 
 # --- Reads --------------------------------------------------------------

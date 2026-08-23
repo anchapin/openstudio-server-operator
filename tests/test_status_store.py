@@ -15,8 +15,8 @@ from kubernetes.client import ApiException
 from _fakes import FakeCustomObjectsApi
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import status_store
+from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE
 from openstudio_operator.status_store import (
-    MERGE_PATCH_CONTENT_TYPE,
     ArchivedAnalysisRecord,
     RequeueRecord,
     SoftStopRecord,

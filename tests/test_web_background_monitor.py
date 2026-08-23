@@ -23,15 +23,14 @@ from prometheus_client import REGISTRY
 
 from _fakes import FakeAppsV1Api, FakeCustomObjectsApi, make_emit
 from _fakes import make_cr as _shared_make_cr
+from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE, RESTARTED_AT_ANNOTATION
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers import web_background_monitor as _wbm
 from openstudio_operator.handlers import web_background_monitor as wbm_module
 from openstudio_operator.handlers.web_background_monitor import (
     DEFAULT_WEB_BACKGROUND_DEPLOYMENT,
-    MERGE_PATCH_CONTENT_TYPE,
     RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
-    RESTARTED_AT_ANNOTATION,
     WEB_BACKGROUND_RESTARTED_EVENT,
     StallWindowTracker,
     run_stall_tick,

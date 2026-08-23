@@ -36,6 +36,7 @@ import responses
 from prometheus_client import REGISTRY
 
 from _fakes import _merge_patch, calls_to, make_cr, make_emit
+from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE, RESTARTED_AT_ANNOTATION
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import (
     OperatorConfig,
@@ -55,7 +56,6 @@ from openstudio_operator.handlers.web_background_monitor import (
     run_stall_tick,
 )
 from openstudio_operator.handlers.worker_recycler import (
-    RESTARTED_AT_ANNOTATION,
     WORKER_RECYCLED_EVENT,
     run_recycler_tick,
 )
@@ -67,7 +67,6 @@ from openstudio_operator.retention import (
     run_retention_tick,
 )
 from openstudio_operator.status_store import (
-    MERGE_PATCH_CONTENT_TYPE,
     StatusStore,
 )
 

@@ -35,12 +35,12 @@ from kubernetes.config import ConfigException
 
 from _fakes import FakeAppsV1Api
 from openstudio_operator._k8s import (
+    MERGE_PATCH_CONTENT_TYPE,
     RESTARTED_AT_ANNOTATION,
     load_operator_kube_config,
     rolling_restart_deployment,
 )
 from openstudio_operator._time import parse_iso_utc
-from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 NAMESPACE = "openstudio-server"
 DEPLOYMENT = "worker"

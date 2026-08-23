@@ -39,6 +39,7 @@ from typing import Any
 from kubernetes.client import ApiException, CustomObjectsApi
 
 from ._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
+from ._k8s import MERGE_PATCH_CONTENT_TYPE
 from ._retry import _sleep
 from ._time import utc_parser
 from .metrics import (
@@ -67,8 +68,10 @@ LAST_WEB_BACKGROUND_RESTART_AT = "lastWebBackgroundRestart"
 STALL_WINDOW_STARTED_AT = "stallWindowStartedAt"
 DEFERRED_EVENTS = "deferredEvents"
 
-MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
-
+# Issue #585 — the merge-patch media type's canonical home is ``_k8s``
+# (every production consumer issues a Kubernetes API PATCH; the historical
+# definition here made the shared utility ``_k8s`` import from this domain
+# module). Imported above; the CR ``.status`` subresource patch below uses it.
 MAX_CONFLICT_RETRIES = 5
 _BACKOFF_BASE_SECONDS = 1.0
 

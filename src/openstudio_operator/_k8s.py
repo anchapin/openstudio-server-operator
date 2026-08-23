@@ -34,9 +34,10 @@ none of the four handler modules owns. Today it hosts:
   function's docstring for the rationale),
 * :func:`rolling_restart_deployment` — perform a rolling restart of a
   Deployment by patching the pod template's ``restartedAt`` annotation,
-  plus the single-site constants :data:`RESTARTED_AT_ANNOTATION` and
-  :data:`DEFAULT_WORKER_DEPLOYMENT` the worker recycler and web_background
-  stall monitor both import (issue #395).
+  plus the single-site constants :data:`RESTARTED_AT_ANNOTATION`,
+  :data:`DEFAULT_WORKER_DEPLOYMENT`, and :data:`MERGE_PATCH_CONTENT_TYPE`
+  the worker recycler, web_background stall monitor, and status store
+  all import (issues #395 and #585).
 * :func:`load_operator_kube_config` — the SINGLE public loader for the
   operator's kubeconfig (in-cluster first, ``kube_config`` fallback). The
   ``singleton.operator_*_api`` factories and
@@ -77,7 +78,6 @@ from kubernetes.client import ApiException, AppsV1Api
 
 from openstudio_operator._constants import K8S_REQUEST_TIMEOUT_SECONDS
 from openstudio_operator.metrics import KUBE_API_REQUEST_DURATION_SECONDS, observe_duration
-from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -237,8 +237,12 @@ def deployment_label_selector(
 # suppression message, and emitted a counter increment. The constants
 # RESTARTED_AT_ANNOTATION and DEFAULT_WORKER_DEPLOYMENT were also
 # duplicated. The constants below are now the single source of truth —
-# both handler modules import them from here (and re-export for their
-# test files' import compatibility).
+# both handler modules import them from here (issue #585 moved
+# MERGE_PATCH_CONTENT_TYPE here as well: every production consumer —
+# this module's Deployment patch and status_store's CR .status
+# subresource patch — is a Kubernetes API patch caller, and the old
+# utility-imports-from-domain direction ``_k8s`` → ``status_store``
+# violated layering; ``status_store`` now imports it FROM here).
 
 #: Pod-template annotation driving the rolling restart — same key/values as
 #: ``kubectl rollout restart``; only the value changing triggers a rollout.
@@ -249,6 +253,14 @@ RESTARTED_AT_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
 #: Also the liveness-corroboration fleet name for the web_background
 #: stall monitor's leg C.
 DEFAULT_WORKER_DEPLOYMENT = "worker"
+
+#: RFC 7386 media type for every Kubernetes API PATCH the operator issues
+#: (Deployment pod-template annotation patches here, the CR ``.status``
+#: subresource patch in :mod:`openstudio_operator.status_store`). The
+#: generated client's default selection for Deployment patches is
+#: json-patch (ops array), which a dict body is not; merge preserves
+#: sibling annotations.
+MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json"
 
 
 def rolling_restart_deployment(
@@ -279,8 +291,8 @@ def rolling_restart_deployment(
         restart_annotation: Annotation key to patch (default is the kubectl
             standard :data:`RESTARTED_AT_ANNOTATION`).
         content_type: Content-Type header for the PATCH request; defaults
-            to :data:`openstudio_operator.status_store.MERGE_PATCH_CONTENT_TYPE`
-            per RFC 7386 to preserve sibling annotations.
+            to :data:`MERGE_PATCH_CONTENT_TYPE` (RFC 7386, canonical home
+            here since issue #585) to preserve sibling annotations.
 
     Returns:
         The ISO-format restart timestamp that was written to the annotation.
