@@ -1219,6 +1219,23 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   other Secret in the namespace. Custom-named secretRefs fail visibly
   — a 403-specific message plus a one-time `RedisSecretRefForbidden`
   Warning event naming both remedies.
+- **`#590`** — operator status writes no longer re-trigger the watch
+  handler triple: the key-layout watch path honors the #490 freshness
+  stamp and the singleton guard skips the CR relist on status-only
+  events (policy-surface fingerprint, fail-closed; boot/resync and
+  delete+recreate always run the full check).
+- **`#592` / `#593` / `#594`** — `rolling_restart_deployment` typed
+  against the `DeploymentManager` Protocol (concrete `AppsV1Api`
+  import dropped from `_k8s`); the watchdog docstring cites the real
+  contract path (+ a src-wide dead-contract-reference drift test); the
+  ResqueKeyLayoutUnknown message interpolates `WORKER_REGISTRY_KEY`
+  (fenced by test).
+- **`#595`** — validation.md's Module status table is an evergreen
+  "what is live" index covering the #400-#606 state-carrying manifests,
+  cross-referencing the #587 apply-steps subsection.
+- **`#596`** — ADR-6 (dual lockfiles + build-toolchain pinning),
+  ADR-7 (asymmetric audit floors + triage), ADR-8 (the #456→#500
+  sign/verify chain) in the established shape, linked from the index.
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
