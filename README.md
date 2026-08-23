@@ -449,11 +449,17 @@ on failed Jobs; treat the counter as best-effort.
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
-ruff check .     # lint
-pytest           # tests
+ruff check .          # lint
+.venv/bin/pytest      # tests (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 
 ```
+
+Working from a wave-orchestration worktree (where the shared venv can resolve
+`openstudio_operator` against a different checkout)? Run
+`bash scripts/check_editable_install.sh` first, or simply re-run
+`pip install -e '.[dev]'` from that checkout. Full setup walkthrough:
+[docs/onboarding.md#quick-start](docs/onboarding.md#quick-start).
 
 Kubernetes manifests (CRD, least-privilege RBAC, operator Deployment) live in `deploy/`.
 
