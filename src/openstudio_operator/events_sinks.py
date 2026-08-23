@@ -54,9 +54,14 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Final, Protocol
 
-import kopf
+# Test seam (issue #651): tests/test_events_sinks.py patches
+# ``sinks_module.kopf.event`` — the shared kopf module object, so the patch
+# also intercepts the routed ``events.emit_kopf_event`` calls. Production
+# code no longer calls ``kopf.*`` from this module.
+import kopf  # noqa: F401
 
 from openstudio_operator import metrics as metrics_module
+from openstudio_operator.events import emit_kopf_event
 
 logger = logging.getLogger(__name__)
 
@@ -372,11 +377,14 @@ class QueuedKopfEventSink:
             for entry in persisted:
                 reason = str(entry.get("reason") or "")
                 message = str(entry.get("message") or "")
-                kopf.event(
+                # Issue #651 — routed through the shared ``kopf.event``
+                # wrapper (same object shape, same arguments) so the
+                # direct-call surface lives only in ``events.py``.
+                emit_kopf_event(
                     {"metadata": {"namespace": namespace, "name": name}},
-                    type="Warning",
-                    reason=reason,
-                    message=message,
+                    "Warning",
+                    reason,
+                    message,
                 )
                 emitted_keys.add((namespace, name, reason, message))
                 flushed += 1
@@ -397,11 +405,12 @@ class QueuedKopfEventSink:
         # the common path, at-least-once across restarts).
         fresh = [msg for msg in pending if msg not in emitted_keys]
         for _ns, _nm, reason, message in fresh:
-            kopf.event(
+            # Issue #651 — same routing as the persisted phase above.
+            emit_kopf_event(
                 {"metadata": {"namespace": namespace, "name": name}},
-                type="Warning",
-                reason=reason,
-                message=message,
+                "Warning",
+                reason,
+                message,
             )
             flushed += 1
         self._queue[:] = [

@@ -42,7 +42,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; E402 enforced via [tool.ruff.lint] extend-select, #507; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 1097 tests across 48 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 1098 tests across 48 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 kopf run --module openstudio_operator.handlers --namespace openstudio-server   # run (needs cluster + CRD)
 ```
 
