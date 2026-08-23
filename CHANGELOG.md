@@ -917,6 +917,24 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   meaningless). README triage documents the `kubectl get jobs` check;
   `OpenStudioOperatorPruneJobFailed` (see `#469`'s entry) keys on
   `kube_job_status_failed` instead of the stale rate expression.
+- **`#645`** — `OpenStudioOperatorPruneJobNoSuccess` rekeyed onto
+  CronJob-level recency:
+  `time() - kube_cronjob_status_last_successful_time > 3600`, plus a
+  never-succeeded bootstrap arm (`last_schedule_time` stale `unless` a
+  success series exists — the series is absent until the first success,
+  and `time() - X` over an absent series is no-data). The `#569`
+  `sum(max_over_time(kube_job_status_succeeded[1h])) or vector(0) < 1`
+  shape was dead on arrival after day one: `successfulJobsHistoryLimit
+  (3)` retains the three newest succeeded Job objects (KSM keeps
+  exporting `succeeded=1` for them; the CronJob controller only GCs
+  history when it creates a NEW Job), so in exactly the no-event modes
+  the alert exists for — suspend, wrong schedule, controller outage —
+  the sum is permanently ≥ 1 and it could never fire. Requires
+  kube-state-metrics ≥ 2.5.0 (the series shipped in v2.5.0, upstream PR
+  #1732; older KSM degrades the alert to schedule-staleness only).
+  Drift-gated by the `#645` section of `tests/test_monitoring_artifacts.py`
+  (canonical-shape fullmatch + firing-scenario simulation, including
+  "3 retained successes, nothing new for 1h → armed").
 - **`#475`** — `OperatorConfigError` moves to `config.py` as a direct
   `Exception` subclass (canonical home; `redis_client` keeps an
   identity-verified compat re-export, the `#305` pattern). The REST
