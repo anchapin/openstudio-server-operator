@@ -541,6 +541,91 @@ def test_gate_closed_senses_nothing_at_all():
     assert events == []
 
 
+# --- Issue #647 — freshness gauges advance through the cooldown gate -------------
+
+
+def test_gate_closed_tick_still_advances_freshness_gauges(monkeypatch):
+    """Issue #647 — a tick inside the cooldown still stamps BOTH #312
+    freshness gauges, so the 300 s staleness alerts cannot false-page
+    during a cooldown that outlasts their threshold (one stall window,
+    default 10 min). The stamps mean "tick alive", not "queue read":
+    ExplodingRedis proves the gate closed before any sensing (same fence
+    as ``test_gate_closed_senses_nothing_at_all``) — only the gauges move.
+
+    Issue #591 — the stamp site reads the wall clock, so the test pins
+    ``time.time`` to a :class:`SteppedWallClock`: the stamp IS the served
+    instant, exactly.
+    """
+    clock = SteppedWallClock(NOW.timestamp())
+    monkeypatch.setattr("time.time", clock)
+    _reset_freshness_gauges()
+    status = {"lastWebBackgroundRestart": (NOW - minute(3)).isoformat()}
+    api = FakeCustomObjectsApi(make_cr(status=status))
+    apps = FakeAppsV1Api()
+
+    clock.step(120.0)  # later instant — a failure to stamp would read 0.0
+    fired, events = tick(api, apps, redis=ExplodingRedis(), tracker=StallWindowTracker())
+
+    assert fired is False
+    assert events == []
+    assert apps.reads == []  # gate closed: gauges only, no sensing
+    assert queue_depth_fresh() == NOW.timestamp() + 120
+    assert stall_window_fresh() == NOW.timestamp() + 120
+
+
+def test_freshness_gauges_never_stale_across_full_cooldown(monkeypatch):
+    """Issue #647 acceptance — across a FULL cooldown (one stall window,
+    default 10 min) driven at the real poll cadence (60 s), neither
+    freshness gauge ever goes older than the 300 s staleness-alert
+    threshold: minutes 5–10 of every cooldown used to guarantee false
+    ``OpenStudioOperatorResqueQueueDepthStale`` /
+    ``OpenStudioOperatorStallWindowStale`` pages after each restart.
+
+    Stepped-clock simulation (#591): the domain clock advances one poll
+    interval per tick and the fake wall clock follows in lockstep, so
+    each between-ticks gauge age is exact — no real-time sleeps.
+    """
+    clock = SteppedWallClock(NOW.timestamp())
+    monkeypatch.setattr("time.time", clock)
+    _reset_freshness_gauges()
+    poll = wbm_module.POLL_INTERVAL_SECONDS
+    assert poll < 300  # the cadence this test's math depends on
+    anchor = NOW - minute(1)  # restart fired 1 min ago
+    api = FakeCustomObjectsApi(
+        make_cr(status={"lastWebBackgroundRestart": anchor.isoformat()})
+    )
+    apps = FakeAppsV1Api()
+    tracker = StallWindowTracker()
+
+    prev_queue_fresh = prev_stall_fresh = None
+    # Ten gated ticks at the poll cadence: NOW+0 … NOW+9 all sit inside
+    # the 10-min cooldown anchored at NOW−1 (the +9 tick is exactly at
+    # the inclusive boundary) — covering minutes 1–10 of the cooldown,
+    # i.e. the whole false-page window the issue describes.
+    for i in range(10):
+        domain_now = NOW + minute(i)
+        clock.now = domain_now.timestamp()
+        if prev_queue_fresh is not None:
+            # Worst-case between-ticks staleness, measured at the NEXT
+            # tick's instant: one poll interval, never the 300 s page.
+            assert clock.now - prev_queue_fresh <= poll
+            assert clock.now - prev_stall_fresh <= poll
+            assert clock.now - prev_queue_fresh < 300
+            assert clock.now - prev_stall_fresh < 300
+        fired, _ = tick(
+            api,
+            apps,
+            now=domain_now,
+            tracker=tracker,
+            redis=ExplodingRedis(),  # the gate must hold on every tick
+        )
+        assert fired is False
+        prev_queue_fresh = queue_depth_fresh()
+        prev_stall_fresh = stall_window_fresh()
+        assert prev_queue_fresh == clock.now  # re-stamped this tick
+        assert prev_stall_fresh == clock.now
+
+
 # --- Cooldown honored across operator restarts (D04) ----------------------------
 
 
