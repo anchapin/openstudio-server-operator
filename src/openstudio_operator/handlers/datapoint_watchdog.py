@@ -119,7 +119,18 @@ DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
 # UN-KEYED ``set[str]`` of datapoint ids, which assumed one CR for the
 # process lifetime and could suppress CR B's exhaustion Warnings with CR
 # A's dedup entries after a delete+recreate.
-_EXHAUSTED_WARNED: dict[tuple[str, str], tuple[str | None, set[str]]] = {}
+#
+# Issue #583 — the lookup/evict/create/upgrade/reset mechanics live in
+# :class:`openstudio_operator._cr_cache.PerCRCache`; this global is the
+# module's instance of that holder.
+_EXHAUSTED_WARNED: cr_cache.PerCRCache[set[str]] = cr_cache.PerCRCache(
+    stale_log=(
+        "exhaustion-dedup cache for %s/%s belongs to a deleted CR "
+        "(recorded uid %r != observed %r) — starting fresh (#364 "
+        "delete+recreate; #497 uid validation)"
+    ),
+    logger=logger,
+)
 
 
 def _get_exhausted_seen(namespace: str, name: str, uid: str | None = None) -> set[str]:
@@ -130,29 +141,13 @@ def _get_exhausted_seen(namespace: str, name: str, uid: str | None = None) -> se
     the #364 delete+recreate path) and is replaced with a fresh set — the
     new CR's still-exhausted datapoints re-earn their one-shot Warning
     instead of being silenced by the old CR's dedup bookkeeping.
+
+    Issue #583 — the mechanics above are
+    :meth:`openstudio_operator._cr_cache.PerCRCache.get_or_create`; this
+    façade keeps the module's typed seam (the set is handed to
+    ``run_watchdog_tick`` as the presentation cache).
     """
-    key = (namespace, name)
-    entry = _EXHAUSTED_WARNED.get(key)
-    if entry is not None and cr_cache.uid_is_stale(entry[0], uid):
-        logger.info(
-            "exhaustion-dedup cache for %s/%s belongs to a deleted CR "
-            "(recorded uid %r != observed %r) — starting fresh (#364 "
-            "delete+recreate; #497 uid validation)",
-            namespace,
-            name,
-            entry[0],
-            uid,
-        )
-        entry = None
-    if entry is None:
-        fresh: set[str] = set()
-        _EXHAUSTED_WARNED[key] = (uid, fresh)
-        return fresh
-    if uid is not None and entry[0] is None:
-        # First uid sighting for an entry recorded pre-uid (or by a
-        # uid-less caller): record it so later lookups can validate.
-        _EXHAUSTED_WARNED[key] = (uid, entry[1])
-    return entry[1]
+    return _EXHAUSTED_WARNED.get_or_create(namespace, name, uid, set)
 
 
 def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
@@ -165,15 +160,7 @@ def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -
     leak at lookup time in the meantime). Anything else is a caller bug and
     raises rather than silently clearing the wrong scope.
     """
-    if namespace is None and name is None:
-        _EXHAUSTED_WARNED.clear()
-    elif namespace is not None and name is not None:
-        _EXHAUSTED_WARNED.pop((namespace, name), None)
-    else:
-        raise ValueError(
-            f"reset_per_cr_caches: pass both namespace and name, or neither "
-            f"(got namespace={namespace!r}, name={name!r})"
-        )
+    _EXHAUSTED_WARNED.reset(namespace, name)
 
 
 def _datapoint_ids(docs: list[dict]) -> list[str]:
