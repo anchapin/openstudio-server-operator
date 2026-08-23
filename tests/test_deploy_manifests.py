@@ -2821,15 +2821,20 @@ def _cel_eval(node, ctx):
     raise _CelError(f"unknown node kind {kind!r}")
 
 
-def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL, operation="CREATE"):
-    """Admission decision for one validation expression: True when the
-    expression evaluates truthy (request allowed), False when it
-    evaluates falsy OR errors — a CEL error denies under
-    `failurePolicy: Fail`, so both paths are rejections. The context
-    carries `request.userInfo.username` (default: the prune SA — the
+def _cel_outcome(expression, *, obj, old, username=PRUNE_SA_FULL, operation="CREATE"):
+    """(allowed, errored) admission outcome for one validation
+    expression, modelling an absent binding as `None` (the docs'
+    DELETE/CREATE shapes: `object` is null on DELETE admission,
+    `oldObject` on CREATE). `errored` is True when the expression
+    raises a CEL evaluation error — under `failurePolicy: Fail` the
+    API server turns that into a deny with a cryptic "resulted in
+    error: no such key: metadata" message, the exact #680 class
+    (fail-closed but policy-logic-independent). `allowed` is True
+    only when the expression evaluates truthy; the context carries
+    `request.userInfo.username` (default: the prune SA — the
     principal the policy constrains) and `request.operation`
-    (default: CREATE) so the #565 carve-out disjunct and the #641
-    operation guard evaluate the way the API server would."""
+    (default: CREATE) so the #565 carve-out disjunct and the #641 /
+    #680 operation guards evaluate the way the API server would."""
     ctx = {
         "object": obj,
         "oldObject": old,
@@ -2837,9 +2842,22 @@ def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL, operation="CREA
     }
     tree = _CelParser(_cel_tokenize(expression)).parse()
     try:
-        return _cel_eval(tree, ctx) is True
+        return (_cel_eval(tree, ctx) is True, False)
     except _CelError:
-        return False
+        return (False, True)
+
+
+def _cel_allows(expression, *, obj, old, username=PRUNE_SA_FULL, operation="CREATE"):
+    """Admission decision for one validation expression: True when the
+    expression evaluates truthy (request allowed), False when it
+    evaluates falsy OR errors — a CEL error denies under
+    `failurePolicy: Fail`, so both paths are rejections. Tests that
+    need to DISTINGUISH a logic deny from an error deny (the #680
+    regression class) use `_cel_outcome` instead."""
+    allowed, _errored = _cel_outcome(
+        expression, obj=obj, old=old, username=username, operation=operation
+    )
+    return allowed
 
 
 def test_prune_job_scope_vap_validations_require_oscm_archive_name_prefix():
@@ -2912,7 +2930,12 @@ def test_prune_job_scope_vap_rejects_spoofed_job_name_with_archival_labels():
         "CREATE of a spoof-named Job carrying the archival labels must "
         "be rejected at admission time (issue #398)"
     )
-    assert _cel_allows(expression, obj=None, old=spoofed) is False, (
+    # #680: the DELETE path carries no `object` binding — model it as
+    # None AND pass the real operation so the operation guards steer
+    # the expression down the oldObject clause.
+    assert (
+        _cel_allows(expression, obj=None, old=spoofed, operation="DELETE") is False
+    ), (
         "DELETE of a spoof-named Job carrying the archival labels must "
         "be rejected at admission time (issue #398)"
     )
@@ -2952,7 +2975,7 @@ def test_prune_job_scope_vap_accepts_real_archival_job_name():
         "name/label requirements must match what archival.py emits "
         "(issues #294, #398)"
     )
-    assert _cel_allows(expression, obj=None, old=job) is True, (
+    assert _cel_allows(expression, obj=None, old=job, operation="DELETE") is True, (
         "DELETE of a real archival Job must pass admission (failed-Job "
         "cleanup path; issues #294, #398)"
     )
@@ -2982,7 +3005,12 @@ def test_prune_job_scope_vap_userinfo_carveout_leaves_non_prune_actors_unrestric
         "a non-prune actor creating a non-archival Job must NOT be "
         "constrained by the policy (issue #565 carve-out)"
     )
-    assert _cel_allows(expression, obj=None, old=non_archival, username=human) is True, (
+    assert (
+        _cel_allows(
+            expression, obj=None, old=non_archival, username=human, operation="DELETE"
+        )
+        is True
+    ), (
         "a non-prune actor deleting a non-archival Job must NOT be "
         "constrained by the policy (issue #565 carve-out)"
     )
@@ -2991,7 +3019,10 @@ def test_prune_job_scope_vap_userinfo_carveout_leaves_non_prune_actors_unrestric
         "rejected — the carve-out must not weaken the #294/#398 fence "
         "(default username is the prune SA)"
     )
-    assert _cel_allows(expression, obj=None, old=non_archival) is False, (
+    assert (
+        _cel_allows(expression, obj=None, old=non_archival, operation="DELETE")
+        is False
+    ), (
         "the prune SA deleting the same non-archival Job must still be "
         "rejected (default username is the prune SA)"
     )
@@ -3247,6 +3278,195 @@ def test_prune_job_scope_vap_spec_fence_userinfo_carveout_leaves_non_prune_actor
     assert _cel_allows(expression, obj=tampered, old=None) is False, (
         "the prune SA creating the tampered Job must be rejected by "
         "the #641 fence (default username is the prune SA)"
+    )
+
+
+# ---- Issue #680: DELETE admission must never CEL-error on the ----
+# `object` binding
+#
+# The apiserver binds `object` to null on DELETE admissions (K8s CEL
+# admission docs: "the value is null for DELETE operations"), so the
+# pod-delete policy's `has(object.metadata.labels)` — which guarded
+# `metadata.labels` but NOT the `object` binding itself — raised
+# "no such key: metadata" (reproduced live on k8s 1.33.1 with an
+# impersonated server-dry-run DELETE as the operator SA) and denied
+# only because `failurePolicy: Fail` absorbs CEL evaluation errors:
+# fail-closed, but cryptic, policy-logic-independent, and silently
+# reversible by any future failurePolicy relaxation. The audit in the
+# issue found the SAME latent class in the prune-scope VAP's
+# name/labels validation (bare `has()` guards on both bindings, no
+# operation gating) and confirmed the #641 spec fence + the #572/#573
+# request.*-only policies are immune. The tests below evaluate the
+# manifests' OWN CEL text with the interpreter above, distinguishing
+# a LOGIC deny from an ERROR deny via `_cel_outcome` — the encode-the-
+# bug-as-a-feature trap #315 audits for.
+
+
+def test_pod_delete_admission_policy_delete_path_denies_via_policy_logic_issue_680():
+    """Issue #680 regression: on DELETE admission (an absent `object`
+    binding, modelled both as None and as the live empty-object `{}`
+    shape) the operator SA deleting a NON-worker pod must DENY via
+    policy logic with ZERO evaluation error, the operator SA deleting
+    a worker pod must PASS (the worker-recycler eviction path), and a
+    human must stay unrestricted — not one denial may come from a CEL
+    evaluation error absorbed by `failurePolicy: Fail`."""
+    expression = _pod_delete_admission_policy()["spec"]["validations"][0]["expression"]
+    # Structural preconditions: the DELETE branch reads `oldObject`
+    # (always populated on delete admission) and the expression
+    # branches on `request.operation` so a null `object` binding is
+    # never selected on the DELETE path.
+    stripped = _strip_cel_whitespace(expression)
+    assert "request.operation == 'DELETE'" in stripped, (
+        "the pod-delete CEL must branch on request.operation so the "
+        "null DELETE-time `object` binding is never selected (issue "
+        f"#680); got: {stripped!r}"
+    )
+    assert "has(oldObject.metadata.labels)" in stripped, (
+        "the DELETE branch must evaluate the worker label on "
+        "`oldObject` (populated on delete admission), not on the null "
+        f"`object` binding (issue #680); got: {stripped!r}"
+    )
+    non_worker = {"metadata": {"labels": {"app": "web"}}}
+    worker = {"metadata": {"labels": {"app": "worker"}}}
+    unlabelled = {"metadata": {"name": "web-5d9dcf7c8b-x2p4z"}}
+    for absent_object in (None, {}):
+        allowed, errored = _cel_outcome(
+            expression,
+            obj=absent_object,
+            old=non_worker,
+            username=_OPERATOR_SA_FULL,
+            operation="DELETE",
+        )
+        assert (allowed, errored) == (False, False), (
+            "operator-SA DELETE of a non-worker pod must deny via "
+            f"POLICY LOGIC with zero CEL error (issue #680); object={absent_object!r}"
+        )
+        allowed, errored = _cel_outcome(
+            expression,
+            obj=absent_object,
+            old=worker,
+            username=_OPERATOR_SA_FULL,
+            operation="DELETE",
+        )
+        assert (allowed, errored) == (True, False), (
+            "operator-SA DELETE of a worker pod must pass — the "
+            "worker-recycler eviction path depends on it (issues "
+            "#293, #680)"
+        )
+        allowed, errored = _cel_outcome(
+            expression,
+            obj=absent_object,
+            old=non_worker,
+            username="kubernetes-admin",
+            operation="DELETE",
+        )
+        assert (allowed, errored) == (True, False), (
+            "a human's DELETE must stay unrestricted (issue #565 "
+            "carve-out) and error-free (issue #680)"
+        )
+    # A pod with no labels map at all also denies cleanly: has()
+    # returns False (no error) on the populated oldObject binding.
+    allowed, errored = _cel_outcome(
+        expression,
+        obj=None,
+        old=unlabelled,
+        username=_OPERATOR_SA_FULL,
+        operation="DELETE",
+    )
+    assert (allowed, errored) == (False, False), (
+        "operator-SA DELETE of an unlabelled pod must deny via policy "
+        "logic (has() on the populated oldObject), not via a CEL "
+        "error (issue #680)"
+    )
+
+
+def test_prune_job_scope_vap_object_bindings_are_operation_guarded_issue_680():
+    """Issue #680 sibling audit: the #294/#398 name/labels validation
+    evaluated `has(object...)` and `has(oldObject...)` with no
+    operation gating, so the prune SA's DELETE of a NON-archival Job
+    errored on the null `object` binding and its CREATE of a
+    non-conforming Job errored on the null `oldObject` binding — the
+    same fail-closed-but-cryptic class. The fixed expression guards
+    the object clause by `request.operation != 'DELETE'` and the
+    oldObject clause by `request.operation != 'CREATE'`; every
+    denial below must be LOGIC, never an evaluation error. Also pins
+    that the #641 spec fence's existing operation guard keeps its
+    DELETE path error-free."""
+    expression = PRUNE_JOB_SCOPE_VAP["spec"]["validations"][0]["expression"]
+    stripped = _strip_cel_whitespace(expression)
+    assert "request.operation != 'DELETE'" in stripped, (
+        "the object-side clause must be guarded by "
+        "request.operation != 'DELETE' (object is null on DELETE "
+        f"admission, issue #680); got: {stripped!r}"
+    )
+    assert "request.operation != 'CREATE'" in stripped, (
+        "the oldObject-side clause must be guarded by "
+        "request.operation != 'CREATE' (oldObject is null on CREATE "
+        f"admission, issue #680); got: {stripped!r}"
+    )
+    non_archival = {
+        "metadata": {
+            "name": "kube-system-cleanup",
+            # Both label KEYS present with wrong VALUES so the deny is
+            # pure label-logic (a missing key would itself error).
+            "labels": {
+                "app.kubernetes.io/managed-by": "attacker",
+                "app.kubernetes.io/component": "debug",
+            },
+        }
+    }
+    # Prune SA DELETE of a non-archival Job: absent object binding,
+    # logic deny, zero error (pre-#680 this was the cryptic error
+    # deny — the exact class the issue was opened for).
+    allowed, errored = _cel_outcome(
+        expression, obj=None, old=non_archival, operation="DELETE"
+    )
+    assert (allowed, errored) == (False, False), (
+        "prune-SA DELETE of a non-archival Job must deny via policy "
+        "logic with zero CEL error (issue #680)"
+    )
+    # Prune SA DELETE of a real archival Job: allow, zero error (the
+    # failed-Job cleanup path the retention pipeline depends on).
+    allowed, errored = _cel_outcome(
+        expression, obj=None, old=_legit_archival_job(), operation="DELETE"
+    )
+    assert (allowed, errored) == (True, False), (
+        "prune-SA DELETE of a real archival Job must pass via policy "
+        "logic with zero CEL error (issues #294, #680)"
+    )
+    # Prune SA CREATE of a non-conforming Job: absent oldObject
+    # binding, logic deny, zero error.
+    allowed, errored = _cel_outcome(
+        expression, obj=non_archival, old=None, operation="CREATE"
+    )
+    assert (allowed, errored) == (False, False), (
+        "prune-SA CREATE of a non-archival Job must deny via policy "
+        "logic with zero CEL error — the null CREATE-time oldObject "
+        "binding must never be selected (issue #680)"
+    )
+    # Human DELETE of a non-archival Job: carve-out allow, zero error.
+    allowed, errored = _cel_outcome(
+        expression,
+        obj=None,
+        old=non_archival,
+        username="kubernetes-admin",
+        operation="DELETE",
+    )
+    assert (allowed, errored) == (True, False), (
+        "a non-prune actor's DELETE must stay unrestricted and "
+        "error-free (issues #565, #680)"
+    )
+    # #641 spec fence DELETE path: its `request.operation` guard
+    # exempts DELETE — the decision must be a clean allow, no error.
+    fence_allowed, fence_errored = _cel_outcome(
+        _spec_fence_expression(),
+        obj=None,
+        old=_legit_archival_job(),
+        operation="DELETE",
+    )
+    assert (fence_allowed, fence_errored) == (True, False), (
+        "the #641 spec fence's DELETE path must be error-free (its "
+        "request.operation guard exempts DELETE) — issue #680 audit"
     )
 
 
