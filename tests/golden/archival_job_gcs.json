@@ -40,7 +40,7 @@
         "containers": [
           {
             "name": "rclone",
-            "image": "rclone/rclone:1.67.0@sha256:25a2a208a8e3f4ad27ac5e7441cbfebdcea7953c8d7c9effa31f234a3c251024",
+            "image": "rclone/rclone:1.75.0@sha256:b06aed988cf5967de7c25be5925240983981c757f4ed1ac9d2fa659d51d60548",
             "command": [
               "/bin/sh",
               "-c",
