@@ -1,0 +1,49 @@
+# Service fronting the operator's plaintext :9090 /metrics endpoint
+# (issue #682 — the DISCOVERY half of the alerting surface; the ingress
+# half is the `openstudio-operator-metrics-ingress` NetworkPolicy,
+# issue #166). Without this Service (or an equivalent scrape config)
+# nothing ever scrapes /metrics, every OpenStudioOperator* alert in
+# deploy/prometheustrule.yaml is permanently inert, and the #646
+# scrape-target-down companion has no target to lose.
+#
+# APPLY + PICKUP
+# --------------
+# Cluster-admin apply (kubectl apply -f deploy/), like every monitoring
+# artifact (#468): the operator's namespaced Role (deploy/rbac.yaml)
+# intentionally holds no `services` verbs, and the operator never
+# creates or mutates Service objects. The Service is namespaced and
+# lives in `openstudio-server` beside the Deployment it selects.
+#
+# The selector is the pod-label conjunction `app: openstudio-operator`
+# AND `app.kubernetes.io/managed-by: openstudio-operator` — exactly the
+# labels the NetworkPolicies match on (issue #224), so the Endpoints
+# population and the ingress fence always agree on which pod is
+# scraped. The named port `metrics` mirrors the containerPort 9090
+# declaration in deploy/operator-deployment.yaml (issue #17); keep the
+# two in sync.
+#
+# This Service changes NOTHING about reachability: a ClusterIP Service
+# is a DNS/routing object, not a firewall rule. Whether /metrics can be
+# READ is still decided, pod-label-scoped, by the metrics-ingress
+# NetworkPolicy (#166/#295) — a Service selector never widens that
+# policy, and this object is not a pod, so its own labels cannot
+# interact with the policy either.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openstudio-operator-metrics
+  namespace: openstudio-server
+  labels:
+    app.kubernetes.io/name: openstudio-operator
+    app.kubernetes.io/part-of: openstudio-server
+spec:
+  type: ClusterIP
+  selector:
+    app: openstudio-operator
+    app.kubernetes.io/managed-by: openstudio-operator
+  ports:
+    - name: metrics # must match the ServiceMonitor endpoint port (servicemonitor-metrics.yaml)
+      protocol: TCP
+      port: 9090
+      targetPort: metrics # named containerPort → 9090 (operator-deployment.yaml)

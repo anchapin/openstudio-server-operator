@@ -5024,3 +5024,171 @@ def test_dockerfile_sets_non_root_user_matching_manifests():
         "deploy/storage-cronjob.yaml:151-156) — ownership semantics must "
         "stay identical (#589)."
     )
+
+
+# ---- Issue #682: Service + ServiceMonitor discovery for the :9090 surface --
+#
+# deploy/prometheustrule.yaml shipped 20 alerts (#468) but NOTHING ever
+# scraped /metrics: absent series never fire, so every alert — including
+# the #646 scrape-target-down companion, which needs a target that
+# existed first — was permanently inert out of the box. #682 ships the
+# owner-validated cluster-local discovery pair: a ClusterIP Service
+# fronting the operator Deployment's named port `metrics` (:9090) plus a
+# ServiceMonitor wiring a Prometheus Operator scrape job to it. The
+# tests below pin the structural wiring — selector/label agreement
+# across the Deployment, Service, and ServiceMonitor — because a
+# drifted label yields an EMPTY Endpoints list exactly as silently as
+# shipping no Service at all (the failure mode #682 was opened for).
+
+
+def _metrics_service():
+    docs = list(yaml.safe_load_all((DEPLOY / "service-metrics.yaml").read_text()))
+    matches = [d for d in docs if d and d["kind"] == "Service"]
+    assert matches, (
+        "no Service in deploy/service-metrics.yaml — the discovery half "
+        "of the alerting surface is unshipped and every PrometheusRule "
+        "alert stays inert (issue #682)"
+    )
+    return matches[0]
+
+
+def _metrics_service_monitor():
+    docs = list(
+        yaml.safe_load_all((DEPLOY / "servicemonitor-metrics.yaml").read_text())
+    )
+    matches = [d for d in docs if d and d["kind"] == "ServiceMonitor"]
+    assert matches, (
+        "no ServiceMonitor in deploy/servicemonitor-metrics.yaml — "
+        "nothing wires a Prometheus Operator scrape job to the "
+        "operator's :9090, so every PrometheusRule alert stays inert "
+        "(issue #682)"
+    )
+    return matches[0]
+
+
+def _operator_pod_template_labels():
+    deployment = next(
+        d
+        for d in yaml.safe_load_all((DEPLOY / "operator-deployment.yaml").read_text())
+        if d and d["kind"] == "Deployment"
+    )
+    return deployment["spec"]["template"]["metadata"]["labels"]
+
+
+def test_metrics_service_targets_operator_pod_labels():
+    """Issue #682: the Service selector must be the operator pod-label
+    conjunction the NetworkPolicies also match on (#224) — every
+    selector key/value must be present on the Deployment's pod template,
+    so the Endpoints population and the ingress fence can never disagree
+    about which pod is scraped."""
+    service = _metrics_service()
+    assert service["apiVersion"] == "v1"
+    assert service["metadata"]["namespace"] == "openstudio-server"
+    assert service["spec"]["type"] == "ClusterIP"
+    selector = service["spec"]["selector"]
+    assert selector, "Service selector must not be empty — it selects the operator pod"
+    pod_labels = _operator_pod_template_labels()
+    for key, value in selector.items():
+        assert pod_labels.get(key) == value, (
+            f"Service selector {key}={value!r} is not on the operator pod "
+            f"template labels {pod_labels!r} — the Service would have ZERO "
+            "endpoints and every alert would stay inert with no signal "
+            "(issue #682; keep the selector in lockstep with the #224 "
+            "pod-label conjunction)"
+        )
+    assert selector.get("app") == "openstudio-operator"
+    assert selector.get("app.kubernetes.io/managed-by") == "openstudio-operator", (
+        "the metrics NetworkPolicies require the #224 conjunction — the "
+        "Service selector should not be looser than the ingress fence"
+    )
+
+
+def test_metrics_service_exposes_named_port_9090():
+    """Issue #682: exactly one port, named `metrics`, Service port 9090,
+    targetPort by NAME — and the name must resolve to containerPort 9090
+    on the operator Deployment (issue #17 named-port convention). A
+    numeric targetPort drift (e.g. someone renumbers the container port)
+    is exactly the silent-inert-alert failure mode #682 exists to end."""
+    service = _metrics_service()
+    ports = service["spec"]["ports"]
+    assert len(ports) == 1, f"expected a single metrics port, got {ports!r}"
+    port = ports[0]
+    assert port["name"] == "metrics"
+    assert port["port"] == 9090
+    assert port["targetPort"] == "metrics", (
+        "targetPort must reference the container port BY NAME so the "
+        "Service tracks the Deployment's named port (issue #17)"
+    )
+    assert port.get("protocol", "TCP") == "TCP"
+    deployment = next(
+        d
+        for d in yaml.safe_load_all((DEPLOY / "operator-deployment.yaml").read_text())
+        if d and d["kind"] == "Deployment"
+    )
+    container_ports = [
+        p
+        for c in deployment["spec"]["template"]["spec"]["containers"]
+        for p in c.get("ports", [])
+    ]
+    named = {p["name"]: p["containerPort"] for p in container_ports}
+    assert named.get("metrics") == 9090, (
+        "the operator Deployment's named port `metrics` no longer maps to "
+        "containerPort 9090 — the Service and Deployment drifted apart "
+        "(issues #17/#682)"
+    )
+
+
+def test_service_monitor_selects_service_port_and_namespace():
+    """Issue #682: the ServiceMonitor must select the shipped Service (by
+    its labels, which must actually appear on the Service), scope to the
+    `openstudio-server` namespace, and scrape the named `metrics` port —
+    a mismatch in any link yields a ServiceMonitor with zero targets and
+    inert alerts with zero diagnostics."""
+    monitor = _metrics_service_monitor()
+    assert monitor["apiVersion"] == "monitoring.coreos.com/v1"
+    assert monitor["metadata"]["namespace"] == "openstudio-server"
+    assert monitor["spec"]["namespaceSelector"]["matchNames"] == ["openstudio-server"], (
+        "namespaceSelector must pin matchNames: [openstudio-server] — the "
+        "Service (and the PrometheusRule) live in exactly that namespace"
+    )
+    selector = monitor["spec"]["selector"]["matchLabels"]
+    service_labels = _metrics_service()["metadata"]["labels"]
+    for key, value in selector.items():
+        assert service_labels.get(key) == value, (
+            f"ServiceMonitor selector {key}={value!r} does not match the "
+            f"shipped Service labels {service_labels!r} — the monitor "
+            "would select nothing (issue #682)"
+        )
+    endpoints = monitor["spec"]["endpoints"]
+    assert len(endpoints) == 1, f"expected a single endpoint, got {endpoints!r}"
+    endpoint = endpoints[0]
+    assert endpoint["port"] == "metrics", (
+        "endpoint port must be the Service's named port `metrics` "
+        "(service-metrics.yaml), not a number"
+    )
+    assert endpoint["interval"] == "30s"
+    assert endpoint["path"] == "/metrics"
+
+
+def test_service_monitor_carries_release_pickup_label():
+    """The ServiceMonitor carries the kube-prometheus-stack default
+    `release: prometheus` serviceMonitorSelector pickup label — the SAME
+    convention prometheustrule.yaml documents for its ruleSelector
+    (issue #468). A Prometheus installed under a different release name
+    silently ignores an unlabeled/mislabeled monitor: the acceptance
+    criterion of #682 is pickup on a STOCK kube-prometheus-stack, so the
+    default label must ship and the rename note must live in the
+    manifest header."""
+    monitor = _metrics_service_monitor()
+    labels = monitor["metadata"]["labels"]
+    assert labels.get("release") == "prometheus", (
+        "kube-prometheus-stack default serviceMonitorSelector pickup "
+        "label missing — see the manifest header for the "
+        "rename-your-release note (mirrors prometheustrule.yaml, #468)"
+    )
+    header = (DEPLOY / "servicemonitor-metrics.yaml").read_text()
+    assert "serviceMonitorSelector" in header, (
+        "the manifest header must document the `release:` label's "
+        "per-cluster rename caveat (same requirement the #485 inventory "
+        "gate enforces for discoverability)"
+    )
