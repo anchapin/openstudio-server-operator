@@ -1994,6 +1994,127 @@ def test_no_port_443_egress_block_uses_kube_dns_placeholder_selector():
     )
 
 
+# ---- Issue #578: kube-apiserver egress peer must be matchable ----------
+#
+# Pre-fix, the first egress block of `openstudio-operator-allow-egress`
+# was a bare `podSelector: {component: kube-apiserver}` — and a `to:` peer
+# with ONLY a podSelector is NAMESPACE-LOCAL: it matches pods in
+# `openstudio-server`, never in `kube-system` where kube-apiserver pods
+# live. The rule matched zero endpoints, so on a CNI that enforces
+# NetworkPolicy the `openstudio-operator-deny-egress` default-deny
+# blackholed the operator's apiserver traffic (kubeconfig watches,
+# StatusStore RMW). kindnet does not enforce NetworkPolicy, which is why
+# the kind validation cluster never caught it.
+#
+# The fix is the compound peer — namespaceSelector
+# {kubernetes.io/metadata.name: kube-system} + podSelector
+# {component: kube-apiserver} in the SAME `to:` entry (logical AND) —
+# which matches self-hosted API servers (kubeadm / kind / self-managed).
+# Hosted control planes (EKS / GKE / AKS) run the API server outside the
+# cluster where no pod selector can match; those environments need an
+# ipBlock peer for the API endpoint CIDR, shipped commented-out with the
+# per-environment guidance because no single CIDR is correct everywhere
+# and a wide ipBlock would reopen the exfil surface #112 closed.
+
+
+def _operator_allow_egress_policy():
+    matches = [
+        d for d in NETPOL_DOCS
+        if d["metadata"]["name"] == "openstudio-operator-allow-egress"
+    ]
+    assert matches, (
+        "no openstudio-operator-allow-egress NetworkPolicy in "
+        "deploy/network-policy.yaml — the deny-egress (#112) would leave "
+        "the operator pod with zero egress"
+    )
+    return matches[0]
+
+
+def _apiserver_egress_rule(policy):
+    """The TCP/443 egress rule of an Egress policy (the API server port)."""
+    for rule in policy["spec"]["egress"]:
+        ports = {p.get("port") for p in rule.get("ports", [])}
+        if 443 in ports:
+            return rule
+    raise AssertionError(
+        "no TCP/443 egress rule in openstudio-operator-allow-egress — the "
+        "operator cannot reach the kube-apiserver (#578)"
+    )
+
+
+def test_operator_allow_egress_apiserver_peer_is_compound_kube_system():
+    """Issue #578: the TCP/443 egress rule's `to:` block MUST contain the
+    compound peer — namespaceSelector {kubernetes.io/metadata.name:
+    kube-system} AND podSelector {component: kube-apiserver} together in
+    ONE peer entry (logical AND). A bare podSelector-only peer is
+    namespace-local (matches only openstudio-server pods), so the pre-fix
+    rule matched zero endpoints and an enforcing CNI + deny-egress
+    blackholed the operator's apiserver traffic. The bare shape is
+    asserted absent so the regression cannot silently recur."""
+    rule = _apiserver_egress_rule(_operator_allow_egress_policy())
+    peers = rule.get("to", [])
+    compound = [
+        peer for peer in peers
+        if peer.get("namespaceSelector", {}).get("matchLabels", {}).get(
+            "kubernetes.io/metadata.name"
+        ) == "kube-system"
+        and peer.get("podSelector", {}).get("matchLabels", {}).get(
+            "component"
+        ) == "kube-apiserver"
+    ]
+    assert compound, (
+        "the TCP/443 egress rule must carry the compound peer — "
+        "namespaceSelector {kubernetes.io/metadata.name: kube-system} + "
+        "podSelector {component: kube-apiserver} in the SAME `to:` entry "
+        "(issue #578); a bare podSelector is namespace-local and never "
+        "matches the kube-system apiserver pods"
+    )
+    bare_apiserver = [
+        peer for peer in peers
+        if peer.get("podSelector", {}).get("matchLabels", {}).get(
+            "component"
+        ) == "kube-apiserver"
+        and "namespaceSelector" not in peer
+    ]
+    assert not bare_apiserver, (
+        "the TCP/443 egress rule must NOT carry a podSelector-only "
+        "kube-apiserver peer — namespace-local, matches zero endpoints, "
+        f"blackholes apiserver traffic on enforcing CNIs (#578): {peers!r}"
+    )
+
+
+def test_operator_allow_egress_apiserver_peer_documents_ipblock_alternative():
+    """Issue #578: the TCP/443 egress rule must carry a commented-out
+    `ipBlock` alternative for hosted control planes (EKS / GKE / AKS run
+    the API server outside the cluster — no pod selector can match it;
+    the per-environment choice is an ipBlock for the API endpoint CIDR),
+    plus the comment explaining the namespace-local-podSelector trap.
+    Asserted on the RAW yaml (yaml.safe_load strips comments) within the
+    openstudio-operator-allow-egress document only."""
+    raw = (DEPLOY / "network-policy.yaml").read_text()
+    start = raw.index("name: openstudio-operator-allow-egress")
+    end = raw.index("\n---", start)
+    allow_egress_doc = raw[start:end]
+    commented_ipblock_lines = [
+        line for line in allow_egress_doc.splitlines()
+        if "ipBlock" in line and line.lstrip().startswith("#")
+    ]
+    assert commented_ipblock_lines, (
+        "the TCP/443 egress rule must document the hosted-control-plane "
+        "ipBlock alternative as a commented entry (issue #578) — hosted "
+        "API servers match no pod selector"
+    )
+    doc_lower = allow_egress_doc.lower()
+    assert "namespace-local" in doc_lower, (
+        "the TCP/443 egress rule must carry a comment explaining the "
+        "namespace-local-podSelector trap (issue #578 acceptance)"
+    )
+    assert "hosted" in doc_lower, (
+        "the ipBlock alternative comment must name the hosted-control-"
+        "plane environment it exists for (issue #578)"
+    )
+
+
 # ---- Issue #294: prune SA's batch/jobs verbs are scoped via a
 # ValidatingAdmissionPolicy ---------------------------------------------
 #
