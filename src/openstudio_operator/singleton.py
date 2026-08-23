@@ -71,7 +71,7 @@ from kubernetes.client import (
 from kubernetes.config import ConfigException
 
 from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_SPEC, CRD_VERSION
-from openstudio_operator._k8s import load_operator_kube_config
+from openstudio_operator._k8s import apply_request_timeout, load_operator_kube_config
 from openstudio_operator._time import utc_parser
 from openstudio_operator.events import EventSink, emit_kopf_event
 from openstudio_operator.metrics import (
@@ -319,6 +319,18 @@ def _cached_k8s_api(
       change to the loader (kubeconfig Secret reference, network-proxy
       client, …) would silently leave inline callsites behind, and the CI
       gate fails loudly.
+    * Bounded requests (issue #579): every constructed client gets
+      :func:`openstudio_operator._k8s.apply_request_timeout` — a
+      :class:`openstudio_operator._k8s.BoundedK8sRequest` wrapper over
+      the client's ``rest_client.request`` that defaults each request's
+      ``_request_timeout`` to
+      :data:`openstudio_operator._constants.K8S_REQUEST_TIMEOUT_SECONDS`
+      (15 s) and translates the resulting urllib3 timeout into an
+      in-``SKIP_TICK_EXCEPTIONS`` ``ApiException``. A black-holed
+      apiserver connection therefore becomes a counted skip-tick (D12,
+      retry next poll) instead of a forever-blocked timer — the pod
+      stays ``Running`` and /metrics stays alive, so pre-#579 nothing
+      self-healed.
     * Reset seam: tests drop the caches via
       :func:`reset_operator_k8s_client` (or by patching a slot directly)
       so the next factory call re-runs the load path with the freshly
@@ -335,7 +347,7 @@ def _cached_k8s_api(
         logger.warning(
             "K8s config not loaded for %s: returning placeholder client.", label
         )
-    client = build()
+    client = apply_request_timeout(build())
     globals()[cache_attr] = client
     return client
 

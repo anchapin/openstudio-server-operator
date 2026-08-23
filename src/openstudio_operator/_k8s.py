@@ -48,6 +48,15 @@ none of the four handler modules owns. Today it hosts:
   ``tests/test_singleton_registry_coverage.py::test_only_one_kubeconfig_loader_call_site``
   rejects any inline ``load_incluster_config(`` / ``load_kube_config(`` call
   outside this module so a partial update fails CI loudly (issue #305).
+* :class:`BoundedK8sRequest` + :func:`apply_request_timeout` — the
+  issue #579 bounded-request wrapper installed on every client built
+  through the shared ``singleton._cached_k8s_api`` factory path: defaults
+  each request's ``_request_timeout`` to
+  :data:`openstudio_operator._constants.K8S_REQUEST_TIMEOUT_SECONDS` and
+  translates the resulting urllib3 timeout error into an
+  in-``SKIP_TICK_EXCEPTIONS`` ``ApiException`` (the D12 counted skip).
+  See the class docstring for why ``Configuration.timeout`` CANNOT be
+  the mechanism on kubernetes-python 29.x–36.x.
 
 Why ``_k8s`` and not ``k8s_helpers`` / ``k8s_api_helpers``? Mirrors the
 ``_constants`` / ``_time`` convention in this package (operator-internal
@@ -59,11 +68,14 @@ shared-internal modules.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol, TypeVar
 
-from kubernetes.client import AppsV1Api
+import urllib3.exceptions
+from kubernetes.client import ApiException, AppsV1Api
 
+from openstudio_operator._constants import K8S_REQUEST_TIMEOUT_SECONDS
 from openstudio_operator.metrics import KUBE_API_REQUEST_DURATION_SECONDS, observe_duration
 from openstudio_operator.status_store import MERGE_PATCH_CONTENT_TYPE
 
@@ -360,3 +372,123 @@ def load_operator_kube_config() -> None:
         load_incluster_config()
     except ConfigException:
         load_kube_config()
+
+
+class _RestClientHolder(Protocol):
+    """Structural slice shared by every ``kubernetes.client`` API object.
+
+    ``CustomObjectsApi`` / ``*V1Api`` instances all carry the process-wide
+    :class:`kubernetes.client.ApiClient` as ``api_client`` (whose
+    ``rest_client`` is the :class:`kubernetes.client.rest.RESTClientObject`
+    this module's timeout wrapper replaces — see
+    :class:`BoundedK8sRequest`). Declaring the slice as a Protocol keeps
+    :func:`apply_request_timeout` typed against the structural shape
+    instead of any single concrete client class, mirroring the
+    ``DeploymentReader`` / ``PodLister`` convention above.
+    """
+
+    api_client: Any
+
+
+_K8sApiT = TypeVar("_K8sApiT", bound=_RestClientHolder)
+
+
+class BoundedK8sRequest:
+    """Issue #579 — bound every Kubernetes API request to a finite timeout.
+
+    Installed as the ``request`` attribute of the constructed client's
+    ``rest_client`` by :func:`apply_request_timeout` (called once at the
+    shared ``singleton._cached_k8s_api`` factory path, so all four client
+    types — and the prune CronJob via the same factories — get it for
+    free). Behaviour:
+
+    * An omitted (``None``) ``_request_timeout`` is defaulted to
+      :data:`openstudio_operator._constants.K8S_REQUEST_TIMEOUT_SECONDS`
+      (15 s); an explicit per-call value (scalar or ``(connect, read)``
+      tuple) passes through untouched — a call site that knows better
+      can still bound itself.
+    * A urllib3 timeout error raised past the bound
+      (``urllib3.exceptions.TimeoutError`` and its ``Read``/``Connect``/
+      ``WriteTimeoutError`` subclasses, or a ``MaxRetryError`` whose
+      ``reason`` is one of those) is translated into
+      ``ApiException(status=0, reason=...)`` — ``status=0`` matching
+      kubernetes' own "no HTTP response" convention (``rest.py`` raises
+      ``ApiException(status=0)`` for SSL failures). ``ApiException`` is
+      a :data:`openstudio_operator._oscm_handlers.SKIP_TICK_EXCEPTIONS`
+      member, so the timer wrapper converts the hang into a COUNTED
+      skip-tick (``HANDLER_TICK_FAILURES_TOTAL`` + retry next poll) per
+      D12 — instead of the pre-#579 forever-blocked tick.
+    * Non-timeout transport errors propagate untranslated (fail-closed
+      posture unchanged).
+
+    Why a request wrapper and NOT ``Configuration.timeout``:
+    kubernetes-python (the supported ``>=29.3,<37`` range) has no
+    ``Configuration.timeout`` attribute at all — nothing in the package
+    consults one; the generated ``*V1Api`` methods pass only a per-call
+    ``_request_timeout`` (``local_var_params.get('_request_timeout')``)
+    and ``rest.RESTClientObject.request`` defaults the urllib3 timeout
+    to ``None`` (wait forever). A pool-level urllib3 default does not
+    work either: ``rest.py`` passes ``timeout=None`` EXPLICITLY, which
+    overrides any pool default. Wrapping ``rest_client.request`` at the
+    single construction path is the only one-site mechanism that bounds
+    every call — and it is the layer where the urllib3 timeout error
+    surfaces first, so the ``ApiException`` translation lives here too.
+    """
+
+    def __init__(
+        self,
+        original: Callable[..., object],
+        *,
+        default_timeout_seconds: float = K8S_REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        self.original = original
+        self.default_timeout_seconds = default_timeout_seconds
+
+    def __call__(self, method: str, url: str, **kwargs: object) -> object:
+        per_call = kwargs.pop("_request_timeout", None)
+        effective = per_call if per_call is not None else self.default_timeout_seconds
+        try:
+            return self.original(method, url, _request_timeout=effective, **kwargs)
+        except urllib3.exceptions.TimeoutError as exc:
+            raise ApiException(
+                status=0,
+                reason=(
+                    f"K8s API request timed out (bounded at {effective}s by "
+                    f"K8S_REQUEST_TIMEOUT_SECONDS, issue #579): "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+        except urllib3.exceptions.MaxRetryError as exc:
+            if isinstance(exc.reason, urllib3.exceptions.TimeoutError):
+                raise ApiException(
+                    status=0,
+                    reason=(
+                        f"K8s API request timed out after retries (bounded at "
+                        f"{effective}s by K8S_REQUEST_TIMEOUT_SECONDS, issue "
+                        f"#579): {type(exc.reason).__name__}: {exc.reason}"
+                    ),
+                ) from exc
+            raise
+
+
+def apply_request_timeout(client: _K8sApiT) -> _K8sApiT:
+    """Install :class:`BoundedK8sRequest` as the client's ``rest_client.request``.
+
+    Called by :func:`openstudio_operator.singleton._cached_k8s_api` right
+    after the ``build()`` thunk constructs each client — the ONE site all
+    four ``operator_*_api`` factories (and through them the prune
+    CronJob and the #463 Secret read) share, so every Kubernetes API
+    request the operator process makes is bounded by
+    :data:`openstudio_operator._constants.K8S_REQUEST_TIMEOUT_SECONDS`.
+    The bare no-arg ``XApi()`` construction calls stay byte-identical in
+    ``singleton.py`` (the #158 / #251 AST gates pin that shape).
+
+    Idempotent: if the client's ``rest_client.request`` is already a
+    ``BoundedK8sRequest`` the client is returned unchanged (no
+    double-wrap), so re-applying after a guard rebuild is safe.
+    """
+    rest_client = client.api_client.rest_client
+    if isinstance(rest_client.request, BoundedK8sRequest):
+        return client
+    rest_client.request = BoundedK8sRequest(rest_client.request)
+    return client

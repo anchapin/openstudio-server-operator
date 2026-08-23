@@ -106,6 +106,37 @@ LAYOUT_WARNING_GRACE_SECONDS: timedelta = timedelta(seconds=60)
 REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL: timedelta = timedelta(minutes=5)
 
 # -----------------------------------------------------------------------------
+# Kubernetes API client transport (issue #579)
+# -----------------------------------------------------------------------------
+
+#: Issue #579 — bounded request timeout for EVERY Kubernetes API call the
+#: operator makes (status RMW patches, singleton-guard CR lists, Deployment
+#: reads/patches, the #463 Secret read, and the prune CronJob's Jobs/Events
+#: through the same factories). Applied once at the shared construction path
+#: (:func:`openstudio_operator.singleton._cached_k8s_api` via
+#: :func:`openstudio_operator._k8s.apply_request_timeout`): a
+#: :class:`openstudio_operator._k8s.BoundedK8sRequest` wrapper over the
+#: constructed client's ``rest_client.request`` — kubernetes-python
+#: (``>=29.3,<37``) has NO ``Configuration.timeout`` wiring (the generated
+#: ``*V1Api`` methods honor only a per-call ``_request_timeout``, and
+#: ``rest.py`` defaults the urllib3 timeout to ``None`` = wait forever), so
+#: without the wrapper a black-holed apiserver connection (kube-proxy stall,
+#: NAT idle drop without RST) blocks the calling timer tick forever while
+#: the pod stays ``Running`` and /metrics keeps answering liveness.
+#:
+#: 15 s rationale: strictly above the REST client's 10 s per-request
+#: timeout and the Redis client's 5 s socket timeouts (an apiserver slower
+#: than the OpenStudio REST dependency it fronts would be an outage worth
+#: surfacing, not a timeout to cut early), strictly below the shortest
+#: timer cadence (``SLA_POLL_INTERVAL_SECONDS`` = 30 s) so the D12
+#: skip-tick lands and the next poll retries within one interval, and
+#: inside the issue's 10–30 s guidance band. A transport timeout is
+#: operator BEHAVIOR, not cluster policy — it stays out of the CRD
+#: ``spec`` / :class:`~openstudio_operator.config.OperatorConfig` boundary
+#: this module's docstring draws.
+K8S_REQUEST_TIMEOUT_SECONDS: float = 15.0
+
+# -----------------------------------------------------------------------------
 # Metrics HTTP server
 # -----------------------------------------------------------------------------
 
