@@ -65,6 +65,18 @@ Census (#497 — what each module holds and why):
   is one-shot PER PROCESS by design (``reset_leg2_safeguard_state`` is
   the existing test seam). Keying them per CR would re-arm a
   process-level diagnostic per CR churn without adding safety.
+* ``handlers/dry_run_audit`` — ``_last_dry_run``, the last-seen
+  ``spec.dryRun`` dedup map keyed ``(namespace, name)`` (#397).
+  Deliberately NOT convention-shaped: a cache miss is a harmless
+  baseline observation (no Event), entries are dropped on the DELETED
+  watch event — so the #364 delete+recreate path is handled by the
+  watch stream, not uid validation — and ``reset_audit_state()`` is
+  the test seam. Classified cache-free by the #652 census (no
+  ``reset_per_cr_caches`` seam) and carried as a documented exception
+  for its one cache-shaped global.
+* ``handlers/redis_layout_check`` — NO module-level per-CR cache (the
+  liveness gauge is re-stamped on every check). Classified cache-free
+  (#652).
 * ``events_sinks`` — the deferred-Warning queue holds per-ENTRY
   ``(namespace, name, reason, message)`` tuples (keyed per entry, not
   per CR); the ``@kopf.on.event`` drain handler fires on the DELETED
@@ -78,6 +90,13 @@ Census (#497 — what each module holds and why):
   by the RESOLVED server/Redis URL (config identity), and the cached
   clients hold no per-CR state — a recreated CR with the same URL
   correctly reuses the same stateless client.
+
+Since #652 the census is fenced, not just documented: the
+machine-readable classification lives in ``tests/_cache_census.py``
+(``CACHE_BEARING_MODULES`` / ``CACHE_FREE_MODULES`` — single-sourced;
+conftest's autouse reset imports it), and the AST gate in
+``tests/test_cache_keying_convention.py`` fails any handler module
+that declares cache-shaped state without being classified.
 """
 
 from __future__ import annotations
