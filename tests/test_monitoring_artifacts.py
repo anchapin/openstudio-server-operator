@@ -14,6 +14,15 @@ compare the live registry against. A metrics-family rename therefore fails
 CI here (the alert/dashboard still names the old family) instead of
 silently shipping a rule that never matches a series.
 
+Issue #581 adds the second invariant, scoped to the #469 scheduler
+heartbeat alert: the expr's ``module="..."`` selector set must be
+set-equal to the OSCM timer population (source of truth
+``_oscm_handlers.REGISTRY``, issue #250) and each clause's threshold must
+be 3x the module's poll interval — so a fifth timer added by the routine
+onboarding 5-step pattern, or an interval change in ``_constants.py``,
+fails CI until the alert is extended/retuned (the same doc-drift-guard
+discipline as the metrics inventory).
+
 Scope guard (#485): these tests deliberately do NOT pin the full deploy/
 file inventory — the deploy-inventory CI guard is owned by #485. Only the
 two #468 artifacts and their referenced families are covered here.
@@ -21,6 +30,9 @@ two #468 artifacts and their referenced families are covered here.
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
 import json
 import re
 import sys
@@ -218,6 +230,207 @@ def test_prometheusrule_freshness_alerts_use_time_minus_idiom():
         expr.startswith("time() - openstudio_operator_handler_last_tick_timestamp")
         for expr in exprs
     ), "heartbeat staleness alert must be `time() - handler_last_tick_timestamp ... > ...`"
+
+
+# ---------------------------------------------------------------------------
+# Issue #581 — heartbeat alert module-set + threshold drift gate.
+#
+# The #469 alert ``OpenStudioOperatorHandlerHeartbeatStale`` hardcodes one
+# ``time() - openstudio_operator_handler_last_tick_timestamp{module="X"} > T``
+# clause per OSCM timer. Nothing else ties that clause set to the actual
+# timer population or the thresholds to the poll constants: a fifth timer
+# (routine per the onboarding 5-step pattern) would have NO staleness
+# alert and CI stayed green, and an interval change in ``_constants.py``
+# silently desynchronised the 3x math (too tight → flappy pages; too loose
+# → late page). The tests below fence both directions against
+# ``_oscm_handlers.REGISTRY`` (#250) and the handler modules' poll
+# constants.
+# ---------------------------------------------------------------------------
+
+#: Name of the #469 scheduler-heartbeat alert in deploy/prometheustrule.yaml.
+_HEARTBEAT_ALERT_NAME = "OpenStudioOperatorHandlerHeartbeatStale"
+
+#: One ``or``-leg of the heartbeat expr: ``time() - <family>{module="X"} > T``.
+#: Used with ``fullmatch`` so a hand-edited leg that drifts from the
+#: staleness shape (extra arithmetic, renamed family, moved threshold)
+#: fails structurally instead of parsing to a wrong-but-plausible clause.
+_HEARTBEAT_CLAUSE_RE = re.compile(
+    r"time\(\) - openstudio_operator_handler_last_tick_timestamp"
+    r'\{module="(?P<module>[^"]+)"\} > (?P<threshold>[0-9]+(?:\.[0-9]+)?)'
+)
+
+#: The alert's threshold multiplier, transcribed from the manifest's own
+#: comment ("Thresholds are 3x each module's interval") and the #469
+#: docstring in metrics.py.
+_HEARTBEAT_THRESHOLD_MULTIPLIER = 3
+
+
+def _heartbeat_alert_expr() -> str:
+    """Return the expr of the (unique) heartbeat alert rule."""
+    matches = [
+        alert["expr"]
+        for alert in _prometheusrule_alerts()
+        if alert.get("alert") == _HEARTBEAT_ALERT_NAME
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {_HEARTBEAT_ALERT_NAME} rule in "
+        f"{PROMETHEUSRULE_PATH.name}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def _heartbeat_alert_clauses() -> dict[str, float]:
+    """Parse the heartbeat expr into ``{module_label: threshold_seconds}``.
+
+    Every ``or``-separated leg must ``fullmatch`` the canonical staleness
+    shape, so the parse doubles as a structure check: an edited expr that
+    no longer consists solely of per-module staleness legs fails here.
+    """
+    clauses: dict[str, float] = {}
+    for leg in _heartbeat_alert_expr().split(" or "):
+        match = _HEARTBEAT_CLAUSE_RE.fullmatch(leg.strip())
+        assert match, (
+            f"heartbeat alert leg does not match the canonical "
+            f"per-module staleness shape "
+            f"`time() - ...handler_last_tick_timestamp{{module=\"X\"}} > N`: {leg!r}"
+        )
+        clauses[match["module"]] = float(match["threshold"])
+    return clauses
+
+
+#: The production handlers-package prefix. ``_oscm_handlers.REGISTRY`` is
+#: process-wide, and some existing tests (e.g. ``tests/test_lenient_api_
+#: factories.py``) register fake timers into it WITHOUT cleanup — entries
+#: whose ``fn.__module__`` is not under this prefix are test fakes, not
+#: the production population the alert fences.
+_PRODUCTION_HANDLERS_PREFIX = "openstudio_operator.handlers."
+
+
+def _oscm_timer_module_intervals() -> dict[str, float]:
+    """Derive ``{module_label: poll_interval_seconds}`` for every OSCM timer.
+
+    Source of truth: ``_oscm_handlers.REGISTRY`` (#250) — the same
+    declarative registry the singleton guard cross-checks against the kopf
+    registry at boot and that
+    ``test_singleton_registry_coverage.py::test_python_registry_includes_all_oscm_spawning_handlers``
+    pins. For each registered handler:
+
+    * the heartbeat **module label** is AST-extracted from the handler
+      module's own ``run_oscm_tick(..., module="...", ...)`` call — the
+      exact literal that stamps ``HANDLER_LAST_TICK_TIMESTAMP`` (the
+      series the alert selects on; no uniform REGISTRY-key→label
+      transformation exists — ``analysis_sla_monitor`` stamps
+      ``analysis_sla``, ``zombie_datapoint_watchdog`` stamps
+      ``datapoint_watchdog``, the other two are identity — so the call
+      site IS the coupling);
+    * the **interval** is the handler module's ``POLL_INTERVAL_SECONDS``
+      — the ``_constants.py`` constant (issue #165) its
+      ``@kopf.timer(interval=...)`` consumes, i.e. the cadence that
+      actually runs.
+
+    No hand-maintained mapping table: a fifth timer that registers (#250)
+    and wires through ``run_oscm_tick`` joins the expected set
+    automatically; one that does NOT (custom wrapper) is caught by the
+    assertion below with instructions to extend the fence and the alert.
+    """
+    from openstudio_operator import _oscm_handlers
+
+    if not _oscm_handlers.REGISTRY:
+        # tests/conftest.py imports openstudio_operator.handlers at module
+        # level (populating REGISTRY before any test runs); guard the
+        # direct-invocation case anyway.
+        import openstudio_operator.handlers  # noqa: F401  (import side effect)
+
+    intervals: dict[str, float] = {}
+    production_entries = {
+        handler_id: fn
+        for handler_id, fn in _oscm_handlers.REGISTRY.items()
+        if fn.__module__.startswith(_PRODUCTION_HANDLERS_PREFIX)
+    }
+    assert production_entries, (
+        "no production OSCM handlers found in _oscm_handlers.REGISTRY — "
+        "the openstudio_operator.handlers import in this helper's guard "
+        "did not populate the registry (issue #581)."
+    )
+    for handler_id, fn in sorted(production_entries.items()):
+        handler_module = importlib.import_module(fn.__module__)
+        tree = ast.parse(inspect.getsource(handler_module))
+        labels = [
+            keyword.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_oscm_tick"
+            for keyword in node.keywords
+            if keyword.arg == "module" and isinstance(keyword.value, ast.Constant)
+        ]
+        assert labels, (
+            f"OSCM handler {handler_id!r} ({fn.__module__}) declares no "
+            f"run_oscm_tick(module=...) call to derive its heartbeat module "
+            f"label from — extend _oscm_timer_module_intervals and the "
+            f"{_HEARTBEAT_ALERT_NAME} expr (issue #581), or route the timer "
+            f"through run_oscm_tick like the four existing handlers."
+        )
+        interval = float(handler_module.POLL_INTERVAL_SECONDS)
+        for label in labels:
+            intervals[label] = interval
+    return intervals
+
+
+def test_heartbeat_alert_module_set_matches_oscm_registry():
+    """#581: the heartbeat expr covers exactly the OSCM timer population.
+
+    Set-equality in both directions against the module labels derived from
+    ``_oscm_handlers.REGISTRY``: a fifth timer with no alert clause fails
+    (the exact scenario #469 was built for — a silently-wedged new timer
+    would otherwise have NO staleness alert while CI stays green), and a
+    stale clause for a removed/renamed timer fails (the selector would
+    match no series, deadening that leg of the alert).
+    """
+    alert_modules = set(_heartbeat_alert_clauses())
+    expected_modules = set(_oscm_timer_module_intervals())
+    missing = expected_modules - alert_modules
+    stale = alert_modules - expected_modules
+    assert not missing, (
+        f"OSCM timer module(s) with no heartbeat clause in "
+        f"{_HEARTBEAT_ALERT_NAME} (issue #581): {sorted(missing)}. A timer "
+        f"without a clause has NO staleness alert — extend the expr with "
+        f"`or time() - openstudio_operator_handler_last_tick_timestamp"
+        f'{{module="{min(missing)}"}} > '
+        f"{_HEARTBEAT_THRESHOLD_MULTIPLIER}x its POLL_INTERVAL_SECONDS`."
+    )
+    assert not stale, (
+        f"heartbeat clause(s) in {_HEARTBEAT_ALERT_NAME} reference module(s) "
+        f"not in the OSCM registry (issue #581): {sorted(stale)} — the "
+        f"selector matches no series and that leg is dead. Remove or "
+        f"re-key the clause."
+    )
+
+
+def test_heartbeat_alert_thresholds_are_three_x_poll_intervals():
+    """#581: every heartbeat clause threshold is 3x the module's interval.
+
+    The 3x multiplier is the alert's designed tolerance (three missed
+    polls before paging). If a module's ``POLL_INTERVAL_SECONDS`` changes
+    in ``_constants.py`` without retuning the expr, the math silently
+    desynchronises — too tight → flappy pages, too loose → late page.
+    """
+    clauses = _heartbeat_alert_clauses()
+    intervals = _oscm_timer_module_intervals()
+    assert set(clauses) == set(intervals), (
+        "module-set mismatch — see "
+        "test_heartbeat_alert_module_set_matches_oscm_registry"
+    )
+    for module in sorted(clauses):
+        threshold = clauses[module]
+        expected = _HEARTBEAT_THRESHOLD_MULTIPLIER * intervals[module]
+        assert threshold == expected, (
+            f"heartbeat threshold for module {module!r} is {threshold:g}s but "
+            f"{_HEARTBEAT_THRESHOLD_MULTIPLIER}x its POLL_INTERVAL_SECONDS "
+            f"({_HEARTBEAT_THRESHOLD_MULTIPLIER} x {intervals[module]:g}) is "
+            f"{expected:g}s — retune the {module} clause in "
+            f"{_HEARTBEAT_ALERT_NAME} (issue #581)."
+        )
 
 
 def test_grafana_dashboard_parses_with_templated_datasource():
