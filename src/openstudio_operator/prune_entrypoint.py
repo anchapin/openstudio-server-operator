@@ -44,9 +44,14 @@ retried in place; the next schedule IS the retry):
   Job (``failedJobsHistoryLimit`` + Job-status alerting) is the durable
   signal for a sustained CR-list outage.
 * ``5`` — D12 runtime failure inside the tick (REST 5xx storm,
-  ``StatusStoreConflictError`` herd, invalid storagePolicy). Same #470
-  rationale as ``4``: nonzero so a sustained retention-pipeline failure
-  — the slow-motion NFS-full outage — alerts via failed Jobs, not just
+  ``StatusStoreConflictError`` herd, invalid storagePolicy) — and, since
+  #650, the config/wiring phase too: a malformed CR spec raised by
+  ``OperatorConfig.from_spec`` and a client-construction failure
+  (``OperatorConfigError``, #475's TLS-CA-bundle class) get the same
+  counted, logged exit-5 skip instead of an uncaught traceback exiting
+  ``1`` — a code this table never promised. Same #470 rationale as
+  ``4``: nonzero so a sustained retention-pipeline failure — the
+  slow-motion NFS-full outage — alerts via failed Jobs, not just
   WARNING logs and a decorative counter.
 * unexpected exceptions propagate (non-zero) — visible, retried next run.
 
@@ -72,18 +77,19 @@ from kubernetes.config import ConfigException
 from openstudio_operator import singleton
 from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from openstudio_operator._k8s import load_operator_kube_config
+from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.logging_setup import install_json_logging
 from openstudio_operator.metrics import PRUNE_TICK_FAILURES_TOTAL, start_metrics_server
-from openstudio_operator.openstudio_client import OpenStudioApiError, OpenStudioClient
+from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.retention import run_retention_tick
 from openstudio_operator.singleton import (
     operator_batch_api,
     operator_core_api,
     operator_custom_objects_api,
 )
-from openstudio_operator.status_store import StatusStore, StatusStoreError
+from openstudio_operator.status_store import StatusStore
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +97,39 @@ logger = logging.getLogger(__name__)
 #: distinguishes prune-CronJob events from operator (kopf) events.
 EVENT_SOURCE_COMPONENT = "openstudio-storage-pruner"
 
-#: D12 skip-tick posture: same exception tuple the old kopf wrapper caught.
-_SKIP_TICK_EXCEPTIONS = (OpenStudioApiError, StatusStoreError, ApiException, ValueError)
+#: D12 skip-tick posture (issue #650): DERIVED from the canonical
+#: :data:`openstudio_operator._oscm_handlers.SKIP_TICK_EXCEPTIONS` — the
+#: union the operator's four timers have caught since #473 unified their
+#: copy-pasted wrappers, widened by #475 (``OperatorConfigError``) and
+#: #493 (``ConfigException`` + ``LocationValueError``) — instead of the
+#: pre-#473 frozen fork this module carried, which silently missed all
+#: three widenings. Explicit deltas (pinned by
+#: ``tests/test_prune_entrypoint.py::test_prune_skip_tick_tuple_derives_from_canonical``):
+#:
+#: * ADDED ``ValueError`` — the storagePolicy-enum parse inside
+#:   ``run_retention_tick`` (bad backend enum) and the
+#:   ``spec.redisCredentials.secretRef`` parse inside
+#:   ``OperatorConfig.from_spec`` raise bare ``ValueError`` on this path.
+#:   The canonical tuple deliberately does NOT carry bare ``ValueError``
+#:   (#493: in the operator a malformed non-empty URL must fail closed
+#:   as an uncaught handler error); the prune actor treats it as a
+#:   counted, logged exit-5 skip — the next CronJob schedule is the
+#:   retry.
+#:
+#: NO exclusions. Canonical members that cannot occur on the prune path
+#: are kept as harmless superset members — carving them out would
+#: re-freeze the fork, the exact drift mechanism #650 closes:
+#:
+#: * ``RedisClientError`` — the prune actor constructs no Redis client
+#:   (the retention pipeline is Redis-free).
+#: * ``OperatorConfigError`` — LIVE here: ``get_openstudio_client``
+#:   (TLS CA-bundle / URL validation, #475's class) runs inside the
+#:   guarded region below.
+#: * ``ConfigException`` / ``LocationValueError`` — the #493
+#:   wiring-failure members; this entrypoint loads kube-config BEFORE
+#:   the CR list (its own exit-4 branch), so they are superset-only on
+#:   the tick path.
+_SKIP_TICK_EXCEPTIONS = SKIP_TICK_EXCEPTIONS + (ValueError,)
 
 #: Issue #306 — ``reason`` label values for :data:`PRUNE_TICK_FAILURES_TOTAL`.
 #: One per failure branch in :func:`main`. The exception class name is
@@ -274,7 +311,26 @@ def main(
     name = str((cr.get("metadata") or {}).get("name") or "")
     spec = cr.get("spec") or {}
 
-    config = OperatorConfig.from_spec(spec)
+    # Issue #650 — the config parse is guarded (option (a) of the issue):
+    # a malformed CR spec must be a clean, counted, DOCUMENTED exit (5),
+    # not an uncaught traceback exiting 1 — a code the exit-code table
+    # never promised. Same rationale as #475 on the operator side: there
+    # the identical config failure is a counted, logged, retry-next-poll
+    # D12 skip; here the next CronJob schedule IS the retry.
+    # ``from_spec`` raises bare ``ValueError`` today (the
+    # spec.redisCredentials.secretRef parse) and ``OperatorConfigError``
+    # if the config parse ever grows it — both are fork members, and the
+    # remaining fork members cannot escape a pure spec-dict parse.
+    try:
+        config = OperatorConfig.from_spec(spec)
+    except _SKIP_TICK_EXCEPTIONS as exc:
+        PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_RUNTIME).inc()
+        logger.warning(
+            "prune tick skipped, retrying next schedule (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return 5
     if not config.server_url:
         logger.warning("spec.serverUrl is empty on %s — prune tick idle", name)
         return 0
@@ -318,9 +374,14 @@ def main(
         return 3
 
     store = StatusStore(namespace, name, custom_api)  # type: ignore[arg-type]
-    client = (client_factory or get_openstudio_client)(config.server_url)
 
     try:
+        # Issue #650 — client construction runs INSIDE the guarded
+        # region (the #493 pattern the operator canonicalized): a TLS
+        # CA-bundle / URL-validation failure raises ``OperatorConfigError``
+        # (#475's class) and gets the same counted exit-5 skip as a tick
+        # failure instead of an uncaught traceback exiting 1.
+        client = (client_factory or get_openstudio_client)(config.server_url)
         result = run_retention_tick(
             client,
             store,
@@ -331,8 +392,11 @@ def main(
             batch_api=batch_api,
         )
     except _SKIP_TICK_EXCEPTIONS as exc:
-        # ValueError: invalid storagePolicy (e.g. bad backend enum) — same
-        # skip-tick posture as the old kopf wrapper; next schedule retries (D12).
+        # ValueError: invalid storagePolicy (e.g. bad backend enum) or a
+        # malformed spec.redisCredentials.secretRef; OperatorConfigError:
+        # client construction (TLS CA-bundle validation) — same skip-tick
+        # posture as the canonical operator tuple (see the fork comment
+        # above); next schedule retries (D12).
         # Issue #306 — bump the skip-tick counter for the Prometheus signal
         # (the WARNING log line is the same event for log forwarding).
         PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_RUNTIME).inc()
