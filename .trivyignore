@@ -19,3 +19,19 @@
 # Rules: one CVE/GHSA per line; a justification comment + follow-up
 # issue are required for any NEW entry; re-review on dependabot
 # base-image bumps.
+# rclone/rclone:1.75.0 (#686) — 8 HIGH in the image's Go stdlib/x/net,
+# fixed in Go 1.25.13/1.26.6 but no rclone release ships a patched
+# build yet. Triage rationale: short-lived CronJob-spawned archival
+# pod, egress restricted to object storage TCP/443 + RFC1918/IMDS
+# excepts (#477), non-internet-facing; DoS-class surfaces require
+# crafted inbound inputs on protocols rclone does not serve. Drop
+# these when a fixed rclone release ships (runbook: #642 step
+# comments; watch issue #689).
+CVE-2026-33818
+CVE-2026-39821
+CVE-2026-46600
+CVE-2026-56853
+CVE-2026-56858
+CVE-2026-56859
+CVE-2026-56860
+CVE-2026-56862
