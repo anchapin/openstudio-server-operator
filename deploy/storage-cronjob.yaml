@@ -322,6 +322,42 @@ spec:
 # any message containing "\n" — and the Binding below carries the
 # required `validationActions` and scopes via `matchResources`
 # (the v1 Binding schema has no `selector` field).
+#
+# Issue #641 — name prefix + labels are BOTH spoofable by the very SA
+# this policy constrains, so they narrowed nothing against their own
+# principal: a compromised prune pod could name a Job
+# `oscm-archive-evil`, stamp the two labels, and ship out ANY
+# namespace Secret via `envFrom` (the kubelet resolves envFrom with no
+# RBAC check against the pod's SA — the exact #294 exfiltration path:
+# `openstudio-redis`, the Mongo credential Secret, TLS bundles) over
+# the archival egress allow. The SECOND validation below fences the
+# pod spec itself to the exact shape `archival.py::build_archival_job`
+# emits (cross-fenced against the Python constant in
+# tests/test_deploy_manifests.py, the #573 pairing pattern):
+#   (a) every container `image` == the pinned `RCLONE_IMAGE` digest
+#       (single-sourced per #417; the literal below must equal
+#       archival.RCLONE_IMAGE or the cross-fence test fails),
+#   (b) every `envFrom` entry is a secretRef whose name matches
+#       `^os-archive-[a-z0-9-]+$` — the #240 CRD pattern mirrored at
+#       admission, so namespace-Secret exfiltration via a foreign
+#       envFrom secretRef fails closed (configMapRef entries are
+#       rejected too),
+#   (c) `command` is pinned to the generator's exact envelope
+#       (`["/bin/sh", "-c", <script>]`, arity 3, script headed by the
+#       generator's constant `set -eu` prologue) and `args` is banned
+#       outright — the legit manifest passes the rclone script via
+#       `command` and never sets `args`. Full command equality is
+#       impossible by design: the script is a pure function of the
+#       CR spec (analysis id, bucket, datapoint ids), so the fence
+#       pins the structural envelope instead. initContainers and
+#       ephemeralContainers (never emitted by the generator) are
+#       rejected outright — closing the sideload-another-image gap.
+# The spec fence is guarded by `request.operation` (only CREATE/UPDATE
+# carry a new `object`; DELETE is exempt, matching the first
+# validation's oldObject shape) and keeps the #565 leading carve-out
+# disjunct so non-prune principals stay unrestricted.
+#
+# Requires: Kubernetes 1.30+ (admissionregistration.k8s.io/v1 GA).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -331,15 +367,20 @@ metadata:
     app.kubernetes.io/component: archival-admission
   annotations:
     energy.nrel.gov/description: |
-      Issues #294 + #398 — constrain the prune SA's batch/jobs verbs
-      to archival Jobs only: both archival labels AND the
-      `oscm-archive-*` deterministic-name prefix from archival.py.
-      Combined with the Role above, the prune SA can only
-      create/delete Jobs that look exactly like the ones retention
-      spawns, so a compromised prune pod cannot spawn arbitrary Jobs
-      (labels alone are spoofable; the name pattern is the second
-      factor). Since #565 only the prune SA is constrained — other
-      principals are unrestricted.
+      Issues #294 + #398 + #641 — constrain the prune SA's batch/jobs
+      verbs to archival Jobs only: both archival labels AND the
+      `oscm-archive-*` deterministic-name prefix from archival.py AND
+      (since #641) the pod spec pinned to the generator shape — every
+      container image equal to the archival.py RCLONE_IMAGE digest,
+      every envFrom secretRef matching `^os-archive-[a-z0-9-]+$` (#240
+      pattern), command pinned to the `/bin/sh -c` generator envelope
+      with no args/initContainers/ephemeralContainers. Combined with
+      the Role above, the prune SA can only create/delete Jobs that
+      look exactly like the ones retention spawns, so a compromised
+      prune pod cannot spawn arbitrary Jobs nor exfiltrate namespace
+      Secrets via a foreign envFrom (labels and the name prefix alone
+      are spoofable by the constrained SA itself). Since #565 only the
+      prune SA is constrained — other principals are unrestricted.
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -373,6 +414,52 @@ spec:
         labels alone are spoofable, so the name pattern is the second
         factor. Every other principal (humans via kubectl, controllers)
         is unrestricted by this policy.
+    # Issue #641 — the spec fence (see the comment block above). The
+    # RCLONE_IMAGE literal below is cross-fenced against
+    # archival.RCLONE_IMAGE by tests/test_deploy_manifests.py (the
+    # #573 pairing pattern); refresh both together via
+    # `docker buildx imagetools inspect rclone/rclone:<tag>`.
+    - expression: |
+        request.userInfo.username !=
+        'system:serviceaccount:openstudio-server:openstudio-storage-pruner-sa'
+        ||
+        (request.operation != 'CREATE' && request.operation != 'UPDATE')
+        || !has(object.spec)
+        || !has(object.spec.template)
+        || !has(object.spec.template.spec)
+        ||
+        (
+          (!has(object.spec.template.spec.initContainers)
+           || object.spec.template.spec.initContainers.size() == 0)
+          &&
+          (!has(object.spec.template.spec.ephemeralContainers)
+           || object.spec.template.spec.ephemeralContainers.size() == 0)
+          &&
+          object.spec.template.spec.containers.all(c,
+            c.image ==
+            'rclone/rclone:1.67.0@sha256:25a2a208a8e3f4ad27ac5e7441cbfebdcea7953c8d7c9effa31f234a3c251024'
+            && !has(c.args)
+            && has(c.command)
+            && c.command.size() == 3
+            && c.command[0] == '/bin/sh'
+            && c.command[1] == '-c'
+            && c.command[2].startsWith('set -eu')
+            && (!has(c.envFrom)
+                || c.envFrom.all(e,
+                     has(e.secretRef)
+                     && e.secretRef.name.matches('^os-archive-[a-z0-9-]+$'))))
+        )
+      message: >-
+        openstudio-storage-pruner-sa archival Jobs must match the exact
+        generator shape of archival.py::build_archival_job (issue #641):
+        every container image pinned to the RCLONE_IMAGE digest, no
+        args, no initContainers, no ephemeralContainers, command pinned
+        to the `/bin/sh -c` envelope of the generated `set -eu` script,
+        and every envFrom secretRef matching ^os-archive-[a-z0-9-]+$
+        (the #240 CRD pattern) — exfiltrating namespace Secrets
+        (openstudio-redis, Mongo credentials, TLS bundles) via a
+        foreign envFrom fails closed. Every other principal is
+        unrestricted by this policy.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

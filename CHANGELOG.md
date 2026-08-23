@@ -658,6 +658,30 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#641`** — the `openstudio-prune-job-scope` VAP in
+  `deploy/storage-cronjob.yaml` gained a second `validations[]` entry
+  fencing the archival-Job pod spec itself: the #294/#398 factors
+  (name prefix + labels) are both spoofable by the very SA the policy
+  constrains, so a compromised prune pod could name a Job
+  `oscm-archive-evil`, stamp the two labels, and exfiltrate ANY
+  namespace Secret via `envFrom` (the kubelet resolves envFrom with no
+  RBAC check against the pod's SA — `openstudio-redis`, the Mongo
+  credential Secret, TLS bundles) over the archival egress allow. The
+  new CEL (guarded by `request.operation` so DELETE stays on the
+  oldObject path, keeping `failurePolicy: Fail` and the #565
+  non-prune-principal carve-out) admits a prune-SA Job only when every
+  container image equals the pinned `archival.RCLONE_IMAGE` digest
+  (cross-fenced against the Python constant in
+  `tests/test_deploy_manifests.py`, the #573 pairing pattern), every
+  `envFrom.secretRef.name` matches `^os-archive-[a-z0-9-]+$` (the
+  `#240` CRD pattern mirrored at admission), `command` is pinned to
+  the generator's `/bin/sh -c` `set -eu` envelope, and
+  `args`/`initContainers`/`ephemeralContainers` are rejected outright.
+  Tamper-tests (wrong image, foreign envFrom, command override, added
+  init/ephemeral container) each fail the manifest's own CEL via the
+  extended test mini-interpreter; the legit
+  `archival.py::build_archival_job` manifest passes on
+  CREATE/UPDATE/DELETE.
 - **`#589`** — the Dockerfile now sets `USER 1000`: the image-level non-root default travels with the artifact (`docker run`, the release dev-dep assert, downstream embeds), matching the manifests' `runAsUser`/`fsGroup` 1000.
 - **`#391`** — operator Deployment gained `livenessProbe` + `readinessProbe`
   against the named `metrics` port (containerPort 9090). Liveness
