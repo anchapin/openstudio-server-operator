@@ -143,6 +143,14 @@ jobs:
       - name: Sign + attest the dev image
         env:
           COSIGN_EXPERIMENTAL: "true"
+          # Issue #574: github.* values reach the shell only via env
+          # vars — never interpolated directly into a `run:` string
+          # (expression injection; fenced by
+          # scripts/check_workflow_run_injections.py).
+          GH_REF: ${{ github.ref }}
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           DIGEST="${{ steps.build.outputs.digest }}"
           if [ -z "$DIGEST" ]; then
@@ -163,10 +171,10 @@ jobs:
           # fields. Output goes to /tmp because the runner cleans that up
           # automatically.
           jq -n \
-            --arg ref "${{ github.ref }}" \
-            --arg repo "${{ github.repository }}" \
-            --arg sha "${{ github.sha }}" \
-            --arg run_id "${{ github.run_id }}" \
+            --arg ref "${GH_REF}" \
+            --arg repo "${GH_REPO}" \
+            --arg sha "${GH_SHA}" \
+            --arg run_id "${GH_RUN_ID}" \
             '{
               "builder": {
                 "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
@@ -257,6 +265,12 @@ jobs:
       - name: Sign + attest the versioned image
         env:
           COSIGN_EXPERIMENTAL: "true"
+          # Issue #574: same env-var indirection as the dev sign step —
+          # github.* values never interpolate directly into run:.
+          GH_REF: ${{ github.ref }}
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           DIGEST="${{ steps.build.outputs.digest }}"
           # Issue #155: generate the SLSA provenance predicate inline via jq
@@ -273,10 +287,10 @@ jobs:
           # fields. Output goes to /tmp because the runner cleans that up
           # automatically.
           jq -n \
-            --arg ref "${{ github.ref }}" \
-            --arg repo "${{ github.repository }}" \
-            --arg sha "${{ github.sha }}" \
-            --arg run_id "${{ github.run_id }}" \
+            --arg ref "${GH_REF}" \
+            --arg repo "${GH_REPO}" \
+            --arg sha "${GH_SHA}" \
+            --arg run_id "${GH_RUN_ID}" \
             '{
               "builder": {
                 "id": ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $ref)
@@ -310,11 +324,14 @@ jobs:
       - name: Verify provenance exists
         env:
           COSIGN_EXPERIMENTAL: "true"
+          # Issue #574: env-var indirection — github.ref_name (tag names
+          # may carry shell metacharacters) must not hit run: directly.
+          GH_REF_NAME: ${{ github.ref_name }}
         run: |
           cosign verify-attestation --certificate-identity "https://github.com/anchapin/openstudio-server-operator/.github/workflows/release.yml@refs/tags/v*" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type slsaprovenance \
-            "ghcr.io/anchapin/openstudio-server-operator:${{ github.ref_name }}"
+            "ghcr.io/anchapin/openstudio-server-operator:${GH_REF_NAME}"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
