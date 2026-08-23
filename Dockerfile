@@ -59,4 +59,9 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
 USER 1000
 
 # Kopf watches the namespace given at runtime; RBAC + CRD live in deploy/.
-CMD ["kopf", "run", "--module", "openstudio_operator.handlers", "--namespace", "openstudio-server"]
+# Issue #681 — programmatic entrypoint (same as the Deployment args): the
+# `kopf run` CLI cannot carry OperatorSettings, so without this the kopf
+# bookkeeping (annotation diffbase + finalizer marker) PATCHes the read-only
+# main OSCM resource and 403s under the #228 RBAC. See
+# openstudio_operator/__main__.py + kopf_persistence.py.
+CMD ["python", "-m", "openstudio_operator", "--namespace", "openstudio-server"]

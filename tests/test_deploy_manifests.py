@@ -1338,6 +1338,62 @@ def test_operator_deployment_carries_user_env_guard_678():
     )
 
 
+# ---- Issue #681: programmatic entrypoint (kopf bookkeeping off the
+# read-only main resource) -------------------------------------------
+#
+# `kopf run` cannot carry OperatorSettings, so with the CLI kopf's own
+# bookkeeping PATCHes the MAIN OSCM resource (annotation diffbase +
+# KopfFinalizerMarker into metadata.finalizers) and 403s on every processing
+# cycle under the deliberate #228 RBAC (patch only on /status).
+# `openstudio_operator.__main__` builds the #681 persistence settings
+# (StatusDiffBaseStorage + finalizer=None + timer finalizer disarm) and
+# calls kopf.run programmatically — kopf's documented embedding pattern.
+
+
+def test_operator_deployment_uses_programmatic_entrypoint_681():
+    """Issue #681 acceptance: the operator container runs
+    ``python -m openstudio_operator`` (with the explicit namespace flag the
+    old CLI invocation carried), never the bare ``kopf run`` CLI — the CLI
+    path silently reverts kopf's persistence to the annotations diffbase +
+    finalizer stamping defaults, and the main-resource PATCH 403 storm
+    returns."""
+    container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    assert container["args"] == [
+        "python",
+        "-m",
+        "openstudio_operator",
+        "--namespace",
+        "openstudio-server",
+    ], (
+        "operator args must launch the programmatic entrypoint "
+        "python -m openstudio_operator (#681): the kopf CLI cannot carry "
+        "the OperatorSettings that keep kopf bookkeeping off the read-only "
+        "main resource (#228) — a `kopf run` args shape reintroduces the "
+        "APIForbiddenError retry storm"
+    )
+
+
+def test_dockerfile_cmd_matches_programmatic_entrypoint_681():
+    """Issue #681 companion: the image CMD mirrors the Deployment args so a
+    bare ``docker run`` of the image gets the same persistence settings.
+    Dockerfile semantics: the LAST CMD directive is the effective one."""
+    dockerfile_text = (DEPLOY.parent / "Dockerfile").read_text()
+    cmd_lines = [
+        line
+        for line in dockerfile_text.splitlines()
+        if line.startswith("CMD ")
+    ]
+    assert cmd_lines, "Dockerfile has no CMD directive"
+    effective_cmd = cmd_lines[-1]
+    assert "python" in effective_cmd and "openstudio_operator" in effective_cmd, (
+        f"Dockerfile CMD must run python -m openstudio_operator (#681), got {effective_cmd!r}"
+    )
+    assert "kopf" not in effective_cmd.replace("openstudio_operator", ""), (
+        f"Dockerfile CMD must not launch the bare kopf CLI (#681) — the CLI "
+        f"cannot carry the persistence Settings; got {effective_cmd!r}"
+    )
+
+
 def test_storage_cronjob_carries_user_env_guard_678():
     """Issue #678 companion: the prune container shares the operator's
     passwd-less runtime shape — same digest-pinned image (#291), UID
