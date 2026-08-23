@@ -344,71 +344,76 @@ class StallWindowTracker:
         return now - self.first_observed >= window
 
 
-_tracker_cache: dict[tuple[str, str], tuple[str | None, StallWindowTracker]] = {}
-# Keyed by ``(namespace, name)``; UID-VALIDATED since #497 (values are
-# ``(recorded_uid, tracker)`` — a lookup under a different uid is the #364
-# delete+recreate signature and starts a fresh tracker; see
-# :mod:`openstudio_operator._cr_cache` for the convention + census and
-# :func:`reset_per_cr_caches` for the reset seam). The D05 singleton guard
-# (see ``openstudio_operator.singleton`` and the invariant captured in
-# ``StallWindowTracker.__init__``'s docstring) ensures at most one OSCM
-# CR per namespace, so the tuple uniquely identifies the active CR.
-# See ``tests/test_singleton_registry_coverage.py`` for the test that
-# fails loudly if the singleton guard is bypassed by a new handler.
-# Issue #167.
+def _warn_singleton_guard_bypass(namespace: str, name: str) -> None:
+    """#583 ``on_fresh`` hook: surface (don't raise) a D05 guard bypass.
+
+    D05 invariant — if the singleton guard has been bypassed, the tracker
+    cache would otherwise silently share state between the two CRs, which
+    is the bug the invariant guards against. We warn-log rather than
+    raise so a canary deploy that legitimately wants two CRs in one
+    namespace (e.g. to A/B the operator's logic) doesn't crash the
+    operator — they get the warning, we keep ticking. See
+    ``tests/test_singleton_registry_coverage.py`` for the upstream
+    invariant; issue #167. Runs BEFORE the fresh entry is inserted, so
+    the other-name scan sees the cache exactly as the pre-#583 inline
+    branch did.
+    """
+    other_names = sorted(n for ns, n in _tracker_cache if ns == namespace)
+    if other_names and other_names[0] != name:
+        logger.warning(
+            "StallWindowTracker cache already holds a tracker for "
+            "namespace %s under name(s) %r — D05 singleton guard has "
+            "been bypassed (a second OSCM CR is being serviced in this "
+            "namespace). The new CR (%r) will share state with the "
+            "existing one until the process restarts. See issue #167 "
+            "and tests/test_singleton_registry_coverage.py.",
+            namespace,
+            other_names,
+            name,
+        )
+
+
+#: Issue #583 — the sustained-window clock cache is a
+#: :class:`openstudio_operator._cr_cache.PerCRCache` instance: keyed by
+#: ``(namespace, name)``; UID-VALIDATED since #497 (values are
+#: ``(recorded_uid, tracker)`` — a lookup under a different uid is the #364
+#: delete+recreate signature and starts a fresh tracker; see
+#: :mod:`openstudio_operator._cr_cache` for the convention + census and
+#: :func:`reset_per_cr_caches` for the reset seam). The D05 singleton guard
+#: (see ``openstudio_operator.singleton`` and the invariant captured in
+#: ``StallWindowTracker.__init__``'s docstring) ensures at most one OSCM
+#: CR per namespace, so the tuple uniquely identifies the active CR.
+#: See ``tests/test_singleton_registry_coverage.py`` for the test that
+#: fails loudly if the singleton guard is bypassed by a new handler.
+#: Issue #167.
+_tracker_cache: cr_cache.PerCRCache[StallWindowTracker] = cr_cache.PerCRCache(
+    stale_log=(
+        "StallWindowTracker cache entry for %s/%s belongs to a deleted "
+        "CR (recorded uid %r != observed %r) — starting a fresh "
+        "sustained-window clock (#364 delete+recreate; #497 uid "
+        "validation)"
+    ),
+    logger=logger,
+    on_fresh=_warn_singleton_guard_bypass,
+)
 
 
 def _get_tracker(namespace: str, name: str, uid: str | None = None) -> StallWindowTracker:
-    entry = _tracker_cache.get((namespace, name))
-    if entry is not None and cr_cache.uid_is_stale(entry[0], uid):
-        # Issue #497 — the cached tracker belongs to the DELETED
-        # predecessor CR (same ``(namespace, name)``, new uid — the #364
-        # delete+recreate path). Its partially-accumulated window must NOT
-        # carry into the new CR: that leak could satisfy the sustained
-        # window on the new CR's FIRST holding ticks and fire a restart
-        # earlier than a fresh observation would (not conservative).
-        logger.info(
-            "StallWindowTracker cache entry for %s/%s belongs to a deleted "
-            "CR (recorded uid %r != observed %r) — starting a fresh "
-            "sustained-window clock (#364 delete+recreate; #497 uid "
-            "validation)",
-            namespace,
-            name,
-            entry[0],
-            uid,
-        )
-        entry = None
-    if entry is None:
-        # D05 invariant — surface (don't raise) if the singleton guard has
-        # been bypassed. The tracker would otherwise silently share state
-        # between the two CRs, which is the bug the invariant guards
-        # against. We warn-log rather than raise so a canary deploy that
-        # legitimately wants two CRs in one namespace (e.g. to A/B the
-        # operator's logic) doesn't crash the operator — they get the
-        # warning, we keep ticking. See
-        # ``tests/test_singleton_registry_coverage.py`` for the upstream
-        # invariant; issue #167.
-        other_names = sorted(n for ns, n in _tracker_cache if ns == namespace)
-        if other_names and other_names[0] != name:
-            logger.warning(
-                "StallWindowTracker cache already holds a tracker for "
-                "namespace %s under name(s) %r — D05 singleton guard has "
-                "been bypassed (a second OSCM CR is being serviced in this "
-                "namespace). The new CR (%r) will share state with the "
-                "existing one until the process restarts. See issue #167 "
-                "and tests/test_singleton_registry_coverage.py.",
-                namespace,
-                other_names,
-                name,
-            )
-        tracker = StallWindowTracker()
-        _tracker_cache[(namespace, name)] = (uid, tracker)
-        return tracker
-    if uid is not None and entry[0] is None:
-        # First uid sighting for an entry recorded pre-uid (or by a
-        # uid-less caller): record it so later lookups can validate.
-        _tracker_cache[(namespace, name)] = (uid, entry[1])
-    return entry[1]
+    """Return the per-CR sustained-window tracker, uid-validating the entry.
+
+    Issue #497 — a stale entry (recorded uid ≠ observed uid) belongs to
+    the DELETED predecessor CR (same ``(namespace, name)``, new uid — the
+    #364 delete+recreate path) and is evicted by the holder: its
+    partially-accumulated window must NOT carry into the new CR — that
+    leak could satisfy the sustained window on the new CR's FIRST
+    holding ticks and fire a restart earlier than a fresh observation
+    would (not conservative). Issue #583 — the lookup/evict/create/
+    upgrade mechanics are
+    :meth:`openstudio_operator._cr_cache.PerCRCache.get_or_create`
+    (fresh-entry creation also runs the #167 D05 singleton-bypass
+    warning through the cache's ``on_fresh`` hook).
+    """
+    return _tracker_cache.get_or_create(namespace, name, uid, StallWindowTracker)
 
 
 def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
@@ -421,15 +426,7 @@ def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -
     at lookup time in the meantime). Anything else is a caller bug and
     raises rather than silently clearing the wrong scope.
     """
-    if namespace is None and name is None:
-        _tracker_cache.clear()
-    elif namespace is not None and name is not None:
-        _tracker_cache.pop((namespace, name), None)
-    else:
-        raise ValueError(
-            f"reset_per_cr_caches: pass both namespace and name, or neither "
-            f"(got namespace={namespace!r}, name={name!r})"
-        )
+    _tracker_cache.reset(namespace, name)
 
 
 def _worker_pods_healthy(

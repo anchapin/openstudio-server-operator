@@ -28,6 +28,20 @@ THE CONVENTION (#497) — every module-level per-CR cache MUST:
    ``@kopf.on.delete`` handler (none exists today — see the gap note in
    the module docstrings of the cache-bearing handlers).
 
+Since #583 the convention is EXECUTABLE, not just documented:
+:class:`PerCRCache` (below) is the generic uid-validated holder — a
+``dict`` subclass keyed ``(namespace, name)`` with ``(recorded_uid,
+value)`` entries — owning the get-or-create / evict-on-stale-uid /
+first-sighting-upgrade / scoped-reset mechanics that
+``datapoint_watchdog._get_exhausted_seen`` and
+``web_background_monitor._get_tracker`` each hand-rolled around the
+two primitives. The cache-bearing modules instantiate it under their
+historical module globals (``_EXHAUSTED_WARNED`` / ``_tracker_cache``)
+and keep only thin typed façades plus ``reset_per_cr_caches`` seams
+delegating to :meth:`PerCRCache.reset` — a third cache-bearing module
+(or a semantics fix to the upgrade/eviction branches) now lands ONCE
+here instead of copy-pasting.
+
 Census (#497 — what each module holds and why):
 
 * ``handlers/analysis_sla`` — NO module-level per-CR cache. The SLA
@@ -68,7 +82,9 @@ Census (#497 — what each module holds and why):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Callable, Mapping
+from typing import TypeVar
 
 
 def cr_uid(body: object) -> str | None:
@@ -102,3 +118,111 @@ def uid_is_stale(recorded: str | None, observed: str | None) -> bool:
     instead of discarding state it cannot prove stale.
     """
     return recorded is not None and observed is not None and recorded != observed
+
+
+_ValueT = TypeVar("_ValueT")
+
+
+class PerCRCache(dict[tuple[str, str], tuple[str | None, _ValueT]]):
+    """Generic uid-validated per-CR cache — the convention, executable (#583).
+
+    A ``dict`` subclass so the raw entry map (``{(namespace, name):
+    (recorded_uid, value)}``) stays introspectable under the module
+    global each cache-bearing handler module already exposes — tests,
+    audits, and the reset seam all read the plain dict interface
+    (``clear`` / ``len`` / ``in`` / iteration / ``== {}``). Owns the
+    mechanics every cache-bearing module hand-rolled before #583:
+
+    1. keyed get-or-create through a caller-supplied ``factory``;
+    2. uid validation at lookup (:func:`uid_is_stale`) — an entry
+       recorded under a different uid belongs to the DELETED predecessor
+       CR (the #364 delete+recreate path) and is evicted with the
+       module's own INFO wording (the ``stale_log`` %-style template,
+       fixed at construction so each module keeps its historical text);
+    3. the "first uid sighting for a pre-uid entry" upgrade — record the
+       uid in place without discarding state that cannot be proven stale;
+    4. the scoped :meth:`reset` (all / exactly-one / ``ValueError``)
+       behind each module's ``reset_per_cr_caches`` seam.
+
+    ``on_fresh`` (optional) runs BEFORE a brand-new entry is inserted,
+    with ``(namespace, name)`` — the hook for module-specific
+    creation-time diagnostics (``web_background_monitor`` uses it for
+    the #167 D05 singleton-bypass warning, which must scan the OTHER
+    cache keys before the new one lands).
+    """
+
+    def __init__(
+        self,
+        *,
+        stale_log: str,
+        logger: logging.Logger,
+        on_fresh: Callable[[str, str], None] | None = None,
+    ) -> None:
+        """Build an empty cache bound to its eviction-log wording and logger.
+
+        ``stale_log`` is a %-style template rendered with
+        ``(namespace, name, recorded_uid, observed_uid)`` on eviction;
+        each module passes its historical wording byte-identically.
+        """
+        super().__init__()
+        self._stale_log = stale_log
+        self._logger = logger
+        self._on_fresh = on_fresh
+
+    def get_or_create(
+        self,
+        namespace: str,
+        name: str,
+        uid: str | None,
+        factory: Callable[[], _ValueT],
+    ) -> _ValueT:
+        """Uid-validating get-or-create: the ONE lookup path (#497/#583).
+
+        Present entry whose recorded uid differs from the observed one
+        (:func:`uid_is_stale` — the #364 delete+recreate signature):
+        evict (INFO log through the ``stale_log`` wording) and fall
+        through to a fresh entry. Missing entry: run ``on_fresh`` (if
+        any), insert ``(uid, factory())``, return it. Present entry
+        whose recorded uid is still ``None`` while the observed uid is
+        not: record the uid in place (``None`` never declares
+        staleness, so the entry survives — it just becomes validatable).
+        Present entry otherwise: return the cached value with stable
+        object identity across lookups.
+        """
+        key = (namespace, name)
+        entry = self.get(key)
+        if entry is not None and uid_is_stale(entry[0], uid):
+            self._logger.info(self._stale_log, namespace, name, entry[0], uid)
+            entry = None
+        if entry is None:
+            if self._on_fresh is not None:
+                self._on_fresh(namespace, name)
+            value = factory()
+            self[key] = (uid, value)
+            return value
+        if uid is not None and entry[0] is None:
+            # First uid sighting for an entry recorded pre-uid (or by a
+            # uid-less caller): record it so later lookups can validate.
+            self[key] = (uid, entry[1])
+        return entry[1]
+
+    def reset(self, namespace: str | None = None, name: str | None = None) -> None:
+        """Scoped reset behind the ``reset_per_cr_caches`` seams.
+
+        Pass neither argument to clear every entry (test isolation); pass
+        both ``namespace`` and ``name`` to drop exactly one CR's entry
+        (the shape a future ``@kopf.on.delete`` handler would call — none
+        exists today; :meth:`get_or_create`'s uid validation closes the
+        delete+recreate leak at lookup time in the meantime). Anything
+        else is a caller bug and raises rather than silently clearing the
+        wrong scope.
+        """
+        if namespace is None and name is None:
+            self.clear()
+        elif namespace is not None and name is not None:
+            self.pop((namespace, name), None)
+        else:
+            raise ValueError(
+                f"reset_per_cr_caches: pass both namespace and name, or neither "
+                f"(got namespace={namespace!r}, name={name!r})"
+            )
