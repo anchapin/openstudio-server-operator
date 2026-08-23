@@ -46,7 +46,12 @@ secretRef tick wiring, `#568` rotation-proof Redis client cache, `#569`
 prune deadline + staleness alert, `#570` partial-unwrap visibility,
 `#572`/`#573` Secret-mutation + Deployment-patch VAP fences), the
 `#566` PriorityClass runbook step, and the earlier iteration's
-test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`).
+test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`). A second
+session drove the P2 security/reliability tier: CI script-injection
+fence (`#574`), SSRF host-grammar closure (`#575`), apiserver egress
+peer fix (`#578`), bounded K8s request timeouts (`#579`), the
+KEDA-burst quota envelope (`#580`), and the persisted stall window
+(`#582`).
 
 ### Changed
 - **`#497`** — one per-CR cache keying + reset convention for the
@@ -1131,6 +1136,40 @@ test/refactor/docs wave (`#286`–`#316`, `#381`, `#382`).
   `web-background` (`operations: ["UPDATE"]` — HTTP PATCH presents as
   UPDATE), closing the pivot where a compromised operator pod patches
   the `web` Deployment (Mongo creds + RW NFS) or `db`.
+- **`#574`** — every untrusted `${{ github.* }}` interpolation inside
+  workflow `run:` blocks converted to env-var indirection (the #301
+  house pattern): `guard-branch-pairing`'s `head_ref` plus three more
+  in release.yml (sign/attest ×2, tag-job ref name). Dual fence:
+  `scripts/check_workflow_run_injections.py` in the lint job +
+  `tests/test_ci_workflow_hygiene.py` locally.
+- **`#575`** — the SSRF host grammar in all three URL fences (CRD
+  `serverUrl`/`redisUrl` patterns + `SECRET_REDIS_URL_PATTERN`) now
+  requires every multi-label host to terminate in
+  `.svc`/`.svc.cluster.local`: `evil.com`-shaped public hostnames —
+  including cred-bearing `redis://:pw@evil.com` Secret values — are
+  rejected at the pattern layer.
+- **`#578`** — the operator's apiserver egress peer never matched
+  anything (a bare `podSelector` in a `to:` rule is namespace-local;
+  apiserver pods live in kube-system). Now the compound
+  `namespaceSelector`+`podSelector` peer, plus a commented `ipBlock`
+  alternative for hosted control planes, with the trap documented.
+- **`#579`** — all kubernetes-python client paths carry a bounded
+  request timeout (`K8S_REQUEST_TIMEOUT_SECONDS = 15.0` via
+  `_k8s.BoundedK8sRequest` at the single factory site;
+  `Configuration.timeout` does not exist in the supported client
+  range): a black-holed apiserver connection becomes a counted D12
+  skip instead of a wedged tick.
+- **`#580`** — the ResourceQuota now covers the KEDA `maxReplicaCount`
+  burst envelope, and the fence test computes that envelope from the
+  manifests at test time. Key fix: the old limits quota (8 CPU) was
+  below even steady-state limits once the LimitRange-injected 2-CPU
+  default per pod counts — limits raised to 20 CPU / 20Gi.
+- **`#582`** — the web_background stall-window start is checkpointed
+  to `status.stallWindowStartedAt` (written on stall-begin, cleared on
+  break and on sensing failure, restored into a fresh tracker after a
+  restart): an operator bounce no longer resets an accumulating stall
+  window to zero, so sustained stalls can't be deferred indefinitely
+  by frequent restarts (D04).
 
 ### Docs
 - **`#288`** — this `[Unreleased]` section gained its `### Changed` /
