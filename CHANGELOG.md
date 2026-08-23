@@ -658,6 +658,16 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#650`** — `prune_entrypoint.py`'s private
+  `_SKIP_TICK_EXCEPTIONS` fork is derived from the canonical
+  `_oscm_handlers.SKIP_TICK_EXCEPTIONS` (+ the documented bare
+  `ValueError` delta for storagePolicy-enum/secretRef parses) instead of
+  a tuple frozen pre-`#473`, so future canonical widenings (`#475`,
+  `#493`-style) fail a CI membership test until a prune decision is
+  recorded. `OperatorConfig.from_spec` and the client factory moved
+  inside the guarded region: a malformed CR spec is now a clean,
+  counted, logged exit 5 (per the exit-code table + `#475` rationale)
+  instead of an uncaught traceback outside every documented exit code.
 - **`#641`** — the `openstudio-prune-job-scope` VAP in
   `deploy/storage-cronjob.yaml` gained a second `validations[]` entry
   fencing the archival-Job pod spec itself: the #294/#398 factors
@@ -878,6 +888,35 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   D12). Test count 797 → 806 across the four claim locations.
 
 ### Docs
+- **`#661`** — `docs/architecture-plan.md` carries a historical-design
+  staleness banner under the title: the doc is the original design plan,
+  current wiring lives in AGENTS.md Layout + `docs/adr/`, and the two
+  superseded §2 diagram boxes are named (storage pruner →
+  `deploy/storage-cronjob.yaml` CronJob `#78`; KEDA/HPA controller →
+  deleted, KEDA-only `#77`).
+- **`#659`** — `docs/audit-dryrun-idempotency.md` §2 gains the D04
+  anchor-proof row for the `#402` deferred Warning-Event queue:
+  `status.deferredEvents` via typed 409-safe accessors, the
+  accept-time mirror in `defer_to_next_tick` with the
+  `MAX_DEFERRED_WARNING_EVENTS` backstop, persisted-first `flush_for`
+  with in-memory-twin dedup (exactly-once common path, at-least-once
+  across restarts), mirroring the per-module-map row format.
+- **`#658`** — `metrics.py` docstrings (4 spots) + one `_constants.py`
+  occurrence now point at the post-`#584` module path
+  `handlers.redis_layout_check._check_redis_key_layout_for_cr`; the
+  stale `handlers/_check_redis_key_layout` grep returns nothing in
+  `src/` (the `#593` drift class, missed instance).
+- **`#657`** — README Development section uses `.venv/bin/pytest` (with
+  the "system pytest won't resolve `openstudio_operator`" caveat) and
+  mentions `scripts/check_editable_install.sh` for worktree users +
+  links `docs/onboarding.md#quick-start`, ending the contradiction with
+  the `#71` venv-drift rule the other two doc surfaces carry.
+- **`#656`** — `docs/onboarding.md`'s handler walkthrough renumbered
+  5→6 steps; new step 3 names the `register_fn` import-time
+  registration (`#407`), shows the exact `analysis_sla.py` code, and
+  explains its CI gate
+  (`test_python_registry_includes_all_oscm_spawning_handlers`);
+  5-step→6-step phrasing synced in AGENTS.md + CONTRIBUTING.md.
 - **`#465`** — AGENTS.md `deploy/` inventory lists all 11 manifests
   (`priority-class.yaml` #414, `resource-quota.yaml` #400 were missing).
 - **`#484`** — `docs/audit-policy.md` (the `#399` kube-apiserver
