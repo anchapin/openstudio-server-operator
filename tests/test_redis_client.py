@@ -23,7 +23,7 @@ import openstudio_operator.handlers as handlers_pkg
 from openstudio_operator import metrics as _metrics_module
 from openstudio_operator import redis_client
 from openstudio_operator.config import RedisSecretRef
-from openstudio_operator.handlers import _check_redis_key_layout_for_cr
+from openstudio_operator.handlers.redis_layout_check import _check_redis_key_layout_for_cr
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
     REQUEUED_QUEUE,
@@ -785,7 +785,7 @@ def _patched_client_factory(fake, monkeypatch):
         )
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
     )
     return _factory
 
@@ -925,7 +925,7 @@ def test_redis_key_layout_check_emits_unreachable_log_line(
         return client
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
     )
 
     item = {
@@ -1045,7 +1045,7 @@ def test_redis_key_layout_check_runs_via_secret_ref(
         )
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
     )
 
     item = {
@@ -1099,7 +1099,7 @@ def test_redis_key_layout_check_secret_ref_resolution_failure_is_unreachable(
         )
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
     )
 
     item = {
@@ -1288,7 +1288,7 @@ def test_redis_key_layout_check_stamps_freshness_gauge_on_non_ok_paths(
             return probe_client
 
         monkeypatch.setattr(
-            "openstudio_operator.handlers.get_read_only_redis_client", _factory
+            "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _factory
         )
     else:  # degraded — empty fakeredis (no Resque keys) drifts the layout.
         _patched_client_factory(fake, monkeypatch)

@@ -11,32 +11,34 @@ Issue #234 — three near-identical queue/drain mechanisms (#116 URL guard,
 :class:`openstudio_operator.events_sinks.QueuedKopfEventSink`. The
 Warning Event reasons (``RedisUrlEmpty``, ``RedisKeyLayoutDrift``,
 ``StatusMapCapped``) are preserved verbatim.
+
+Issue #584 — the key-layout check itself (the ``@kopf.on.event``
+registration + the per-CR validator) moved OUT of this package init into
+:mod:`openstudio_operator.handlers.redis_layout_check`, so
+``web_background_monitor``'s #490 revalidation rider imports it at module
+top level instead of reaching back into the package via a function-local
+import (the deferred-import cycle this file used to force). The sink
+wiring below is unchanged: the check defers through the SAME shared sink
+this init binds, and this init's drain handler still flushes it.
 """
 
 import logging
-import time
 
 import kopf
 
 from openstudio_operator import singleton, status_store
 from openstudio_operator._constants import CRD_SPEC
-from openstudio_operator.client_factory import get_read_only_redis_client
-from openstudio_operator.config import OperatorConfig, OperatorConfigError
 from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.handlers import (  # noqa: F401
     analysis_sla,
     datapoint_watchdog,
     dry_run_audit,
+    redis_layout_check,
     web_background_monitor,
     worker_recycler,
 )
 from openstudio_operator.logging_setup import install_json_logging
-from openstudio_operator.metrics import (
-    REDIS_KEY_LAYOUT_STATUS,
-    REDIS_KEY_LAYOUT_STATUS_FRESH,
-    start_metrics_server,
-)
-from openstudio_operator.redis_client import RedisClientError
+from openstudio_operator.metrics import start_metrics_server
 
 logger = logging.getLogger(__name__)
 
@@ -82,227 +84,6 @@ def _emit_redis_warning_event(*, namespace: str, name: str, message: str) -> Non
     _sink.defer_to_next_tick(
         namespace=namespace, name=name, reason="RedisUrlEmpty", message=message,
     )
-
-
-# Issue #163 — boot-time Redis key-layout validation (D05/D13 invariant).
-# ``validate_key_layout()`` is documented in AGENTS.md as the startup-time
-# assertion that the Redis Service ``queue`` exposes the Resque keyspace the
-# operator reads (``resque:worker:*``, ``resque:queue:simulations``, etc.). A
-# quiet drift (helm chart upgrade to a Resque-2.x-with-different-prefix
-# layout, or a different queue backend entirely) would otherwise only be
-# noticed downstream when the worker-registry gauges go silent — too late for
-# the boot-time identity the singleton guard polices. The fix is to call
-# ``validate_key_layout()`` once per CR at operator boot (the kopf watch's
-# initial listing IS the boot path for any non-zero namespace), emit a
-# structured log line ``redis_key_layout=ok|degraded|unreachable``, and queue
-# a Warning Event on the degraded branch. The whole call is wrapped in
-# try/except so a Redis connectivity failure degrades gracefully (operator
-# continues to boot, retries on the next CR tick) — never crashes the
-# process. The drain path is the consolidated :func:`_drain_queued_warning_events`.
-#
-# Issue #490 — validation is no longer boot-only: the web_background stall
-# tick re-runs this check every
-# ``_constants.REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`` (5 min) via
-# ``web_background_monitor._maybe_revalidate_redis_key_layout``, so a
-# mid-flight layout drift is caught within a bounded window instead of
-# waiting for a CR edit to happen to coincide. Every run stamps the paired
-# freshness gauge through :func:`_set_redis_key_layout_status` above.
-
-
-def _emit_redis_key_layout_event(
-    namespace: str, name: str, reason: str, message: str
-) -> None:
-    """Defer a redis-key-layout Warning Event to the next OSCM watch tick.
-
-    Counterpart to :func:`_check_redis_key_layout_for_cr`'s degraded
-    branch. Fires from the per-CR check; the actual ``kopf.event``
-    emit happens on the next OSCM watch tick (same queue/defer pattern
-    as :func:`_emit_redis_warning_event` for issue #116, both routed
-    through the consolidated :data:`_sink` after #234).
-    """
-    _sink.defer_to_next_tick(
-        namespace=namespace, name=name, reason=reason, message=message,
-    )
-
-
-def _set_redis_key_layout_status(value: float) -> None:
-    """Set the #253 status gauge + its #490 freshness stamp in lockstep.
-
-    Issue #490 — the status gauge alone is a blind-holds-value signal on
-    a steady-state cluster (no OSCM watch events → no revalidation), so
-    every terminal path of
-    :func:`_check_redis_key_layout_for_cr` goes through THIS helper: the
-    freshness timestamp proves the validator ran recently while the
-    status value carries the result. Centralizing the pair here keeps
-    the two gauges from drifting apart the way a hand-maintained second
-    ``.set(...)`` line at each of the eight branches eventually would.
-    """
-    REDIS_KEY_LAYOUT_STATUS.set(value)
-    REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
-
-
-def _check_redis_key_layout_for_cr(
-    item: object, *, logger: logging.Logger
-) -> str:
-    """Run ``validate_key_layout()`` for one OSCM CR; return a status string.
-
-    Returns one of ``"ok"``, ``"degraded"``, ``"unreachable"``, ``"error"``,
-    or ``"skipped"`` (empty redis_url with no secretRef, nameless item,
-    etc.). The handler controls the structured log line based on the return
-    value; the test suite asserts the line is emitted (see
-    ``tests/test_redis_client.py::test_redis_key_layout_check_emits_*``).
-
-    Issue #567 — the check is secretRef-aware: the effective Redis URL is
-    resolved through the factory's #463 path (``secret_ref`` from
-    ``spec.redisCredentials.secretRef`` plus the CR's ``namespace``), so a
-    secretRef-only CR (``spec.redisUrl`` empty — the preferred production
-    shape) VALIDATES instead of returning ``"skipped"``. The skip branch
-    survives only for a CR with neither an inline URL nor a secretRef
-    (the #116 empty-``spec.redisUrl`` concern). A resolution failure
-    (missing Secret/key, bad value) raises
-    :class:`~openstudio_operator.redis_client.RedisCredentialResolutionError`
-    — a :class:`~openstudio_operator.redis_client.RedisClientError`
-    subclass — and therefore lands on the ``"unreachable"`` branch; a
-    malformed secretRef raises ``ValueError`` in the config parse and
-    lands on the ``"error"`` branch (the function stays total — never
-    raises).
-
-    Wrapped in try/except so a Redis connectivity failure (network down,
-    DNS failure, refused connection, timeout) does NOT crash the boot —
-    the operator continues in degraded mode and retries on the next tick,
-    per the issue's "silent-misbehavior risk" counter-spec.
-
-    Issue #253 — every return path updates the cluster-wide
-    ``openstudio_operator_redis_key_layout_status`` Gauge: ``1.0`` on
-    ``ok`` (the most recent validator run succeeded) and ``0.0`` for
-    every other terminal status (``degraded`` | ``unreachable`` |
-    ``error`` | ``skipped``). The gauge is a cluster-wide latest-observation
-    signal — no per-CR labels, so cardinality stays bounded regardless of
-    CR count.
-
-    Issue #490 — every return path ALSO stamps the paired
-    ``openstudio_operator_redis_key_layout_status_fresh`` timestamp gauge
-    (via :func:`_set_redis_key_layout_status`, in lockstep with the
-    status value). Callers besides the ``@kopf.on.event`` watch: the
-    periodic revalidation riding the web_background stall tick
-    (``web_background_monitor._maybe_revalidate_redis_key_layout`` on
-    ``REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL``) — that cadence is what
-    bounds the freshness gap a dashboard's ``time() - fresh`` computation
-    alerts on.
-    """
-    if not isinstance(item, dict):
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
-    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
-    if not isinstance(meta, dict):
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
-    ns = str(meta.get("namespace") or "")
-    nm = str(meta.get("name") or "")
-    if not ns or not nm:
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
-    spec = item.get("spec") or {}
-    try:
-        # Issue #567 — parse through OperatorConfig (the single config
-        # path) so the secretRef resolution matches the timer wire
-        # closures exactly; the parse runs INSIDE the try so a malformed
-        # secretRef keeps the function total (broad-except → "error").
-        config = OperatorConfig.from_spec(spec)
-        if not config.redis_url and config.redis_credentials.secret_ref is None:
-            # Neither credential source is set — a separate concern
-            # (#116) — don't fail layout validation on the operator's
-            # intentional refusal to default.
-            logger.debug(
-                "redis_key_layout skip: OSCM %s/%s has empty spec.redisUrl "
-                "and no spec.redisCredentials.secretRef (#116)",
-                ns,
-                nm,
-            )
-            _set_redis_key_layout_status(0.0)
-            return "skipped"
-        get_read_only_redis_client(
-            config.redis_url,
-            secret_ref=config.redis_credentials.secret_ref,
-            namespace=ns,
-        ).validate_key_layout()
-    except OperatorConfigError as exc:
-        # Layout drift (issue #44). Since #475 this class lives in config.py
-        # and is NOT a RedisClientError subclass, so the ordering of this
-        # except ladder no longer depends on subclassing — the layout-drift
-        # branch is reachable only here, by name, which is the intent.
-        logger.warning(
-            "redis_key_layout=degraded namespace=%s name=%s reason=%s: %s",
-            ns,
-            nm,
-            "layout_drift",
-            exc,
-        )
-        _emit_redis_key_layout_event(
-            ns,
-            nm,
-            "RedisKeyLayoutDrift",
-            (
-                "Redis key layout validation failed (issue #163): "
-                f"{exc}. Modules 3/5 (worker recycler / web_background "
-                "stall) may produce noisy signals or stay silent — the "
-                "centralized Resque key constants in "
-                "src/openstudio_operator/redis_client.py do not match the "
-                "live Redis layout. Verify with "
-                f"`redis-cli -u <redis_url> KEYS 'resque:*'` and update "
-                "the constants (see issue #44 / docs/kind-validation.md)."
-            ),
-        )
-        _set_redis_key_layout_status(0.0)
-        return "degraded"
-    except (RedisClientError, OSError) as exc:
-        # Redis connectivity failure (refused, DNS, timeout) — wire-level,
-        # not a layout drift. Since #567 this branch also absorbs the
-        # secretRef resolution failures (``RedisCredentialResolutionError``
-        # is a ``RedisClientError`` subclass): a missing Secret/key or a
-        # fence-violating value reads as "unreachable", and the log line
-        # names the exact object to fix. Loud warning, no event (we don't
-        # know the layout drifted; we just couldn't reach the server).
-        # Operator MUST continue to boot — the issue's hard requirement.
-        logger.warning(
-            "redis_key_layout=unreachable namespace=%s name=%s: %s",
-            ns,
-            nm,
-            exc,
-        )
-        _set_redis_key_layout_status(0.0)
-        return "unreachable"
-    except Exception as exc:  # noqa: BLE001 — defensive last-resort (see web_background_monitor.py)
-        logger.warning(
-            "redis_key_layout=error namespace=%s name=%s: %s: %s",
-            ns,
-            nm,
-            type(exc).__name__,
-            exc,
-        )
-        _set_redis_key_layout_status(0.0)
-        return "error"
-    logger.info(
-        "redis_key_layout=ok namespace=%s name=%s",
-        ns,
-        nm,
-    )
-    _set_redis_key_layout_status(1.0)
-    return "ok"
-
-
-@kopf.on.event(**CRD_SPEC)
-def _redis_key_layout_check(
-    name: str, namespace: str, body: kopf.Body, **_kwargs: object
-) -> None:
-    """Run ``validate_key_layout()`` per CR at boot (initial listing) and on every change.
-
-    The kopf watch's initial listing fires this for every existing CR — that
-    IS the boot path. Idempotent: ``validate_key_layout()`` is reentrant and
-    capped at ``VALIDATE_SCAN_KEY_BUDGET`` keys. A queued Warning Event is
-    drained on the next tick by :func:`_drain_queued_warning_events`.
-    """
-    _check_redis_key_layout_for_cr(body, logger=logger)
 
 
 # Issue #171 — production kopf-backed Warning-Event sink for the

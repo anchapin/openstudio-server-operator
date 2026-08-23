@@ -198,12 +198,18 @@ def test_redis_shared_across_handler_modules():
 
     Before #235 a running operator held (at least) three distinct clients per
     Redis URL: the stall detector's cached one, a fresh one per SLA tick, and
-    the boot-time layout probe's. The import is now a single symbol.
+    the boot-time layout probe's. The import is now a single symbol. Since
+    #584 the boot-time layout probe lives in ``handlers.redis_layout_check``
+    (moved out of the package init), so that module is the probe's home in
+    this tuple.
     """
-    from openstudio_operator import handlers
-    from openstudio_operator.handlers import analysis_sla, web_background_monitor
+    from openstudio_operator.handlers import (
+        analysis_sla,
+        redis_layout_check,
+        web_background_monitor,
+    )
 
-    modules = (handlers, analysis_sla, web_background_monitor)
+    modules = (redis_layout_check, analysis_sla, web_background_monitor)
     for module in modules:
         assert module.get_read_only_redis_client is get_read_only_redis_client
 

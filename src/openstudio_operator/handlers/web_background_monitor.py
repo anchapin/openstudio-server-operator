@@ -85,7 +85,7 @@ flipping ``spec.dryRun`` back to false changes only the mutation.
 Issue #490 — this timer is also the carrier for the periodic Redis
 key-layout revalidation: every tick first offers
 :func:`_maybe_revalidate_redis_key_layout` the chance to re-run
-``handlers._check_redis_key_layout_for_cr`` (once per 5-minute
+``handlers.redis_layout_check._check_redis_key_layout_for_cr`` (once per 5-minute
 :data:`REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL`), because a steady-state
 cluster generates no OSCM watch events and the #163 boot-time check would
 otherwise never re-fire. The rider runs BEFORE the stall evaluation
@@ -132,6 +132,9 @@ from openstudio_operator.config import (
     OperatorConfig,
 )
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.handlers.redis_layout_check import (
+    _check_redis_key_layout_for_cr,
+)
 from openstudio_operator.metrics import (
     KUBE_API_REQUEST_DURATION_SECONDS,
     RESQUE_QUEUE_DEPTH,
@@ -224,7 +227,7 @@ def reset_leg2_safeguard_state() -> None:
 
 
 #: Issue #490 — when this module last re-ran the Redis key-layout
-#: validation (``handlers._check_redis_key_layout_for_cr``) from the stall
+#: validation (``handlers.redis_layout_check._check_redis_key_layout_for_cr``) from the stall
 #: tick. Process-lifetime state, deliberately UN-keyed (the same #497
 #: census rationale as the leg-2 flags above: the Resque key layout is a
 #: Redis-server property, not a CR property, and the D05 singleton guard
@@ -254,7 +257,7 @@ def _maybe_revalidate_redis_key_layout(
     this rider the key-layout status gauge holds its boot value forever and
     a mid-flight Resque layout drift (helm chart upgrade to a different
     prefix, queue backend swap) is both unreported AND undetected. This
-    rider re-invokes ``handlers._check_redis_key_layout_for_cr`` — the
+    rider re-invokes ``handlers.redis_layout_check._check_redis_key_layout_for_cr`` — the
     single validation code path, so the status gauge, its #490 freshness
     pair, the structured log line, and the ``RedisKeyLayoutDrift`` Warning
     deferral all behave exactly as at boot — at most once per
@@ -264,10 +267,13 @@ def _maybe_revalidate_redis_key_layout(
 
     Never raises: the underlying check is total (fully wrapped), so a
     failing validation degrades to the ``unreachable``/``error`` gauges
-    and logs — the stall tick that carries it is unaffected. The deferred
-    import breaks the handlers↔module cycle (``handlers/__init__``
-    imports this module at package load; the check symbol only exists
-    after that import block runs).
+    and logs — the stall tick that carries it is unaffected. Since #584
+    the check lives in
+    :mod:`openstudio_operator.handlers.redis_layout_check` and is
+    imported at MODULE TOP LEVEL (above) — the function-local deferred
+    import this rider used to carry (the handlers↔module cycle #584
+    removed) is gone; a rename of the private symbol now fails at import
+    time, not at the first stall tick.
     """
     global _last_key_layout_revalidation
     if (
@@ -280,8 +286,6 @@ def _maybe_revalidate_redis_key_layout(
     # hypothetical future raising variant would retry next tick rather
     # than hot-looping.
     _last_key_layout_revalidation = now
-    from openstudio_operator.handlers import _check_redis_key_layout_for_cr
-
     _check_redis_key_layout_for_cr(body, logger=logger)
 
 
