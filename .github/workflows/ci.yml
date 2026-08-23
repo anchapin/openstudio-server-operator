@@ -81,6 +81,17 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      # Issue #577: every Python tool this workflow runs (pyyaml for the
+      # YAML-parsing guards, ruff for lint) installs from the hash-pinned
+      # CI-only requirements-ci.txt — a third lockfile beside the #479
+      # pair, never part of pyproject/requirements.lock/requirements.txt
+      # (the #481 rule). A bare `pip install <tool>` resolves to mutable
+      # PyPI latest, so the very guards that fence the supply chain would
+      # run unverified code with the job's GITHUB_TOKEN — pyyaml alone
+      # parses every PR's manifest content.
+      # tests/test_ci_workflow_hygiene.py fences the pattern repo-wide.
+      - name: Install CI tooling from hash-pinned requirements-ci.txt (#577)
+        run: pip install --require-hashes -r requirements-ci.txt
       # Issue #389: fail the build if any `uses:` line in any workflow
       # resolves to a mutable major tag (e.g. `actions/checkout@v4`) instead
       # of a 40-char commit SHA. A compromised mutable tag would gain push
@@ -110,10 +121,9 @@ jobs:
       # pattern itself and are NOT flagged. tests/test_ci_workflow_hygiene.py
       # runs the same script locally as part of pytest.
       - name: "Reject github.* interpolation inside run: blocks (issue #574)"
-        run: |
-          pip install pyyaml  # the guard script uses yaml.safe_load
-          python scripts/check_workflow_run_injections.py
-      - run: pip install 'ruff>=0.16' # same floor as pyproject dev deps (#68); otherwise follows latest
+        run: python scripts/check_workflow_run_injections.py
+      # ruff installs from requirements-ci.txt above (#577, exact-pinned
+      # there); the >=0.16 floor stays declared in pyproject dev deps (#68).
       - run: ruff check .
       # Issue #152: drift guard against initial-scaffold TODO(phase N)
       # placeholders (e.g. the one tracked from #146 in
@@ -132,9 +142,7 @@ jobs:
       # Parses YAML structurally so comments / image names / namespace labels
       # are NOT flagged.
       - name: Check no legacy Redis password literal (issue #150)
-        run: |
-          pip install pyyaml  # the guard script uses yaml.safe_load
-          bash scripts/check_redis_password_unique.sh
+        run: bash scripts/check_redis_password_unique.sh
       # Issue #219 — Mongo companion to the #150 Redis guard. Fails the build
       # if the legacy literal `openstudio` re-appears as a Mongo password
       # value in 01-mongo.yaml / 04-web.yaml / 05-web-background.yaml /
@@ -142,8 +150,8 @@ jobs:
       - name: Check no legacy Mongo password literal (issue #219)
         run: |
           bash scripts/check_mongo_password_unique.sh
-        # pyyaml is already installed by the #150 step above; the Mongo
-        # companion guards uses the same yaml.safe_load.
+        # pyyaml arrives via the shared requirements-ci.txt install (#577);
+        # the Mongo companion guard uses the same yaml.safe_load.
       # Issue #301 — PR body must carry a `Scope guard:` block naming the
       # issues this PR touches and declaring what is intentionally NOT
       # being changed. Complements the #88 merge-subject hygiene rule
@@ -275,11 +283,14 @@ jobs:
           python-version: "3.12"
       # pip-audit is a CI-only auditing tool — deliberately NOT a project
       # dependency (#481 constraint): it appears in neither lockfile nor
-      # pyproject.toml, so it can never enter the runtime image.
+      # pyproject.toml, so it can never enter the runtime image. Since #577
+      # it installs hash-pinned from requirements-ci.txt (the CI-only third
+      # lockfile) — the vulnerability gate must not itself be built from
+      # mutable-latest PyPI code.
       - name: pip-audit requirements.lock (issue #481)
         run: |
           set -euo pipefail
-          pip install pip-audit
+          pip install --require-hashes -r requirements-ci.txt
           # Turn each non-comment line of .pip-audit-ignore.txt into a
           # --ignore-vuln argument (triaged exceptions only — see that
           # file's header for the triage rules).

@@ -452,3 +452,118 @@ def test_build_backend_closure_is_hash_pinned_in_both_lockfiles() -> None:
         "closure is hand-spliced; re-add it with --generate-hashes output "
         "after any regeneration."
     )
+
+
+# CI-only tool lockfile (issue #577)
+# ----------------------------------
+# requirements-ci.txt is a THIRD lockfile: the hash-pinned source for the
+# tooling the ci.yml lint/audit jobs run (pip-audit, ruff, pyyaml). It is
+# deliberately NOT part of the #479 pair and NOT compiled from pyproject —
+# pip-audit must never appear in pyproject.toml or either runtime lockfile
+# (#481: it is a CI-only auditing tool and must stay out of the production
+# image). The gates below fail when:
+#
+# * the file is missing, or does not pin all three tools the issue names,
+# * any entry is not an exact ``==`` pin (a floor floats to PyPI latest —
+#   the exact supply-chain hole #577 closes), or lacks its ``--hash`` lines,
+# * pip-audit (or ruff/pyyaml-as-CI-tools, by name collision intent) leaks
+#   into pyproject.toml / requirements.lock / requirements.txt.
+#
+# The workflow-side fence (no bare ``pip install`` in any workflow) lives
+# in tests/test_ci_workflow_hygiene.py.
+
+REQUIREMENTS_CI = REPO_ROOT / "requirements-ci.txt"
+
+# The three tools issue #577 names, PEP 503-normalized.
+CI_TOOL_NAMES = ("pip-audit", "pyyaml", "ruff")
+
+
+def _entry_without_extras(entry: str) -> str:
+    """Strip a PEP 508 extras marker (``cachecontrol[filecache]==0.14.4`` →
+    ``cachecontrol==0.14.4``) — the lockfiles pin only the base package."""
+    if "[" not in entry:
+        return entry
+    name, _, rest = entry.partition("[")
+    return name + rest.partition("]")[2]
+
+
+def test_requirements_ci_file_exists() -> None:
+    """``requirements-ci.txt`` (the CI-only tool lockfile) exists at the repo root."""
+    assert REQUIREMENTS_CI.exists(), (
+        f"requirements-ci.txt not found at {REQUIREMENTS_CI}. The ci.yml "
+        "lint/audit tooling must install from a hash-pinned file (issue #577) — "
+        "see the regenerate procedure in that file's header comment."
+    )
+
+
+def test_requirements_ci_pins_the_three_ci_tools() -> None:
+    """requirements-ci.txt carries exact ``==`` entries for pip-audit, ruff,
+    and pyyaml — the three tools the pre-#577 ci.yml installed from mutable
+    latest. A tool missing here means its workflow step either fails or was
+    quietly reverted to a bare ``pip install``."""
+    blocks = _parse_lockfile(REQUIREMENTS_CI.read_text())
+    missing = [name for name in CI_TOOL_NAMES if name not in blocks]
+    assert not missing, (
+        f"requirements-ci.txt is missing the CI tools {missing} (issue #577). "
+        "Regenerate it per the header comment so every ci.yml tool step "
+        "installs from this file."
+    )
+
+
+def test_requirements_ci_every_entry_is_exact_pinned_and_hashed() -> None:
+    """Every requirements-ci.txt entry is an exact ``==`` pin WITH ``--hash``
+    lines — the same two-part contract the #479 pair enforces, applied to
+    the CI tools (issue #577: the vulnerability gate must not itself be
+    built from mutable-latest PyPI code)."""
+    text = REQUIREMENTS_CI.read_text()
+    blocks = _parse_lockfile(text)
+    assert blocks, "requirements-ci.txt contains no package entries (issue #577)"
+    entries = [
+        line.rstrip("\\ ").rstrip()
+        for line in text.splitlines()
+        if line and not line[0].isspace() and not line.startswith("#") and "\\" in line
+    ]
+    not_exact = [entry for entry in entries if not _EXACT_PIN_RE.match(_entry_without_extras(entry))]
+    unhashed = sorted(name for name, has in blocks.items() if not has)
+    problems = []
+    if not_exact:
+        problems.append(f"entries not exact '==' pins: {not_exact}")
+    if unhashed:
+        problems.append(f"entries missing --hash=sha256:... lines: {unhashed}")
+    assert not problems, (
+        "requirements-ci.txt contract broken (issue #577):\n  - "
+        + "\n  - ".join(problems)
+        + "\nRemediation: regenerate per the header comment:\n"
+        "  pip-compile --generate-hashes --no-strip-extras \\\n"
+        "      --output-file=requirements-ci.txt /tmp/requirements-ci.in"
+    )
+
+
+# pip-audit is the one CI tool whose presence in the project dependency
+# surfaces would be a supply-chain regression (#481): ruff and pyyaml ARE
+# legitimate project deps (dev-extra / runtime) — only pip-audit is
+# CI-only by design.
+_CI_ONLY_TOOLS = ("pip-audit",)
+
+
+def test_pip_audit_never_enters_project_dependency_surfaces() -> None:
+    """pip-audit appears ONLY in requirements-ci.txt — never in pyproject.toml
+    or either lockfile of the #479 pair (#481 rule, restated as a gate by
+    #577): it is a CI-only auditing tool and must never reach the production
+    image or the dev install."""
+    surfaces = {
+        "pyproject.toml": PYPROJECT.read_text(),
+        "requirements.lock": REQUIREMENTS_LOCK.read_text(),
+        "requirements.txt": REQUIREMENTS_TXT.read_text(),
+    }
+    leaked = sorted(
+        label
+        for label, text in surfaces.items()
+        if any(_normalize(name) in _dep_names(text.splitlines()) for name in _CI_ONLY_TOOLS)
+        or re.search(r"(?im)^pip-audit==", text) is not None
+    )
+    assert not leaked, (
+        f"pip-audit leaked into {leaked} (issues #481/#577): it is "
+        "a CI-only auditing tool — its only home is requirements-ci.txt, "
+        "installed solely by the ci.yml audit job."
+    )
