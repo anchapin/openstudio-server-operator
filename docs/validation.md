@@ -23,10 +23,19 @@ real helm deployment (NatLabRockies chart, `develop` branch, namespace
 - mutating actions (`soft_stop`, `requeue`, `DELETE`) against analyses that
   matter — under `dryRun` first, then for real on throwaway analyses only.
 
-## Module status (post-#77/#78; column updated after wave-3 merges)
+## Module status (what is live: operator handlers + state-carrying `deploy/` manifests)
 
 The table below reflects the handlers that are loaded by `handlers/__init__.py`
-on every operator boot and the manifests actually shipped under `deploy/`.
+on every operator boot plus every state-carrying guardrail/observability
+manifest shipped under `deploy/` — the runbook's index of what is live. The
+operator's own wiring (CRD, RBAC, Deployment, storage CronJob) is applied and
+verified in the Phases below; the four namespace-hardening + alerting
+artifacts are applied from the
+[Namespace hardening + alerting artifacts](#namespace-hardening--alerting-artifacts-issues-400--112--166--468)
+Prerequisites subsection (#587), which owns their apply steps and operational
+caveats — cross-reference it; this table does not repeat them. The complete
+`deploy/` inventory (including the credential-secret templates and
+`namespace-labels.yaml`) is [`AGENTS.md`](../AGENTS.md)'s Layout bullet.
 Earlier revisions of this runbook described modules 2/3/5 as "stubs" and
 referenced the deleted `handlers/storage_pruner.py`; those lines predate the
 #10/#11/#13/#78 merges and are no longer accurate.
@@ -37,12 +46,18 @@ referenced the deleted `handlers/storage_pruner.py`; those lines predate the
 | 2 — Zombie datapoint watchdog | `src/openstudio_operator/handlers/datapoint_watchdog.py` | **live** | Requeue path for `started → jobless` datapoints |
 | 3 — Worker recycler | `src/openstudio_operator/handlers/worker_recycler.py` | **live** | Idle Resque fence + pod-delete recycle; operator Surface-trim tracked in #104 |
 | 4 — NFS archival + prune | `src/openstudio_operator/archival.py` (Job generator, in-process) → `src/openstudio_operator/retention.py` + `src/openstudio_operator/prune_entrypoint.py` (CronJob entrypoint) | **live** | Prune orchestration moved from operator to a dedicated CronJob in #78; operator Role lost `batch/jobs`. Live-cloud scheduling validation tracked in #101 |
-| 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | **live** | Reads Resque queue depth via `redis_client.stale_workers(...)`; pod eviction on stall |
+| 5 — web_background stall detector | `src/openstudio_operator/handlers/web_background_monitor.py` | **live** | Reads Resque queue depth via `redis_client.stale_workers(...)`; pod eviction on stall; stall window anchored in CR status `stallWindowStartedAt` (#582) |
 | Phase 4 — KEDA autoscaling | `deploy/keda-scaledobject.yaml` (ScaledObject + TriggerAuthentication) | **live** | Replaces custom Redis HPA-floor handler in #77; operator owns zero autoscaling surface and emits no `hpa_floor_adjustments_total` counter |
 | Singleton guard (D05) | `src/openstudio_operator/singleton.py`, installed from `handlers/__init__.py` | **live** | Passive oldest-CR-per-namespace guard; Warning Event + loud log on second CR |
+| Metrics endpoint + optional bearer-token authN (#401) | `src/openstudio_operator/metrics.py` (operator boot) + `src/openstudio_operator/prune_entrypoint.py::main` (prune CronJob, shared `start_metrics_server()`) | **live** | Plaintext `/metrics` on :9090 for BOTH the operator and the pruner; empty-by-default `OPENSTUDIO_METRICS_TOKEN_FILE` opt-in — when set, requests must carry `Authorization: Bearer <token>` and a missing/empty file fails CLOSED (401 for everything; pruner parity #478). Ingress is NetworkPolicy-gated (row below) |
 | VAP pod-delete scope (#293) | `deploy/pod-delete-admission-policy.yaml` (cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the operator SA's `pods/delete` to pods labeled `app=worker` — a constraint RBAC cannot express (`PolicyRule` has no `labelSelector`). Requires K8s 1.30+ (`admissionregistration.k8s.io/v1` GA); pre-1.30 clusters must skip it |
 | VAP prune batch/jobs scope (#294) | `deploy/storage-cronjob.yaml` (embedded cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the prune SA's `batch/jobs` create/update/delete to Jobs carrying both `app.kubernetes.io/managed-by=openstudio-operator` and `app.kubernetes.io/component=archival` and named `oscm-archive-*` (labels alone are spoofable — the name pattern from `archival.py::archival_job_name` is the second factor, #398). Requires K8s 1.30+; pre-1.30 clusters must skip it |
 | VAP deployment-patch scope (#573) | `deploy/deployment-patch-admission-policy.yaml` (cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Narrows the operator SA's `apps/deployments` patch/update to the names `worker` and `web-background` (the worker-recycler and web-background-restart surfaces) — RBAC's `resourceNames` cannot express a CR-configurable target. Admission presents HTTP PATCH as operation UPDATE (the operations enum has no PATCH literal, #565). Requires K8s 1.30+; pre-1.30 clusters must skip it |
+| VAP secret-read scope (#572) | `deploy/secret-read-admission-policy.yaml` (cluster-scoped ValidatingAdmissionPolicy + Binding) | **live** | Constrains the operator SA's Secret *mutations* to `openstudio-redis*` names (VAPs cannot intercept GET — admission runs on the mutating path only); the read side is bounded by RBAC instead — the Role's `secrets: get` grant is exact-name-bounded via `resourceNames` to `openstudio-redis` (#606). Requires K8s 1.30+; pre-1.30 clusters must skip it |
+| PriorityClass eviction protection (#414) | `deploy/priority-class.yaml` | **live** | Cluster-scoped `openstudio-operator-critical`, referenced via `priorityClassName` by BOTH `deploy/operator-deployment.yaml` and the prune CronJob — node-pressure eviction protection. Must exist before the Deployment (admission rejects pods naming a nonexistent PriorityClass); applied in Phase A step 1 |
+| ResourceQuota + LimitRange (#400) | `deploy/resource-quota.yaml` | **live** | Bounds the namespace's aggregate + per-container resource surface; sized by #580 to the full KEDA burst envelope (recomputed by `tests/test_deploy_manifests.py` so drift fails CI). Admission-time only — running pods untouched. Apply steps + caveats: [Namespace hardening subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
+| NetworkPolicy egress + metrics-ingress fence (#112/#166) | `deploy/network-policy.yaml` | **live** | Default-deny egress for the operator-owned pod surface (operator, storage-pruner, archival Jobs) plus label-scoped ingress lockdown of BOTH plaintext `/metrics` endpoints (operator #166; pruner parity #478; apiserver egress peer #578). The #166 scraper-namespace footgun and the #578 hosted-apiserver trap: [subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
+| Alerting surface (#468) | `deploy/prometheustrule.yaml` · `deploy/grafana-dashboard.json` | **live** | PrometheusRule alerts transcribed from the `metrics.py` docstrings (incl. prune Job failed + absence-of-success alerts #569, singleton-unwrap rekey #570) + Grafana dashboard for the `/metrics` surface (drift-gated by `tests/test_monitoring_artifacts.py`). Cluster-admin apply, `release: prometheus` pickup label — operator RBAC deliberately holds no `prometheusrules` verbs. See the [subsection](#namespace-hardening--alerting-artifacts-issues-400--112--166--468) |
 
 ## Ground rules (from AGENTS.md)
 
