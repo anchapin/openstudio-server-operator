@@ -365,7 +365,8 @@ SINGLETON_EXPECTED_HANDLERS = Gauge(
 # ``resque_workers_seen_max`` gauge is the related diagnostic but only
 # asserts worker presence in a candidate key prefix; this gauge asserts the
 # validator itself returned ok. Set at every call to
-# ``handlers/_check_redis_key_layout_for_cr`` so the metric reflects the
+# ``handlers.redis_layout_check._check_redis_key_layout_for_cr`` so the
+# metric reflects the
 # latest operator boot observation per CR — without labels to keep
 # cardinality bounded (one series for the cluster-wide validator state,
 # not per-CR).
@@ -379,7 +380,7 @@ REDIS_KEY_LAYOUT_STATUS = Gauge(
     "condition fires vacuously — as a Prometheus signal so an SRE can "
     "alert on ``openstudio_operator_redis_key_layout_status == 0`` "
     "instead of correlating logs. Set in "
-    "``handlers/_check_redis_key_layout_for_cr`` for every CR on every "
+    "``handlers.redis_layout_check._check_redis_key_layout_for_cr`` for every CR on every "
     "OSCM watch event (cluster-wide latest observation, not per-CR — "
     "the validator outcome is process-wide).",
 )
@@ -396,7 +397,7 @@ REDIS_KEY_LAYOUT_STATUS = Gauge(
 # resque_queue_depth / stall_window_elapsed_seconds closes that blind
 # holds-value risk here too: this stamp is set to ``time.time()`` in
 # LOCKSTEP with the status gauge at every
-# ``handlers/_check_redis_key_layout_for_cr`` invocation, on EVERY
+# ``handlers.redis_layout_check._check_redis_key_layout_for_cr`` invocation, on EVERY
 # terminal path (ok | degraded | unreachable | error | skipped — fresh
 # means "recently validated"; the status gauge carries the result).
 # Unlabelled like its data gauge: the validator outcome is process-wide,
@@ -408,7 +409,7 @@ REDIS_KEY_LAYOUT_STATUS_FRESH = Gauge(
     "Unix-epoch seconds of the most recent "
     "``REDIS_KEY_LAYOUT_STATUS`` update (issue #490). Set to "
     "``time.time()`` in lockstep with the status gauge at every "
-    "``handlers/_check_redis_key_layout_for_cr`` invocation, on every "
+    "``handlers.redis_layout_check._check_redis_key_layout_for_cr`` invocation, on every "
     "terminal path (``ok`` | ``degraded`` | ``unreachable`` | ``error`` "
     "| ``skipped`` — fresh means recently validated; the status gauge "
     "carries the result). Without this pair the status gauge holds its "
