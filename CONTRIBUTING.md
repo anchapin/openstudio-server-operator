@@ -2,7 +2,7 @@
 
 Thanks for your interest in this project. This file is the canonical,
 quick-reference entry point for branch, PR, and merge conventions.
-The deeper walkthrough (venv setup, the 5-step "add a new OSCM timer
+The deeper walkthrough (venv setup, the 6-step "add a new OSCM timer
 handler" pattern, audit-doc update rules, working-rules-that-bite,
 good-first-PR candidates) lives in
 [`docs/onboarding.md`](./docs/onboarding.md) — read that first if you
@@ -114,7 +114,7 @@ commit. Triaged exceptions go in `.pip-audit-ignore.txt` /
 
 - First time here? Start with
   [`docs/onboarding.md`](./docs/onboarding.md) (issue #178) — the
-  venv drift guard, the 5-step "add a new OSCM timer handler" pattern,
+  venv drift guard, the 6-step "add a new OSCM timer handler" pattern,
   and the working-rules-that-bite section are all there.
 - Looking for a small first PR? See the **Good first PR candidates**
   list at the end of `docs/onboarding.md` (doctypo fixes, fixture

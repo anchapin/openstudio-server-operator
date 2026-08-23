@@ -180,7 +180,7 @@ Regression tests: `tests/test_stale_worktree_check.py`.
 ## Adding a new OSCM timer handler module
 
 This is the highest-traffic contributor workflow in this repo: every
-new plan-module OSCM timer follows the same five-step pattern. Skip a
+new plan-module OSCM timer follows the same six-step pattern. Skip a
 step and `tests/test_singleton_registry_coverage.py` will fail loudly
 — that is the gate.
 
@@ -209,29 +209,60 @@ step and `tests/test_singleton_registry_coverage.py` will fail loudly
    ~35-line wrapper; the four existing modules are the canonical
    `wire`/`tick` templates.
 
-3. **Add the module to the import block** in
+3. **Register the handler in the Python-level OSCM registry** — the
+   second, mandatory registration (issues #250/#285, `register_fn`
+   convenience since #407). The import block (step 4) makes *kopf*
+   see the timer; this call makes the Python-level `REGISTRY` in
+   `src/openstudio_operator/_oscm_handlers.py` see it, and the
+   singleton guard cross-checks the two registries at gate time.
+   Import the `__name__`-introspecting convenience under the alias
+   all four handler modules use, then make the one-line call the
+   module's last statement (the live template is
+   `src/openstudio_operator/handlers/analysis_sla.py`):
+
+   ```python
+   from openstudio_operator._oscm_handlers import (
+       register_fn as _register_oscm_handler,
+   )
+
+   # ... the @kopf.timer handler above ...
+
+   _register_oscm_handler(your_new_handler)
+   ```
+
+   The id is introspected from `fn.__name__`, so it cannot drift out
+   of agreement with the kopf `id`; call `register(id, fn)` directly
+   only when the id must differ from the function name (none of the
+   production timers do). Forgetting this call is the bug
+   `test_python_registry_includes_all_oscm_spawning_handlers` is
+   designed to catch — the handler lands in the kopf registry but
+   not the Python registry, and the test fails with `OSCM timer(s)
+   registered with kopf but NOT in the Python-level registry:
+   ['your_new_id']` — read that error, it is the spec.
+
+4. **Add the module to the import block** in
    `src/openstudio_operator/handlers/__init__.py`. The import block is
    what makes `kopf run --module openstudio_operator.handlers` see the
    new timer; the `install_singleton_guard()` call at the bottom of that
    file then wraps it automatically — DO NOT try to wire the guard per
    module.
 
-4. **Add the handler `id` to `EXPECTED_OSCM_TIMER_HANDLER_IDS`** in
+5. **Add the handler `id` to `EXPECTED_OSCM_TIMER_HANDLER_IDS`** in
    `tests/test_singleton_registry_coverage.py`. Forgetting this is the
    bug `test_all_oscm_spawning_handlers_are_singleton_guarded` is
    designed to catch — both the "added but not declared" and "declared
    but not added" directions.
 
-5. **Write the targeted unit tests** under `tests/test_<module>.py`. Use
+6. **Write the targeted unit tests** under `tests/test_<module>.py`. Use
    `responses` for the OpenStudio REST surface and `fakeredis` for the
    queue-fabric client; do not introduce new mocking libraries.
 
 ```bash
-# local gate that catches step-4 mistakes BEFORE pushing
+# local gate that catches step-3 and step-5 mistakes BEFORE pushing
 .venv/bin/pytest tests/test_singleton_registry_coverage.py -v
 ```
 
-If you skip step 4, the test fails with `New OSCM spawning handler(s)
+If you skip step 5, the test fails with `New OSCM spawning handler(s)
 registered but not declared in EXPECTED_OSCM_TIMER_HANDLER_IDS:
 ['your_new_id']` — read that error, it is the spec.
 
