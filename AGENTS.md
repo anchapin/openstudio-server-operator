@@ -15,7 +15,7 @@ Codebase structure and key references:
 - `docs/audit-dryrun-idempotency.md` — cross-cutting idempotency / dry-run audit (D04 / D05 / D11 / D12).
 - `docs/validation.md`, `docs/kind-validation.md` — cluster validation runbooks + live evidence.
 - `docs/audit-policy.md` — kube-apiserver audit-policy recipe for the operator's API surface (#399).
-- `docs/adr/` — ADR index for the load-bearing decisions (kopf pin, single-replica, KEDA-only, VAPs, redisUrl fence) (#487).
+- `docs/adr/` — ADR index for the load-bearing decisions (kopf pin, single-replica, KEDA-only, VAPs, redisUrl fence) (#487); ADR-6/7/8 cover the #479 lockfile split, #481 audit floors, and the #456→#500 signing chain.
 - `docs/skill-snapshot/` — disposable in-repo copies of the github-wave-orchestrator skill (#379): the un-numbered `SKILL.md`/`REFERENCE.md`/`scripts/` are frozen pre-#379 legacy snapshots (kept because `tests/test_render_orchestrator_snippet.py` parses the §0 contract out of the frozen `SKILL.md`), and `SKILL.wave-N.md` files are the wave-numbered lineage that prevents add/add rebase collisions; the canonical files live in `~/.config/opencode/skill/github-wave-orchestrator/`, never edited here (#486; `docs/skill-snapshot/README.md` is the source of truth).
 - `CHANGELOG.md` — curated Keep-a-Changelog notes per release (issue #177).
 

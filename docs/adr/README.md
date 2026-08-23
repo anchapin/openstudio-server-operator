@@ -15,6 +15,9 @@ Shape (lightweight MADR): `# ADR-N: Title` · `## Status` · `## Context` ·
 | [ADR-3](./adr-3-keda-only-autoscaling.md) | KEDA ScaledObject is the only autoscaler; the custom HPA-floor adjuster is deleted |
 | [ADR-4](./adr-4-validating-admission-policies.md) | ValidatingAdmissionPolicies express the label/name-scoped verbs RBAC cannot |
 | [ADR-5](./adr-5-redisurl-empty-default.md) | `spec.redisUrl` empty-by-default regression fence |
+| [ADR-6](./adr-6-dual-lockfiles.md) | Dual lockfiles — runtime-only `requirements.txt` + dev `requirements.lock`, refreshed as a pair |
+| [ADR-7](./adr-7-audit-severity-floors.md) | Asymmetric audit floors — pip-audit fails on any advisory, trivy gates at CRITICAL,HIGH |
+| [ADR-8](./adr-8-image-sign-verify-chain.md) | Sign/verify chain — SLSA v0.2 attestation, CI cosign verify, deploy-time verification |
 
 Adding a new record: copy the shape above, take the next number, and link it
 here. The substance comes from the AGENTS.md working rules and the code — the
