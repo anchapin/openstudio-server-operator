@@ -9,7 +9,7 @@ A Kubernetes operator for [OpenStudio Server](https://github.com/NREL/OpenStudio
 Codebase structure and key references:
 
 - `README.md` — module table, metrics table, JSON log schema, quick triage commands.
-- `docs/onboarding.md` — first-time contributor + AI-agent walkthrough (issue #178): setup, single-test/full-suite commands, venv drift guard, the 5-step "add a new OSCM timer handler" pattern, Working-rules-that-bite, audit-doc update rules, branch/PR conventions, good-first-PR candidates. **Read this before adding a new handler.**
+- `docs/onboarding.md` — first-time contributor + AI-agent walkthrough (issue #178): setup, single-test/full-suite commands, venv drift guard, the 6-step "add a new OSCM timer handler" pattern (including the `register_fn` Python-registry registration, #656), Working-rules-that-bite, audit-doc update rules, branch/PR conventions, good-first-PR candidates. **Read this before adding a new handler.**
 - `docs/architecture-plan.md` — design plan that named the modules.
 - `docs/contracts/openstudio-server-v3.11.0-rest.md` — verified REST contract (ground truth for the upstream surface).
 - `docs/audit-dryrun-idempotency.md` — cross-cutting idempotency / dry-run audit (D04 / D05 / D11 / D12).
@@ -55,7 +55,7 @@ kopf run --module openstudio_operator.handlers --namespace openstudio-server   #
 
 ## Layout
 
-- `src/openstudio_operator/handlers/` — Kopf handlers, one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor` (the four OSCM timers), plus `dry_run_audit` (a pure `@kopf.on.event` watch handler — NOT singleton-gated, NOT in the `_oscm_handlers` spawning registry — that emits the `DryRunToggled` audit Event on `spec.dryRun` transitions, #397). `handlers/__init__.py` is the operator entrypoint: it starts the Prometheus `/metrics` server, installs the singleton guard, registers the warning-event sinks (Redis-URL guard, Resque key-layout guard, status-store cap), and boots the JSON-logging handler. **Add new handler modules to its import block** — see `docs/onboarding.md` for the 5-step pattern.
+- `src/openstudio_operator/handlers/` — Kopf handlers, one file per plan module: `analysis_sla`, `datapoint_watchdog`, `worker_recycler`, `web_background_monitor` (the four OSCM timers), plus `dry_run_audit` (a pure `@kopf.on.event` watch handler — NOT singleton-gated, NOT in the `_oscm_handlers` spawning registry — that emits the `DryRunToggled` audit Event on `spec.dryRun` transitions, #397). `handlers/__init__.py` is the operator entrypoint: it starts the Prometheus `/metrics` server, installs the singleton guard, registers the warning-event sinks (Redis-URL guard, Resque key-layout guard, status-store cap), and boots the JSON-logging handler. **Add new handler modules to its import block** — see `docs/onboarding.md` for the 6-step pattern.
 - Shared utility modules (single source of truth for the cross-handler surface):
   - `_constants.py` — operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace; owns the canonical CRD identity `CRD_GROUP`/`CRD_VERSION`/`CRD_PLURAL`/`CRD_SPEC`, #495). Policy values do NOT belong here — cluster policy lives in the CRD `spec` / `config.py`.
   - `_time.py` — `parse_iso_utc(...)`; tz-aware UTC, `None`-safe. Use this for any new timestamp parse — don't roll your own. Its `utc_parser(error_cls)` factory absorbs the per-module `_parse_utc` re-raise wrappers (singleton/status_store bind theirs from it, #506).
