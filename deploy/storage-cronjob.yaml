@@ -169,6 +169,17 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # Issue #678 — same passwd-less runtime shape as the
+                # operator Deployment: same digest-pinned image (#291),
+                # UID 1000, no /etc/passwd entry, no login env vars. The
+                # prune entrypoint never starts kopf's peering (kopf's
+                # only getpass.getuser() call site), so it does not hit
+                # the #678 crash today, but it imports kopf transitively
+                # (prune_entrypoint → singleton → kopf) — the USER pin
+                # is cheap defense-in-depth that removes the pwd-lookup
+                # failure class for both pods of the shared image.
+                - name: USER
+                  value: operator
                 # Issue #478 — optional bearer-token authN for the prune
                 # CronJob's /metrics endpoint, at parity with the operator
                 # Deployment's #401 hook (deploy/operator-deployment.yaml):

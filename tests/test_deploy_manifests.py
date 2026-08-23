@@ -1299,6 +1299,68 @@ def test_operator_deployment_pod_securitycontext_hardened():
     assert sc["fsGroup"] == 1000, sc
 
 
+# ---- Issue #678: USER env guard for passwd-less runtimes -------------
+#
+# kopf's peering identity detection (`detect_own_id`) calls
+# `getpass.getuser()`; CPython consults LOGNAME/USER/LNAME/USERNAME env
+# vars first and falls through to `pwd.getpwuid(os.getuid())` only when
+# none are set. The image runs UID 1000 (Dockerfile `USER 1000`, #589)
+# with no /etc/passwd entry, and a bare container sets none of the login
+# env vars — so the unpatched operator pod crash-loops at boot with
+# `KeyError: 'getpwuid(): uid not found: 1000'` before any handler runs.
+# The kind-validation walkthrough missed it because it ran `kopf run`
+# from a dev shell (which inherits USER/LOGNAME from the login
+# environment), not the in-cluster Deployment pod.
+
+
+def test_operator_deployment_carries_user_env_guard_678():
+    """Issue #678 acceptance: the operator container pins the ``USER``
+    env var so kopf's ``detect_own_id`` → ``getpass.getuser()`` takes
+    CPython's env-var branch instead of falling through to
+    ``pwd.getpwuid(os.getuid())``. Not reproduced by kind-validation:
+    that evidence ran ``kopf run`` from a dev shell
+    (docs/kind-validation.md "Run the operator locally (no image
+    needed)"), which inherits USER/LOGNAME — only the passwd-less
+    in-cluster pod hits the pwd fallback. The fix is deliberately
+    manifest-level: the Dockerfile USER and the #161 securityContext
+    posture are untouched."""
+    container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e for e in container.get("env") or []}
+    assert "USER" in env, (
+        "operator container must pin the USER env var (#678): kopf's "
+        "detect_own_id calls getpass.getuser(), which falls through to "
+        "pwd.getpwuid(1000) in a bare container and KeyErrors — the "
+        "operator crash-loops before any handler runs"
+    )
+    assert env["USER"].get("value") == "operator", (
+        "USER must be a plain non-empty literal (not valueFrom) so "
+        "CPython's getpass.getuser() env-var branch always wins (#678)"
+    )
+
+
+def test_storage_cronjob_carries_user_env_guard_678():
+    """Issue #678 companion: the prune container shares the operator's
+    passwd-less runtime shape — same digest-pinned image (#291), UID
+    1000, no /etc/passwd entry, no login env vars — and imports kopf
+    transitively (prune_entrypoint → singleton → kopf). It never starts
+    kopf's peering (kopf's only getpass.getuser() call site), so it does
+    not hit the #678 crash today; the USER pin is defense-in-depth that
+    removes the pwd-lookup failure class for both pods of the shared
+    image, mirroring the operator Deployment's guard."""
+    container = CRONJOB["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e for e in container.get("env") or []}
+    assert "USER" in env, (
+        "prune container must pin the USER env var (#678 companion): it "
+        "runs the same passwd-less UID-1000 image as the operator and "
+        "imports kopf transitively — without the pin any future "
+        "getpass/pwd lookup in that pod fails the same way"
+    )
+    assert env["USER"].get("value") == "operator", (
+        "USER must be a plain non-empty literal (not valueFrom) so "
+        "CPython's getpass.getuser() env-var branch always wins (#678)"
+    )
+
+
 # ---- Issue #391: operator Deployment liveness/readiness probes -------
 #
 # Single-replica + Recreate (no leader election, no second replica) means

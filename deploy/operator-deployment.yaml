@@ -83,6 +83,24 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Issue #678 — kopf's peering identity detection
+            # (`kopf/_core/engines/peering.py::detect_own_id`) calls
+            # `getpass.getuser()`; CPython consults LOGNAME/USER/LNAME/
+            # USERNAME env vars first and only falls through to
+            # `pwd.getpwuid(os.getuid())` when none are set. A bare
+            # container sets none of them, and the image runs UID 1000
+            # (Dockerfile `USER 1000`, #589) with no /etc/passwd entry
+            # for that UID — the lookup raises KeyError and the operator
+            # crash-loops before any handler runs. Pinning USER short-
+            # circuits the env-var branch without touching the image or
+            # the #161 securityContext posture. Not reproduced by the
+            # kind-validation walkthrough because that evidence ran
+            # `kopf run` from a dev shell (docs/kind-validation.md
+            # "Run the operator locally (no image needed)"), which
+            # inherits USER/LOGNAME from the login environment — only
+            # the passwd-less in-cluster pod hits the pwd fallback.
+            - name: USER
+              value: operator
             # Issue #242 — optional hook for clusters whose API server /
             # inter-service traffic is fronted by a custom CA. When unset
             # or empty the client uses the system trust store
