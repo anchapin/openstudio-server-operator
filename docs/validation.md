@@ -188,6 +188,137 @@ Scope guard (issue #396): this bundle governs the **upstream
 own kube-apiserver connection and does NOT touch the rclone archival
 credentials.
 
+### Namespace hardening + alerting artifacts (issues #400 / #112 / #166 / #468)
+
+Four more `deploy/` artifacts harden and observe the namespace the
+operator runs in: `deploy/resource-quota.yaml` (#400, sized by #580),
+`deploy/network-policy.yaml` (#112; metrics ingress #166; pruner parity
+#478; apiserver peer fixed #578), `deploy/prometheustrule.yaml` (#468;
+prune alerts #569, unwrap rekey #570) and
+`deploy/grafana-dashboard.json` (#468). None of them is an operator
+object — the operator's namespaced Role holds no verbs for any of the
+four — so each is a cluster-admin apply done once alongside the Phase A
+manifests (order between them is free; each is idempotent).
+[`AGENTS.md`](../AGENTS.md) inventories all four in its `deploy/` Layout
+bullet; this subsection is the operator-runbook spelling of their
+operational caveats:
+
+1. **ResourceQuota + LimitRange — `deploy/resource-quota.yaml` (#400,
+   sized by #580)** — bounds the namespace's aggregate resource surface
+   (requests 4 CPU / 8 Gi, limits 20 CPU / 20 Gi) and injects
+   per-container defaults (requests 500m / 512Mi, limits 2 CPU / 4 Gi)
+   for containers that omit resources:
+
+   ```bash
+   # Issue #400 — ResourceQuota (the aggregate namespace bound) +
+   # LimitRange (the per-container defaults the quota's limits-tracking
+   # depends on). Namespaced core/v1; no operator RBAC involved.
+   kubectl apply -f deploy/resource-quota.yaml
+   ```
+
+   - Quota is admission-time only: running pods are untouched, but any
+     NEW pod is rejected while the namespace sits at the bounds. The
+     #580 sizing covers the full KEDA burst envelope at real requests
+     (2.5 CPU / 6.375 Gi requests; 18.75 CPU / 19 Gi limits aggregate at
+     `maxReplicaCount=5`) with headroom, and
+     `tests/test_deploy_manifests.py::test_resource_quota_covers_keda_burst_envelope`
+     recomputes the envelope from the manifests so drift fails CI — but a
+     namespace running extra non-chart workloads must re-size first, or
+     the next rescheduled chart pod (or the single-replica `Recreate`
+     operator itself) is quota-rejected until something else terminates.
+   - The LimitRange is load-bearing, not cosmetic: the chart pods
+     (`web`, `web-background`, `worker`) declare `limits.memory` but NOT
+     `limits.cpu`, and a quota that tracks limits REJECTS containers
+     omitting them — do not delete the LimitRange while the quota is in
+     place.
+
+2. **NetworkPolicy — `deploy/network-policy.yaml`** — default-deny
+   egress for the operator-owned pod surface (operator, storage-pruner,
+   archival Jobs) plus ingress lockdown of BOTH plaintext `/metrics`
+   endpoints (operator + storage-pruner, port 9090):
+
+   ```bash
+   # Issues #112/#166 — default-deny egress + explicit allows (DNS,
+   # apiserver, web, Redis, storage HTTPS) and the two metrics-ingress
+   # policies. Read the two caveats below BEFORE applying on this
+   # cluster's CNI.
+   kubectl apply -f deploy/network-policy.yaml
+   ```
+
+   - **The #166 footgun — edit the namespace label or `/metrics` goes
+     silently unreadable.** Both metrics-ingress policies allow scraping
+     ONLY from (a) a namespace labeled
+     `kubernetes.io/metadata.name: prometheus` and (b) same-namespace
+     pods labeled `app.kubernetes.io/component: metrics-scraper` (#295
+     label convention). A cluster whose Prometheus runs in a
+     differently-named namespace (`monitoring`,
+     `kube-prometheus-stack`, `observability`, …) MUST edit the
+     `namespaceSelector` label match in BOTH policies before applying —
+     otherwise scraping is silently dropped (connection timeouts, no
+     error event anywhere). This is exactly the trap AGENTS.md's
+     [Working rules](../AGENTS.md) `/metrics`-ingress bullet warns
+     about; never widen the same-namespace peer to `podSelector: {}`
+     (the label-scoped selector is the regression fence behind
+     `tests/test_deploy_manifests.py`).
+   - **Enforcing-CNI apiserver trap (#578).** The operator's apiserver
+     egress peer is the compound selector (kube-system namespace +
+     `component: kube-apiserver` pods) — the self-hosted control-plane
+     shape (kubeadm / kind / self-managed). Hosted control planes
+     (EKS / GKE / AKS …) run the API server OUTSIDE the cluster, so the
+     peer matches nothing there and operator apiserver traffic
+     (kubeconfig watches, StatusStore RMW) is blackholed while the deny
+     policy holds. Uncomment the `ipBlock` alternative in the manifest
+     and set the API endpoint CIDR as narrowly as the endpoint allows.
+     kindnet does not enforce NetworkPolicy, which is why the kind
+     walkthrough can never catch this (see
+     [Approximations](kind-validation.md#approximations-vs-production)).
+   - On a CNI that does not enforce NetworkPolicy the apply is inert but
+     harmless — the policy bites only where the CNI honors it
+     (Calico / Cilium / …).
+
+3. **PrometheusRule — `deploy/prometheustrule.yaml` (#468)** — the alert
+   definitions transcribed from the `metrics.py` docstrings (handler
+   tick failures, REST exception rate, heartbeat staleness, the #570
+   singleton-unwrap `wrapped < expected` pair, the prune Job failed +
+   #569 absence-of-success alerts):
+
+   ```bash
+   # Issue #468 — cluster-admin apply (the operator Role deliberately
+   # holds no `prometheusrules` verbs); rename the `release:` label if
+   # your kube-prometheus-stack release is not the stock `prometheus`.
+   kubectl apply -f deploy/prometheustrule.yaml
+   ```
+
+   - Cluster-admin scope, no operator RBAC: the operator never creates
+     or mutates PrometheusRule objects. The resource is namespaced
+     (`monitoring.coreos.com/v1`) and lives in `openstudio-server` so a
+     per-namespace Prometheus picks it up next to the scrape target.
+   - The `release: prometheus` label matches kube-prometheus-stack's
+     default `ruleSelector` (stock release name `prometheus`). A
+     Prometheus installed under a different release name needs the label
+     renamed (or the manifest's labels added to the selector); clusters
+     not running the Prometheus Operator can transcribe the `expr`
+     strings into static rule files — they are plain PromQL.
+   - Scrape prerequisite: every expression assumes a scrape config on
+     the operator pod's plaintext `:9090/metrics` — ingress gated by
+     artifact 2 above, so the scraper must satisfy the metrics-ingress
+     policy or the alerts stay permanently empty. The prune group's two
+     Job alerts additionally require **kube-state-metrics** (standard
+     in kube-prometheus-stack): they key on `kube_job_status_failed`
+     and the #569 absence-of-success
+     `max_over_time(kube_job_status_succeeded …) or vector(0)`.
+
+4. **Grafana dashboard — `deploy/grafana-dashboard.json` (#468)** —
+   panels for the action counters, tick-duration histograms and Resque
+   queue-fabric gauges. Import via the Grafana UI (Dashboards → Import
+   → upload the JSON); bind the `${DS_PROMETHEUS}` datasource input to
+   the Prometheus instance scraping the operator's `:9090/metrics`
+   (README.md#metrics) — without that binding every panel renders
+   datasource-not-found. Panel queries mirror
+   `tests/_metrics_inventory.py` and are drift-gated by
+   `tests/test_monitoring_artifacts.py`, so a metrics-family rename
+   fails CI instead of silently blanking panels.
+
 ## Phase 0 — pre-flight: fixture drift on the work cluster
 
 Confirm the work cluster's REST surface still matches the contract the
@@ -383,6 +514,15 @@ from tags would need the subject widened to
    `kubectl apply -f deploy/storage-cronjob.yaml` installs the CronJob and
    the VAP in one stroke; on a pre-1.30 cluster strip the embedded VAP
    documents out of that manifest before applying it.
+
+   The four namespace-hardening + alerting artifacts
+   (`deploy/resource-quota.yaml`, `deploy/network-policy.yaml`,
+   `deploy/prometheustrule.yaml`, `deploy/grafana-dashboard.json`) are
+   applied from the
+   [Namespace hardening + alerting artifacts](#namespace-hardening--alerting-artifacts-issues-400--112--166--468)
+   Prerequisites subsection, not from this block: they harden and observe
+   the namespace the operator runs in, and the operator's Role holds no
+   verbs for any of them (#587).
 
 2. **Create the OSCM custom resource, dry-run mode, with tuned policies**
    so a short batch can trip the SLA clock within minutes instead of hours
