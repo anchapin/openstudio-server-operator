@@ -36,7 +36,7 @@ import pytest
 from openstudio_operator import singleton
 from openstudio_operator._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from openstudio_operator.config import OperatorConfigError
-from openstudio_operator.handlers import _check_redis_key_layout_for_cr
+from openstudio_operator.handlers.redis_layout_check import _check_redis_key_layout_for_cr
 from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import GROUP, PLURAL
 
@@ -413,7 +413,7 @@ def test_redis_key_layout_handler_invokes_validate_key_layout(
     # the handler's closed-over get_read_only_redis_client (issue #235 — the
     # centralized ReadOnlyRedisClient factory) is redirected to the stub.
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _stub_factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _stub_factory
     )
 
     body = {
@@ -603,7 +603,7 @@ def test_check_redis_key_layout_for_cr_covers_all_status_branches(
         return _StubClient()
 
     monkeypatch.setattr(
-        "openstudio_operator.handlers.get_read_only_redis_client", _stub_factory
+        "openstudio_operator.handlers.redis_layout_check.get_read_only_redis_client", _stub_factory
     )
 
     item: dict = {

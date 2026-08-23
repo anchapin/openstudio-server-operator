@@ -36,6 +36,20 @@ Scope:
   import freely from any handler module. (Tests are consumers, not
   peers.)
 
+Issue #584 carve-out — SHARED_HANDLER_SUPPORT_MODULES: a small set of
+modules under ``handlers/`` that are shared support leaves, NOT peer
+timer handlers (today: ``redis_layout_check``, the Redis key-layout
+validator ``web_background_monitor``'s #490 revalidation rider calls).
+Handler modules MAY import from a shared support module through the
+module-qualified form (``from openstudio_operator.handlers
+.redis_layout_check import …``); the support modules themselves are
+still scanned as importers (they must not import handler siblings) and
+must import only neutral domain modules. The companion gate
+:func:`test_no_handler_module_imports_package_init_symbols` closes the
+other half of #584: no handler module (any nesting depth, including
+function-local deferred imports) may import SYMBOLS owned by the
+package ``__init__`` — the reach-around that forced the cycle.
+
 Source-format support:
 
 * ``import openstudio_operator.handlers.analysis_sla`` (bare ``import``)
@@ -49,9 +63,12 @@ Source-format support:
 If you genuinely need to share a Kubernetes helper between two
 handlers, add it to :mod:`openstudio_operator._k8s` (or another shared
 internal module: ``_constants``, ``_time``, ``events``,
-``events_sinks``, ``client_factory``, ``status_store``, …). The handler
-modules are deliberately a flat set — there is no shared "handlers
-commons" by design.
+``events_sinks``, ``client_factory``, ``status_store``, …). Shared
+domain logic that genuinely belongs under ``handlers/`` (a check a
+handler must re-run on cadence) goes in a shared support module and
+MUST be added to ``SHARED_HANDLER_SUPPORT_MODULES`` — the deliberate,
+reviewed carve-out. The handler modules are deliberately a flat set —
+there is no general "handlers commons" by design.
 """
 
 from __future__ import annotations
@@ -74,6 +91,38 @@ PACKAGE_INIT = HANDLERS_DIR / "__init__.py"
 # module importing from a sibling module — through any import form —
 # is a regression of issue #236.
 ALLOWED_IMPORTERS_FROM_HANDLERS_PACKAGE: frozenset[Path] = frozenset({PACKAGE_INIT})
+
+# Issue #584 — shared support modules under ``handlers/``: not peer
+# timer handlers, but domain leaves that handler modules MAY import
+# (module-qualified form only — never via the package ``__init__``).
+# ``redis_layout_check`` is the Redis key-layout validator the #490
+# revalidation rider in ``web_background_monitor`` calls; it used to
+# live in ``handlers/__init__.py``, forcing a function-local
+# reach-around import (the deferred-import cycle #584 removed). Adding
+# a name here is a deliberate, reviewed decision — each entry must
+# import only neutral domain modules (never handler siblings), or this
+# gate fails on IT as an importer.
+SHARED_HANDLER_SUPPORT_MODULES: frozenset[str] = frozenset({"redis_layout_check"})
+
+_HANDLERS_PKG_PREFIX = "openstudio_operator.handlers."
+
+
+def _is_sibling_handler_module(dotted: str) -> bool:
+    """True iff ``dotted`` names a PEER handler module (not shared support).
+
+    ``dotted`` is an absolute dotted path. The bare package form
+    (``openstudio_operator.handlers``, no trailing component) is NOT a
+    sibling module — the caller handles it separately. Names inside
+    :data:`SHARED_HANDLER_SUPPORT_MODULES` (and any deeper nesting,
+    which does not exist in this flat tree) are excluded from the
+    peer set.
+    """
+    if not dotted.startswith(_HANDLERS_PKG_PREFIX):
+        return False
+    sibling = dotted[len(_HANDLERS_PKG_PREFIX):]
+    if not sibling:
+        return False  # the bare package form — handled by the caller
+    return sibling not in SHARED_HANDLER_SUPPORT_MODULES
 
 # Sentinel Logger shim for issue #308. The four timer wrappers accept a
 # ``logger: kopf.Logger`` kwarg; the empty-serverUrl early-return path
@@ -115,10 +164,7 @@ def _is_handler_to_handler_import(node: ast.stmt, *, current_file: Path) -> bool
     relative form is just as much a handler-to-handler coupling; flagged.
     """
     if isinstance(node, ast.Import):
-        return any(
-            alias.name.startswith("openstudio_operator.handlers.")
-            for alias in node.names
-        )
+        return any(_is_sibling_handler_module(alias.name) for alias in node.names)
 
     if isinstance(node, ast.ImportFrom):
         module = node.module or ""
@@ -126,19 +172,40 @@ def _is_handler_to_handler_import(node: ast.stmt, *, current_file: Path) -> bool
 
         # Relative imports (``from .sibling import …``): any handler file
         # doing this IS coupling to a sibling. The shared namespace is the
-        # handlers package itself.
+        # handlers package itself. Shared support modules (#584) are
+        # exempt in their resolved absolute form, same as below.
         if level > 0:
             # Resolve the relative module to its absolute form so the error
             # message can quote a stable path.
             absolute = _resolve_relative_import(current_file, module, level)
-            return absolute.startswith("openstudio_operator.handlers.")
+            return _is_sibling_handler_module(absolute)
 
         # Absolute imports:
         if module == "openstudio_operator.handlers":
             return True
-        return module.startswith("openstudio_operator.handlers.")
+        return _is_sibling_handler_module(module)
 
     return False
+
+
+def _module_dotted_path(file: Path) -> str | None:
+    """Dotted module path of ``file`` under the ``src/`` layout, or ``None``.
+
+    Issue #584 fix ridealong: the relative-import resolution below used
+    to build paths straight off ``PROJECT_ROOT`` (``src.openstudio_
+    operator.handlers.X``), so the ``startswith("openstudio_operator.
+    handlers.")`` match NEVER fired — the documented relative-form
+    flagging was silently dead. Stripping the ``src`` layout segment
+    here restores it.
+    """
+    try:
+        rel = file.resolve().relative_to(PROJECT_ROOT)
+    except ValueError:
+        return None
+    parts = rel.with_suffix("").parts
+    if parts and parts[0] == "src":
+        parts = parts[1:]
+    return ".".join(parts)
 
 
 def _resolve_relative_import(
@@ -159,11 +226,12 @@ def _resolve_relative_import(
     exits the handlers package entirely and therefore can never be a
     handler-to-handler import. ``level == 1`` against another sibling
     in the same directory IS the handler-to-handler coupling we want
-    to flag.
+    to flag. Shared support modules (#584) are exempt once resolved.
     """
-    package_parts = current_file.relative_to(PROJECT_ROOT).with_suffix("").parts
-    # Drop the filename; keep the package path of the current module.
-    package_parts = package_parts[:-1]
+    dotted = _module_dotted_path(current_file)
+    if not dotted:
+        return module  # malformed; bail and let the caller flag it.
+    package_parts = dotted.split(".")[:-1]
     # ``level`` dots walk up ``level - 1`` directories from the current
     # package (PEP 328): ``from .X`` = 1 dot → stay in current package;
     # ``from ..X`` = 2 dots → parent of current package; etc.
@@ -229,10 +297,116 @@ def test_no_handler_to_handler_imports_outside_init() -> None:
         + "\n\nMove the shared helper into a neutral module "
         "(openstudio_operator._k8s is the established home for "
         "generic Kubernetes API helpers, see issue #236; mirrors the "
-        "_constants / _time convention). Update both the source and "
+        "_constants / _time convention) — or, if it is shared domain "
+        "logic a handler must re-run on cadence, a shared support "
+        "module listed in SHARED_HANDLER_SUPPORT_MODULES (issue #584, "
+        "see the module docstring). Update both the source and "
         "this test if the home module changes — the gate's job is to "
         "prevent regressions of #236, not to dictate where new shared "
         "helpers live."
+    )
+
+
+# --- Issue #584 — no handler module may import package-init symbols ---------------
+
+
+def _handler_submodule_names() -> set[str]:
+    """Module names (file stems) under ``handlers/`` other than ``__init__``."""
+    return {py.stem for py in _iter_handler_modules() if py != PACKAGE_INIT}
+
+
+def _package_init_owned_symbol_names() -> set[str]:
+    """Names bound at module level by ``handlers/__init__.py``, minus submodules.
+
+    AST-walks the package init's top-level statements and collects every
+    name it binds — functions, classes, assignments, and imported
+    symbols (the aggregate handler import block binds the submodule
+    names, which are subtracted via :func:`_handler_submodule_names`).
+    What remains is the set of symbols whose HOME is the package init:
+    importing any of them from a handler module is the #584
+    reach-around (a handler depending on a private symbol of the
+    package ``__init__`` — the coupling that forced the
+    ``web_background_monitor`` function-local
+    ``from openstudio_operator.handlers import
+    _check_redis_key_layout_for_cr`` cycle).
+    """
+    tree = ast.parse(
+        PACKAGE_INIT.read_text(encoding="utf-8"), filename=str(PACKAGE_INIT)
+    )
+    owned: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            owned.add(node.name)
+        elif isinstance(node, ast.Assign):
+            owned.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                owned.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                owned.add(alias.asname or alias.name.split(".")[0])
+    return owned - _handler_submodule_names()
+
+
+def test_no_handler_module_imports_package_init_symbols() -> None:
+    """Issue #584: handler modules must NOT import symbols owned by the package init.
+
+    The #236 sibling gate above only scans module-TOP import statements,
+    so the original #584 offender — the function-local deferred
+    ``from openstudio_operator.handlers import
+    _check_redis_key_layout_for_cr`` inside
+    ``web_background_monitor._maybe_revalidate_redis_key_layout`` — was
+    invisible to it. This gate walks the WHOLE AST (``ast.walk``, every
+    nesting depth) of every non-init handler module and fails when any
+    ``from openstudio_operator.handlers import <name>`` binds a name
+    whose home is the package ``__init__`` (e.g. ``_sink``, private
+    helpers, re-exported domain symbols). Importing the package itself
+    or one of its SUBMODULES through that form stays legal — the flag
+    is specifically the init-owned-symbol reach-around.
+
+    The failure mode this pins: reordering ``__init__``'s import block
+    or renaming a private init symbol used to break only at the first
+    stall tick, not at import time. With the check in its own module
+    (``handlers/redis_layout_check.py``) the dependency is a normal
+    top-level import that fails loudly at collection.
+    """
+    owned = _package_init_owned_symbol_names()
+    assert owned, (
+        "Parsed handlers/__init__.py but found no module-level bound "
+        "names — the init file moved or the AST walk in "
+        "_package_init_owned_symbol_names is stale. This gate cannot "
+        "run blind; fix the parser (issue #584)."
+    )
+    findings: list[tuple[str, int, str]] = []
+    for py in _iter_handler_modules():
+        if py == PACKAGE_INIT:
+            continue
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level != 0 or (node.module or "") != "openstudio_operator.handlers":
+                continue
+            hit = sorted(alias.name for alias in node.names if alias.name in owned)
+            if hit:
+                findings.append(
+                    (
+                        str(py.relative_to(PROJECT_ROOT)),
+                        node.lineno,
+                        f"{ast.unparse(node)} (init-owned: {', '.join(hit)})",
+                    )
+                )
+    assert not findings, (
+        "Handler modules must not import symbols owned by the handlers "
+        "package __init__ (issue #584). Offending imports:\n  "
+        + "\n  ".join(f"{path}:{lineno}: {stmt}" for path, lineno, stmt in findings)
+        + "\n\nMove the symbol into its own module under handlers/ (a "
+        "shared support module listed in SHARED_HANDLER_SUPPORT_MODULES "
+        "if handler modules need it — see handlers/redis_layout_check.py, "
+        "the #584 precedent) or a neutral domain module, and import it "
+        "module-qualified at the TOP LEVEL of the consumer."
     )
 
 

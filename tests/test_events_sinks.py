@@ -51,6 +51,7 @@ from openstudio_operator import handlers as handlers_pkg
 from openstudio_operator import metrics as metrics_module
 from openstudio_operator import status_store
 from openstudio_operator.events_sinks import QueuedKopfEventSink, get_default_sink
+from openstudio_operator.handlers import redis_layout_check
 
 # --- 1. Class contract ------------------------------------------------------
 
@@ -285,16 +286,18 @@ def test_handlers_emit_redis_key_layout_drift_via_helper(
 ) -> None:
     """The key-layout helper still defers a ``RedisKeyLayoutDrift`` event.
 
-    Invokes :func:`openstudio_operator.handlers._emit_redis_key_layout_event`
+    Invokes :func:`openstudio_operator.handlers.redis_layout_check._emit_redis_key_layout_event`
     directly (the helper ``_check_redis_key_layout_for_cr`` calls into
     on the degraded branch — the layout-drift logic itself is
-    exhaustively tested in ``tests/test_redis_client.py``). Asserts
-    the deferred event carries the ``RedisKeyLayoutDrift`` reason.
+    exhaustively tested in ``tests/test_redis_client.py``; the helper
+    moved to its own module in #584). Asserts the deferred event lands
+    in the SAME shared sink the package drains (the new module binds
+    the same ``get_default_sink()`` singleton as ``handlers_pkg._sink``).
     Pre-#234 this lived in ``_REDIS_KEY_LAYOUT_QUEUE``; after #234 it
     routes through the shared sink. The CI gate for unchanged reasons.
     """
     handlers_pkg._sink.clear()
-    handlers_pkg._emit_redis_key_layout_event(
+    redis_layout_check._emit_redis_key_layout_event(
         "ns", "osc",
         "RedisKeyLayoutDrift",
         "synthetic layout drift (issue #234)",

@@ -1604,7 +1604,9 @@ class _CheckRecorder:
 def _record_check(monkeypatch: pytest.MonkeyPatch) -> _CheckRecorder:
     recorder = _CheckRecorder()
     monkeypatch.setattr(
-        "openstudio_operator.handlers._check_redis_key_layout_for_cr", recorder
+        "openstudio_operator.handlers.web_background_monitor"
+        "._check_redis_key_layout_for_cr",
+        recorder,
     )
     return recorder
 
