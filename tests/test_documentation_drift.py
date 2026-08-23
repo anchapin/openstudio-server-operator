@@ -46,6 +46,13 @@ exactly because no gate watched it: ``_cr_cache.py`` (#497) and ``_retry.py``
 contributors. The nested ``handlers/`` sub-entries are indented one level
 deeper and are deliberately NOT part of this top-level module inventory.
 
+Issue #593 adds the src contract-reference gate: every
+``docs/contracts/...`` path cited anywhere in a ``src/**/*.py`` file
+(docstring or comment — any prose a contributor might chase) must resolve
+to a real file on disk. The pre-#593 ``datapoint_watchdog`` module
+docstring cited a drafting-context directory that never existed; the
+existing gates policed only ``docs/`` files, so the dead path survived CI.
+
 Historical capture logs are the one legitimate home for the literal: a capture
 transcribed before #150 is authentic evidence and may keep it — but only when
 the block is explicitly introduced by a leading ``PRE-#150`` marker line so no
@@ -174,6 +181,35 @@ def test_contracts_doc_cites_rotated_placeholder_and_rotation_scripts() -> None:
             f"The contract doc must point readers at `{script}` "
             "(rotate-before-applying caveat, issues #409 / #150 / #219)."
         )
+
+
+# Issue #593 — the src contract-reference gate. A ``docs/contracts/...``
+# citation inside src/ is a pointer a contributor will chase; if the named
+# file does not exist on disk (the pre-#593 watchdog docstring cited a
+# drafting-context directory), the pointer is dead. The contract doc is
+# ground truth for the upstream surface, so the class of drift is fenced
+# here rather than left to review.
+SRC_CONTRACT_REFERENCE = re.compile(r"docs/contracts/[\w.-]+")
+SRC_DIR = REPO_ROOT / "src"
+
+
+def test_src_contract_references_resolve_to_real_files() -> None:
+    """Issue #593: every ``docs/contracts/...`` path cited in a
+    ``src/**/*.py`` file must exist on disk. Scans the full file text
+    (docstrings AND comments) — both are contributor-facing prose."""
+    offenders: list[str] = []
+    for py_file in SRC_DIR.rglob("*.py"):
+        text = py_file.read_text(encoding="utf-8")
+        for match in SRC_CONTRACT_REFERENCE.finditer(text):
+            if not (REPO_ROOT / match.group(0)).is_file():
+                offenders.append(
+                    f"{py_file.relative_to(REPO_ROOT)} -> {match.group(0)}"
+                )
+    assert not offenders, (
+        "src/ cites contract doc path(s) that do not exist on disk "
+        f"(issue #593). Fix the path to point at a real file under "
+        f"docs/contracts/. Offenders: {offenders}"
+    )
 
 
 def readme_layout_section_lines() -> list[str]:
