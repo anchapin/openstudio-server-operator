@@ -264,11 +264,28 @@ def _resolve_redis_tls_ca_bundle() -> str | None:
 #: Issue #476: the ``rediss?`` scheme alternation accepts the TLS
 #: (``rediss://``) twin everywhere the plaintext scheme is accepted —
 #: same in-cluster host fence, credentials still allowed.
+#:
+#: Shared SSRF host grammar (issue #575) — keep in sync across the three
+#: fence sites: crd.yaml spec.serverUrl pattern, crd.yaml spec.redisUrl
+#: pattern, and this constant. A legal host is exactly one of:
+#:
+#: * ``<service>`` — ``web``, ``queue``;
+#: * ``<service>.svc[.cluster.local]`` — ``web.svc``,
+#:   ``web.svc.cluster.local``;
+#: * ``<service>.<namespace>.svc[.cluster.local]`` —
+#:   ``web.openstudio-server.svc``.
+#:
+#: Every multi-label host MUST terminate in ``.svc`` or
+#: ``.svc.cluster.local``: a free two-label host (``evil.com``,
+#: ``exfil.io``) is indistinguishable from a public TLD domain, so the bare
+#: service.namespace form is rejected — use the ``.svc``-suffixed spelling
+#: instead. Pre-#575 the optional second label was unconstrained, so
+#: ``redis://:pw@evil.com:6379`` matched and the Secret path would hand
+#: the queue password to any attacker-controlled two-label domain.
 SECRET_REDIS_URL_PATTERN: re.Pattern[str] = re.compile(
     r"^rediss?://([^@]+@)?"
     r"[a-z0-9]([-a-z0-9]*[a-z0-9])?"
-    r"(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?"
-    r"(\.svc(\.cluster\.local)?)?"
+    r"(\.svc(\.cluster\.local)?|\.[a-z0-9]([-a-z0-9]*[a-z0-9])?\.svc(\.cluster\.local)?)?"
     r"(:[0-9]{1,5})?(/[0-9]+)?$"
 )
 

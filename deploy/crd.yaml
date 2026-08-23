@@ -35,12 +35,23 @@ spec:
                   # user with `create` on the OSCM CR could point the operator at any
                   # reachable endpoint (SSRF / credential-exfiltration surface). The
                   # pattern restricts the URL to http(s) against an in-cluster
-                  # Service name: a bare label (`web`), a namespaced form
-                  # (`web.openstudio-server`), or the `.svc[.cluster.local]` FQDN,
-                  # with an optional port and path. Multi-label public hostnames
-                  # (`evil.example.com`) and non-HTTP schemes (`ftp://`) are rejected
-                  # by the API server at apply time.
-                  pattern: '^https?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/.*)?$'
+                  # Service name, with an optional port and path.
+                  #
+                  # Shared SSRF host grammar (issue #575) — keep in sync across the
+                  # three fence sites: crd.yaml spec.serverUrl pattern, crd.yaml
+                  # spec.redisUrl pattern, and redis_client.SECRET_REDIS_URL_PATTERN.
+                  # A legal host is exactly one of:
+                  #   <service>                                  (web, queue)
+                  #   <service>.svc[.cluster.local]              (web.svc,
+                  #                                              web.svc.cluster.local)
+                  #   <service>.<namespace>.svc[.cluster.local]  (web.openstudio-server.svc)
+                  # Every multi-label host MUST terminate in .svc or
+                  # .svc.cluster.local: a free two-label host (evil.com, exfil.io)
+                  # is indistinguishable from a public TLD domain, so the bare
+                  # service.namespace form is rejected — use the .svc-suffixed
+                  # spelling instead. Non-HTTP schemes (ftp://) are rejected by the
+                  # API server at apply time.
+                  pattern: '^https?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.svc(\.cluster\.local)?|\.[a-z0-9]([-a-z0-9]*[a-z0-9])?\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/.*)?$'
                   x-kubernetes-validations:
                     - rule: "self.startsWith('http://') || self.startsWith('https://')"
                       message: "spec.serverUrl must be an in-cluster http:// or https:// URL (issue #160)."
@@ -53,14 +64,25 @@ spec:
                   # (`src/openstudio_operator/redis_client.py`) at any reachable
                   # host and coerce the Resque keyspace probe to talk to it
                   # (SSRF / hostile-Redis exfiltration). The pattern restricts the
-                  # URL to ``redis://`` against an in-cluster Service name: a bare
-                  # Service label (`queue`), a namespaced form
-                  # (`queue.openstudio-server`), or the ``.svc[.cluster.local]``
-                  # FQDN, with optional port and ``/<db>`` selector. Multi-label
-                  # public hostnames (``attacker.example.com``) and non-Redis
-                  # schemes (``http://``, ``ftp://``) are rejected by the API
-                  # server at apply time. The trailing ``|^$`` branch preserves
-                  # the #116 empty-default escape hatch.
+                  # URL to ``redis://`` against an in-cluster Service name, with
+                  # optional port and ``/<db>`` selector. Non-Redis schemes
+                  # (``http://``, ``ftp://``) are rejected by the API server at
+                  # apply time. The trailing ``|^$`` branch preserves the #116
+                  # empty-default escape hatch.
+                  #
+                  # Shared SSRF host grammar (issue #575) — keep in sync across the
+                  # three fence sites: crd.yaml spec.serverUrl pattern, crd.yaml
+                  # spec.redisUrl pattern, and redis_client.SECRET_REDIS_URL_PATTERN.
+                  # A legal host is exactly one of:
+                  #   <service>                                  (web, queue)
+                  #   <service>.svc[.cluster.local]              (web.svc,
+                  #                                              web.svc.cluster.local)
+                  #   <service>.<namespace>.svc[.cluster.local]  (web.openstudio-server.svc)
+                  # Every multi-label host MUST terminate in .svc or
+                  # .svc.cluster.local: a free two-label host (evil.com, exfil.io)
+                  # is indistinguishable from a public TLD domain, so the bare
+                  # service.namespace form is rejected — use the .svc-suffixed
+                  # spelling instead.
                   # Issue #463: the pre-#463 pattern allowed an optional
                   # ``([^@]+@)?`` userinfo group, which let the queue-fabric
                   # password ride inline in the CR spec — stored plaintext in
@@ -77,7 +99,7 @@ spec:
                   # Cache / Memorystore / ElastiCache shapes) everywhere the
                   # plaintext scheme is accepted; the in-cluster host fence
                   # and the #463 no-credentials rule are unchanged.
-                  pattern: '^rediss?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)?(\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
+                  pattern: '^rediss?://[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.svc(\.cluster\.local)?|\.[a-z0-9]([-a-z0-9]*[a-z0-9])?\.svc(\.cluster\.local)?)?(:[0-9]{1,5})?(/[0-9]+)?$|^$'
                   x-kubernetes-validations:
                     - rule: "self == '' || self.startsWith('redis://') || self.startsWith('rediss://')"
                       message: "spec.redisUrl must be empty or an in-cluster redis:// or rediss:// (TLS) Service URL (issue #390, #476)."

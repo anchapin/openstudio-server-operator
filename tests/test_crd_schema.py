@@ -355,15 +355,39 @@ def test_server_url_rejects_off_cluster_host():
     )
 
 
+def test_server_url_rejects_two_label_public_hostnames_575():
+    """Issue #575: a free two-label host is indistinguishable from a public
+    TLD domain — ``http://evil.com`` matched the pre-#575 grammar because
+    the optional second label was unconstrained. Every multi-label host
+    must now terminate in ``.svc`` or ``.svc.cluster.local``; with and
+    without ports, and the retired bare service.namespace form, are all
+    rejected at apply time."""
+    schema = _spec_field("serverUrl")
+    for bad in (
+        "http://evil.com",
+        "https://attacker.dev",
+        "http://exfil.io:8080",
+        "https://web.openstudio-server",  # retired bare namespace form (#575)
+        "http://a.b.c.d.e",
+    ):
+        assert not _matches_pattern(bad, schema), (
+            f"spec.serverUrl: two-label public hostname {bad!r} must be "
+            f"rejected (issue #575)"
+        )
+
+
 def test_server_url_accepts_in_cluster_forms():
     """The pattern must still accept every URL shape a real deployment
-    uses: the bare Service name, the namespaced form, the full
-    ``svc.cluster.local`` FQDN, and an explicit port/path."""
+    uses: the bare Service name, the ``.svc`` short forms, the full
+    ``svc.cluster.local`` FQDN, and an explicit port/path. Since #575 the
+    bare two-label service.namespace form is NO longer accepted — the
+    ``.svc``-suffixed spelling replaces it."""
     schema = _spec_field("serverUrl")
     for url in (
         "http://web",
         "http://web:80",
-        "https://web.openstudio-server",
+        "http://web.svc",
+        "http://web.svc.cluster.local",
         "http://web.openstudio-server.svc",
         "http://web.openstudio-server.svc.cluster.local",
         "http://web.openstudio-server.svc.cluster.local:80/analyses.json",
@@ -450,13 +474,16 @@ _REDIS_URL_GOOD = (
     # shape (auth-less dev cluster), also used by ``test_prune_entrypoint``
     # and other test fixtures.
     "redis://queue:6379",
-    # Two-label namespaced Service form (no .svc suffix): legal in-cluster
-    # DNS even though the operator never resolves it that way.
-    "redis://queue.openstudio-server:6379",
+    # Two-label short form ending in .svc — the #575 replacement for the
+    # retired bare service.namespace spelling.
+    "redis://queue.svc:6379",
+    # Four-label short FQDN ending in .svc.cluster.local.
+    "redis://queue.svc.cluster.local:6379",
     # Three-label namespaced Service form ending in .svc.
     "redis://queue.openstudio-server.svc:6379",
-    # Four-label full FQDN ending in .svc.cluster.local — the credential-free
-    # twin of the form ``singleton.py``'s #116 guidance documents.
+    # Five-label full FQDN ending in .svc.cluster.local — the
+    # credential-free twin of the form ``singleton.py``'s #116 guidance
+    # documents.
     "redis://queue.openstudio-server.svc.cluster.local:6379",
     # Full FQDN with a Redis db-number selector, credential-free.
     "redis://queue.openstudio-server.svc.cluster.local:6379/1",
@@ -467,7 +494,7 @@ _REDIS_URL_EMPTY = ""  # documented empty-default escape hatch (#116)
 # plaintext tuple covers, with the ``rediss://`` scheme.
 _REDIS_URL_TLS_GOOD = (
     "rediss://queue:6379",
-    "rediss://queue.openstudio-server:6379",
+    "rediss://queue.svc:6379",
     "rediss://queue.openstudio-server.svc:6379",
     "rediss://queue.openstudio-server.svc.cluster.local:6379",
     "rediss://queue.openstudio-server.svc.cluster.local:6379/1",
@@ -487,6 +514,62 @@ def test_redis_url_rejects_off_cluster_host():
         assert not _matches_pattern(bad, schema), (
             f"spec.redisUrl: {bad!r} must be rejected by the in-cluster DNS pattern"
         )
+
+
+def test_redis_url_rejects_two_label_public_hostnames_575():
+    """Issue #575: ``redis://evil.com:6379`` matched the pre-#575 grammar
+    (the optional second label was unconstrained), re-opening the #390
+    exfiltration surface for two-label public domains. With and without
+    ports, both schemes, and the retired bare service.namespace form are
+    all rejected at apply time."""
+    schema = _spec_field("redisUrl")
+    for bad in (
+        "redis://evil.com",
+        "redis://exfil.io:6379",
+        "rediss://attacker.dev:6379",
+        "redis://queue.openstudio-server:6379",  # retired bare form (#575)
+        "redis://a.b.c.d.e:6379",
+    ):
+        assert not _matches_pattern(bad, schema), (
+            f"spec.redisUrl: two-label public hostname {bad!r} must be "
+            f"rejected (issue #575)"
+        )
+
+
+def test_url_fence_host_grammar_shared_across_three_sites_575():
+    """Issue #575 anti-drift fence: the two CRD patterns and the Python
+    ``SECRET_REDIS_URL_PATTERN`` (the Secret-resolved Redis URL fence in
+    ``redis_client.py``, reached via ``client_factory._resolve_redis_url``)
+    must agree on the SAME host grammar — accept and reject — so the three
+    sites cannot drift apart. Each pattern is probed with its own scheme /
+    credential decorations around the identical host matrix."""
+    from openstudio_operator.redis_client import SECRET_REDIS_URL_PATTERN
+
+    server_schema = _spec_field("serverUrl")
+    redis_schema = _spec_field("redisUrl")
+    legal_hosts = (
+        "web",
+        "web.svc",
+        "web.svc.cluster.local",
+        "web.openstudio-server.svc",
+        "web.openstudio-server.svc.cluster.local",
+    )
+    illegal_hosts = (
+        "evil.com",
+        "exfil.io",
+        "attacker.dev",
+        "web.openstudio-server",  # retired bare namespace form (#575)
+        "a.b.c.d.e",
+        "web.evil.com",
+    )
+    for host in legal_hosts:
+        assert _matches_pattern(f"http://{host}", server_schema), host
+        assert _matches_pattern(f"redis://{host}:6379", redis_schema), host
+        assert SECRET_REDIS_URL_PATTERN.match(f"redis://:pw@{host}:6379"), host
+    for host in illegal_hosts:
+        assert not _matches_pattern(f"http://{host}", server_schema), host
+        assert not _matches_pattern(f"redis://{host}:6379", redis_schema), host
+        assert not SECRET_REDIS_URL_PATTERN.match(f"redis://:pw@{host}:6379"), host
 
 
 def test_redis_url_accepts_in_cluster_forms():
