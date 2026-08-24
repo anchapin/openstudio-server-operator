@@ -4421,14 +4421,18 @@ def test_resource_quota_manifest_ships_quota_and_limitrange():
         assert doc["apiVersion"] == "v1", doc
         assert doc["metadata"]["namespace"] == "openstudio-server", doc
     hard = RESOURCE_QUOTA["spec"]["hard"]
+    # pods is added in issue #740; the four CPU/memory totals are the
+    # original issue #400 surface. The set comparison is exact so that
+    # adding a new dimension is a deliberate, reviewed act.
     assert set(hard) == {
+        "pods",
         "requests.cpu",
         "requests.memory",
         "limits.cpu",
         "limits.memory",
     }, (
-        f"ResourceQuota must track all four CPU/memory totals, got "
-        f"{sorted(hard)!r}"
+        f"ResourceQuota must track pods (issue #740) and all four "
+        f"CPU/memory totals, got {sorted(hard)!r}"
     )
 
 
