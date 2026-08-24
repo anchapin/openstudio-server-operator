@@ -1,0 +1,187 @@
+==== ISSUE #727 ====
+`tests/test_dryrun_walkthrough.py:122-159` declares four near-identical helpers — `soft_stops_total`, `workers_recycled_total`, `worker_pods_evicted_total`, `analyses_deleted_total` — each summing every label series of one labeled Counter via `labelled_metric(name, {label: value})` for the outcomes listed in the metric's docstring. The four helpers share the same 5-line shape: iterate a tuple of label values, accumulate `labelled_metric(name, {label: v})` for each, return the sum. The label tuples themselves are scattered across the four helpers (e.g. `("issued", "dry-run")` for soft stops, `("analysis-completed", "interval-elapsed")` for recycles, `("evicted", "evicted-partial", "no-matching-pods", "dry-run")` for evictions), and the per-metric tuples drift separately from the production code's metric docstring in `metrics.py` — a new outcome added at the metric site (`metrics.py:107-122` for `SOFT_STOPS_TOTAL`) silently disappears from this walkthrough until a test breaks.
+
+Extract one `sum_labelled_counter(name: str, label: str, values: tuple[str, ...]) -> float` helper and a `LABELED_COUNTER_OUTCOMES: dict[str, tuple[str, ...]]` constant keyed by metric name (the single source of truth that the walkthrough test reads and that the metric docstring cites).
+
+Acceptance criterion: the four helpers collapse to four `LABELED_COUNTER_OUTCOMES` constant entries, and any future outcome added to `metrics.py` is discovered here by adding one line to the constant.
+
+Scope guard: Do NOT change the assertion semantics; this is a helper-extraction refactor only.
+---
+
+==== ISSUE #721 ====
+`status_store._conflict_backoff` (`status_store.py:183`) computes the backoff as `_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random())` — the jitter is multiplicative only, with NO upper bound. After `MAX_CONFLICT_RETRIES = 5` attempts, the worst-case cumulative sleep is `1.0 * (1 + 2 + 4 + 8) * 1.5 = 22.5 s` of pure sleep BEFORE the conflict is escalated to `StatusStoreConflictError`.
+
+The SLA poll cadence is 30 s (`SLA_POLL_INTERVAL_SECONDS`); a sustained 409 storm on a status PATCH during a tick can spend 22.5 s sleeping inside the wrapper's RMW cycle, leaving only 7.5 s for the actual REST/Redis work — or worse, the cumulative sleep plus the actual work exhausts the cadence budget so the next kopf tick cannot start on time (kopf's timer cadence is wall-clock-aligned; a tick that overruns is silently skipped, no count).
+
+The `BoundedK8sRequest` (#579) explicitly cites this concern as motivation but only for the network surface; the status-store retry loop has the same concern on the `.status` subresource path.
+
+Acceptance criterion: bound the conflict-sleep ceiling to `min(_conflict_backoff(attempt), MAX_CONFLICT_SLEEP_SECONDS)` where the ceiling is well inside the shortest timer cadence (e.g. 2.0 s, making worst-case cumulative 9 s). Add a regression test that monkey-patches `_sleep` to capture the sleeps, forces a 5-409 storm, and asserts `sum(sleeps) < SLA_POLL_INTERVAL_SECONDS * 0.5`.
+
+Scope guard: Do NOT change the retry COUNT (`MAX_CONFLICT_RETRIES`); only the per-attempt sleep ceiling is in scope.
+---
+
+==== ISSUE #708 ====
+Independent of #709 (call site decision). Implements the D04 (status-anchored
+idempotency) half of the `stop_analysis` wiring contract per #707.
+
+## What to ship
+
+### 1. New `.status` map: `stoppedAnalyses`
+
+Add a fifth `.status` map alongside `softStops`, `requeues`, `startedSince`,
+`archivedAnalyses`:
+
+```python
+# status_store.py
+@dataclass
+class StopRecord:
+    issued_at: datetime          # tz-aware UTC; the SLA-clock origin for D04
+    outcome: str                 # "issued" | "dry-run" | "completed" | "timeout"
+    stopped_at: datetime | None  # populated when server reports completed
+    # (or when the bounded wait expires — outcome="timeout")
+```
+
+Map shape: `status.stoppedAnalyses[analysis_id] = StopRecord(...)`.
+
+### 2. Extend `STATUS_MAP_MAX_ENTRIES` cap accounting
+
+The cap at `STATUS_MAP_MAX_ENTRIES = 10000` (status_store.py, evict-oldest-first)
+must now apply to a fifth map. The cap-eviction logic at `_set_map_entry` already
+iterates all known maps; just add `stoppedAnalyses` to the iteration. Verify the
+eviction order semantics are unchanged (oldest-first sorted by key, UUIDs are
+deterministic but not age-aware — same caveat as `softStops`).
+
+### 3. New `StatusStore.get_stop_record(analysis_id)` and `set_stop_record(...)`
+
+Mirror the `SoftStopRecord` API surface (`status_store.py:209-225`):
+
+```python
+def get_stop_record(self, analysis_id: str) -> StopRecord | None: ...
+def set_stop_record(self, analysis_id: str, record: StopRecord) -> bool: ...
+def prune_stop_record(self, analysis_id: str) -> bool: ...  # for anchor retirement
+```
+
+All three must use the existing RMW envelope (`_read_status` → typed merge →
+`_patch_status` with 409 retry). Anchor retirement (`prune_stop_record`) must be
+the same idempotency-preserving pattern as `prune_soft_stop_record`.
+
+### 4. CRD `.status` shape update
+
+The CRD `openstudioclustermanagers.energy.nrel.gov` `v1alpha1` `status` schema
+gains a `stoppedAnalyses` field (`Map<string, StopRecord>`). Update `deploy/crd.yaml`
+to match. (The CRD identity — group/version/kind — is unchanged; see #495.)
+
+### 5. New Prometheus gauge: `openstudio_operator_stopped_analyses_entries`
+
+Mirrors `openstudio_operator_status_map_entries` (#489) but `map_name="stoppedAnalyses"`.
+Stamped on every read (RMW fresh GETs + plain getters). Cardinality bounded by D05
+(one series per CR-map pair).
+
+## Acceptance criterion
+
+- [ ] `status_store.py` exposes `get_stop_record` / `set_stop_record` / `prune_stop_record`.
+- [ ] `STATUS_MAP_MAX_ENTRIES` cap-eviction covers the new map.
+- [ ] `deploy/crd.yaml` `.status.stoppedAnalyses` field documented.
+- [ ] `openstudio_operator_stopped_analyses_entries{namespace,name}` gauge
+      appears in `/metrics` with `map_name="stoppedAnalyses"`.
+- [ ] Unit tests for: round-trip RMW, cap-eviction ordering, 409-retry envelope.
+- [ ] `_metrics_inventory.py::EXPECTED_GAUGE_FAMILIES` updated per the #406
+      shared-canonical-source convention.
+
+## Scope guard
+
+This issue does NOT wire the actual `stop_analysis` REST call — that lands in
+#708 (dryRun gate + marked Event). This issue is the data-layer plumbing only.
+
+Refs #707 (epic). Independent of #709 (call-site decision) — the anchor map
+shape is call-site-agnostic; the keys are `(namespace, name, analysis_id)`
+regardless of which handler issues the POST.
+---
+
+==== ISSUE #707 ====
+The waiting-variant stop (POST `/analyses/{id}/action` with `analysis_action=stop`,
+set `run_flag` false + wait for in-flight runs to complete) is contract-complete and
+tested in `OpenStudioClient.stop_analysis` (openstudio_client.py:355-380) but has
+**zero call sites** per `docs/architecture-plan.md:147` and the resolution of #49
+(which decided its *fate* — keep for contract completeness — but did not wire it).
+
+`audit-dryrun-idempotency.md` §1.1 row R2 is currently **DORMANT**.
+
+## Why this is now actionable
+
+The hard preconditions the contract requires (D11 dryRun-gate + D04 status-anchor +
+audit-doc update in the same PR) all have working reference implementations:
+
+- **D11 reference**: `soft_stop_analysis` in `handlers/analysis_sla.py:381-401` —
+  `if not dry_run:` gate + marked `AnalysisSoftStopped` Warning Event +
+  `outcome="dry-run"` anchor.
+- **D04 reference**: `status.softStops[id]` anchor map (`status_store.py:209-225`,
+  `SoftStopRecord`; `StatusStore.prune` for cap eviction per #648).
+- **Audit-doc reference**: rows R1, R3, R4, K1-K5 already show the GATED shape —
+  copy the schema.
+
+The wiring is mechanical — the design *decision* is which handler gets the call site.
+
+## Two viable call sites (decision in sub-issue #709)
+
+1. **SLA escalation fallback** (`handlers/analysis_sla.py`, between soft-stop and pod
+   eviction). After `gracefulStopTimeoutMinutes` of still-`started`, try one
+   `stop_analysis` POST and wait for it; only escalate to pod eviction if the
+   in-flight runs do not finish in a bounded budget. *Effect: fewer wedged-pod
+   evictions on analyses that just need a few more seconds to finish naturally.*
+
+2. **Retention pre-delete gate** (`retention.py`, before `delete_analysis`). When the
+   prune CronJob sees a `started` analysis at verification tick time, issue
+   `stop_analysis` first, wait for the analysis to reach `completed`/`na`, then
+   `delete_analysis`. *Effect: zero in-flight runs killed by NFS cascade; storage
+   semantics become "graceful" rather than "forceful".*
+
+Both paths use the same wiring shape (D11 gate + D04 anchor + marked Event). The
+choice is purely a UX question (which operator-level guarantee to prioritize) and
+*must be made before any code lands* — the config field name, anchor key shape, and
+metric labels all branch on it.
+
+## Scope guard
+
+This epic does **not** change:
+
+- The OpenStudio Server REST contract (verified against v3.11.0 — see
+  `docs/contracts/openstudio-server-v3.11.0-rest.md`).
+- `soft_stop_analysis` semantics (the SLA handler's primary stop path).
+- `delete_analysis` semantics (retention's NFS-cascade cleanup path).
+- The K8s-side pod-eviction path (K1 in §1.1) — that stays as-is for the
+  failure case where `stop_analysis` itself does not return.
+- Any CRD `spec` field shape beyond a single, optional `stoppedAnalyses` map
+  read into the `.status` subresource by the new wiring.
+
+## Sub-issues (auto-numbered; dependencies explicit)
+
+| Issue | Title | Files touched | Depends on |
+|-------|-------|---------------|------------|
+| #708 | Add `status.stoppedAnalyses[id]` anchor map + `StatusStore` plumbing (D04) | `status_store.py`, `config.py`, CRD `.status` shape | — |
+| #709 | Decide call site for `stop_analysis` (SLA escalation vs retention pre-delete) | design doc only | — |
+| #710 | Wire dryRun gate + marked Warning Event + audit doc R2 DORMANT→GATED (D11 + doc) | chosen handler + `audit-dryrun-idempotency.md` | #708, #709 |
+| #711 | Regression tests: one-shot, dryRun suppression, restart-survival, no-double-fire | `tests/test_<chosen_handler>.py`, fakes | #710 |
+| #712 | CHANGELOG + AGENTS.md test-count bump + kind integration test | `CHANGELOG.md`, `AGENTS.md`, `tests/`, `docs/kind-validation.md` | #711 |
+
+## Acceptance criteria for this epic to close
+
+- [ ] Call site decided (#709) and the decision recorded in this issue body.
+- [ ] `stop_analysis` invoked from the chosen handler with full D11 + D04 contract (#710).
+- [ ] Audit doc §1.1 row R2 reads `GATED` with the gate line cited (#710).
+- [ ] Stale line-number drift in the audit doc (`openstudio_client.py:209` →
+      `:355`) corrected in the same PR (#710).
+- [ ] All six regression tests in #711 green; CI fence added.
+- [ ] No `--admin` merges required; ruff + pytest green on the resulting PR.
+- [ ] `CHANGELOG.md` entry cross-references this issue and the resolved call-site
+      issue (#709) (#712).
+---
+
+==== ISSUE #689 ====
+rclone 1.75.0 (the current stable, pinned via #686) is still built with a Go toolchain that predates the fixes for the 8 HIGH findings the #642 gate surfaced: CVE-2026-33818, CVE-2026-39821, CVE-2026-46600, CVE-2026-56853, CVE-2026-56858, CVE-2026-56859, CVE-2026-56860, CVE-2026-56862 (Go stdlib net/http, crypto/tls, html/template, encoding/xml, net/url DoS-class + x/net/idna Punycode privilege escalation — fixes shipped in Go 1.25.13 / 1.26.6).
+
+They are triaged into \`.trivyignore\` (justification: no fixed rclone release exists yet; the archival Job is a short-lived CronJob-spawned pod with egress restricted to object-storage TCP/443 + RFC1918/IMDS excepts per #477, non-internet-facing; the DoS-reachable surface requires crafted inputs on protocols rclone does not serve inbound).
+
+**Acceptance criterion:** when a rclone release built with Go >= 1.25.13/1.26.6 ships, bump \`RCLONE_IMAGE\` per the #642 runbook, remove the eight entries from \`.trivyignore\`, and the audit job stays green. The weekly Dependabot signal PRs exercise the gate, so staleness will re-surface loudly if the entries linger past a fixed release.
+---
+

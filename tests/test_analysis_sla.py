@@ -171,6 +171,15 @@ def register_soft_stop(analysis_id: str) -> None:
     responses.get(f"{BASE}/analyses/{analysis_id}/soft_stop", status=200, json={"result": "accepted"})
 
 
+def register_stop_analysis(analysis_id: str) -> None:
+    """``POST /analyses/{id}/action`` with ``analysis_action=stop`` (issue #707)."""
+    responses.post(
+        f"{BASE}/analyses/{analysis_id}/action",
+        json={"status": "ok"},
+        status=200,
+    )
+
+
 def make_pod(name: str, ip: str | None = None, labels: dict | None = None):
     """Generated-client pod shape, attribute-style (V1Pod duck type).
 
@@ -423,6 +432,7 @@ def test_soft_stop_fires_exactly_once_across_ticks():
     register_started_analysis_via_status("a1")  # second tick's poll
     register_started_analysis_via_status("a1")  # third tick's poll
     register_soft_stop("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
 
     # Tick 1: first sight, no soft-stop (anchor written as `watching`).
     result1, _ = tick(api, now=NOW)
@@ -467,6 +477,7 @@ def test_anchor_survives_operator_restart():
     register_analyses_index("a1")
     register_analysis_status("a1")
     register_soft_stop("a1")
+    register_stop_analysis("a1")  # issue #707: tick 2 hits new stop_analysis branch
     # Two operators in sequence: first fires the soft-stop; second
     # observes outcome="issued" and does NOT re-fire the soft_stop.
     result1, _ = tick(api, client=OpenStudioClient(BASE))
@@ -696,6 +707,7 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
@@ -713,8 +725,9 @@ def test_restart_mid_grace_escalates_from_original_anchor_time():
     assert anchor["issuedAt"] == PAST_GRACE.isoformat()  # original clock preserved
     assert anchor["escalatedAt"] == NOW.isoformat()
     assert anchor["escalationOutcome"] == "evicted"
-    assert len(events) == 1
-    event_type, reason, message = events[0]
+    # issue #707: two events — AnalysisStopped (stop_analysis) then AnalysisEscalated (eviction)
+    assert len(events) == 2
+    event_type, reason, message = events[-1]  # last event is the escalation
     assert event_type == "Warning"
     assert reason == ANALYSIS_ESCALATED_EVENT
     assert "a1" in message and "16m" in message
@@ -749,6 +762,7 @@ def test_escalation_uses_resque_worker_identity_not_ip_matching():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api(
         [
             make_pod("worker-a", "10.0.0.1"),  # victim
@@ -801,6 +815,7 @@ def test_escalation_skips_workers_with_no_matching_pod_in_namespace():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-a")])  # only worker-a exists
     redis_client = FakeRedisClient(
         {
@@ -843,6 +858,7 @@ def test_escalation_with_no_matching_workers_records_no_match():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient()  # empty Resque registry
 
@@ -854,7 +870,8 @@ def test_escalation_with_no_matching_workers_records_no_match():
 
     assert result.escalated == ["a1"]
     assert pod_api.deletes == []
-    assert "no Resque workers" in events[0][2]
+    # issue #707: stop_analysis event precedes escalation event
+    assert "no Resque workers" in events[-1][2]
     assert api.obj["status"]["softStops"]["a1"]["escalationOutcome"] == "no-matching-pods"
 
 
@@ -876,6 +893,7 @@ def test_default_delete_passes_no_grace_seconds():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
@@ -888,7 +906,8 @@ def test_default_delete_passes_no_grace_seconds():
     assert result.escalated == ["a1"]
     assert len(pod_api.deletes) == 1
     assert pod_api.deletes[0]["kwargs"]["grace_period_seconds"] is None
-    assert "default grace (drain)" in events[0][2]
+    # issue #707: stop_analysis event precedes escalation event
+    assert "default grace (drain)" in events[-1][2]
 
 
 @responses.activate
@@ -913,6 +932,7 @@ def test_force_delete_passes_grace_zero():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
 
@@ -925,7 +945,8 @@ def test_force_delete_passes_grace_zero():
 
     assert result.escalated == ["a1"]
     assert pod_api.deletes[0]["kwargs"]["grace_period_seconds"] == 0
-    assert "grace_period_seconds=0 (immediate kill)" in events[0][2]
+    # issue #707: stop_analysis event precedes escalation event
+    assert "grace_period_seconds=0 (immediate kill)" in events[-1][2]
 
 
 @responses.activate
@@ -1047,6 +1068,7 @@ def test_dry_run_suppresses_pod_deletes_and_marks_event():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pod_api = FakePodsCoreV1Api([make_pod("worker-1")])
     redis_client = FakeRedisClient({"worker-1:1:requeued,simulations": ["a1"]})
     metric_before = pods_evicted_total()
@@ -1061,8 +1083,15 @@ def test_dry_run_suppresses_pod_deletes_and_marks_event():
     assert result.escalated == ["a1"]  # decision made, mutation suppressed
     assert pod_api.deletes == []
     assert pods_evicted_total() - metric_before == 1  # counts the decision
-    assert len(events) == 1
+    # issue #707: two events — AnalysisStopped (stop suppressed) then AnalysisEscalated (pod deletions suppressed)
+    assert len(events) == 2
+    # First event is stop_analysis with dry-run suppression
     event_type, reason, message = events[0]
+    assert event_type == "Warning"
+    assert reason == "AnalysisStopped"
+    assert "stop suppressed (spec.dryRun)" in message
+    # Last event is the escalation with dry-run suppression
+    event_type, reason, message = events[-1]
     assert event_type == "Warning"
     assert reason == ANALYSIS_ESCALATED_EVENT
     assert "worker-1" in message and "suppressed (spec.dryRun)" in message
@@ -1165,6 +1194,7 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
     pods = [make_pod("worker-1"), make_pod("worker-2")]
 
     class PartialPodApi(FakePodsCoreV1Api):
@@ -1192,8 +1222,9 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
     )
 
     assert result.escalated == ["a1"]
-    assert len(events) == 1
-    assert events[0][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
+    # issue #707: two events — AnalysisStopped then AnalysisEscalated
+    assert len(events) == 2
+    assert events[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
     # outcome recorded as partial
     anchor = api.obj["status"]["softStops"]["a1"]
     assert anchor["escalationOutcome"] == "evicted-partial"
@@ -1261,6 +1292,7 @@ def test_escalation_with_all_pod_deletes_failing_re_raises_for_wrapper():
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
+    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
 
     class AllFailPodApi(FakePodsCoreV1Api):
         def delete_namespaced_pod(self, name, namespace, **kwargs):
