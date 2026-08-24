@@ -35,7 +35,7 @@ import fakeredis
 import responses
 from prometheus_client import REGISTRY
 
-from _fakes import _merge_patch, calls_to, make_cr, make_emit
+from _fakes import FakePodsCoreV1Api, _merge_patch, calls_to, make_cr, make_emit
 from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE, RESTARTED_AT_ANNOTATION
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import (
@@ -84,7 +84,12 @@ PAST_GRACE = NOW - timedelta(minutes=GRACE_MIN + 1)
 
 
 class FakeCO:
-    """In-memory CustomObjectsApi with RFC 7386 merge-patch (status subresource)."""
+    """In-memory CustomObjectsApi with RFC 7386 merge-patch (status subresource).
+
+    Kept local deliberately (#653): a narrative minimal get/patch pair —
+    no list surface, no synthetic-409 seam — so each walkthrough section
+    stays self-contained beside the scenario it serves.
+    """
 
     def __init__(self, obj: dict) -> None:
         self.obj = copy.deepcopy(obj)
@@ -185,33 +190,14 @@ SLA_SPEC = {
 }
 
 
-class FakePodApi:
-    def __init__(self, pods: list) -> None:
-        self.pods = pods
-        self.deletes: list[dict] = []
-
-    def list_namespaced_pod(self, namespace, label_selector=None, **_kw):
-        # Issue #83 D2: the new escalation path calls list_namespaced_pod
-        # with no label_selector to verify that each Resque-resolved
-        # candidate pod name actually exists in the namespace. An empty
-        # selector matches every pod in the namespace (Kubernetes
-        # semantics).
-        if not label_selector:
-            return SimpleNamespace(items=list(self.pods))
-        wanted = label_selector.split(",")
-        items = [
-            pod
-            for pod in self.pods
-            if all(f"{k}={v}" in wanted for k, v in pod.metadata.labels.items())
-        ]
-        return SimpleNamespace(items=items)
-
-    def delete_namespaced_pod(self, name, namespace, **kwargs):
-        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
-        return {}
-
-
 class FakeApps:
+    """Read-only deployment-selector fixture (int counter ``reads``).
+
+    Kept local deliberately (#653): the narrative asserts a plain ``reads``
+    int counter; the shared FakeAppsV1Api records ``(name, namespace)``
+    tuples instead.
+    """
+
     def __init__(self) -> None:
         self.reads = 0
 
@@ -329,7 +315,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
         now=NOW,
         emit=emit_first,
         namespace=NAMESPACE,
-        pod_api=FakePodApi([]),
+        pod_api=FakePodsCoreV1Api([], filter_label_selector=True),
         redis_client=redis_dry,
     )
     assert events_first == []
@@ -344,7 +330,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
         now=NOW + timedelta(hours=4),
         emit=emit_dry,
         namespace=NAMESPACE,
-        pod_api=FakePodApi([]),
+        pod_api=FakePodsCoreV1Api([], filter_label_selector=True),
         redis_client=redis_dry,
     )
     assert calls_to("/soft_stop") == 0
@@ -370,7 +356,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
         now=NOW,
         emit=emit_first,
         namespace=NAMESPACE,
-        pod_api=FakePodApi([]),
+        pod_api=FakePodsCoreV1Api([], filter_label_selector=True),
         redis_client=redis_real,
     )
     before = soft_stops_total()
@@ -382,7 +368,7 @@ def test_dryrun_soft_stop_is_strict_suppression():
         now=NOW + timedelta(hours=4),
         emit=emit_real,
         namespace=NAMESPACE,
-        pod_api=FakePodApi([]),
+        pod_api=FakePodsCoreV1Api([], filter_label_selector=True),
         redis_client=redis_real,
     )
     assert calls_to("/soft_stop") == 1
@@ -417,7 +403,7 @@ def test_dryrun_escalation_is_strict_suppression():
     def run_one(spec: dict, *, real: bool):
         _escalation_path_responses(analysis_id)
         api = FakeCO(make_cr(spec, status=anchored))
-        pods = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
+        pods = FakePodsCoreV1Api([_make_pod("worker-1", "10.0.0.1")], filter_label_selector=True)
         redis_client = _FakeRedisForDryRun(
             {"worker-1:1:requeued,simulations": [analysis_id]}
         )
@@ -549,6 +535,14 @@ WR_SPEC = {
 
 
 class FakeAppsWR:
+    """Patch-only AppsV1Api stand-in for the worker-recycle section.
+
+    Kept local deliberately (#653): records-only (no store, no
+    merge-application) — the walkthrough asserts the OUTGOING patch body,
+    and the shared FakeAppsV1Api's apply-to-``obj`` surface is surplus
+    narrative here.
+    """
+
     def __init__(self) -> None:
         self.patches: list[dict] = []
 
@@ -648,6 +642,14 @@ def _completed_doc(analysis_id: str, age_days: float = 10.0) -> dict:
 
 
 class FakeBatch:
+    """Minimal BatchV1Api stand-in for the pruner section.
+
+    Kept local deliberately (#653): the walkthrough only asserts the
+    creates/deletes LEDGERS — no 404/409 semantics, no job store — and the
+    shared ``_fakes.FakeBatchV1Api``'s faithful conflict/missing surfaces
+    are surplus narrative here.
+    """
+
     def __init__(self, jobs: list | None = None) -> None:
         from kubernetes.client import ApiException
 
@@ -820,6 +822,13 @@ WBM_SPEC = {
 
 
 class FakeAppsWBM:
+    """Read+patch AppsV1Api stand-in pinned to the WBM selector.
+
+    Kept local deliberately (#653): serves the walkthrough's own
+    ``{"component": "worker"}`` selector AND patches without applying —
+    the D11 diff here reads the outgoing body only.
+    """
+
     def __init__(self) -> None:
         self.patches: list[dict] = []
         self.reads: list[tuple[str, str]] = []
@@ -835,14 +844,6 @@ class FakeAppsWBM:
     def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
         self.patches.append({"name": name, "namespace": namespace, "body": body, "kwargs": kwargs})
         return {}
-
-
-class FakePodsWBM:
-    def __init__(self, pods: list) -> None:
-        self.pods = pods
-
-    def list_namespaced_pod(self, namespace, **_kw):
-        return SimpleNamespace(items=list(self.pods))
 
 
 def _stall_redis(at: datetime) -> ReadOnlyRedisClient:
@@ -869,7 +870,7 @@ def _pod_running() -> SimpleNamespace:
 def _seed_stall(api: FakeCO, *, spec: dict, tracker: StallWindowTracker) -> None:
     """Drive the tracker through the full window so the next tick fires."""
     apps = FakeAppsWBM()
-    pods = FakePodsWBM([_pod_running(), _pod_running()])
+    pods = FakePodsCoreV1Api([_pod_running(), _pod_running()])
     store = StatusStore(NAMESPACE, NAME, api)
     cfg = OperatorConfig.from_spec(spec)
     for offset in (0, 5):
@@ -898,7 +899,7 @@ def test_dryrun_web_background_restart_is_strict_suppression():
         tracker = StallWindowTracker()
         _seed_stall(api, spec=spec, tracker=tracker)
         apps = FakeAppsWBM()
-        pods = FakePodsWBM([_pod_running(), _pod_running()])
+        pods = FakePodsCoreV1Api([_pod_running(), _pod_running()])
         before = metric("openstudio_operator_web_background_restarts_total")
         store = StatusStore(NAMESPACE, NAME, api)
         cfg = OperatorConfig.from_spec(spec)
@@ -1025,7 +1026,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
 
     # Module 1 (soft-stop) — first tick: first sight of started → no
     # soft-stop, anchor written as ``watching`` (issue #83 D1).
-    pods_api = FakePodApi([_make_pod("worker-1", "10.0.0.1")])
+    pods_api = FakePodsCoreV1Api([_make_pod("worker-1", "10.0.0.1")], filter_label_selector=True)
     redis_client = _FakeRedisForDryRun({"worker-1:1:requeued,simulations": [analysis_id]})
     events, emit = make_emit()
     run_sla_tick(
@@ -1127,7 +1128,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
 
     # Module 5 (web_background) — pre-seed the tracker
     apps_wbm = FakeAppsWBM()
-    pods_wbm = FakePodsWBM([_pod_running(), _pod_running()])
+    pods_wbm = FakePodsCoreV1Api([_pod_running(), _pod_running()])
     tracker = StallWindowTracker()
     for offset in (0, 5):
         events, emit = make_emit()

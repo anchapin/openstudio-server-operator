@@ -19,17 +19,15 @@ RBAC note (#78): the Job create/read/delete asserted here are covered by the
 any batch permissions.
 """
 
-import copy
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from types import SimpleNamespace
 
 import pytest
 import responses
 from kubernetes.client import ApiException
 from prometheus_client import REGISTRY
 
-from _fakes import FakeCustomObjectsApi, calls_to, make_emit
+from _fakes import FakeBatchV1Api, FakeCustomObjectsApi, calls_to, make_emit, make_job
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.archival import archival_job_name, build_archival_job
 from openstudio_operator.config import OperatorConfig, StoragePolicy
@@ -155,61 +153,6 @@ def register_delete(analysis_id: str) -> None:
 
 def register_datapoints(docs: list[dict]) -> None:
     responses.get(f"{BASE}/data_points.json", json=docs)
-
-
-def make_job(name: str, *, complete: bool = False, failed: bool = False, running: bool = True):
-    """Generated-client Job shape (attribute-style V1Job duck type).
-
-    ``running`` with a non-terminal condition present but not True exercises
-    the condition filter (a Job that exists but has not terminated).
-    """
-    conditions = []
-    if complete:
-        conditions.append(SimpleNamespace(type="Complete", status="True"))
-    if failed:
-        conditions.append(SimpleNamespace(type="Failed", status="True"))
-    if running and not complete and not failed:
-        conditions.append(SimpleNamespace(type="Complete", status="False"))
-    return SimpleNamespace(
-        metadata=SimpleNamespace(name=name),
-        status=SimpleNamespace(conditions=conditions or None, succeeded=0, failed=0),
-    )
-
-
-class FakeBatchV1Api:
-    """BatchV1Api stand-in: in-memory Jobs with faithful 404/409 semantics.
-
-    The create/read/delete exercised here are the ``batch/jobs`` verbs from
-    deploy/storage-cronjob.yaml (the prune CronJob's Role, #78).
-    """
-
-    def __init__(self, jobs: list | None = None) -> None:
-        self.jobs = {job.metadata.name: job for job in (jobs or [])}
-        self.reads: list[dict] = []
-        self.creates: list[dict] = []
-        self.deletes: list[dict] = []
-
-    def read_namespaced_job(self, name, namespace, **kwargs):
-        self.reads.append({"name": name, "namespace": namespace})
-        if name not in self.jobs:
-            raise ApiException(status=404, reason="Not Found")
-        return self.jobs[name]
-
-    def create_namespaced_job(self, namespace, body, **kwargs):
-        name = body["metadata"]["name"]
-        if name in self.jobs:
-            raise ApiException(status=409, reason="Conflict")
-        job = make_job(name)
-        self.jobs[name] = job
-        self.creates.append({"namespace": namespace, "body": copy.deepcopy(body)})
-        return job
-
-    def delete_namespaced_job(self, name, namespace, **kwargs):
-        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
-        if name not in self.jobs:
-            raise ApiException(status=404, reason="Not Found")
-        del self.jobs[name]
-        return {}
 
 
 def tick(api, spec=None, client=None, *, batch_api, now=NOW):
@@ -751,3 +694,39 @@ def test_spawn_emits_the_backend_job_template_for_every_cloud_target(backend):
     assert result.spawned == ["a1"]
     assert len(batch.creates) == 1
     assert batch.creates[0]["body"] == build_archival_job("a1", policy, NAMESPACE, ("dp-1",))
+
+
+# --- Shared FakeBatchV1Api semantics (#653 reconciliation pins) ------------------
+
+
+def test_shared_fake_delete_of_missing_job_is_strict_404():
+    """#653 reconciliation pin: the shared ``_fakes.FakeBatchV1Api`` keeps the
+    retention copy's REAL-API delete semantics (404 on missing) — the prune
+    copy's lax ``pop(name, None)`` swallow is gone, so a future call path
+    that deletes a vanished Job fails loudly in tests instead of passing
+    silently."""
+    batch = FakeBatchV1Api()
+
+    with pytest.raises(ApiException) as excinfo:
+        batch.delete_namespaced_job("oscm-archive-missing", NAMESPACE)
+
+    assert excinfo.value.status == 404
+    # The failed attempt was still recorded (#531 records-every-attempt precedent).
+    assert [d["name"] for d in batch.deletes] == ["oscm-archive-missing"]
+
+
+def test_shared_fake_fail_with_seam_raises_after_recording_one_shot():
+    """#653: the ``fail_with`` seam (FakeAppsV1Api's #531 precedent) raises the
+    staged exception on the NEXT mutating call AFTER recording it, exactly
+    once — the call-count/body assertions of a propagation test keep working
+    against the raising attempt."""
+    batch = FakeBatchV1Api()
+    batch.fail_with = ApiException(status=503, reason="Service Unavailable")
+
+    with pytest.raises(ApiException) as excinfo:
+        batch.create_namespaced_job(NAMESPACE, {"metadata": {"name": "oscm-archive-a1"}})
+
+    assert excinfo.value.status == 503
+    assert len(batch.creates) == 1 and batch.deletes == []
+    assert batch.fail_with is None  # one-shot
+    assert "oscm-archive-a1" not in batch.jobs  # raised before touching the store

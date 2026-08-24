@@ -11,15 +11,14 @@ effectively unscrapeable. The tick logic itself is covered by
 test_retention.py.
 """
 
-import copy
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 import responses
 from kubernetes.client import ApiException
 
-from _fakes import FakeCustomObjectsApi, calls_to
+from _fakes import FakeBatchV1Api, FakeCustomObjectsApi, calls_to
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import OperatorConfigError
@@ -53,20 +52,17 @@ def make_cr(
     spec: dict | None = None,
     status: dict | None = None,
 ) -> dict:
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": {
-            "name": name,
-            "namespace": NAMESPACE,
-            "uid": f"uid-{name}",
-            "creationTimestamp": (NOW - timedelta(days=created_days_ago)).isoformat().replace(
-                "+00:00", "Z"
-            ),
-        },
-        "spec": copy.deepcopy(spec if spec is not None else {"serverUrl": BASE}),
-        "status": copy.deepcopy(status if status is not None else {}),
-    }
+    """Thin binding onto the shared ``_fakes.make_cr`` (#653): keeps this
+    module's relative ``created_days_ago`` clock while the CRD identity
+    strings and body construction live once in ``_fakes``."""
+    return _shared_make_cr(
+        spec,
+        status,
+        name=name,
+        uid=f"uid-{name}",
+        created=(NOW - timedelta(days=created_days_ago)).isoformat().replace("+00:00", "Z"),
+        default_spec={"serverUrl": BASE},
+    )
 
 
 def completed_doc(analysis_id: str, *, age_days: float = 10.0) -> dict:
@@ -85,31 +81,6 @@ class FakeCoreV1Api:
     def create_namespaced_event(self, namespace, body, **_kw):
         self.events.append({"namespace": namespace, "body": body})
         return body
-
-
-class FakeBatchV1Api:
-    def __init__(self, jobs: list | None = None) -> None:
-        self.jobs = {j.metadata.name: j for j in (jobs or [])}
-        self.creates: list[dict] = []
-        self.deletes: list[dict] = []
-
-    def read_namespaced_job(self, name, namespace, **_kw):
-        if name not in self.jobs:
-            raise ApiException(status=404, reason="Not Found")
-        return self.jobs[name]
-
-    def create_namespaced_job(self, namespace, body, **_kw):
-        name = body["metadata"]["name"]
-        if name in self.jobs:
-            raise ApiException(status=409, reason="Conflict")
-        self.jobs[name] = SimpleNamespace(metadata=SimpleNamespace(name=name))
-        self.creates.append({"namespace": namespace, "body": body})
-        return self.jobs[name]
-
-    def delete_namespaced_job(self, name, namespace, **_kw):
-        self.deletes.append({"name": name, "namespace": namespace})
-        self.jobs.pop(name, None)
-        return {}
 
 
 def run_main(custom_api, *, spec=None, batch=None, now=NOW):

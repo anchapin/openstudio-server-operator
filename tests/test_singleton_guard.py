@@ -18,6 +18,7 @@ from kubernetes.client import ApiException, CustomObjectsApi
 from kubernetes.config import ConfigException
 
 from _fakes import FakeSecretsCoreV1Api, encode_secret_value
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import singleton
 from openstudio_operator.client_factory import get_read_only_redis_client
 from openstudio_operator.singleton import (
@@ -40,15 +41,17 @@ LOGGER = logging.getLogger("singleton-test")
 
 
 def make_cr(name: str, created: str, uid: str | None = None, spec: dict | None = None) -> dict:
-    meta: dict = {"name": name, "namespace": NAMESPACE, "creationTimestamp": created}
-    if uid is not None:
-        meta["uid"] = uid
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": meta,
-        "spec": copy.deepcopy(spec if spec is not None else {"serverUrl": "http://web.test"}),
-    }
+    """Thin binding onto the shared ``_fakes.make_cr`` (#653): keeps this
+    module's positional ``(name, created)`` call shape while the CRD identity
+    strings and body construction live once in ``_fakes`` (the pre-#653 local
+    copy hardcoded them — the same scatter src/ is AST-fenced against)."""
+    return _shared_make_cr(
+        spec,
+        name=name,
+        uid=uid,
+        created=created,
+        default_spec={"serverUrl": "http://web.test"},
+    )
 
 
 class ListOnlyFakeCustomObjectsApi:

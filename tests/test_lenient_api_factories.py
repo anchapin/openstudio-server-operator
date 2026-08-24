@@ -66,6 +66,7 @@ from kubernetes.config import ConfigException
 from prometheus_client import REGISTRY
 
 from _fakes import FakeCustomObjectsApi
+from _fakes import make_cr as _shared_make_cr
 from openstudio_operator import singleton
 from openstudio_operator.handlers import analysis_sla
 from openstudio_operator.singleton import SingletonGuard
@@ -82,22 +83,19 @@ LOGGER = logging.getLogger("lenient-api-factories-test")
 
 
 def make_cr(name: str, created: str, uid: str | None = None) -> dict:
-    """Synthesize a minimal OSCM body that satisfies ``_same_cr`` identity.
-
-    Mirrors the helper in :mod:`tests.test_singleton_guard` — the body must
-    carry ``metadata.{name, namespace, uid, creationTimestamp}`` so the
-    singleton guard's ``_same_cr`` identity heuristic recognises the CR the
-    guard's list returns.
-    """
-    meta: dict = {"name": name, "namespace": NAMESPACE, "creationTimestamp": created}
-    if uid is not None:
-        meta["uid"] = uid
-    return {
-        "apiVersion": "energy.nrel.gov/v1alpha1",
-        "kind": "OpenStudioClusterManager",
-        "metadata": meta,
-        "spec": {"serverUrl": "http://web.test"},
-    }
+    """Thin binding onto the shared ``_fakes.make_cr`` (#653) — keeps this
+    module's positional ``(name, created)`` shape; the body and CRD identity
+    strings live once in ``_fakes`` (the pre-#653 local copy mirrored
+    test_singleton_guard's helper and hardcoded them). The body must carry
+    ``metadata.{name, namespace, uid, creationTimestamp}`` so the singleton
+    guard's ``_same_cr`` identity heuristic recognises the CR the guard's
+    list returns."""
+    return _shared_make_cr(
+        name=name,
+        uid=uid,
+        created=created,
+        default_spec={"serverUrl": "http://web.test"},
+    )
 
 
 def _counter(module: str, error_type: str) -> float:

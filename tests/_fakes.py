@@ -13,6 +13,14 @@ Issue #531 added ``FakeAppsV1Api`` (the deployment-patch surface the worker
 recycler, web_background stall monitor, and ``_k8s`` helper tests share) —
 previously triplicated across three test modules with a divergent
 apply-semantics fourth copy.
+
+Issue #653 finished the #531/#567 leftovers: ``FakeBatchV1Api`` (the
+retention/prune Job surface, previously two copies with silently divergent
+delete semantics), ``FakePodsCoreV1Api`` (the pod-list surface, previously
+duplicated across the SLA / stall-monitor / walkthrough suites), ``make_job``
+(the V1Job duck type the batch fake builds), and ``make_cr`` gained the
+``uid``/``created`` params that absorb the singleton-guard / lenient-factories
+/ prune-entrypoint local copies.
 """
 
 from __future__ import annotations
@@ -49,17 +57,30 @@ def make_cr(
     name: str = NAME,
     namespace: str = NAMESPACE,
     default_spec: dict | None = None,
+    uid: str | None = None,
+    created: str | None = None,
 ) -> dict:
     """Minimal OSCM custom-resource body.
 
     Per-module default specs differ, so consumers bind theirs with
     ``functools.partial(make_cr, default_spec=SPEC)`` — the body is otherwise
     byte-identical to the helpers this replaces.
+
+    ``uid``/``created`` (#653) populate ``metadata.uid`` /
+    ``metadata.creationTimestamp`` when given — the singleton guard's
+    ``_same_cr`` identity needs both, so the three modules that used to carry
+    local ``make_cr`` copies hardcoding the CRD identity strings bind them
+    here instead.
     """
+    meta: dict = {"name": name, "namespace": namespace}
+    if uid is not None:
+        meta["uid"] = uid
+    if created is not None:
+        meta["creationTimestamp"] = created
     return {
         "apiVersion": f"{GROUP}/{VERSION}",
         "kind": "OpenStudioClusterManager",
-        "metadata": {"name": name, "namespace": namespace},
+        "metadata": meta,
         "spec": copy.deepcopy(spec if spec is not None else (default_spec or {})),
         "status": copy.deepcopy(status if status is not None else {}),
     }
@@ -201,6 +222,137 @@ class FakeAppsV1Api:
             raise exc
         _merge_patch(self.obj, body)
         return copy.deepcopy(self.obj)
+
+
+def make_job(name: str, *, complete: bool = False, failed: bool = False, running: bool = True):
+    """Generated-client Job shape (attribute-style V1Job duck type).
+
+    ``running`` with a non-terminal condition present but not True exercises
+    the condition filter (a Job that exists but has not terminated). Moved
+    from test_retention.py (#653) because the shared ``FakeBatchV1Api`` builds
+    its created Jobs with it.
+    """
+    conditions = []
+    if complete:
+        conditions.append(SimpleNamespace(type="Complete", status="True"))
+    if failed:
+        conditions.append(SimpleNamespace(type="Failed", status="True"))
+    if running and not complete and not failed:
+        conditions.append(SimpleNamespace(type="Complete", status="False"))
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        status=SimpleNamespace(conditions=conditions or None, succeeded=0, failed=0),
+    )
+
+
+class FakeBatchV1Api:
+    """BatchV1Api stand-in: in-memory Jobs with faithful 404/409 semantics (issue #653).
+
+    Consolidates the two pre-#653 near-verbatim copies (test_retention.py /
+    test_prune_entrypoint.py). Their one silent divergence — delete of a
+    MISSING Job — is reconciled the strict, real-API-faithful way: 404, like
+    the retention copy (and like a real API server); the prune copy's lax
+    ``pop(name, None)`` swallow is gone, so a call path that deletes a
+    vanished Job now fails loudly in tests instead of passing silently.
+
+    - ``read_namespaced_job`` — records every attempt in ``reads`` as
+      ``{"name", "namespace"}`` dicts; raises 404 on missing.
+    - ``create_namespaced_job`` — records EVERY attempt (including raising
+      ones) in ``creates`` as ``{"namespace", "body"}`` (body deep-copied),
+      raises 409 on a duplicate name, then stores and returns a
+      :func:`make_job`-shaped Job.
+    - ``delete_namespaced_job`` — records every attempt (including raising
+      ones) in ``deletes`` as ``{"name", "namespace", "kwargs"}`` (retention
+      asserts ``propagation_policy`` through it), raises 404 on missing,
+      then removes the Job.
+    - ``fail_with`` — exception the NEXT create/delete raises after being
+      recorded, one-shot (ApiException propagation tests; ``FakeAppsV1Api``'s
+      #531 precedent).
+
+    The create/read/delete exercised here are the ``batch/jobs`` verbs from
+    deploy/storage-cronjob.yaml (the prune CronJob's Role, #78).
+    """
+
+    def __init__(self, jobs: list | None = None) -> None:
+        self.jobs = {job.metadata.name: job for job in (jobs or [])}
+        self.reads: list[dict] = []
+        self.creates: list[dict] = []
+        self.deletes: list[dict] = []
+        self.fail_with: ApiException | None = None
+
+    def read_namespaced_job(self, name, namespace, **kwargs):
+        self.reads.append({"name": name, "namespace": namespace})
+        if name not in self.jobs:
+            raise ApiException(status=404, reason="Not Found")
+        return self.jobs[name]
+
+    def create_namespaced_job(self, namespace, body, **kwargs):
+        name = body["metadata"]["name"]
+        self.creates.append({"namespace": namespace, "body": copy.deepcopy(body)})
+        if self.fail_with is not None:
+            exc, self.fail_with = self.fail_with, None
+            raise exc
+        if name in self.jobs:
+            raise ApiException(status=409, reason="Conflict")
+        job = make_job(name)
+        self.jobs[name] = job
+        return job
+
+    def delete_namespaced_job(self, name, namespace, **kwargs):
+        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
+        if self.fail_with is not None:
+            exc, self.fail_with = self.fail_with, None
+            raise exc
+        if name not in self.jobs:
+            raise ApiException(status=404, reason="Not Found")
+        del self.jobs[name]
+        return {}
+
+
+class FakePodsCoreV1Api:
+    """CoreV1Api pod stand-in: fixed pod list + recorded deletes (issue #653).
+
+    Consolidates the pre-#653 pod-list copies: test_analysis_sla's
+    list+delete recorder (the #83 D2 escalation surface),
+    test_web_background_monitor's selector recorder, and the walkthrough's
+    filtering variant (``FakePodApi``).
+
+    - ``list_namespaced_pod`` — serves ``pods`` as-is, recording every call
+      in ``list_calls`` as ``{"namespace", "label_selector", "kwargs"}`` and
+      every selector in ``selectors``. With ``filter_label_selector=True``
+      the list is filtered server-side (comma-separated equality ``k=v``
+      pairs — real-API semantics; the walkthrough variant). Default False:
+      the stall-monitor's pods are deliberately label-free duck types, so
+      the default serves every pod exactly like both pre-#653 copies.
+    - ``delete_namespaced_pod`` — records every attempt in ``deletes`` as
+      ``{"name", "namespace", "kwargs"}`` (the escalation eviction path).
+    """
+
+    def __init__(self, pods: list, *, filter_label_selector: bool = False) -> None:
+        self.pods = list(pods)
+        self.filter_label_selector = filter_label_selector
+        self.list_calls: list[dict] = []
+        self.selectors: list[str | None] = []
+        self.deletes: list[dict] = []
+
+    def list_namespaced_pod(self, namespace, label_selector=None, **kwargs):
+        self.list_calls.append(
+            {"namespace": namespace, "label_selector": label_selector, "kwargs": kwargs}
+        )
+        self.selectors.append(label_selector)
+        items = list(self.pods)
+        if label_selector and self.filter_label_selector:
+            wanted = label_selector.split(",")
+            items = [
+                pod
+                for pod in items
+                if all(f"{k}={v}" in wanted for k, v in pod.metadata.labels.items())
+            ]
+        return SimpleNamespace(items=items)
+
+    def delete_namespaced_pod(self, name, namespace, **kwargs):
+        self.deletes.append({"name": name, "namespace": namespace, "kwargs": kwargs})
+        return {}
 
 
 def make_emit():
