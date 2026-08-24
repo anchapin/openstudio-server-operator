@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 
 import kopf
 
@@ -203,7 +204,7 @@ def _check_redis_key_layout_for_cr(
     production-scale fleets). The bounded diagnostic SCAN runs only on
     the failure path, to build the error-message evidence.
     """
-    if not isinstance(item, dict):
+    if not isinstance(item, Mapping):
         _set_redis_key_layout_status(0.0)
         return "skipped"
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
