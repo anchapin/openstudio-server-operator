@@ -67,7 +67,7 @@ spec:
           # ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e on the
           # pre-issue-149 baseline; subsequent develop pushes will overwrite
           # this line via the workflow's sed.
-          image: ghcr.io/anchapin/openstudio-server-operator@sha256:7f14723ea62728311cc2fc2b04257425a24da2aa0b57e39d2fa68edfe5e700db
+          image: ghcr.io/anchapin/openstudio-server-operator@sha256:838d672352fd9fe27b60832b5bbdd5b70b937e998ef7149befdc9326ffafe9fa
           # Issue #681 — programmatic entrypoint, NOT the `kopf run` CLI.
           # The CLI cannot carry OperatorSettings; without them kopf's
           # bookkeeping PATCHes the READ-ONLY main OSCM resource (diffbase
