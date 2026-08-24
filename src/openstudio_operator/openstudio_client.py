@@ -176,6 +176,24 @@ class OpenStudioClient:
         self._backoff_base_seconds = backoff_base_seconds
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
+        # Issue #714 — disable ``requests`` env-var proxy auto-detection.
+        # By default ``requests`` honors ``HTTP_PROXY`` / ``HTTPS_PROXY`` /
+        # ``NO_PROXY`` / ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE`` /
+        # ``CURL_CA_BUNDLE`` environment variables — a compromised or
+        # misconfigured host env (or an attacker who controls env
+        # injection, the #678 USER-shape attack class) could
+        # transparently redirect ``GET /analyses.json`` through an
+        # attacker-controlled proxy. The in-cluster MITM surface is
+        # bounded by ``readOnlyRootFilesystem=true`` + the
+        # ``capabilities.drop: ["ALL"]`` posture, but kopf's own
+        # process inherits the pod env wholesale — pinning
+        # ``trust_env=False`` keeps the operator's REST traffic on the
+        # explicit ``self._base`` URL with no proxy fallback. Cluster
+        # admins who need a corporate proxy MUST mount the proxy as a
+        # sidecar or route through the existing
+        # ``OPENSTUDIO_TLS_CA_BUNDLE`` env var rather than rely on
+        # ``HTTPS_PROXY`` (the #242 contract).
+        self._session.trust_env = False
         # Issue #242: pin ``verify=True`` explicitly (requests default) AND honor
         # ``OPENSTUDIO_TLS_CA_BUNDLE`` for clusters whose API server / inter-service
         # traffic is fronted by a custom CA (corporate PKI roots, air-gapped
