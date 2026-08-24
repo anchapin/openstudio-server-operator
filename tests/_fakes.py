@@ -21,6 +21,12 @@ duplicated across the SLA / stall-monitor / walkthrough suites), ``make_job``
 (the V1Job duck type the batch fake builds), and ``make_cr`` gained the
 ``uid``/``created`` params that absorb the singleton-guard / lenient-factories
 / prune-entrypoint local copies.
+
+Issue #718 added ``FakeCoreV1Api`` (the prune-CronJob's
+``create_namespaced_event`` surface — the only CoreV1Api method
+``prune_entrypoint.main`` actually uses; previously a local copy in
+``tests/test_prune_entrypoint.py`` that was the last K8s-API surface
+not in this shared module).
 """
 
 from __future__ import annotations
@@ -414,6 +420,29 @@ class FakeSecretsCoreV1Api:
             data=dict(self._data),
             metadata=SimpleNamespace(resource_version=self._resource_version),
         )
+
+
+class FakeCoreV1Api:
+    """Just enough ``CoreV1Api`` for the prune-CronJob's Event emission.
+
+    Issue #718. The CronJob platform has no kopf, so ``prune_entrypoint.main``
+    calls ``core_v1.create_namespaced_event(namespace, body)`` directly via
+    ``build_event_emitter``. Records every event as a
+    ``{"namespace", "body"}`` dict in ``.events`` so tests can assert the
+    Event reason / message / involvedObject without a live API server.
+
+    Consumes only the ``create_namespaced_event`` surface — the same
+    minimum the prior local copy in ``tests/test_prune_entrypoint.py``
+    served (and the same minimum the real CronJob pod exercises in
+    production).
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def create_namespaced_event(self, namespace, body, **_kw):
+        self.events.append({"namespace": namespace, "body": body})
+        return body
 
 
 def calls_to(suffix: str) -> int:

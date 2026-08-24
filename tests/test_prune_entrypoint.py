@@ -17,7 +17,7 @@ import pytest
 import responses
 from kubernetes.client import ApiException
 
-from _fakes import FakeBatchV1Api, FakeCustomObjectsApi, calls_to
+from _fakes import FakeBatchV1Api, FakeCoreV1Api, FakeCustomObjectsApi, calls_to
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator._oscm_handlers import SKIP_TICK_EXCEPTIONS
 from openstudio_operator.archival import archival_job_name
@@ -72,15 +72,6 @@ def completed_doc(analysis_id: str, *, age_days: float = 10.0) -> dict:
         "created_at": (NOW - timedelta(days=age_days + 20)).isoformat(),
         "updated_at": (NOW - timedelta(days=age_days)).isoformat(),
     }
-
-
-class FakeCoreV1Api:
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-
-    def create_namespaced_event(self, namespace, body, **_kw):
-        self.events.append({"namespace": namespace, "body": body})
-        return body
 
 
 def run_main(custom_api, *, spec=None, batch=None, now=NOW):

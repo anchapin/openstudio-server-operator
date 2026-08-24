@@ -1950,3 +1950,52 @@ def test_gated_wrapper_bumps_singleton_loser_skips_total_monotonically(
         f"series per (module, namespace, name) tuple; observed "
         f"{_singleton_loser_skips_series('oscm_timer')}. See issue #403."
     )
+
+
+# --- Issue #718: every K8s-API fake lives in tests/_fakes.py ------------
+#
+# Pre-#718, ``FakeCoreV1Api`` was a local class in
+# ``tests/test_prune_entrypoint.py`` — the last K8s-API surface NOT in
+# the shared ``_fakes.py`` module after #653's
+# ``FakeBatchV1Api``/``FakePodsCoreV1Api`` consolidation. Issue #718
+# promoted it into ``_fakes.py`` and the gate below prevents a future
+# contributor from re-introducing a duplicate ``class FakeXxxApi``
+# definition in any ``tests/test_*.py`` file.
+
+
+def _local_fake_k8s_api_classes() -> list[tuple[str, str, int]]:
+    """Walk ``tests/`` and return every ``class Fake<...>Api`` definition
+    that lives OUTSIDE ``_fakes.py``.
+
+    Each entry is ``(test_file_path, class_name, line_number)`` so the
+    failure message points at the exact location of the violation.
+    """
+    tests_root = Path(__file__).parent
+    found: list[tuple[str, str, int]] = []
+    for py in sorted(tests_root.glob("test_*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            # Match ``Fake<Something>Api`` (CoreV1Api, AppsV1Api, etc.).
+            if not node.name.startswith("Fake") or not node.name.endswith("Api"):
+                continue
+            found.append((str(py.relative_to(tests_root.parent)), node.name, node.lineno))
+    return found
+
+
+def test_all_k8s_api_fakes_live_in_tests_fakes_py() -> None:
+    """Issue #718 — every ``Fake<...>Api`` class lives in ``tests/_fakes.py``.
+
+    The shared fakes module is the single home for every K8s-API stand-in
+    (CustomObjectsApi / AppsV1Api / BatchV1Api / PodsCoreV1Api /
+    SecretsCoreV1Api / CoreV1Api). A duplicate local class would re-open
+    the drift door #653 closed, and consumers would have to know which
+    of two implementations they're using.
+    """
+    violations = _local_fake_k8s_api_classes()
+    assert violations == [], (
+        f"K8s-API fake classes must live in tests/_fakes.py only "
+        f"(issue #718, #653 consolidation). Found local definitions at: "
+        f"{[(p, n, l) for p, n, l in violations]}"
+    )
