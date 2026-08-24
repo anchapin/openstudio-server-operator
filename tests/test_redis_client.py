@@ -29,6 +29,7 @@ from openstudio_operator.config import RedisSecretRef
 from openstudio_operator.handlers.redis_layout_check import (
     _check_redis_key_layout_for_cr,
     _redis_key_layout_check,
+    _validate_item_meta,
 )
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
@@ -1388,6 +1389,27 @@ def test_redis_key_layout_check_skips_nameless_item(
     assert status == "skipped", (
         f"Expected status='skipped' on a nameless item; got {status!r}. "
         f"Captured: {caplog.text!r}. See issue #163."
+    )
+
+
+def test_validate_item_meta_returns_none_for_missing_namespace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #726: _validate_item_meta returns None for an item missing namespace.
+
+    The helper must emit _set_redis_key_layout_status(0.0) and return None
+    when the item has metadata but no namespace field. The regression: all
+    three skipped branches previously duplicated the gauge-set + return
+    pattern; this test asserts the consolidated helper still guards correctly.
+    """
+    item = {"metadata": {"name": "test-osc"}}  # missing namespace
+    result = _validate_item_meta(item)
+    assert result is None, f"Expected None for missing namespace; got {result!r}"
+    # The gauge must be set to 0.0 by the helper.
+    from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS
+
+    assert REDIS_KEY_LAYOUT_STATUS._value.get() == 0.0, (
+        "Gauge must be set to 0.0 when helper returns None"
     )
 
 
