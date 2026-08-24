@@ -19,13 +19,13 @@ from types import SimpleNamespace
 import responses
 from prometheus_client import REGISTRY
 
-from _fakes import FakeCustomObjectsApi, FakePodsCoreV1Api, calls_to, make_emit
+from _fakes import FakeCustomObjectsApi, calls_to, make_emit
 from _fakes import make_cr as _shared_make_cr
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.analysis_sla import run_sla_tick
 from openstudio_operator.openstudio_client import OpenStudioClient
-from openstudio_operator.status_store import StatusStore, StopRecord, STATUS_MAP_MAX_ENTRIES
+from openstudio_operator.status_store import STATUS_MAP_MAX_ENTRIES, StatusStore, StopRecord
 
 BASE = "http://web.test"
 NAMESPACE = "openstudio-server"
@@ -182,13 +182,13 @@ def test_stop_analysis_fires_exactly_once_across_ticks():
 
     # Tick 2: 4h later, runtime > maxDuration → soft_stop fires.
     # Grace still running (4h >> 15m grace), so stop_analysis NOT called yet.
-    result2, events2, _ = tick(api, now=NOW + timedelta(hours=4))
+    result2, _, _ = tick(api, now=NOW + timedelta(hours=4))
     assert result2.soft_stopped == ["a1"]
     assert result2.stopped == []  # grace not expired yet
     assert calls_to("/action") == 0
 
     # Tick 3: 8h later, grace expired → stop_analysis fires, then escalation.
-    result3, events3, _ = tick(api, now=NOW + timedelta(hours=8))
+    result3, _, _ = tick(api, now=NOW + timedelta(hours=8))
     assert result3.stopped == ["a1"]  # stop_analysis was issued this tick
     assert calls_to("/action") == 1  # exactly one POST across all ticks
 
@@ -238,7 +238,7 @@ def test_dry_run_suppresses_stop_analysis_rest_call_and_marks_event():
     config = OperatorConfig.from_spec(spec)
     store = StatusStore(NAMESPACE, NAME, api)
 
-    result = run_sla_tick(
+    _ = run_sla_tick(
         OpenStudioClient(BASE),
         store,
         config,
@@ -364,7 +364,6 @@ def test_flipping_dry_run_off_does_not_reissue_stop():
     register_analyses_index("a1")
     register_analysis_status("a1")
     # stop_analysis WOULD fire but StopRecord already exists
-    config_live = OperatorConfig.from_spec(spec_live)
     store2 = StatusStore(NAMESPACE, NAME, api2)
 
     result2, _, _ = tick(api2, spec=spec_live, now=NOW + timedelta(hours=4))
