@@ -36,6 +36,7 @@ spec:
         app.kubernetes.io/managed-by: openstudio-operator
     spec:
       serviceAccountName: openstudio-operator-sa
+      automountServiceAccountToken: false
       # Issue #414 — node-pressure protection: single-replica + Recreate
       # means a mid-tick eviction leaves the StatusStore RMW half-applied.
       # The openstudio-operator-critical PriorityClass

@@ -131,6 +131,7 @@ spec:
             app.kubernetes.io/component: storage-pruner
         spec:
           serviceAccountName: openstudio-storage-pruner-sa
+          automountServiceAccountToken: false
           restartPolicy: Never
           # Issue #414 — node-pressure protection: a mid-tick eviction
           # strands a retention tick (D12 makes the next schedule retry

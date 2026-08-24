@@ -236,10 +236,13 @@ def build_archival_job(
                     # token and authenticate against the API server with
                     # whatever RBAC the SA carries). Disable the mount
                     # explicitly; the kubelet default would otherwise leave
-                    # it in place. The prune CronJob intentionally keeps
-                    # its SA token mount (it needs API access for
-                    # StatusStore RMW and Batch Jobs) — do not copy this
-                    # field onto it.
+                    # it in place. Both the operator Deployment and prune
+                    # CronJob also set automountServiceAccountToken: false
+                    # (issue #713) — they reach the kube-apiserver via the
+                    # python kubernetes client's own token-reading logic,
+                    # which falls back to the kubelet-mounted path only when
+                    # present; removing that fallback removes the attack
+                    # surface for all three pod templates.
                     "automountServiceAccountToken": False,
                     # Issue #161 — pod-level defense-in-depth baseline. PSS
                     # `restricted` validates pod-level runAsNonRoot +
