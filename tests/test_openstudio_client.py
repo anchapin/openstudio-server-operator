@@ -302,6 +302,76 @@ def test_retries_connection_error_then_succeeds(client, sleeps):
     assert len(sleeps) == 1
 
 
+# --- Issue #716: widened transient-exception tuple ----------------------
+#
+# Regression fence for the #716 expansion: every subclass added to
+# ``openstudio_client._TRANSIENT_EXCEPTIONS`` must round-trip through
+# the GET retry envelope (i.e. cause exactly one re-attempt + one backoff
+# sleep, then succeed). Pre-#716 these escaped the retry loop and were
+# re-raised as ``OpenStudioApiError`` after a single attempt — the SLA /
+# watchdog polls lost one retry-cycle of resilience.
+@responses.activate
+def test_retries_chunked_encoding_error_then_succeeds(client, sleeps):
+    responses.get(
+        f"{BASE}/analyses.json",
+        body=requests.exceptions.ChunkedEncodingError("mid-stream EOF"),
+    )
+    responses.get(f"{BASE}/analyses.json", status=200, json=[])
+    assert client.list_analyses() == []
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
+@responses.activate
+def test_retries_content_decoding_error_then_succeeds(client, sleeps):
+    responses.get(
+        f"{BASE}/analyses.json",
+        body=requests.exceptions.ContentDecodingError("truncated gzip body"),
+    )
+    responses.get(f"{BASE}/analyses.json", status=200, json=[])
+    assert client.list_analyses() == []
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
+@responses.activate
+def test_retries_ssl_error_then_succeeds(client, sleeps):
+    responses.get(
+        f"{BASE}/analyses.json",
+        body=requests.exceptions.SSLError("handshake timeout"),
+    )
+    responses.get(f"{BASE}/analyses.json", status=200, json=[])
+    assert client.list_analyses() == []
+    assert len(responses.calls) == 2
+    assert len(sleeps) == 1
+
+
+@responses.activate
+def test_transient_tuple_exhausts_each_subclass_and_raises(client, sleeps):
+    """Regression fence: every subclass in ``_TRANSIENT_EXCEPTIONS`` must
+    round-trip through the full retry envelope before raising.
+
+    Pre-#716 only ``ConnectionError`` and ``Timeout`` did this; the
+    additional subclasses escaped after a single attempt. This test
+    iterates each subclass and asserts the 4-attempt exhaustion path.
+    """
+    for exc_cls in (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ContentDecodingError,
+        requests.exceptions.SSLError,
+    ):
+        sleeps.clear()
+        responses.calls.reset()  # clear accumulated calls from prior iterations
+        for _ in range(4):
+            responses.get(f"{BASE}/analyses.json", body=exc_cls("boom"))
+        with pytest.raises(OpenStudioApiError, match="failed after 4 attempts"):
+            client.list_analyses()
+        assert len(responses.calls) == 4, f"{exc_cls.__name__} did not retry 4x"
+        assert len(sleeps) == 3, f"{exc_cls.__name__} did not sleep 3x"
+
+
 @responses.activate
 def test_exhausts_retries_with_backoff_schedule_then_raises(client, sleeps):
     for _ in range(4):
