@@ -257,3 +257,37 @@ def test_publish_dev_pin_sed_matches_tag_and_digest_forms() -> None:
         "forms — a literal ':' after the image name never matches the "
         "digest form the manifests carry between releases (#699)"
     )
+
+
+def test_publish_dev_pin_step_lands_via_pr_not_direct_push() -> None:
+    """Issue #701: the re-pin must not `git push origin develop`.
+
+    The bot is not a bypass actor on the develop ruleset, so a direct
+    push is rejected ("required status checks are expected") — the
+    second half of the frozen-digest bug (#699 was the sed). The pin
+    now lands via a floating ``bot/digest-repin`` branch + PR with
+    auto-merge (required checks run on the PR), and the workflow needs
+    ``pull-requests: write`` to open/merge it.
+    """
+    doc = load_workflow("release.yml")
+    assert doc["jobs"]["publish-dev"], "publish-dev job missing"
+    perms = doc.get("permissions", {})
+    assert perms.get("pull-requests") == "write", (
+        "release.yml must carry pull-requests: write for the bot to open "
+        "+ auto-merge the re-pin PR (#701)"
+    )
+    steps = job_steps(doc, "publish-dev")
+    pin = step_by_name(steps, "Pin operator image by SHA256 digest")
+    run = pin.get("run", "")
+    assert isinstance(run, str)
+    assert "git push origin develop" not in run, (
+        "the pin step must never push develop directly — the ruleset "
+        "rejects the bot push (#701)"
+    )
+    assert 'HEAD:refs/heads/${PIN_BRANCH}' in run and "gh pr create" in run, (
+        "the pin must land via the floating bot/digest-repin branch + PR (#701)"
+    )
+    assert "gh pr merge" in run and "--auto" in run, (
+        "the re-pin PR must be auto-merge armed so the required checks "
+        "gate the landing (#701)"
+    )
