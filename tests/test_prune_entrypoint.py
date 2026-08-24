@@ -420,19 +420,23 @@ def test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches():
     # inspecting the source of prune_entrypoint.main(). The
     # single-quoted strings in the constants ARE the strings at the
     # call sites (no `reason="..."` literal shadows the constants).
-    # Four call sites since #650: the config-phase from_spec guard adds
-    # a fourth branch REUSING reason="runtime_failure" (no new reason
-    # value — the vocabulary stays the three constants above).
+    # Five call sites since #722: the kubeconfig-load guard adds a
+    # fifth branch (issue #722) REUSING reason="runtime_failure" (no
+    # new reason value — the vocabulary stays the three constants
+    # above). Each new guard reuses the existing ``RUNTIME`` reason
+    # so the labelled cardinality stays bounded at three reason
+    # values for the #306 PromQL alert budget.
     source = inspect.getsource(prune_entrypoint)
     branch_call_sites = [
         line for line in source.splitlines()
         if "PRUNE_TICK_FAILURES_TOTAL.labels" in line
     ]
-    assert len(branch_call_sites) == 4, (
+    assert len(branch_call_sites) == 5, (
         f"prune_entrypoint must call PRUNE_TICK_FAILURES_TOTAL.labels "
-        f"exactly four times (one per failure branch: CR-list skip, D12 "
-        f"runtime skip, exit-3 redisUrl guard #392, and the #650 "
-        f"config-phase from_spec guard reusing runtime_failure), "
+        f"exactly five times (one per failure branch: CR-list skip, D12 "
+        f"runtime skip, exit-3 redisUrl guard #392, the #650 config-phase "
+        f"from_spec guard reusing runtime_failure, and the #722 "
+        f"kubeconfig-load guard reusing runtime_failure), "
         f"got {len(branch_call_sites)}:\n"
         + "\n".join(branch_call_sites)
     )
