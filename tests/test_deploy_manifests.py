@@ -1316,6 +1316,149 @@ def test_all_workloads_have_pod_level_securitycontext():
     )
 
 
+# ---- Issue #720: PSS-restricted compatibility gate ----------------------
+#
+# The namespace carries `pod-security.kubernetes.io/enforce: restricted`
+# (deploy/namespace-labels.yaml). Every workload pod spec under deploy/
+# must be compatible with that profile — i.e. the pod spec must pass
+# PSS `restricted` validation if the namespace has enforce=restricted.
+# This is the regression fence that prevents the operator from shipping a
+# manifest that would be rejected by the namespace policy at apply time.
+#
+# PSS `restricted` requires at the container level:
+#   allowPrivilegeEscalation != true (default false → pass)
+#   capabilities.drop includes ALL
+#   readOnlyRootFilesystem == true (where applicable)
+#   seccompProfile.type == "RuntimeDefault" or "Localhost" (K8s 1.19+)
+# And at the pod level:
+#   runAsNonRoot == true
+#   runAsUser / runAsGroup is non-zero
+#   seccompProfile.type == "RuntimeDefault" or "Localhost"
+#   No hostPath volumes (emptyDir is fine; hostPath is not)
+
+
+def _iter_deploy_workload_volumes():
+    """Yield (manifest_name, kind, name, volume_dict) for every volume in
+    every pod spec under deploy/. Used by the PSS-restricted hostPath gate.
+
+    Mirrors _iter_deploy_workload_pod_specs() in scope and defensive
+    handling — same skipped helm-overlay files, same YAML-error resilience."""
+    manifests = [
+        ("deploy/", DEPLOY.glob("*.yaml")),
+        (
+            "scripts/manifests/",
+            sorted((Path(__file__).resolve().parents[1] / "scripts" / "manifests").glob("*.yaml")),
+        ),
+    ]
+    skipped_helm_overlay_files = {"01-mongo.yaml", "02-redis.yaml"}
+    for prefix, paths in manifests:
+        for path in paths:
+            if prefix == "deploy/":
+                label_prefix = ""
+            else:
+                label_prefix = prefix
+                if path.name in skipped_helm_overlay_files:
+                    continue
+            try:
+                docs = list(yaml.safe_load_all(path.read_text()))
+            except yaml.YAMLError:
+                continue
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                name = doc.get("metadata", {}).get("name", "<unnamed>")
+                label = f"{label_prefix}{path.name}"
+                if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+                    pod_spec = (
+                        doc.get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                    )
+                    for vol in pod_spec.get("volumes") or []:
+                        yield label, kind, name, vol
+                elif kind == "CronJob":
+                    pod_spec = (
+                        doc.get("spec", {})
+                        .get("jobTemplate", {})
+                        .get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                    )
+                    for vol in pod_spec.get("volumes") or []:
+                        yield label, kind, name, vol
+
+
+def test_all_deploy_podspecs_compatible_with_restricted_pss():
+    """Issue #720 acceptance: every pod spec under deploy/ must pass PSS
+    `restricted` validation if the namespace carries
+    ``pod-security.kubernetes.io/enforce: restricted``
+    (deploy/namespace-labels.yaml). A manifest that violates the
+    restricted profile would be rejected by the namespace policy at
+    apply time — this regression fence catches it in CI instead.
+
+    The check covers:
+      - Container securityContext: runAsNonRoot, allowPrivilegeEscalation,
+        capabilities.drop (ALL), seccompProfile (RuntimeDefault or
+        Localhost), readOnlyRootFilesystem
+      - Pod securityContext: runAsNonRoot, runAsUser, seccompProfile
+      - Volumes: no hostPath (emptyDir is the only allowed volume type)
+
+    This test does NOT repeat the full six-field container hardening
+    check — ``test_every_deploy_workload_container_has_hardening_baseline``
+    already owns that. It adds the PSS-specific gates: seccompProfile
+    accepts "Localhost" (not just "RuntimeDefault", per K8s 1.19+),
+    and no hostPath volumes."""
+    container_offenders = []
+    for path_name, kind, name, container in _iter_workload_containers():
+        sc = container.get("securityContext") or {}
+        problems = []
+        # runAsNonRoot is required at container level for restricted
+        if sc.get("runAsNonRoot") is not True:
+            problems.append(f"runAsNonRoot={sc.get('runAsNonRoot')!r} (must be True)")
+        # allowPrivilegeEscalation must be explicitly False (not just default-false)
+        if sc.get("allowPrivilegeEscalation") is not False:
+            problems.append(
+                f"allowPrivilegeEscalation={sc.get('allowPrivilegeEscalation')!r} "
+                "(must be False)"
+            )
+        # capabilities.drop must include ALL
+        caps = sc.get("capabilities") or {}
+        if caps.get("drop") != ["ALL"]:
+            problems.append(f"capabilities.drop={caps.get('drop')!r} (must be ['ALL'])")
+        # seccompProfile: restricted accepts RuntimeDefault OR Localhost (K8s 1.19+)
+        seccomp = sc.get("seccompProfile") or {}
+        if seccomp.get("type") not in ("RuntimeDefault", "Localhost"):
+            problems.append(
+                f"seccompProfile.type={seccomp.get('type')!r} "
+                "(must be 'RuntimeDefault' or 'Localhost')"
+            )
+        # readOnlyRootFilesystem where applicable (containers that need writes use emptyDir)
+        if sc.get("readOnlyRootFilesystem") is not True:
+            problems.append(
+                f"readOnlyRootFilesystem={sc.get('readOnlyRootFilesystem')!r} "
+                "(must be True for PSS restricted)"
+            )
+        if problems:
+            container_offenders.append(
+                (path_name, kind, name, container.get("name"), problems)
+            )
+
+    # Volume-level check: no hostPath volumes (emptyDir is fine)
+    volume_offenders = []
+    for path_name, kind, name, vol in _iter_deploy_workload_volumes():
+        if "hostPath" in vol:
+            volume_offenders.append(
+                (path_name, kind, name, vol.get("name"), "hostPath volume present")
+            )
+
+    offenders = container_offenders + volume_offenders
+    assert not offenders, (
+        "pod specs not compatible with PSS restricted profile "
+        f"(issue #720): {offenders}"
+    )
+
+
 def test_operator_deployment_pod_securitycontext_hardened():
     """Issue #161 targeted test: the operator Deployment's pod template
     carries the same baseline as the prune CronJob (deploy/storage-cronjob
