@@ -213,6 +213,8 @@ jobs:
       - name: Pin operator image by SHA256 digest
         id: pin
         env:
+          # Issue #574: github.* reaches the shell only via env:.
+          GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
@@ -263,7 +265,6 @@ jobs:
           # Floating branch: force-push the single pin commit on top of the
           # just-checked-out develop head so stale branches can't accumulate.
           git push --force origin "HEAD:refs/heads/${PIN_BRANCH}"
-          export GH_TOKEN="${{ github.token }}"
           PR_URL=$(gh pr create --base develop --head "${PIN_BRANCH}" \
             --title "build: pin operator + cronjob image by SHA256 digest (${DIGEST:0:19}…)" \
             --body "Refs #149 #291 #699 #701 — automated digest re-pin from release.yml (publish-dev).
