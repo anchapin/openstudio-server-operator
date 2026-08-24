@@ -18,6 +18,8 @@ unaffected.
 
 EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_soft_stops_total",
+    # Issue #709 — hard-stop counter (POST /analyses/{id}/action stop).
+    "openstudio_operator_stop_stops_total",
     "openstudio_operator_datapoints_requeued_total",
     "openstudio_operator_datapoints_requeue_exhausted_total",
     "openstudio_operator_workers_recycled_total",

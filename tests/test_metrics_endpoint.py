@@ -202,6 +202,7 @@ def test_metrics_http_server_serves_all_declared_counters():
     # series so the family-existence assertion below is self-contained
     # (mirrors the #117 / #171 / #237 / #239 / #255 pattern).
     metrics.SOFT_STOPS_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    metrics.STOP_STOPS_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
     metrics.WORKERS_RECYCLED_TOTAL.labels(trigger="__metrics_test_sentinel__").inc()
     metrics.WORKER_PODS_EVICTED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
     metrics.ANALYSES_DELETED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
@@ -360,6 +361,11 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_soft_stops_total":
             assert (
                 'openstudio_operator_soft_stops_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_stop_stops_total":
+            assert (
+                'openstudio_operator_stop_stops_total{outcome="__metrics_test_sentinel__"}'
                 in response.text
             )
         elif name == "openstudio_operator_workers_recycled_total":
