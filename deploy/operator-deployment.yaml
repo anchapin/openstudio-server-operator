@@ -68,11 +68,21 @@ spec:
           # pre-issue-149 baseline; subsequent develop pushes will overwrite
           # this line via the workflow's sed.
           image: ghcr.io/anchapin/openstudio-server-operator@sha256:6681d2545970ff5183cf4a99c2310a8a1a6febaf8d9be43af9ed1bab46f0ee4e
+          # Issue #681 — programmatic entrypoint, NOT the `kopf run` CLI.
+          # The CLI cannot carry OperatorSettings; without them kopf's
+          # bookkeeping PATCHes the READ-ONLY main OSCM resource (diffbase
+          # into metadata.annotations, the KopfFinalizerMarker into
+          # metadata.finalizers) and 403s on every processing cycle under
+          # the deliberate #228 RBAC (patch only on /status).
+          # `openstudio_operator.__main__` builds the #681 settings
+          # (StatusDiffBaseStorage + finalizer=None + timer finalizer
+          # disarm) and calls kopf.run(...) — kopf's documented embedding
+          # pattern. The namespace flag mirrors the old CLI invocation's
+          # explicit `--namespace` (the entrypoint default is identical).
           args:
-            - kopf
-            - run
-            - --module
-            - openstudio_operator.handlers
+            - python
+            - -m
+            - openstudio_operator
             - --namespace
             - openstudio-server
           # Server URL comes from the CR spec.serverUrl (config.py) — single

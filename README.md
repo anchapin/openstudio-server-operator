@@ -402,6 +402,7 @@ on failed Jobs; treat the counter as best-effort.
 ├── docs/                       # audit-policy.md, onboarding.md, architecture-plan.md, audit-dryrun-idempotency.md, validation.md, kind-validation.md, contracts/, adr/, skill-snapshot/ (frozen wave-orchestrator skill copies, #379/#486)
 ├── scripts/                    # kind cluster recipe + fixture capture + drift checker + wave-orchestration tooling (wave-planner.js, auto_close_issues.py, render_orchestrator_snippet.py — #486)
 ├── src/openstudio_operator/
+│   ├── __main__.py             # programmatic operator entrypoint (`python -m openstudio_operator`): kopf.run + the #681 persistence settings — the kopf CLI cannot carry OperatorSettings
 │   ├── _constants.py           # Operator-behavior constants (polling cadences, metrics port, Resque-key-layout grace, K8S_REQUEST_TIMEOUT_SECONDS #579); owns the canonical CRD identity CRD_GROUP/CRD_VERSION/CRD_PLURAL/CRD_SPEC (#495); single source of truth — policy values do NOT live here (#165)
 │   ├── _cr_cache.py            # per-CR cache convention (#497): every handler-module cache keyed (namespace, name) + uid-validated at lookup (cr_uid/uid_is_stale — a #364 delete+recreate yields fresh state, no deletion hook); uniform reset_per_cr_caches() seams
 │   ├── _time.py                # tz-aware UTC parser (`parse_iso_utc`), None-safe; replaces three byte-equivalent duplicates (#174); `utc_parser(error_cls)` factory absorbs the per-module re-raise wrappers (#506)
@@ -421,6 +422,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164); emission type aliases `TickEmitter`/`EventSink` + `emit_kopf_event` (#496)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)
+│   ├── kopf_persistence.py     # #681 persistence settings: StatusDiffBaseStorage + finalizer=None + OSCM timer finalizer disarm — keeps kopf bookkeeping off the read-only main resource (#228 RBAC)
 │   └── handlers/               # Kopf handlers, one file per plan module
 │       ├── analysis_sla.py
 │       ├── datapoint_watchdog.py
