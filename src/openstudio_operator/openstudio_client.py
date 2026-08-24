@@ -47,7 +47,33 @@ from ._retry import _sleep
 from ._time import parse_iso_utc
 from .config import OperatorConfigError
 
-_TRANSIENT_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+# Transient-exception tuple (issue #716) — every ``requests`` exception
+# class that can fire mid-flight during a live deployment and is
+# recoverable via the GET retry envelope. The pre-#716 tuple was
+# narrower than the module docstring's "5xx, connection errors,
+# timeouts" claim: a live ``ChunkedEncodingError`` mid-stream, a
+# ``ContentDecodingError`` from a truncated gzip body, or a TLS-handshake
+# ``SSLError`` escaped the retry loop and was re-raised as
+# ``OpenStudioApiError``, costing the operator one retry-cycle of
+# resilience on the SLA / watchdog polls that ride this path.
+#
+# Each class is enumerated explicitly (NOT a bare ``RequestException``
+# umbrella) so programmer-error subclasses like ``MissingSchema`` /
+# ``InvalidURL`` / ``InvalidHeader`` — which must NOT be retried — stay
+# outside the retry envelope. Mirrors the K8s-side ``BoundedK8sRequest``
+# translation (#579) which folds urllib3 ``MaxRetryError`` into
+# ``SKIP_TICK_EXCEPTIONS`` rather than retrying.
+_TRANSIENT_EXCEPTIONS = (
+    # Pre-#716 narrow tuple — kept as explicit siblings so the regression
+    # fence in ``tests/test_openstudio_client.py`` (which asserts each
+    # subclass individually) has a stable hook.
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    # Issue #716 additions:
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.SSLError,
+)
 
 
 _PEM_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
