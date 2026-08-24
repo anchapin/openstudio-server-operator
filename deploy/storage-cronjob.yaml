@@ -131,6 +131,8 @@ spec:
             app.kubernetes.io/component: storage-pruner
         spec:
           serviceAccountName: openstudio-storage-pruner-sa
+          # Issue #713 — SA token not needed; prune uses its own SA.
+          automountServiceAccountToken: false
           restartPolicy: Never
           # Issue #414 — node-pressure protection: a mid-tick eviction
           # strands a retention tick (D12 makes the next schedule retry
