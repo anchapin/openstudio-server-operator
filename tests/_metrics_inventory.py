@@ -18,6 +18,7 @@ unaffected.
 
 EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_soft_stops_total",
+    "openstudio_operator_stops_total",  # issue #707
     "openstudio_operator_datapoints_requeued_total",
     "openstudio_operator_datapoints_requeue_exhausted_total",
     "openstudio_operator_workers_recycled_total",
