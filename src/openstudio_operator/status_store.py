@@ -42,6 +42,12 @@ from ._constants import CRD_GROUP, CRD_PLURAL, CRD_VERSION
 from ._k8s import MERGE_PATCH_CONTENT_TYPE
 from ._retry import _sleep
 from ._time import utc_parser
+
+# Issue #725 — re-export the canonical StatusEventSink alias from
+# events_sinks so the type lives in exactly one place (issue #496's
+# invariant). See the ``EmitStatusEvent`` re-export near the bottom of
+# this module for the long-form rationale.
+from .events_sinks import StatusEventSink as EmitStatusEvent
 from .metrics import (
     KUBE_API_REQUEST_DURATION_SECONDS,
     STATUS_CONFLICT_RETRIES_EXHAUSTED_TOTAL,
@@ -145,7 +151,6 @@ def reset_protected_anchor_keys() -> None:
 #: this exact seam already exists as
 #: :data:`openstudio_operator.events_sinks.StatusEventSink`. Re-homing it
 #: under yet another name would recreate the drift #496 collapses.
-EmitStatusEvent = Callable[[str, str, str, str], None]
 
 
 def _emit_status_map_event(_namespace: str, _name: str, _reason: str, _message: str) -> None:

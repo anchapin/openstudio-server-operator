@@ -1999,3 +1999,64 @@ def test_all_k8s_api_fakes_live_in_tests_fakes_py() -> None:
         f"(issue #718, #653 consolidation). Found local definitions at: "
         f"{[(p, n, l) for p, n, l in violations]}"
     )
+
+
+# --- Issue #725: StatusEventSink has a single canonical definition ---------
+#
+# Pre-#725, ``EmitStatusEvent`` (status_store.py) and ``StatusEventSink``
+# (events_sinks.py) were structurally-identical
+# ``Callable[[str, str, str, str], None]`` aliases defined twice. Issue
+# #725 collapsed ``EmitStatusEvent`` into a re-export of
+# ``StatusEventSink``, and the gate below prevents re-introduction of
+# a duplicate ``Callable[...]`` assignment in either module.
+
+
+def _emit_status_event_alias_definitions() -> list[tuple[str, str, int]]:
+    """Return every module-level ``EmitStatusEvent`` / ``StatusEventSink``
+    binding across ``src/openstudio_operator/`` so the failure message
+    names the exact location of any violation.
+
+    Each entry is ``(module_path, alias_name, line_number)``. The re-export
+    in status_store.py is permitted (it's the post-#725 shape); a
+    fresh ``= Callable[...]`` assignment in either module is the violation.
+    """
+    from openstudio_operator import _constants  # canonical reference; not the test target
+
+    src_root = Path(_constants.__file__).parent
+    found: list[tuple[str, str, int]] = []
+    for py in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in tree.body:
+            if not isinstance(node, ast.AnnAssign):
+                continue
+            target = node.target
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id not in ("EmitStatusEvent", "StatusEventSink"):
+                continue
+            # The post-#725 status_store.py re-export is an
+            # ``AnnAssign`` whose value is an ``ImportFrom`` (the re-export).
+            # Anything else (a fresh ``Callable[...]`` assignment) is the
+            # violation we want to surface.
+            if isinstance(node.value, ast.Call):
+                found.append((str(py.relative_to(src_root.parent)), target.id, node.lineno))
+    return found
+
+
+def test_emit_status_event_alias_has_single_definition() -> None:
+    """Issue #725 — ``EmitStatusEvent`` / ``StatusEventSink`` is defined once.
+
+    Pre-#725 two structurally-identical ``Callable[...]`` aliases existed
+    in :mod:`status_store` and :mod:`events_sinks`. The collapse keeps the
+    canonical home in :mod:`events_sinks` (``StatusEventSink``) and
+    re-exports it as ``EmitStatusEvent`` from :mod:`status_store` (the
+    only caller-facing name in the prior contract). A regression — a
+    fresh ``Callable[...]`` assignment in either module — would recreate
+    the drift #496/#725 closed.
+    """
+    violations = _emit_status_event_alias_definitions()
+    assert violations == [], (
+        f"EmitStatusEvent / StatusEventSink must each be defined at most once "
+        f"across src/openstudio_operator/ (issue #725, #496 consolidation). "
+        f"Found duplicate assignments at: {[(p, n, l) for p, n, l in violations]}"
+    )
