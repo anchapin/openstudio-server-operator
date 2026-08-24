@@ -974,3 +974,82 @@ def test_get_deferred_events_rejects_corrupt_shapes(store, api):
     api.obj["status"]["deferredEvents"] = ["nope"]
     with pytest.raises(StatusStoreError, match=r"expected object"):
         store.get_deferred_events()
+
+
+# --- Issue #648 — prune return value + anchor-aware cap eviction -----------------
+
+
+def test_prune_returns_pruned_ids_per_map(store, api):
+    """Issue #648 — ``prune`` returns the ids it actually dropped, as a
+    ``{field: sorted ids}`` dict, so the watchdog's hygiene pass can emit
+    its one-per-run summary Event without re-reading the maps. Empty when
+    nothing was dead (the RMW skipped the write entirely)."""
+    api.obj["status"] = {
+        "softStops": {"a1": make_soft_stop().to_dict(), "a2": make_soft_stop().to_dict()},
+        "requeues": {"dp1": make_requeue().to_dict(), "dp2": make_requeue(2).to_dict()},
+    }
+
+    pruned = store.prune(live_analysis_ids={"a2"}, live_datapoint_ids={"dp2"})
+
+    assert pruned == {"softStops": ["a1"], "requeues": ["dp1"]}
+
+    nothing = store.prune(live_analysis_ids={"a2"}, live_datapoint_ids={"dp2"})
+    assert nothing == {}
+    assert api.patch_calls == 1  # the second prune wrote nothing
+
+
+def test_protect_anchor_keys_rejects_unknown_field(store):
+    """A typo'd field name raises rather than silently protecting nothing."""
+    with pytest.raises(StatusStoreError, match="unknown status map field"):
+        store.protect_anchor_keys("softstop", {"a1"})
+
+
+def test_protect_anchor_keys_replaces_previous_set_wholesale(store):
+    """A shrinking live view must SHRINK the protection, not accumulate it —
+    the hygiene pass re-registers each map's live set on every heavy check."""
+    store.protect_anchor_keys("softStops", {"a1", "a2"})
+    store.protect_anchor_keys("softStops", {"a1"})
+    assert status_store._PROTECTED_ANCHOR_KEYS[(NAMESPACE, NAME, "softStops")] == {"a1"}
+
+
+def test_status_map_cap_never_evicts_protected_live_anchor(api, store):
+    """Issue #648 acceptance: a map at cap with a LIVE id present must not
+    lose that id's entry. The lexicographically-smallest key is protected
+    (it would be the deterministic victim of the pre-#648 sort) — the
+    eviction must skip it and drop the next-unprotected key instead."""
+    _fill_map_to_cap(api, "softStops")
+    cap = status_store.STATUS_MAP_MAX_ENTRIES
+    # Protect the smallest sortable key ("a00000") — the exact key the
+    # pre-#648 lexicographic eviction dropped (pinned by
+    # test_status_map_cap_drops_oldest_entries above).
+    store.protect_anchor_keys("softStops", {"a00000"})
+
+    store.set_soft_stop("new-key", make_soft_stop())
+
+    stops = store.get_soft_stops()
+    assert "a00000" in stops  # the live anchor survived the cap hit
+    assert "new-key" in stops
+    assert "a00001" not in stops  # the next-unprotected key was the victim
+    assert len(stops) == cap
+
+
+def test_status_map_cap_still_evicts_when_every_key_is_protected(api, store, status_event_sink):
+    """The hard cap dominates protection: when EVERY candidate is protected
+    (a defense-in-depth registry gone stale, or a genuinely all-live map at
+    cap), the etcd 1.5 MB bound still holds — and the Warning Event names
+    the protected losses instead of dropping D06 anchors silently."""
+    _fill_map_to_cap(api, "softStops")
+    cap = status_store.STATUS_MAP_MAX_ENTRIES
+    store.protect_anchor_keys(
+        "softStops", {f"a{i:05d}" for i in range(cap)}
+    )
+
+    store.set_soft_stop("new-key", make_soft_stop())
+
+    stops = store.get_soft_stops()
+    assert "new-key" in stops
+    assert len(stops) == cap  # the cap is still enforced
+    # The event flags the protected loss.
+    assert len(status_event_sink) == 1
+    message = status_event_sink[0][3]
+    assert "live-anchor-protected" in message

@@ -1009,10 +1009,11 @@ PRUNE_TICK_FAILURES_TOTAL = Counter(
 # Increment happens inside :meth:`EventEmitter.emit` at the same site that
 # increments :attr:`EventEmitter.suppressed_count`. Labelled by ``reason``
 # mirroring the warning-event reason vocabulary
-# (``AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued`` |
+# ``(AnalysisSoftStopped`` | ``AnalysisEscalated`` | ``DatapointRequeued`` |
 # ``DatapointRequeueExhausted`` | ``WorkerRecycled`` |
 # ``WebBackgroundRestarted`` | ``WebBackgroundRestartIneffective`` (#649) |
-# ``ResqueKeyLayoutUnknown``) so a dashboard can
+# ``ResqueKeyLayoutUnknown`` | ``StatusAnchorsPruned`` (#648)) so a dashboard
+# can
 # tell WHICH action the dry-run gate intercepted, not just that it did.
 # Companion emitted counter below lets ``rate(emitted) / rate(suppressed)``
 # be derived without log parsing — the dry-run ratio is the headline SLO for

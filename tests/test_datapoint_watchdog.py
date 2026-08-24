@@ -20,11 +20,18 @@ from prometheus_client import REGISTRY
 
 from _fakes import FakeCustomObjectsApi, calls_to, make_emit, tick_failures_total
 from _fakes import make_cr as _shared_make_cr
+from openstudio_operator import status_store
+from openstudio_operator._constants import (
+    STATUS_ANCHOR_PRUNE_EVERY_N_TICKS,
+    STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS,
+)
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
 from openstudio_operator.handlers.datapoint_watchdog import (
     DATAPOINT_REQUEUE_EXHAUSTED_EVENT,
     DATAPOINT_REQUEUED_EVENT,
+    STATUS_ANCHORS_PRUNED_EVENT,
+    AnchorPruneState,
     run_watchdog_tick,
     zombie_datapoint_watchdog,
 )
@@ -62,11 +69,24 @@ def register_started(*dp_ids: str) -> None:
     )
 
 
+def register_full_datapoints(*dp_ids: str) -> None:
+    """Heavy ``GET /data_points.json`` — the #648 hygiene liveness view."""
+    responses.get(f"{BASE}/data_points.json", json=[{"_id": dp_id} for dp_id in dp_ids])
+
+
+def register_full_analyses(*an_ids: str) -> None:
+    """Heavy ``GET /analyses.json`` — the #648 hygiene liveness view."""
+    responses.get(
+        f"{BASE}/analyses.json",
+        json=[{"_id": an_id, "status": "completed"} for an_id in an_ids],
+    )
+
+
 def register_requeue(dp_id: str) -> None:
     responses.post(f"{BASE}/data_points/{dp_id}/requeue", status=204)
 
 
-def tick(api, spec=None, client=None, exhausted_seen=None, now=NOW):
+def tick(api, spec=None, client=None, exhausted_seen=None, now=NOW, anchor_prune=None):
     store = StatusStore(NAMESPACE, NAME, api)
     config = OperatorConfig.from_spec(spec if spec is not None else SPEC)
     events, emit = make_emit()
@@ -77,6 +97,7 @@ def tick(api, spec=None, client=None, exhausted_seen=None, now=NOW):
         now=now,
         emit=emit,
         exhausted_seen=exhausted_seen if exhausted_seen is not None else set(),
+        anchor_prune_state=anchor_prune,
     )
     return requeued, events
 
@@ -702,3 +723,262 @@ def test_raw_api_exception_from_status_patch_is_counted_by_shared_skip_tuple(mon
     # The tick died at the very first status write (first observation clock).
     assert api.patch_calls == 0
     assert api.obj["status"] == {}
+
+
+# --- Issue #648 — status-anchor age-out hygiene ---------------------------------
+#
+# "Gone for good" (operational definition, pinned here): an id absent from
+# the light started view AND from the heavy full listing of its id-space for
+# STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS consecutive heavy checks, where a
+# heavy check runs on every STATUS_ANCHOR_PRUNE_EVERY_N_TICKS-th watchdog
+# tick. Re-appearance in ANY live view resets the counter. The absence
+# counters are an in-memory per-CR cache (AnchorPruneState) — restart merely
+# defers a prune, so every test below drives the state object directly.
+
+
+def heavy_tick(api, state, *, started=(), full_dps=(), full_ans=(), spec=None, now=NOW):
+    """Run one watchdog tick that lands ON the heavy cadence multiple.
+
+    The tick counter is set to EVERY_N-1 so this invocation is the Nth —
+    isolating the gone-for-good state machine from cadence counting (which
+    test_anchor_hygiene_runs_heavy_listings_on_every_nth_tick pins
+    separately over real consecutive ticks).
+    """
+    state.ticks = STATUS_ANCHOR_PRUNE_EVERY_N_TICKS - 1
+    register_started(*started)
+    register_full_datapoints(*full_dps)
+    register_full_analyses(*full_ans)
+    return tick(api, spec=spec, anchor_prune=state, now=now)
+
+
+@responses.activate
+def test_anchor_hygiene_skips_heavy_listings_when_no_anchor_entries():
+    """Idle gate: with no requeues/softStops/archivedAnalyses entries there is
+    nothing that can be gone-for-good, so the hygiene pass must not pay the
+    heavy-listing cost at all (zero /data_points.json + /analyses.json calls
+    even ON the heavy cadence multiple)."""
+    api = FakeCustomObjectsApi(make_cr())
+    state = AnchorPruneState()
+
+    heavy_tick(api, state, started=("d1",))
+
+    assert calls_to("/data_points.json") == 0
+    assert calls_to("/analyses.json") == 0
+    # startedSince alone never triggers the heavy pass (its departure prune
+    # at the top of every tick is its own lifecycle).
+    assert api.obj["status"]["startedSince"] == {"d1": NOW.isoformat()}
+
+
+@responses.activate
+def test_anchor_hygiene_runs_heavy_listings_on_every_nth_tick():
+    """Cadence: ticks 1..9 never touch the heavy listings; the 10th does,
+    exactly once per heavy check (no per-tick full listing — the issue's
+    hard constraint)."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 1, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+    register_started()
+    register_full_datapoints("dp1")
+    register_full_analyses()
+
+    for _ in range(STATUS_ANCHOR_PRUNE_EVERY_N_TICKS - 1):
+        tick(api, anchor_prune=state)
+    assert calls_to("/data_points.json") == 0
+    assert calls_to("/analyses.json") == 0
+
+    tick(api, anchor_prune=state)
+    assert calls_to("/data_points.json") == 1
+    assert calls_to("/analyses.json") == 1
+
+
+@responses.activate
+def test_requeue_anchor_survives_fewer_than_n_consecutive_absences():
+    """Debounce: a dead dp absent for 2 of the required 3 heavy checks keeps
+    its budget anchor — and no summary Event fires."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 2, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+
+    for _ in range(STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS - 1):
+        events = heavy_tick(api, state)[1]
+
+    assert api.obj["status"]["requeues"]["dp1"]["count"] == 2
+    assert events == []
+
+
+@responses.activate
+def test_requeue_anchor_pruned_after_n_consecutive_absences():
+    """Gone for good: after the 3rd consecutive heavy absence the requeues
+    entry is pruned and exactly ONE summary Event (StatusAnchorsPruned,
+    per-run not per-id) fires — on the pruning tick only."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 2, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+
+    events: list = []
+    for _ in range(STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS):
+        events = heavy_tick(api, state)[1]
+
+    assert api.obj["status"].get("requeues", {}) == {}
+    assert len(events) == 1
+    assert events[0][:2] == ("Normal", STATUS_ANCHORS_PRUNED_EVENT)
+    assert "requeues: 1" in events[0][2]
+    # Pruned ids are never re-tracked: the next heavy check stays silent.
+    events_after = heavy_tick(api, state)[1]
+    assert events_after == []
+
+
+@responses.activate
+def test_anchor_reappearance_resets_absence_counter():
+    """Re-appearance resets: 2 absences, 1 heavy check back alive (in the
+    full listing), then 2 more absences — still under the threshold, so the
+    anchor survives (2 < 3; the counter restarted at the re-appearance)."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 1, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+
+    for _ in range(2):
+        heavy_tick(api, state)
+    heavy_tick(api, state, full_dps=("dp1",))  # re-appears (e.g. back from the requeued queue)
+    for _ in range(2):
+        heavy_tick(api, state)
+
+    assert api.obj["status"]["requeues"]["dp1"]["count"] == 1
+
+
+@responses.activate
+def test_full_listing_presence_protects_requeue_anchor():
+    """The heavy view is the liveness oracle: a dp absent from ``started``
+    (sitting on the requeued queue) but PRESENT in the full listing is live —
+    its budget anchor must survive arbitrarily many heavy checks."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 1, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+
+    for _ in range(STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS + 2):
+        events = heavy_tick(api, state, full_dps=("dp1",))[1]
+
+    assert api.obj["status"]["requeues"]["dp1"]["count"] == 1
+    assert events == []
+
+
+@responses.activate
+def test_soft_stop_and_archived_anchors_pruned_after_n_absences():
+    """Analysis id-space: softStops + archivedAnalyses entries whose analysis
+    vanished from /analyses.json age out together after N heavy checks, in
+    the SAME prune pass + summary Event."""
+    api = FakeCustomObjectsApi(
+        make_cr(
+            status={
+                "softStops": {"a1": {"issuedAt": NOW.isoformat(), "outcome": "issued"}},
+                "archivedAnalyses": {"a2": {"backend": "s3", "bucket": "b"}},
+            }
+        )
+    )
+    state = AnchorPruneState()
+
+    events: list = []
+    for _ in range(STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS):
+        events = heavy_tick(api, state)[1]
+
+    assert api.obj["status"].get("softStops", {}) == {}
+    assert api.obj["status"].get("archivedAnalyses", {}) == {}
+    assert len(events) == 1
+    assert events[0][:2] == ("Normal", STATUS_ANCHORS_PRUNED_EVENT)
+    assert "softStops: 1" in events[0][2]
+    assert "archivedAnalyses: 1" in events[0][2]
+
+
+@responses.activate
+def test_anchor_prune_proceeds_under_dry_run():
+    """D11 posture: pruning .status maps is operator-memory hygiene, not a
+    cluster mutation — it proceeds under spec.dryRun exactly like the requeue
+    budget increment (identical accounting, suppressed mutation only). The
+    summary Event's D11 gate is EventEmitter's own (pinned by test_events.py);
+    the make_emit recorder here observes the call, not the gate."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 2, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+    spec = {**SPEC, "dryRun": True}
+
+    events: list = []
+    for _ in range(STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS):
+        events = heavy_tick(api, state, spec=spec)[1]
+
+    assert api.obj["status"].get("requeues", {}) == {}
+    assert any(e[1] == STATUS_ANCHORS_PRUNED_EVENT for e in events)
+
+
+@responses.activate
+def test_anchor_hygiene_registers_cap_eviction_protection():
+    """Defense-in-depth wiring: every heavy check registers each map's LIVE
+    set with StatusStore.protect_anchor_keys so the #171 cap eviction
+    (#648) can never drop a live id's anchor while an unprotected candidate
+    remains (behavior pinned by the test_status_store.py cap tests)."""
+    api = FakeCustomObjectsApi(
+        make_cr(status={"requeues": {"dp1": {"count": 1, "lastRequeuedAt": NOW.isoformat()}}})
+    )
+    state = AnchorPruneState()
+
+    heavy_tick(api, state, started=("d2",), full_dps=("dp1",), full_ans=("a9",))
+
+    registry = status_store._PROTECTED_ANCHOR_KEYS
+    assert registry[(NAMESPACE, NAME, "requeues")] == {"dp1", "d2"}
+    assert registry[(NAMESPACE, NAME, "startedSince")] == {"dp1", "d2"}
+    assert registry[(NAMESPACE, NAME, "softStops")] == {"a9"}
+    assert registry[(NAMESPACE, NAME, "archivedAnalyses")] == {"a9"}
+
+
+def test_wrapper_passes_the_cached_anchor_prune_state(monkeypatch):
+    """Wrapper wiring: the kopf timer passes the per-CR cached AnchorPruneState
+    (uid-validated, #497) to run_watchdog_tick — SAME object identity across
+    two invocations, so the every-Nth-tick cadence and the absence debounce
+    actually accumulate in production (a throwaway state per tick would make
+    the hygiene pass inert)."""
+    from openstudio_operator.handlers import datapoint_watchdog
+
+    captured: list[AnchorPruneState] = []
+
+    def fake_run(client, store, config, *, now, emit, exhausted_seen, anchor_prune_state=None):
+        captured.append(anchor_prune_state)
+        return []
+
+    monkeypatch.setattr(datapoint_watchdog, "run_watchdog_tick", fake_run)
+    monkeypatch.setattr(
+        "openstudio_operator.handlers.datapoint_watchdog.operator_custom_objects_api",
+        lambda: FakeCustomObjectsApi(make_cr()),
+    )
+
+    for _ in range(2):
+        zombie_datapoint_watchdog(
+            body=make_cr(),
+            spec=SPEC,
+            namespace=NAMESPACE,
+            name=NAME,
+            logger=logging.getLogger("test"),
+        )
+
+    assert len(captured) == 2
+    assert captured[0] is captured[1]
+    assert isinstance(captured[0], AnchorPruneState)
+    datapoint_watchdog.reset_per_cr_caches()
+
+
+def test_anchor_prune_state_is_reset_by_the_module_seam():
+    """The #497 reset seam drops the anchor-prune cache with the exhaustion
+    cache — the conftest autouse reset depends on it for test isolation."""
+    from openstudio_operator.handlers import datapoint_watchdog as dpw
+
+    state = dpw._get_anchor_prune_state(NAMESPACE, NAME, "uid-1")
+    state.absent_datapoints["dp1"] = 2
+    dpw.reset_per_cr_caches()
+    assert dpw._ANCHOR_PRUNE == {}
+    fresh = dpw._get_anchor_prune_state(NAMESPACE, NAME, "uid-1")
+    assert fresh is not state
+    assert fresh.absent_datapoints == {}

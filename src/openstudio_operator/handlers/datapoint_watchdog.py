@@ -37,7 +37,34 @@ Documented decisions (beyond the issue text):
   the view while it sits on the ``requeued`` Resque queue, and wiping its
   budget then would reset the bound and unbound the loop. Entries persist
   until a datapoint disappears for good; ``StatusStore.clear_started_since``
-  therefore exists instead of the coupled ``StatusStore.prune``.
+  therefore exists instead of the coupled ``StatusStore.prune``. Issue
+  #648 defines "disappears for good" operationally and wires the prune:
+  see the anchor-hygiene paragraph below.
+* Status-anchor hygiene (#648): every
+  ``STATUS_ANCHOR_PRUNE_EVERY_N_TICKS``-th tick (10th → 600 s, the
+  retention CronJob's cadence) the tick runs ONE heavy liveness pass —
+  ``GET /data_points.json`` + ``GET /analyses.json`` (the heavy full
+  listings, fetched at most once per hygiene pass, never per tick, and
+  skipped entirely while no ``requeues``/``softStops``/``archivedAnalyses``
+  entries exist to age out). An id absent from BOTH the light started
+  view and its full listing for ``STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS``
+  consecutive heavy checks (3 → ~30 min of sustained absence) is pruned
+  from the ``.status`` maps via :meth:`StatusStore.prune`; re-appearance
+  at any heavy check resets its counter. The absence counters are an
+  in-memory per-CR cache (uid-validated, #497 convention) on purpose:
+  persisting them would add a NEW monotonic id-keyed ``.status`` map —
+  the exact problem #648 fixes — and they are debounce state, not
+  idempotency anchors: the prune decision derives purely from live
+  server views plus the persisted maps, so a restart merely defers a
+  prune by up to N heavy checks. The heavy pass also re-registers each
+  map's live-id set with ``StatusStore.protect_anchor_keys`` so the #171
+  cap eviction (#648 defense-in-depth) never drops a live id's anchor
+  while an unprotected candidate remains. dryRun (D11): pruning status
+  maps is operator-memory hygiene, not a cluster mutation — it proceeds
+  under ``spec.dryRun`` exactly like every other ``.status`` write (the
+  requeue budget increment, retention's dry-run markers); the one
+  summary Event per pruned run flows through the D11-gated emitter and
+  is suppressed/counted like every Normal Event.
 * dryRun (D11): the REST call is suppressed and the Event message is
   dry-run-marked, but the budget is incremented EXACTLY as in a real run —
   so flipping ``spec.dryRun`` off never double-burns the budget. This
@@ -62,12 +89,18 @@ recorded ones never re-fire.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import kopf
 
 from openstudio_operator import _cr_cache as cr_cache
-from openstudio_operator._constants import CRD_SPEC, DATAPOINT_POLL_INTERVAL_SECONDS
+from openstudio_operator._constants import (
+    CRD_SPEC,
+    DATAPOINT_POLL_INTERVAL_SECONDS,
+    STATUS_ANCHOR_PRUNE_EVERY_N_TICKS,
+    STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS,
+)
 from openstudio_operator._oscm_handlers import (
     observe_tick_duration,
     run_oscm_tick,
@@ -86,6 +119,10 @@ from openstudio_operator.metrics import (
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_custom_objects_api
 from openstudio_operator.status_store import (
+    ARCHIVED_ANALYSES,
+    REQUEUES,
+    SOFT_STOPS,
+    STARTED_SINCE,
     RequeueRecord,
     StatusStore,
 )
@@ -104,6 +141,32 @@ POLL_INTERVAL_SECONDS = DATAPOINT_POLL_INTERVAL_SECONDS
 
 DATAPOINT_REQUEUED_EVENT = "DatapointRequeued"
 DATAPOINT_REQUEUE_EXHAUSTED_EVENT = "DatapointRequeueExhausted"
+#: Issue #648 — one Normal Event per hygiene pass that actually pruned
+#: anchor entries (summary counts, never per-id: a 10k-entry age-out must
+#: not become a 10k-Event storm). Flows through the D11-gated emitter.
+STATUS_ANCHORS_PRUNED_EVENT = "StatusAnchorsPruned"
+
+
+@dataclass
+class AnchorPruneState:
+    """Issue #648 — per-CR debounce state for the status-anchor hygiene pass.
+
+    Deliberately in-memory cache, not ``.status`` (D04): the absence
+    counters are a debounce on a decision that derives purely from live
+    server views plus the persisted maps, so a restart (or the #364
+    delete+recreate, via the uid-validated cache key) merely restarts the
+    debounce — nothing mutating ever reads this state. Persisting the
+    counters would add a new monotonic id-keyed status map, the exact
+    growth problem #648 exists to fix.
+    """
+
+    #: Watchdog ticks seen for this CR by this process (drives the
+    #: every-Nth-tick heavy cadence).
+    ticks: int = 0
+    #: datapoint id → consecutive heavy checks absent from every live view.
+    absent_datapoints: dict[str, int] = field(default_factory=dict)
+    #: analysis id → consecutive heavy checks absent from every live view.
+    absent_analyses: dict[str, int] = field(default_factory=dict)
 
 # Presentation-only (D04): datapoints whose exhaustion Warning has already
 # been emitted for THIS CR in this operator process — dedupes per-tick Event
@@ -150,21 +213,43 @@ def _get_exhausted_seen(namespace: str, name: str, uid: str | None = None) -> se
     return _EXHAUSTED_WARNED.get_or_create(namespace, name, uid, set)
 
 
-def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
-    """Reset seam (#497): drop exhaustion-dedup entries (all, or one CR).
+# Issue #648 — the anchor-hygiene debounce state (see :class:`AnchorPruneState`
+# for why it is a per-CR #497 cache and not ``.status``). Same convention as
+# ``_EXHAUSTED_WARNED`` above: keyed ``(namespace, name)``, uid-validated at
+# lookup, reset through the module's single ``reset_per_cr_caches`` seam.
+_ANCHOR_PRUNE: cr_cache.PerCRCache[AnchorPruneState] = cr_cache.PerCRCache(
+    stale_log=(
+        "anchor-prune debounce state for %s/%s belongs to a deleted CR "
+        "(recorded uid %r != observed %r) — starting fresh (#364 "
+        "delete+recreate; #497 uid validation)"
+    ),
+    logger=logger,
+)
 
-    Pass neither argument to clear every entry (test isolation); pass both
-    ``namespace`` and ``name`` to clear exactly one CR's entry (the shape a
-    future ``@kopf.on.delete`` handler would call — none exists today; the
-    uid validation in :func:`_get_exhausted_seen` closes the delete+recreate
-    leak at lookup time in the meantime). Anything else is a caller bug and
-    raises rather than silently clearing the wrong scope.
+
+def _get_anchor_prune_state(namespace: str, name: str, uid: str | None = None) -> AnchorPruneState:
+    """Return the per-CR anchor-hygiene debounce state, uid-validating (#497)."""
+    return _ANCHOR_PRUNE.get_or_create(namespace, name, uid, AnchorPruneState)
+
+
+def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -> None:
+    """Reset seam (#497): drop per-CR caches (all, or one CR).
+
+    Clears both module caches: the exhaustion-dedup set and the #648
+    anchor-prune debounce state. Pass neither argument to clear every
+    entry (test isolation); pass both ``namespace`` and ``name`` to clear
+    exactly one CR's entry (the shape a future ``@kopf.on.delete``
+    handler would call — none exists today; the uid validation in the
+    lookup façades closes the delete+recreate leak at lookup time in the
+    meantime). Anything else is a caller bug and raises rather than
+    silently clearing the wrong scope.
     """
     _EXHAUSTED_WARNED.reset(namespace, name)
+    _ANCHOR_PRUNE.reset(namespace, name)
 
 
 def _datapoint_ids(docs: list[dict]) -> list[str]:
-    """Ordered, de-duplicated ``_id`` extraction from the light view."""
+    """Ordered, de-duplicated ``_id`` extraction from an id-bearing doc list."""
     ids: list[str] = []
     seen: set[str] = set()
     for doc in docs:
@@ -175,6 +260,121 @@ def _datapoint_ids(docs: list[dict]) -> list[str]:
     return ids
 
 
+def _bump_absences(counters: dict[str, int], tracked: set[str], live: set[str]) -> None:
+    """Advance the gone-for-good debounce for one id-space (issue #648).
+
+    ``tracked`` is the set of ids currently keyed in the ``.status`` maps
+    for this id-space; ``live`` the ids present in any live server view
+    this heavy check. Absent ids gain one consecutive-absence tick;
+    re-appearances RESET to zero (a datapoint back in any view must never
+    age out on stale evidence); ids no longer tracked (already pruned or
+    hand-cleared) drop out of the counter map entirely.
+    """
+    for key in tracked:
+        if key in live:
+            counters.pop(key, None)
+        else:
+            counters[key] = counters.get(key, 0) + 1
+    for key in list(counters):
+        if key not in tracked:
+            del counters[key]
+
+
+def _run_anchor_hygiene(
+    client: OpenStudioClient,
+    store: StatusStore,
+    *,
+    emit: EventEmitter,
+    state: AnchorPruneState,
+    started_ids: list[str],
+) -> None:
+    """One heavy liveness pass: age out gone-for-good anchors (#648).
+
+    Runs on every ``STATUS_ANCHOR_PRUNE_EVERY_N_TICKS``-th watchdog tick.
+    "Gone for good" = absent from the light started view AND from the
+    heavy full listing of the id-space for
+    ``STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS`` consecutive heavy checks.
+    REST/store failures raise → the tick is skipped (D12) and the debounce
+    resumes on the next heavy check — an uncounted check never ages
+    anything out. dryRun (D11): pruning ``.status`` maps is operator-memory
+    hygiene, not a cluster mutation, so it proceeds under ``spec.dryRun``
+    like every other status write; the summary Event is D11-gated by the
+    emitter like every Normal Event.
+    """
+    requeues = store.get_requeues()
+    soft_stops = store.get_soft_stops()
+    archived = store.get_archived_analyses()
+    tracked_datapoints = set(requeues)
+    tracked_analyses = set(soft_stops) | set(archived)
+
+    if not (tracked_datapoints or tracked_analyses):
+        # Nothing keyed anywhere → nothing can be gone-for-good. Skip the
+        # heavy listings entirely: an idle cluster pays zero heavy-view
+        # cost from this pass (``startedSince`` alone is not tracked here
+        # — its departure prune at the top of every tick already removes
+        # every entry not in the current started view).
+        state.absent_datapoints.clear()
+        state.absent_analyses.clear()
+        return
+
+    live_datapoints = set(started_ids) | set(_datapoint_ids(client.list_datapoints()))
+    live_analyses = set(_datapoint_ids(client.list_analyses()))
+
+    _bump_absences(state.absent_datapoints, tracked_datapoints, live_datapoints)
+    _bump_absences(state.absent_analyses, tracked_analyses, live_analyses)
+
+    confirmed_datapoints = {
+        key
+        for key, count in state.absent_datapoints.items()
+        if count >= STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS
+    }
+    confirmed_analyses = {
+        key
+        for key, count in state.absent_analyses.items()
+        if count >= STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS
+    }
+
+    # Issue #648 defense-in-depth: register the LIVE sets (not the
+    # debounce-augmented sets) so cap eviction never drops an anchor for
+    # an id a live view just proved alive.
+    store.protect_anchor_keys(REQUEUES, live_datapoints)
+    store.protect_anchor_keys(STARTED_SINCE, live_datapoints)
+    store.protect_anchor_keys(SOFT_STOPS, live_analyses)
+    store.protect_anchor_keys(ARCHIVED_ANALYSES, live_analyses)
+
+    if not (confirmed_datapoints or confirmed_analyses):
+        return
+
+    # The prune live sets keep the not-yet-confirmed absent ids "live" so
+    # the N-check debounce survives the prune call itself (prune would
+    # otherwise drop them on their FIRST absence).
+    prune_datapoint_live = live_datapoints | (
+        set(state.absent_datapoints) - confirmed_datapoints
+    )
+    prune_analysis_live = live_analyses | (set(state.absent_analyses) - confirmed_analyses)
+    pruned = store.prune(
+        live_datapoint_ids=prune_datapoint_live,
+        live_analysis_ids=prune_analysis_live,
+    )
+    # Confirmed ids are gone from the maps now — retire their counters.
+    for key in confirmed_datapoints:
+        state.absent_datapoints.pop(key, None)
+    for key in confirmed_analyses:
+        state.absent_analyses.pop(key, None)
+
+    if pruned:
+        summary = ", ".join(f"{field}: {len(ids)}" for field, ids in sorted(pruned.items()))
+        emit(
+            "Normal",
+            STATUS_ANCHORS_PRUNED_EVENT,
+            f"Status-anchor hygiene pruned {len(pruned)} map(s) — {summary}; "
+            f"ids absent from every live view for "
+            f"{STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS} consecutive heavy "
+            f"checks (issue #648). Live anchors and their D06 budgets are "
+            f"untouched.",
+        )
+
+
 def run_watchdog_tick(
     client: OpenStudioClient,
     store: StatusStore,
@@ -183,6 +383,7 @@ def run_watchdog_tick(
     now: datetime,
     emit: EventEmitter,
     exhausted_seen: set[str],
+    anchor_prune_state: AnchorPruneState | None = None,
 ) -> list[str]:
     """One watchdog poll over the light started-datapoints view.
 
@@ -192,6 +393,11 @@ def run_watchdog_tick(
     across ticks and operator restarts (D04). Raises on API/status-store
     failure so the caller can skip the tick (D12). ``exhausted_seen`` is
     the caller-owned presentation cache for one-shot exhaustion Events.
+    ``anchor_prune_state`` is the caller-owned #648 hygiene debounce
+    state (the wrapper passes the per-CR cached instance); ``None`` gives
+    the tick a throwaway state whose tick counter never reaches the
+    every-Nth-tick heavy cadence — the hygiene pass is inert for one-shot
+    callers.
     """
     max_runtime = timedelta(minutes=config.datapoint_policy.max_datapoint_runtime_minutes)
     max_requeues = config.datapoint_policy.max_auto_requeues
@@ -261,6 +467,17 @@ def run_watchdog_tick(
         store.set_started_since(dp_id, now)
         started_since[dp_id] = now
         requeued.append(dp_id)
+
+    # Status-anchor hygiene (#648): background age-out for gone-for-good
+    # ids, on the every-Nth-tick heavy cadence. Runs AFTER the requeue
+    # actions — a hygiene failure raises out of the tick (D12 skip-tick)
+    # with the requeue anchors already recorded, so the retry is idempotent.
+    prune_state = anchor_prune_state if anchor_prune_state is not None else AnchorPruneState()
+    prune_state.ticks += 1
+    if prune_state.ticks % STATUS_ANCHOR_PRUNE_EVERY_N_TICKS == 0:
+        _run_anchor_hygiene(
+            client, store, emit=emit, state=prune_state, started_ids=started_ids
+        )
     return requeued
 
 
@@ -305,6 +522,7 @@ def zombie_datapoint_watchdog(
             now=now,
             emit=emit,
             exhausted_seen=_get_exhausted_seen(namespace, name, cr_cache.cr_uid(body)),
+            anchor_prune_state=_get_anchor_prune_state(namespace, name, cr_cache.cr_uid(body)),
         )
 
     requeued = run_oscm_tick(
