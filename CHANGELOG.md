@@ -721,6 +721,22 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#699`** — release.yml's digest re-pin sed only matched the
+  `:tag` image form, silently no-op'ing on every run since the first
+  pin (the manifests live in `@sha256:` form between releases) — the
+  committed digest froze at the pre-#149 baseline, the exact skew
+  #679 documented. The `[:@]` character class now matches both forms;
+  regression-fenced in the #588 workflow-test family.
+- **`#701`** — layer two of the same bug: even with the sed fixed,
+  the bot's direct develop push is rejected by the ruleset (the bot
+  is not a bypass actor). The re-pin now lands via a floating
+  `bot/digest-repin` branch + PR with auto-merge (required checks run
+  on the PR); `pull-requests: write` + #574-compliant token
+  indirection. Until the repo's "Allow GitHub Actions to create and
+  approve pull requests" toggle is flipped (#704 — owner decision),
+  each release pushes the branch and fails loudly at PR creation;
+  the frozen pin was landed manually once (PR #703, digest
+  `sha256:b24d8dce…`).
 - **`#681`** — kopf's own bookkeeping no longer PATCHes the
   read-only OSCM main resource (#228): the operator launches via
   `python -m openstudio_operator` (`kopf.run` embedding with
