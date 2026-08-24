@@ -139,6 +139,32 @@ REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL: timedelta = timedelta(minutes=5)
 K8S_REQUEST_TIMEOUT_SECONDS: float = 15.0
 
 # -----------------------------------------------------------------------------
+# Status-anchor age-out hygiene (issue #648)
+# -----------------------------------------------------------------------------
+
+#: Issue #648 — the datapoint watchdog's status-anchor hygiene pass runs on
+#: every Nth watchdog tick (60 s × 10 = 600 s — the same 600 s cadence the
+#: storage-prune CronJob uses), never per tick. The hygiene pass confirms
+#: liveness against the HEAVY full listings (``GET /data_points.json`` +
+#: ``GET /analyses.json``); this divisor keeps that cost at or below the
+#: retention pipeline's own heavy-poll budget. Operator behavior, not
+#: cluster policy — a constant here, not a CRD field.
+STATUS_ANCHOR_PRUNE_EVERY_N_TICKS: int = 10
+
+#: Issue #648 — how many consecutive heavy-check absences an id must
+#: accumulate before its ``.status`` anchor entries are pruned. An id is
+#: absent for a heavy check when it is missing from BOTH the light started
+#: view AND the heavy full listing of its id-space. 3 confirmations ≈ 30
+#: minutes of sustained absence at the default cadence — long enough that
+#: a datapoint sitting on the ``requeued`` Resque queue (still present in
+#: the full listing) or an analysis in any non-started state can never
+#: trip it, short enough that dead anchors age out in under an hour.
+#: Operator behavior, not cluster policy — a constant here, not a CRD
+#: field (nothing here decides the fate of real data, unlike
+#: ``storagePolicy.retentionDays``).
+STATUS_ANCHOR_PRUNE_GONE_CONFIRMATIONS: int = 3
+
+# -----------------------------------------------------------------------------
 # Metrics HTTP server
 # -----------------------------------------------------------------------------
 

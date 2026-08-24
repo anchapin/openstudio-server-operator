@@ -277,14 +277,17 @@ class OpenStudioClient:
         Live v3.11.0 contract: this is the heavy endpoint — the per-dp docs
         carry ``_id``, ``analysis_id``, ``status``, ``status_message``, and
         ``ip_address`` (always ``null`` on K8s — see #83 D2; the SLA
-        escalator no longer uses it). The retention pipeline is the ONLY
-        caller (issue #252): it needs the per-analysis datapoint ID set
-        for archival Job args, so the heavy poll is gated by the
-        retention tick (run at most once per ``storage-cronjob.yaml``
-        schedule — 600 s by default) and only when a spawn is actually
-        due. The SLA monitor's per-tick observation is the LIGHT
-        endpoint (:meth:`list_started_datapoints`); the watchdog's
-        per-tick observation is also the LIGHT endpoint.
+        escalator no longer uses it). Two callers, both heavy-poll-gated
+        (issue #252): the retention pipeline (needs the per-analysis
+        datapoint ID set for archival Job args — at most once per
+        ``storage-cronjob.yaml`` schedule, 600 s by default, and only when
+        a spawn is actually due) and, since #648, the datapoint watchdog's
+        status-anchor hygiene pass (gone-for-good liveness confirmation,
+        every ``STATUS_ANCHOR_PRUNE_EVERY_N_TICKS``-th 60 s tick and only
+        while anchor entries exist to age out). The SLA monitor's per-tick
+        observation is the LIGHT endpoint
+        (:meth:`list_started_datapoints`); the watchdog's per-tick
+        observation is also the LIGHT endpoint.
 
         Issue #252 — added as the public surface replacement for the
         legacy ``client._request_json("GET", "/data_points.json")`` seam

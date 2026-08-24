@@ -99,6 +99,34 @@ _STATUS_MAP_FIELDS = (SOFT_STOPS, REQUEUES, STARTED_SINCE, ARCHIVED_ANALYSES)
 #: short string so dashboard filters / alert rules can match it.
 STATUS_MAP_CAPPED_EVENT = "StatusMapCapped"
 
+#: Issue #648 — live-anchor protection registry for the cap-eviction path
+#: (defense-in-depth). Keyed ``(namespace, name, map field)`` → the set of
+#: ids the watchdog's hygiene pass last observed ALIVE in a live server
+#: view; the eviction in :meth:`StatusStore._set_map_entry` prefers
+#: UNPROTECTED keys so a still-live id's D06 anchor (its ``requeues``
+#: budget, its ``startedSince`` clock) is never the arbitrary lexicographic
+#: victim at the cap. Deliberately a plain module-level dict (NOT a
+#: :class:`~openstudio_operator._cr_cache.PerCRCache` entry): it is
+#: advisory-only eviction-ordering state — never a source of truth (D04)
+#: — whose worst-case staleness (a CR deleted mid-flight) self-heals on
+#: the next heavy tick of whatever CR holds the name next, and whose size
+#: is bounded by the live id count of the last registration. The watchdog
+#: re-registers each map's live set on every hygiene pass
+#: (:meth:`StatusStore.protect_anchor_keys`).
+_PROTECTED_ANCHOR_KEYS: dict[tuple[str, str, str], frozenset[str]] = {}
+
+
+def reset_protected_anchor_keys() -> None:
+    """Drop every registered live-anchor protection set (test seam).
+
+    Production never needs this — each hygiene pass replaces its CR's
+    entries wholesale — but the test suite registers protections against
+    shared ``(namespace, name)`` fixtures and must not leak them into
+    unrelated cap-eviction cases. Mirrors the ``set_event_sink(None)``
+    restore pattern below.
+    """
+    _PROTECTED_ANCHOR_KEYS.clear()
+
 #: ``(namespace, name, reason, message)`` — kopf-backed sink in production,
 #: recorder in tests. The StatusStore instance knows its own ``namespace``/
 #: ``name`` and calls the sink with the CR body so the production sink can
@@ -435,6 +463,18 @@ class StatusStore:
             # does not evict: the eviction is in the path that adds a new
             # entry, not in every write.
             #
+            # Issue #648 — the eviction order is ANCHOR-AWARE: ids the
+            # watchdog's hygiene pass last saw alive in a live server view
+            # (``_PROTECTED_ANCHOR_KEYS``) are evicted only after every
+            # unprotected candidate is exhausted, so the arbitrary
+            # lexicographic victim is never a still-live zombie datapoint's
+            # ``requeues`` budget (the D06 anchor whose silent loss re-arms
+            # the unbounded requeue loop ``maxAutoRequeues`` bounds). The
+            # protection is defense-in-depth behind the hygiene pass's own
+            # prune — when EVERY candidate is protected the hard cap still
+            # dominates (the etcd 1.5 MB bound is not negotiable) and the
+            # per-eviction Event below names the protected losses.
+            #
             # Merge-patch semantics (RFC 7386, mirrored by the API Server):
             # a dict at the field level is merged per-key, not replaced as a
             # whole. To remove a key we MUST send its full patch with None
@@ -450,8 +490,12 @@ class StatusStore:
                 and current != encoded
             ):
                 num_to_drop = len(current_field) - STATUS_MAP_MAX_ENTRIES + 1
-                sorted_keys = sorted(current_field.keys())
-                evicted_keys = sorted_keys[:num_to_drop]
+                protected = _PROTECTED_ANCHOR_KEYS.get(
+                    (self._namespace, self._name, field), frozenset()
+                )
+                unprotected_first = [k for k in sorted(current_field) if k not in protected]
+                protected_last = [k for k in sorted(current_field) if k in protected]
+                evicted_keys = (unprotected_first + protected_last)[:num_to_drop]
                 evicted_set = set(evicted_keys)
                 patch_field: dict[str, Any] = {k: None for k in evicted_keys}
                 for k, v in current_field.items():
@@ -479,16 +523,33 @@ class StatusStore:
             preview = ", ".join(repr(k) for k in evicted_keys[:5])
             if len(evicted_keys) > 5:
                 preview += f" (+{len(evicted_keys) - 5} more)"
+            message = (
+                f"status.{field} size capped at {STATUS_MAP_MAX_ENTRIES}: "
+                f"dropped {len(evicted_keys)} entries ({preview}) to "
+                f"make room for key {key!r}. Defensive cap (issue #171); "
+                f"the underlying status map is the operator's only durable "
+                f"state, and an unbounded map would amplify RMW cost on "
+                f"every tick."
+            )
+            # Issue #648 — when every eviction candidate was a protected
+            # live anchor, the hard cap forced a protected loss; say so
+            # (the D06 anchor reset is exactly what the operator must
+            # never do silently).
+            protected = _PROTECTED_ANCHOR_KEYS.get(
+                (self._namespace, self._name, field), frozenset()
+            )
+            protected_dropped = [k for k in evicted_keys if k in protected]
+            if protected_dropped:
+                message += (
+                    f" WARNING: {len(protected_dropped)} evicted entry(ies) were "
+                    f"live-anchor-protected (no unprotected candidate remained — "
+                    f"the hard cap dominates; issue #648)."
+                )
             _emit_status_map_event(
                 self._namespace,
                 self._name,
                 STATUS_MAP_CAPPED_EVENT,
-                f"status.{field} size capped at {STATUS_MAP_MAX_ENTRIES}: "
-                f"dropped {len(evicted_keys)} oldest entries ({preview}) to "
-                f"make room for key {key!r}. Defensive cap (issue #171); "
-                f"the underlying status map is the operator's only durable "
-                f"state, and an unbounded map would amplify RMW cost on "
-                f"every tick.",
+                message,
             )
 
     def _get_scalar(self, field: str) -> datetime | None:
@@ -786,12 +847,33 @@ class StatusStore:
 
     # --- pruning ---------------------------------------------------------------
 
+    def protect_anchor_keys(self, field: str, keys: Iterable[str]) -> None:
+        """Register the live-id set protecting ``field`` at cap-eviction time.
+
+        Issue #648 (defense-in-depth): the watchdog's hygiene pass calls
+        this once per heavy check with the ids it just observed ALIVE in a
+        live server view; :meth:`_set_map_entry`'s eviction then prefers
+        unprotected keys, so a still-live zombie datapoint's ``requeues``
+        budget anchor survives an arbitrary cap hit even if the hygiene
+        pass itself is broken or delayed. Replaces the CR's previous set
+        wholesale — a shrinking live view must SHRINK the protection, not
+        accumulate it. ``field`` is one of the four ``_STATUS_MAP_FIELDS``
+        map names; an unknown field name raises (a typo'd field would
+        silently protect nothing).
+        """
+        if field not in _STATUS_MAP_FIELDS:
+            raise StatusStoreError(
+                f"protect_anchor_keys: unknown status map field {field!r} "
+                f"(expected one of {_STATUS_MAP_FIELDS})"
+            )
+        _PROTECTED_ANCHOR_KEYS[(self._namespace, self._name, field)] = frozenset(keys)
+
     def prune(
         self,
         *,
         live_analysis_ids: Iterable[str] | None = None,
         live_datapoint_ids: Iterable[str] | None = None,
-    ) -> None:
+    ) -> dict[str, list[str]]:
         """Drop map entries whose analysis/datapoint id is not in the live set.
 
         Callers pass the ids that still need tracking (how "live" is defined
@@ -800,6 +882,13 @@ class StatusStore:
         set) and disappearance (id no longer returned by the API). ``None``
         (the default) leaves that id-space untouched, so each handler prunes
         only the maps it has fresh knowledge for.
+
+        Issue #648 — returns the ids actually pruned, as a ``{field: ids}``
+        dict (empty when nothing was dead), captured from the patch the
+        successful RMW applied — the retry loop may recompute the patch
+        from fresher reads, so the return value always reflects the last
+        (applied) computation, never a superseded 409 attempt. Callers use
+        it for their one-per-run summary Event.
         """
         analysis_live = None if live_analysis_ids is None else set(live_analysis_ids)
         datapoint_live = None if live_datapoint_ids is None else set(live_datapoint_ids)
@@ -809,8 +898,11 @@ class StatusStore:
             (REQUEUES, datapoint_live),
             (STARTED_SINCE, datapoint_live),
         ]
+        applied: dict[str, list[str]] = {}
 
         def build_patch(status: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal applied
+            applied = {}
             deletions: dict[str, Any] = {}
             for field, live in scopes:
                 if live is None:
@@ -821,6 +913,8 @@ class StatusStore:
                 dead = {key: None for key in entries if key not in live}
                 if dead:
                     deletions[field] = dead
+                    applied[field] = sorted(dead)
             return {"status": deletions} if deletions else None
 
         self._mutate(build_patch)
+        return applied

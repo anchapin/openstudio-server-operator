@@ -59,7 +59,7 @@ import kubernetes.client
 import pytest
 
 from _cache_census import CACHE_BEARING_MODULES as _PER_CR_CACHE_MODULES
-from openstudio_operator import handlers, singleton
+from openstudio_operator import handlers, singleton, status_store
 
 # Issue #497 — the per-CR cache reset seams join the autouse reset. Since
 # #652 the census of cache-bearing modules is SINGLE-SOURCED in
@@ -183,6 +183,11 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
     kubernetes.client.Configuration._default = None
+    # Issue #648 — the live-anchor protection registry is advisory-only
+    # eviction-ordering state, but a test that registers protections
+    # against the shared (NAMESPACE, NAME) fixtures must not tilt a later
+    # cap-eviction case. Reset pre AND post like the seams above.
+    status_store.reset_protected_anchor_keys()
     for module in _PER_CR_CACHE_MODULES:
         module.reset_per_cr_caches()
     for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
@@ -193,9 +198,6 @@ def _reset_operator_module_state() -> Generator[None, None, None]:
     singleton.set_guard(None)
     singleton.reset_operator_k8s_client()
     kubernetes.client.Configuration._default = None
+    status_store.reset_protected_anchor_keys()
     for module in _PER_CR_CACHE_MODULES:
         module.reset_per_cr_caches()
-    for legacy_queue_attr in ("_NOTIFY_QUEUE", "_REDIS_KEY_LAYOUT_QUEUE", "_STATUS_MAP_CAP_QUEUE"):
-        queue = getattr(handlers, legacy_queue_attr, None)
-        if queue is not None and hasattr(queue, "clear"):
-            queue.clear()
