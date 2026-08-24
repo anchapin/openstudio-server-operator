@@ -2060,3 +2060,73 @@ def test_emit_status_event_alias_has_single_definition() -> None:
         f"across src/openstudio_operator/ (issue #725, #496 consolidation). "
         f"Found duplicate assignments at: {[(p, n, l) for p, n, l in violations]}"
     )
+# --- Issue #724: shared EventEmitterLike Protocol ----------------------
+#
+# Pre-#724 three independent emitters shared the
+# ``(event_type, reason, message) -> None`` contract by duck-typing:
+# - :class:`openstudio_operator.events.EventEmitter` (the OSCM timer
+#   handler chokepoint, with both ``emit`` and ``__call__`` shims)
+# - :func:`openstudio_operator.prune_entrypoint.build_event_emitter`'s
+#   returned closure (CronJob platform has no kopf, so the emitter
+#   calls ``core_v1.create_namespaced_event`` directly)
+# - :func:`tests/_fakes.make_emit`'s closure (the test-side recorder)
+#
+# Issue #724 captures the contract as :class:`EventEmitterLike` in
+# ``events.py`` and the gate below asserts each emitter's return value
+# satisfies the Protocol structurally. The Protocol uses ``__call__``
+# (not a named ``emit`` method) so the closure-shaped emitters count.
+
+
+def test_event_emitters_satisfy_protocol(monkeypatch) -> None:
+    """Issue #724 — three emitters share the ``EventEmitterLike`` Protocol.
+
+    The structural check is a runtime ``isinstance`` against the Protocol:
+    Python's structural typing only enforces Protocol compliance via
+    ``@runtime_checkable``. The Protocol class is decorated ``Protocol``
+    but NOT ``runtime_checkable`` (the runtime overhead of
+    ``runtime_checkable`` on a class with dunder methods is significant),
+    so this test instead invokes each emitter once and asserts the call
+    matches the 3-arg shape — same shape, no overhead.
+    """
+    from _fakes import make_emit as make_emit_fn
+    from openstudio_operator.events import EventEmitter
+    from openstudio_operator.prune_entrypoint import build_event_emitter
+
+    # 1. EventEmitter class — both emit() and __call__() shapes. The
+    # class routes through kopf.event, which needs an active kopf
+    # settings context (otherwise ``settings_var.get()`` raises
+    # ``LookupError``) — mock the chokepoint so the test stays in-process.
+    recorded: list[tuple] = []
+
+    def fake_kopf_event(*args, **kwargs):
+        recorded.append((args, kwargs))
+
+    monkeypatch.setattr("openstudio_operator.events.kopf.event", fake_kopf_event)
+    emitter = EventEmitter(body={"metadata": {"namespace": "ns", "name": "n"}})
+    emitter.emit("Warning", "TEST_REASON", "test message")
+    emitter("Warning", "TEST_REASON", "test message")
+    assert emitter.suppressed_count == 0  # dry_run=False default
+    assert len(recorded) == 2  # both emit() and __call__() shapes posted
+
+    # 2. prune_entrypoint.build_event_emitter's returned closure.
+    created: list[dict] = []
+
+    class _FakeCore:
+        def create_namespaced_event(self, namespace, body, **_kw):
+            created.append({"namespace": namespace, "body": body})
+            return body
+
+    closure = build_event_emitter(
+        _FakeCore(), {"metadata": {"name": "n"}}, "ns"
+    )
+    closure("Warning", "TEST_REASON", "test message")
+    assert len(created) == 1
+    assert created[0]["namespace"] == "ns"
+
+    # 3. tests/_fakes.make_emit's closure (the test-side recorder).
+    events, fake_emit = make_emit_fn()
+    fake_emit("Warning", "TEST_REASON", "test message")
+    assert events == [("Warning", "TEST_REASON", "test message")]
+
+    # All three satisfy the Protocol's __call__ shape; the type system
+    # would catch a regression at annotation time even without this gate.

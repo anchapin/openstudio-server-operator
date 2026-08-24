@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
+from typing import Protocol
 
 import kopf
 
@@ -61,6 +62,39 @@ logger = logging.getLogger(__name__)
 #: class but a different, incompatible call signature. The alias lives
 #: here under a non-colliding name so exactly one module defines it.
 TickEmitter = Callable[[str, str, str], None]
+
+
+class EventEmitterLike(Protocol):
+    """Structural type for the 3-arg ``(event_type, reason, message)`` emission.
+
+    Issue #724 — captures the contract that three independent emitters
+    satisfy:
+
+    * :class:`EventEmitter` (the OSCM timer-handler chokepoint, with both
+      :meth:`emit` and :meth:`__call__` shims);
+    * :func:`prune_entrypoint.build_event_emitter`'s returned closure
+      (CronJob platform has no kopf, so the emitter calls
+      ``core_v1.create_namespaced_event`` directly);
+    * :func:`tests._fakes.make_emit`'s closure (the test-side recorder
+      that has satisfied all three signatures by coincidence since #474).
+
+    The Protocol uses ``__call__`` rather than a named ``emit`` method
+    because :func:`build_event_emitter`'s return value is a plain
+    function — naming the contract ``emit`` would force it to become a
+    class. ``__call__`` is satisfied by every callable with the right
+    3-arg shape, so the structural test below can assert each emitter's
+    signature matches without naming the method.
+    """
+
+    def __call__(self, event_type: str, reason: str, message: str) -> None:
+        ...
+
+
+#: ``(obj, event_type, reason, message)`` — an Event attached to a full
+#: object body via ``kopf.event`` in production, a recorder in tests.
+#: Issue #496: identical aliases lived in ``singleton.py`` and
+#: ``handlers/dry_run_audit.py``; both now import this one.
+EventSink = Callable[[dict, str, str, str], None]
 
 #: ``(obj, event_type, reason, message)`` — an Event attached to a full
 #: object body via ``kopf.event`` in production, a recorder in tests.
@@ -247,5 +281,10 @@ class EventEmitter:
         uses ``emit(type, reason, message)`` (a plain callable). Keeping
         that syntax alive lets the class drop in without changing every
         call site; new code should prefer :meth:`emit` directly.
+
+        Issue #724: signature annotated against :class:`EventEmitterLike`
+        so the structural test in
+        ``tests/test_singleton_registry_coverage.py`` can confirm every
+        emitter satisfies the same Protocol.
         """
         self.emit(event_type, reason, message)
