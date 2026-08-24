@@ -213,15 +213,17 @@ spec:
   policyTypes: ["Egress"]
   egress:
     - to:
-        # IPv6 / dual-stack caveat (issue #477): an `0.0.0.0/0` ipBlock
-        # rule does NOT constrain IPv6 egress on dual-stack CNIs — a pod
-        # with an IPv6 address could still egress anywhere via ::. The
-        # equivalent hardening for IPv6 clusters is an `::/0` ipBlock
-        # rule with excepts for the private/link-local IPv6 ranges
-        # (e.g. fe80::/10). Not emitted here because this policy has no
-        # IPv6 pattern to mirror and the default install (kind recipe)
-        # is IPv4-only; documented as a known limitation for dual-stack
-        # operators.
+        # IPv6 except-parity (issue #644, closing the #477 dual-stack
+        # caveat): on dual-stack CNIs an `0.0.0.0/0` ipBlock rule does
+        # NOT constrain IPv6 egress — a pod with an IPv6 address could
+        # egress anywhere via ::, so the v4 except-list hardening below
+        # simply did not exist for IPv6. Not theoretical on AWS: the
+        # instance metadata service is ALSO reachable at the IPv6
+        # endpoint fd00:ec2::254 on Nitro instances, so a compromised
+        # credential-bearing rclone could reach IMDS over IPv6 and
+        # bypass the documented v4 except-list entirely. The active
+        # `::/0` entry mirrors the v4 rule (harmless no-op on
+        # IPv4-only clusters, including the default kind install).
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
@@ -243,6 +245,27 @@ spec:
               # legitimate storage endpoint; excluded alongside RFC1918
               # so the "public HTTPS only" posture holds. (issue #477)
               - 100.64.0.0/10
+        # The IPv6 mirror of the v4 rule above (issue #644): ULA +
+        # link-local are excepted so the "public HTTPS only, no IMDS,
+        # no private nets" posture holds over :: as well. Containment
+        # note: the AWS IMDSv6 endpoint fd00:ec2::254 needs NO separate
+        # /128 except — its first byte 0xfd places it inside fd00::/8,
+        # and fc00::/7's /7 prefix (1111110x) matches both 0xfc and
+        # 0xfd first bytes, so fd00::/8 ⊂ fc00::/7 and the ULA except
+        # below already blocks it.
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              # ULA fc00::/7 (fc00::/8 + fd00::/8) — IPv6's RFC1918
+              # analogue (in-cluster IPv6 services live here too);
+              # also covers the AWS IMDSv6 endpoint fd00:ec2::254 per
+              # the containment note above.
+              - fc00::/7
+              # Link-local fe80::/10 — the IPv6 analogue of
+              # 169.254.0.0/16 (neighbor discovery; some cloud
+              # metadata services). Same IMDS-steals-node-identity
+              # rationale as the v4 link-local except. (issue #477)
+              - fe80::/10
       ports:
         - protocol: TCP
           port: 443
