@@ -103,8 +103,13 @@ The test IDs are descriptive by design — `pytest --collect-only -q
 tests/<file>` will show you the names. Use them.
 
 ### Full suite
+1201 tests across 53 files (run `.venv/bin/pytest --collect-only` to
+re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
+cache; ten on a cold one. CI runs the same command under
+`.github/workflows/ci.yml` job `test`.
 
-1195 tests across 53 files (run `.venv/bin/pytest --collect-only` to
+
+
 re-verify the count before bumping `AGENTS.md`). Two seconds on a warm
 cache; ten on a cold one. CI runs the same command under
 `.github/workflows/ci.yml` job `test`.

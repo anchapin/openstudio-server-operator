@@ -1137,6 +1137,38 @@ def test_storage_cronjob_carries_metrics_token_file_env():
     )
 
 
+def test_operator_deployment_carries_redis_keepidle_env_var():
+    """Issue #723 acceptance: the operator Deployment must ship the
+    ``REDIS_TCP_KEEPIDLE_SECONDS`` env var (empty-by-default) so the
+    cluster admin has a one-knob override for the operationally-common
+    TCP keepalive cadence without rebuilding the image. The default-empty
+    value preserves the in-source module constant
+    (``REDIS_TCP_KEEPIDLE_SECONDS = 60``) — same fail-closed contract as
+    #296 / #476 / #401: an unparseable / non-positive value aborts every
+    tick with ``OperatorConfigError`` rather than silently skewing the
+    redis-py's probe cadence. Without this env var, only the per-tick
+    fail-closed 401 / TLS / keepidle surface exists; per-cluster drift
+    would require a full re-install — the regression fence for the
+    #723 acceptance criterion."""
+    op_container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in op_container.get("env") or []}
+    assert "REDIS_TCP_KEEPIDLE_SECONDS" in env, (
+        "operator-deployment.yaml must ship the REDIS_TCP_KEEPIDLE_SECONDS "
+        "env var (empty-by-default override of the in-source module "
+        "constant — issue #723 cluster-admin knob for the operationally "
+        "common TCP keepalive cadence). Mirrors OPENSTUDIO_TLS_CA_BUNDLE (#296), "
+        "OPENSTUDIO_METRICS_TOKEN_FILE (#401), REDIS_TLS_CA_BUNDLE (#476): "
+        "fail-closed empty-by-default, the only env-overridable knob."
+    )
+    assert env["REDIS_TCP_KEEPIDLE_SECONDS"] == "", (
+        "REDIS_TCP_KEEPIDLE_SECONDS must default to empty (in-source "
+        "REDIS_TCP_KEEPIDLE_SECONDS = 60 takes over — #723 fence parity "
+        "with #296 / #401 / #476); a non-empty default would silently "
+        "force a Secret-or-ConfigMap-shaped deployment story the stock "
+        "install does not require."
+    )
+
+
 def test_storage_cronjob_pod_labels_match_ingress_policy_selectors():
     """Issue #306 regression fence: the CronJob pod template must carry
     every label the new ingress policy requires. The CronJob carries
