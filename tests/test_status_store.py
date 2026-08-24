@@ -579,7 +579,7 @@ def test_prune_on_completion_drops_finished_analysis_entries(store, api):
 
     assert set(store.get_soft_stops()) == {"a2"}
     assert store.get_archived_analyses() == {}
-    assert set(store.get_stop_record(id_) for id_ in ("a1", "a3")) == {None, make_stop("issued")}
+    assert {store.get_stop_record(id_) for id_ in ("a1", "a3")} == {None, make_stop("issued")}
     # The datapoint id-space was left alone (None).
     assert set(store.get_requeues()) == {"dp9"}
 
