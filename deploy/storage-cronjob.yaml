@@ -90,6 +90,9 @@ spec:
   startingDeadlineSeconds: 300
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
+  # Suspended 2026-08-24: live-patched during fleet scale-up (600→9000 workers).
+  # Next kubectl apply would silently un-suspend without this flag.
+  suspend: true
   jobTemplate:
     spec:
       # The entrypoint already implements skip-and-retry-next-schedule (D12);
