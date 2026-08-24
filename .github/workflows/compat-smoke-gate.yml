@@ -1,0 +1,63 @@
+# Compatibility smoke gate (issue #679): prove the COMMITTED image digest
+# in deploy/operator-deployment.yaml and the CURRENT deploy/ manifests are
+# mutually compatible — or fail loudly.
+#
+# Trigger shape (documented choice, per the issue's point 3):
+#   * `schedule` (weekly, Monday 06:00 UTC) — the drift window this gate
+#     exists for is BETWEEN develop pushes: release.yml re-pins the
+#     digest on every publish, so a post-publish run in release.yml
+#     would test a pair that is coherent by construction (image built
+#     from the very commit whose manifests are being applied) and add
+#     ~5-8 kind minutes to every develop push for near-zero signal.
+#     The scheduled run instead tests the exact snapshot a cluster
+#     admin gets from `kubectl apply -f deploy/` TODAY.
+#   * `workflow_dispatch` — on-demand repin verification after an
+#     RBAC/VAP/CRD semantics change (see docs/validation.md
+#     §Prerequisites, issue #679 point 4).
+#   * Deliberately NOT on pull_request/push: the PR's digest only
+#     exists after publish (the committed pin is what the gate boots),
+#     and a kind cluster + GHCR digest pull per PR would dominate PR
+#     runner minutes. The scheduled/dispatched runs carry the whole
+#     regression value.
+#
+# The gate itself is scripts/compat-smoke-gate.sh; assertions:
+#   (a) no `empty spec.redisUrl` warning (the #116 fence must stay
+#       silent when spec.redisCredentials.secretRef resolves, #463),
+#   (b) no main-resource PATCH 403/Forbidden (the #228 RBAC shape),
+#   (c) operator pod Ready + OSCM timers ticking (log-shaped evidence —
+#       an old pinned digest using the `kopf run` CLI still passes).
+name: Compat smoke gate
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compat-smoke-gate:
+    runs-on: ubuntu-latest
+    # Kind cluster create + GHCR digest pull + observe window + teardown:
+    # ~4-5 min nominal. 10 min bounds the worst case (slow digest pull,
+    # 120s Ready timeout + 60s settle) without burning runner minutes.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # kind/kubectl are not preinstalled on ubuntu-latest. kind is
+      # pinned to v0.24.0 — the same version docs/kind-validation.md's
+      # one-line install documents (its bundled default node image is
+      # K8s 1.31, so the deploy/ VAP manifests apply; pre-1.30 is
+      # tolerated inside the script itself). kubectl tracks the
+      # dl.k8s.io stable pin; +/-1 minor skew vs the node is supported.
+      - name: Install kind + kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Run the pinned-digest vs deploy/ compatibility gate (issue #679)
+        run: bash scripts/compat-smoke-gate.sh
