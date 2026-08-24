@@ -103,6 +103,24 @@ the four that change how you interpret curl output here:
   `deploy/operator-deployment.yaml`. If the published image is unavailable,
   run the operator locally (Phase A step 4), or build/push the dev image
   yourself before using the Deployment.
+- **Re-pin procedure + compatibility smoke gate (#679):** the committed
+  digest in `deploy/operator-deployment.yaml` is re-pinned by `release.yml`
+  on every `develop` push — but between publishes the sibling manifests
+  (RBAC verbs/#606 `resourceNames`, VAP semantics, CRD fields like the
+  #463 `spec.redisCredentials.secretRef`) can move ahead of the last
+  published dev image, and a directory-level `kubectl apply -f deploy/`
+  then ships a self-incompatible snapshot (the live-observed signatures:
+  the `empty spec.redisUrl` warning despite a resolving secretRef, and
+  non-`/status` PATCH 403 retry storms under the #228 RBAC). **If you
+  edit RBAC/VAP semantics in `deploy/`, repin the digest or expect the
+  smoke gate to fail.** The gate — `.github/workflows/compat-smoke-gate.yml`
+  running `scripts/compat-smoke-gate.sh` (weekly schedule +
+  `workflow_dispatch`) — boots the committed digest against the current
+  `deploy/` set on a disposable kind cluster with a secretRef-carrying CR
+  fixture and asserts the two failure signatures stay absent plus the
+  timers keep ticking; run it on demand after any manifest-semantics
+  change, and treat a red scheduled run as "repin now" (push/merge to
+  `develop` triggers `release.yml`, which publishes and re-pins).
 - The two cluster-scoped ValidatingAdmissionPolicies that narrow the
   operator / prune ServiceAccounts beyond what RBAC can express (RBAC
   `PolicyRule` has no `labelSelector`; `resourceNames` takes exact strings
