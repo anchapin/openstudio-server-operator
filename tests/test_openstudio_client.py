@@ -496,6 +496,33 @@ def test_session_default_verify_is_pinned_true(monkeypatch):
     assert client._session.verify is True
 
 
+# --- Issue #714: env-var proxy auto-detection disabled -------------------
+
+
+def test_session_trust_env_is_disabled():
+    """Issue #714: ``trust_env=False`` must be set on every ``OpenStudioClient``
+    session.
+
+    Regression fence: ``requests.Session()`` defaults to ``trust_env=True``,
+    which honors ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``NO_PROXY`` /
+    ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE`` / ``CURL_CA_BUNDLE``
+    environment variables — a compromised or misconfigured host env can
+    transparently redirect the in-cluster REST traffic through an
+    attacker-controlled proxy. The pin closes that surface explicitly.
+    Cluster admins who need a corporate proxy MUST mount it as a sidecar
+    or route through the existing ``OPENSTUDIO_TLS_CA_BUNDLE`` env var
+    (#242 contract) rather than rely on ``HTTPS_PROXY``.
+    """
+    client = OpenStudioClient(BASE)
+    assert client._session.trust_env is False, (
+        "OpenStudioClient session must NOT honor HTTP_PROXY/HTTPS_PROXY/"
+        "REQUESTS_CA_BUNDLE/SSL_CERT_FILE/CURL_CA_BUNDLE env vars; an "
+        "attacker who controls env injection (the #678 USER-shape attack "
+        "class) could otherwise MITM the in-cluster REST traffic."
+        " See issue #714."
+    )
+
+
 def test_session_verify_honors_ca_bundle_env_var(monkeypatch, tmp_path):
     """Issue #242: when ``OPENSTUDIO_TLS_CA_BUNDLE`` is set, the session
     uses the bundle path instead of the system trust store.
