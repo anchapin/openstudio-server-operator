@@ -60,7 +60,7 @@ existing handler module as a template, and start editing.
 | `requirements.txt` | pinned | the runtime-only lockfile (`#479`) the Dockerfile installs from — same `pip-compile` invocation as above but WITHOUT `--extra=dev`, so no dev tools ship in the production image. Refresh it in the same commit as `requirements.lock`. |
 | `ruff` | **`>=0.16`** | pinned in `pyproject.toml` `[project.optional-dependencies].dev`. Local floor must match CI's floor — the `#68` incident (TRY004 + RUF059) was caused by an old local ruff that activated new CI rules. If `ruff --version` reports `<0.16`, upgrade before committing. |
 | `pytest` | `>=8.0` | installed by `pip install -e '.[dev]'`. **Use the venv pytest, not the system one** — the system pytest cannot resolve the `openstudio_operator` package import and reports `ModuleNotFoundError` for almost every test. |
-| `kubectl` + a cluster | for live validation only | `kopf run --module openstudio_operator.handlers` needs the CRD applied and the namespace `openstudio-server` reachable. The unit-test loop does NOT require a cluster. |
+| `kubectl` + a cluster | for live validation only | `python -m openstudio_operator` (programmatic entry, #681) needs the CRD applied and the namespace `openstudio-server` reachable. The unit-test loop does NOT require a cluster. |
 | `kind` (optional) | for the validation recipe | `scripts/create-kind-cluster.sh` + `scripts/deploy-openstudio-stack.sh` stand up a single control-plane node and the full helm overlay. See `docs/kind-validation.md` for the live-evidence runbook. |
 
 Mocking dependencies are **pinned in `pyproject.toml`**: `responses` for
@@ -245,7 +245,7 @@ step and `tests/test_singleton_registry_coverage.py` will fail loudly
 
 4. **Add the module to the import block** in
    `src/openstudio_operator/handlers/__init__.py`. The import block is
-   what makes `kopf run --module openstudio_operator.handlers` see the
+   what makes `python -m openstudio_operator` (#681 programmatic entry) see the
    new timer; the `install_singleton_guard()` call at the bottom of that
    file then wraps it automatically — DO NOT try to wire the guard per
    module.

@@ -54,6 +54,14 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
 (`#582`).
 
 ### Changed
+- **`#653`** — the `#531`/`#567` fakes consolidation finished:
+  shared `FakeBatchV1Api` (strict 404-on-missing delete, `fail_with`
+  seam), `FakePodsCoreV1Api` (opt-in server-side label filtering),
+  `make_job`, and `make_cr(uid=, created=)` absorbed the local
+  copies across retention/prune/singleton-guard/lenient-factories/
+  client-factory/analysis-sla/web-background tests; the deliberately
+  narrative walkthrough fakes now carry the convention-required
+  justification docstrings.
 - **`#652`** — the #497 per-CR cache census is single-sourced in
   `tests/_cache_census.py` (conftest + the convention test import
   it) and fenced by AST: every handler module must be classified
@@ -170,6 +178,32 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   census.
 
 ### Added
+- **`#682`** — `deploy/service-metrics.yaml` (ClusterIP Service
+  fronting the operator's named `metrics` port 9090, #224
+  label-conjunction selector) + `deploy/servicemonitor-metrics.yaml`
+  (ServiceMonitor, `namespaceSelector.matchNames:
+  [openstudio-server]`, 30s scrape, `release: prometheus` pickup
+  label with the rename caveat): the discovery half of the alerting
+  surface — all 20 alerts were inert out of the box because nothing
+  scraped `/metrics`. docs/validation.md's scrape prerequisite now
+  ships the apply commands.
+- **`#648`** — StatusStore anchor hygiene: "gone for good" = absent
+  from the started view AND the heavy full listing for 3 consecutive
+  heavy checks (every 10th watchdog tick, skipped when no anchors
+  exist); `store.prune(...)` is wired into the watchdog tick and cap
+  eviction is anchor-aware (`protect_anchor_keys` live-id registry —
+  a live zombie datapoint's requeue budget can no longer be
+  silently reset by lexicographic cap eviction). Absence counters
+  live in a per-CR uid-validated cache (#497), deliberately not
+  persisted.
+- **`#679`** — pinned-digest vs deploy/ compatibility smoke gate:
+  `scripts/compat-smoke-gate.sh` boots the committed operator digest
+  in a disposable kind cluster with the current deploy/ set and a
+  secretRef-carrying CR, asserting no `empty spec.redisUrl` warning
+  (#463 signature), no 403/Forbidden logs (#228 signature), and
+  Ready + ticking timers; scheduled weekly + dispatchable. The
+  between-publishes skew window now fails loudly instead of
+  degrading on install.
 - **`#649`** — ineffective-restart circuit breaker for sustained
   web_background stalls: consecutive count persisted on
   `status.webBackgroundIneffectiveRestarts` (D04), action-level
@@ -687,6 +721,38 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   Job name. Requires K8s 1.30+ (ValidatingAdmissionPolicy v1 GA).
 
 ### Fixed
+- **`#681`** — kopf's own bookkeeping no longer PATCHes the
+  read-only OSCM main resource (#228): the operator launches via
+  `python -m openstudio_operator` (`kopf.run` embedding with
+  `OperatorSettings` — the CLI cannot carry settings in 1.44),
+  pinning `diffbase_storage=StatusDiffBaseStorage` (status-scoped)
+  and `finalizer=None`, plus `disarm_oscm_finalizer_requirements()`
+  because kopf 1.44 hardcodes `requires_finalizer=True` for timers
+  and a null finalizer alone would still append a null marker to
+  `metadata.finalizers`. The recurring APIForbiddenError retry storm
+  on every event batch is gone; RBAC #228 and the kopf pin are
+  untouched.
+- **`#680`** — the pod-delete VAP's CEL branches on
+  `request.operation` (DELETE evaluates `oldObject`, which is always
+  populated) so denials come from policy logic instead of CEL
+  evaluation errors; the #294/#398 name/labels validation in
+  storage-cronjob.yaml got the same per-operation object/oldObject
+  guarding. `#572`/`#573` audited immune; the #641 fence verified
+  error-free. The mini-interpreter now distinguishes logic-denies
+  from error-denies.
+- **`#678`** — the operator and prune containers carry
+  `env: USER=operator` so kopf's peering `getpass.getuser()` never
+  falls through to `pwd.getpwuid` on passwd-less runtimes (the
+  boot-time crash-loop the owner hit on a fresh cluster); the
+  kind-validation delta (dev shells inherit USER) is documented
+  in-manifest and in the regression tests.
+- **`#688`** — `validate_key_layout()` is EXISTS-first: `EXISTS
+  resque:workers` / `resque:workers:heartbeat` decide the verdict
+  (O(1)); SCAN runs only on the failure path as diagnostic evidence
+  and budget exhaustion labels the sample PARTIAL (incomplete view)
+  instead of "absent". Production-scale keyspaces (DBSIZE > budget)
+  no longer produce a permanent false `RedisKeyLayoutInvalid`
+  critical alert.
 - **`#686`** — the pinned rclone image refreshed `1.67.0@sha256:25a2…`
   → `1.75.0@sha256:b06a…` (manifest-list digest) after the new
   `#642` gate's first run surfaced the 2026 Go stdlib CVE crop
@@ -939,6 +1005,10 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   D12). Test count 797 → 806 across the four claim locations.
 
 ### Docs
+- **`#644`** — the archival egress allow is dual-stack active:
+  `::/0` ipBlock with `fc00::/7` + `fe80::/10` excepts beside the
+  v4 rule (no-op on IPv4-only clusters; AWS IMDSv6 `fd00:ec2::254`
+  is covered by the ULA except — containment documented in-file).
 - **`#660`** — onboarding.md's phantom "Update protocol" reference
   points at AGENTS.md's actual "Doc-drift guards" section, and the
   mocking-deps paragraph names `hypothesis` (#246) alongside

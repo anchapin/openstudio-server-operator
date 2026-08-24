@@ -274,7 +274,7 @@ dev machine with kubeconfig pointed at kind:
    election by design):
 
    ```bash
-   kopf run --module openstudio_operator.handlers --namespace openstudio-server -v
+   python -m openstudio_operator --namespace openstudio-server -v   # programmatic entry (#681): kopf.run with the persistence Settings
    ```
 
 4. **Expected observations with `dryRun: true` (D11):**
@@ -793,7 +793,7 @@ above blocks R2 live acceptance and ANY live dryRun walkthrough of the timer
 modules (#45's live-cluster rows). Suggested one-line-class fix (follow-up
 issue): in `singleton.py::_get_guard`, mirror `status_store.StatusStore.in_cluster`
 — call `kubernetes.config.load_incluster_config()` (with a
-`load_kube_config()` fallback for local `kopf run`) before constructing
+`load_kube_config()` fallback for the local programmatic run) before constructing
 `CustomObjectsApi()`.
 
 > **Post-#66 update (2026-08-18, issue #67 session):** the escalation above
