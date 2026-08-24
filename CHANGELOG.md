@@ -135,6 +135,7 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   constants (the new branch reuses `runtime_failure`).
 
 ### Changed
+- Wire the `stop_analysis` waiting-variant stop (POST /analyses/{id}/action with `analysis_action=stop`) into the operator with dryRun gate and marked `AnalysisStopped` Event. Adds `status.stoppedAnalyses[id]` anchor map (D04), `openstudio_operator_stops_total{outcome}` counter, and the `AnalysisStopped` Event vocabulary to the D11 dry-run gate. Closes #707.
 - **`#653`** — the `#531`/`#567` fakes consolidation finished:
   shared `FakeBatchV1Api` (strict 404-on-missing delete, `fail_with`
   seam), `FakePodsCoreV1Api` (opt-in server-side label filtering),

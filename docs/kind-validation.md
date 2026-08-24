@@ -348,6 +348,7 @@ attach the evidence (Event YAML, `curl /metrics` snippet, or
 | 1.2 | `.status.softStops[<analysis-id>].outcome == "dry-run"` (the one-shot anchor) | `handlers/analysis_sla.py:246-252` | `[CI] tests/test_analysis_sla.py:319` (same) |
 | 1.3 | `openstudio_operator_soft_stops_total` counter +1 on the operator `:9090/metrics` | `metrics.py` (the counter increments in the suppressed path too — D11 decision counter) | `[CI] tests/test_analysis_sla.py:319` (same) |
 | 1.4 | NO `GET /analyses/{id}/soft_stop` request in `web` logs for the duration of the walkthrough | contract — `soft_stop_analysis` is the gated mutation | `[CI] tests/test_analysis_sla.py:319` (mocked REST, zero calls) + `[REQUIRES LIVE CLUSTER]` web log on kind |
+| 1.5 | SLA handler — stop_analysis wiring: Dry-run tick: anchor written with outcome="dry-run", no REST call; Live tick: AnalysisStopped Event posted, anchor pruned on reconciliation | `handlers/analysis_sla.py` (stop_analysis wiring site) | TBD |
 
 ### Module 1b — Grace wait + worker-pod escalation (probe: anchored analysis past `gracefulStopTimeoutMinutes`)
 
