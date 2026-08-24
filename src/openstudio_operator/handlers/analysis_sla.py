@@ -114,6 +114,7 @@ from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     KUBE_API_REQUEST_DURATION_SECONDS,
     SOFT_STOPS_TOTAL,
+    STOP_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
     observe_duration,
 )
@@ -122,6 +123,7 @@ from openstudio_operator.singleton import operator_core_api, operator_custom_obj
 from openstudio_operator.status_store import (
     SoftStopRecord,
     StatusStore,
+    StopRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,7 @@ ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /
 #: ``WorkerRecycled``; this name follows the same <Subject><Action> shape.
 ANALYSIS_ESCALATED_EVENT = "AnalysisEscalated"
+ANALYSIS_STOPPED_EVENT = "AnalysisStopped"
 
 _STARTED = "started"
 #: First-sight observation outcome (issue #83 D1): the SLA clock anchor is the
@@ -167,6 +170,8 @@ class SlaTickResult:
     soft_stopped: list[str]
     #: Analysis ids escalated to worker-pod eviction this tick.
     escalated: list[str]
+    #: Analysis ids hard-stopped (POST /analyses/{id}/action stop) this tick.
+    stopped: list[str]
 
 
 class WorkerPodApi(PodLister, Protocol):
@@ -277,7 +282,7 @@ def run_sla_tick(
     """
     if not config.analysis_policy.auto_soft_stop:
         logger.debug("analysisPolicy.autoSoftStop is false — SLA monitor passive this tick")
-        return SlaTickResult(soft_stopped=[], escalated=[])
+        return SlaTickResult(soft_stopped=[], escalated=[], stopped=[])
     soft_stops = store.get_soft_stops()
     analyses = client.list_analyses()
     # Issue #179 — observe the per-tick analysis count from the SLA
@@ -307,7 +312,7 @@ def run_sla_tick(
             SoftStopRecord(issued_at=now, outcome=_OUTCOME_WATCHING),
         )
         started_ids.add(analysis_id)
-    soft_stopped, escalated = _grace_and_escalate(
+    soft_stopped, escalated, stopped = _grace_and_escalate(
         client,
         store,
         config,
@@ -318,7 +323,7 @@ def run_sla_tick(
         pod_api=pod_api,
         redis_client=redis_client,
     )
-    return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated)
+    return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated, stopped=stopped)
 
 
 def _grace_and_escalate(
@@ -332,7 +337,7 @@ def _grace_and_escalate(
     namespace: str,
     pod_api: WorkerPodApi | None,
     redis_client: RedisClientLike | None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Walk persisted anchors: prune the finished, soft-stop the over-runtime, escalate the stuck.
 
     Issue #83 D1: the SLA clock anchor is the operator-observed first sight
@@ -360,6 +365,7 @@ def _grace_and_escalate(
     max_runtime = timedelta(minutes=config.analysis_policy.max_duration_minutes)
     soft_stopped: list[str] = []
     escalated: list[str] = []
+    stopped: list[str] = []
     for analysis_id, record in store.get_soft_stops().items():
         if analysis_id not in started_ids:
             # Left `started` (completed / post-processing / …) or vanished from
@@ -369,6 +375,36 @@ def _grace_and_escalate(
             logger.info("softStops anchor for %s retired (analysis no longer started)", analysis_id)
             continue
         if record.escalated_at is not None:
+            # Hard-stop check (#709): if the analysis was escalated (worker pods
+            # evicted) but is STILL running after the full gracefulStopTimeoutMinutes
+            # window from escalation, fire the hard stop as the last resort.
+            stop_record = store.get_stop_record(analysis_id)
+            if stop_record is None:
+                elapsed_since_escalation = now - record.escalated_at
+                if elapsed_since_escalation > grace:
+                    dry_run = config.dry_run
+                    if not dry_run:
+                        client.stop_analysis(analysis_id)
+                    message = (
+                        f"Analysis {analysis_id} still started "
+                        f"{int(elapsed_since_escalation // timedelta(minutes=1))}m "
+                        f"after worker-pod eviction "
+                        f"(gracefulStopTimeoutMinutes={config.analysis_policy.graceful_stop_timeout_minutes})"
+                        f" — hard-stopping via POST /analyses/{{id}}/action"
+                    )
+                    if dry_run:
+                        message += " — hard stop suppressed (spec.dryRun)"
+                    else:
+                        message += " — hard stop issued"
+                    emit("Warning", ANALYSIS_STOPPED_EVENT, message)
+                    STOP_STOPS_TOTAL.labels(
+                        outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED
+                    ).inc()
+                    store.set_stop_record(
+                        analysis_id,
+                        StopRecord(issued_at=now, outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED),
+                    )
+                    stopped.append(analysis_id)
             continue  # never escalate the same analysis twice (D03/D04)
         runtime = now - record.issued_at
         if record.outcome == _OUTCOME_WATCHING and runtime > max_runtime:
@@ -423,7 +459,7 @@ def _grace_and_escalate(
             redis_client=redis_client,
         )
         escalated.append(analysis_id)
-    return soft_stopped, escalated
+    return soft_stopped, escalated, stopped
 
 
 def _resque_matched_worker_pods(

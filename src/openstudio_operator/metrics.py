@@ -85,6 +85,16 @@ SOFT_STOPS_TOTAL = Counter(
     labelnames=["outcome"],
 )
 
+STOP_STOPS_TOTAL = Counter(
+    "openstudio_operator_stop_stops_total",
+    "Analyses hard-stopped (POST /analyses/{id}/action stop) by the SLA "
+    "monitor after worker-pod escalation failed to unblock the analysis. "
+    "Labelled by ``outcome`` so the dashboard can distinguish real stops "
+    "(``issued``) from dry-run-marked suppressions (``dry-run``). "
+    "Incremented at the hard-stop branch in ``run_sla_tick``.",
+    labelnames=["outcome"],
+)
+
 DATAPOINTS_REQUEUED_TOTAL = Counter(
     "openstudio_operator_datapoints_requeued_total",
     "Zombie datapoints automatically requeued",

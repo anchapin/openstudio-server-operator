@@ -872,7 +872,7 @@ def test_analysis_sla_monitor_wrapper_resolves_redis_client_from_secret_ref(
 
     def _capture(*_args: object, **kwargs: object) -> SlaTickResult:
         captured["redis_client"] = kwargs["redis_client"]
-        return SlaTickResult(soft_stopped=[], escalated=[])
+        return SlaTickResult(soft_stopped=[], escalated=[], stopped=[])
 
     monkeypatch.setattr(analysis_sla, "run_sla_tick", _capture)
 
