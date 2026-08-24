@@ -92,6 +92,47 @@ KEDA-burst quota envelope (`#580`), and the persisted stall window
   `tests/test_singleton_registry_coverage.py::test_all_k8s_api_fakes_live_in_tests_fakes_py`
   prevents re-introducing a duplicate `class Fake<...>Api`
   definition in any `tests/test_*.py` file.
+- **`#725`** — `status_store.EmitStatusEvent` collapsed into a
+  re-export of `events_sinks.StatusEventSink` so the type lives in
+  exactly one place. The pre-#725 docstring already noted this
+  invariant ("the PUBLIC alias for this exact seam already exists
+  as `StatusEventSink`; re-homing it under yet another name would
+  recreate the drift #496 collapses") but the local definition
+  remained — `#725` enforces it. New AST gate
+  `tests/test_singleton_registry_coverage.py::test_emit_status_event_alias_has_single_definition`
+  walks `src/openstudio_operator/` and rejects a fresh
+  `Callable[...]` assignment to either alias name.
+- **`#724`** — `class EventEmitterLike(Protocol)` captures the
+  3-arg `(event_type, reason, message) -> None` shape that the
+  three independent emitters share by duck-typing
+  (`events.EventEmitter`, `prune_entrypoint.build_event_emitter`'s
+  closure, `tests/_fakes.make_emit`'s closure). The Protocol uses
+  `__call__` rather than a named `emit` method so the
+  closure-shaped emitters count (a `def emit` Protocol would force
+  the closures to become classes). New structural test
+  `tests/test_singleton_registry_coverage.py::test_event_emitters_satisfy_protocol`
+  invokes each emitter once and asserts the call shape.
+- **`#722`** — `prune_entrypoint.main`'s `load_operator_kube_config()`
+  call + the three `operator_*_api()` factory calls now sit
+  inside the same `_SKIP_TICK_EXCEPTIONS` guard as the rest of the
+  tick body. Pre-#722 a fresh CronJob pod with no `~/.kube/config`
+  AND no in-cluster service-account env vars raised `ConfigException`
+  twice (once from `load_incluster_config`, once from the
+  `load_kube_config` fallback) and the second `ConfigException`
+  propagated out of `load_operator_kube_config` BEFORE the CR-list
+  try/except was reached — the CronJob exited with code 1 (raw
+  traceback) rather than the documented exit-5 (D12 runtime
+  failure). The guard restores the exit-code contract by funneling
+  the kubeconfig load failure into the same counted skip-tick path
+  (`PRUNE_TICK_FAILURES_TOTAL{reason="runtime_failure"}.inc()` +
+  WARNING log + exit 5) as the rest of the tick body, making the
+  exit-code table exhaustive (2 = missing `POD_NAMESPACE`, 3 = empty
+  `redisUrl`, 4 = CR-list failure, 5 = runtime failure, 0 = idle).
+  The pre-existing
+  `tests/test_prune_entrypoint.py::test_prune_skip_tick_counter_is_the_only_emitted_metric_for_skip_branches`
+  AST gate updated from 4 to 5 call sites — the labelled
+  cardinality stays bounded at the three `PRUNE_TICK_FAILURE_REASON_*`
+  constants (the new branch reuses `runtime_failure`).
 
 ### Changed
 - **`#653`** — the `#531`/`#567` fakes consolidation finished:
