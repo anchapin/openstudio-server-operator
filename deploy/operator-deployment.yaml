@@ -197,12 +197,19 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           resources:
+            # 2026-08-24 scale-up campaign (CAMPAIGN-RECORD-20260824.md in the
+            # operator-deploy-scratch dir): kopf informer cache OOMKilled
+            # repeatedly (9 restarts) once the watched fleet exceeded ~2800
+            # pods under the previous 256Mi limit. Live values below were
+            # applied as an emergency kubectl patch at fleet ~2800 and are
+            # now folded into the manifest so every future apply carries
+            # them. Do NOT redeploy the old 100m/128Mi + 500m/256Mi block.
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 250m
+              memory: 512Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: "1"
+              memory: 2Gi
           volumeMounts:
             - name: tmp
               mountPath: /tmp
