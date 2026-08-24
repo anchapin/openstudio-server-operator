@@ -236,3 +236,24 @@ def test_ci_core_jobs_do_not_rerun_on_workflow_run() -> None:
         assert doc["jobs"][job_id].get("if") == (
             "github.event_name != 'workflow_run'"
         ), f"ci.yml job '{job_id}' must skip workflow_run events (issue #588)"
+
+
+def test_publish_dev_pin_sed_matches_tag_and_digest_forms() -> None:
+    """Issue #699: the digest re-pin sed must match BOTH image forms.
+
+    The manifests live in ``@sha256:`` form between releases, so a sed
+    that only matches ``image: ${IMAGE}:<tag>`` (literal colon after the
+    image name) silently no-ops on every run after the first pin — the
+    committed digest froze at the pre-#149 baseline, exactly the skew
+    #679's live-cluster evidence documented and its smoke gate now
+    catches. The character class ``[:@]`` is load-bearing.
+    """
+    steps = job_steps(load_workflow("release.yml"), "publish-dev")
+    pin = step_by_name(steps, "Pin operator image by SHA256 digest")
+    run = pin.get("run", "")
+    assert isinstance(run, str)
+    assert 's|image: ${IMAGE}[:@].*|image: ${IMAGE}@${DIGEST}|' in run, (
+        "the pin substitution must match both the ':tag' and '@sha256:' "
+        "forms — a literal ':' after the image name never matches the "
+        "digest form the manifests carry between releases (#699)"
+    )
