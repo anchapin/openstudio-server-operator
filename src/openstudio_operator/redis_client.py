@@ -108,6 +108,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import time
 from collections.abc import Callable
 from urllib.parse import urlparse
@@ -168,6 +169,82 @@ WORKER_HEARTBEAT_HASH_KEY = "resque:workers:heartbeat"
 #: sample PARTIAL — budget exhaustion is surfaced honestly and can never
 #: masquerade as "key absent".
 VALIDATE_SCAN_KEY_BUDGET = 1000
+
+#: Issue #723 — TCP keepalive + periodic health-check knobs that keep the
+#: outbound Redis connection alive through Cloud NAT (EKS/GKE/AKS) and L4
+#: load-balancer idle-timeout fences. Without these, a connection past
+#: the NAT's idle window (typically 350–900 s) is silently dropped without
+#: an RST; the next operator tick reads through a half-open socket,
+#: redis-py retries once, ``socket_timeout`` (5 s) elapses → ``HANDLER_TICK_FAILURES_TOTAL``
+#: bumps by one → the SLA clock / requeue budget is delayed by a full
+#: timer cadence (60 s) while the pool re-establishes. ``SO_KEEPALIVE``
+#: plus per-probe tuning keeps every connection fresh; the periodic
+#: ``health_check_interval`` PING catches any drift the kernel misses.
+#: All four values are cluster-tunable via a single
+#: ``REDIS_TCP_KEEPIDLE_SECONDS`` env var (the most operationally
+#: meaningful knob) — issue #723 acceptance criterion. The other three
+#: values are deliberately local constants: the cluster-side companion
+#: lives on the kubelet/CRI (kernel ``net.ipv4.tcp_keepalive_time`` /
+#: ``tcp_keepalive_intvl`` / ``tcp_keepalive_probes``) and is tuned there.
+#: Math reasoning: the redis-py keepalive probes are sent every
+#: ``TCP_KEEPIDLE=60 s`` idle; the kubelet default ``tcp_keepalive_time``
+#: is 7200 s; setting the client to 60 s means the NAT sees a fresh probe
+#: every minute while idle and well before any reasonable NAT idle
+#: timeout (350–900 s) drops the connection.
+REDIS_TCP_KEEPIDLE_SECONDS = 60
+REDIS_TCP_KEEPINTVL_SECONDS = 10
+REDIS_TCP_KEEPCNT = 3
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
+
+#: Issue #723 — the env-var override knob. Mirrors the
+#: :data:`_REDIS_TLS_CA_BUNDLE_ENV` shape (only the most operationally
+#: common knob is overridable; the rest are local constants and a
+#: cluster-wide kernel sysctl call). Unset/empty/garbage = use the
+#: :data:`REDIS_TCP_KEEPIDLE_SECONDS` constant. A non-integer value
+#: raises :class:`OperatorConfigError` so the operator refuses to build
+#: the client rather than silently degrading to the default value.
+_REDIS_TCP_KEEPIDLE_SECONDS_ENV = "REDIS_TCP_KEEPIDLE_SECONDS"
+
+
+def _resolve_redis_tcp_keepidle_seconds() -> int:
+    """Validate ``REDIS_TCP_KEEPIDLE_SECONDS`` (issue #723) and return the idle value.
+
+    Mirrors :func:`_resolve_redis_tls_ca_bundle` shape at a fraction of the
+    surface — only the operationally common knob is overridable; the rest
+    (``TCP_KEEPINTVL``, ``TCP_KEEPCNT``, ``health_check_interval``) are
+    local constants and a cluster-wide kernel sysctl call respectively,
+    so exposing them via the env would invite per-cluster drift. The
+    truthy-string fallthrough would silently accept ``"True"``/``"1"``/
+    ``"yes"`` as the idle value and skew the keepalive probe cadence by
+    a factor of ~70 (one minute vs. one hour) — so the value must parse
+    as a positive integer; on failure we raise
+    :class:`OperatorConfigError` and refuse to build the client, mirroring
+    the #476/#296 contract.
+
+    Returns the parsed value (``int``) on success. Returns
+    :data:`REDIS_TCP_KEEPIDLE_SECONDS` (the module constant) when the
+    env var is unset or empty — explicit "" falls through to the default
+    just like ``OPENSTUDIO_TLS_CA_BUNDLE`` does. Raises
+    :class:`OperatorConfigError` on a non-integer or non-positive value.
+    """
+    raw = os.environ.get(_REDIS_TCP_KEEPIDLE_SECONDS_ENV)
+    if not raw:
+        return REDIS_TCP_KEEPIDLE_SECONDS
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise OperatorConfigError(
+            f"{_REDIS_TCP_KEEPIDLE_SECONDS_ENV}={raw!r} is not a valid integer "
+            f"seconds value (issue #723); refusing to build the Redis client "
+            f"with an unparseable TCP keepalive cadence."
+        ) from exc
+    if parsed <= 0:
+        raise OperatorConfigError(
+            f"{_REDIS_TCP_KEEPIDLE_SECONDS_ENV}={raw!r} must be a positive "
+            f"integer (issue #723); refusing to build the Redis client with "
+            f"a non-positive TCP keepalive idle window."
+        )
+    return parsed
 
 
 def _redis_target_for_diagnostics(redis_url: str) -> str:
@@ -390,6 +467,26 @@ class ReadOnlyRedisClient:
     ``connection`` injects a pre-built client (fakeredis in tests); it MUST be created
     with ``decode_responses=True`` like the URL path. ``now_fn`` supplies the epoch
     clock for staleness judgment (injected for deterministic tests).
+
+    Issue #723 — the outbound socket is hardened against Cloud NAT / L4 LB
+    idle-drop fences (EKS/GKE/AKS pattern). Every parameter is
+    cluster-tunable through two layers:
+
+    * the redis-py socket itself — ``socket_keepalive=True`` plus the
+      kernel-level ``TCP_KEEPIDLE``/``TCP_KEEPINTVL``/``TCP_KEEPCNT`` triad
+      (defaults :data:`REDIS_TCP_KEEPIDLE_SECONDS` /
+      :data:`REDIS_TCP_KEEPINTVL_SECONDS` / :data:`REDIS_TCP_KEEPCNT`)
+      and a periodic ``health_check_interval`` PING (default
+      :data:`REDIS_HEALTH_CHECK_INTERVAL_SECONDS` s);
+    * the operator pod — the cluster-side companion is the kubelet/CRI
+      kernel sysctl ``net.ipv4.tcp_keepalive_time``
+      (kubelet/Node-level; no core/v1 PodSpec field exists), so the
+      client-side probe cadence is sized to be well below any reasonable
+      NAT idle window. The client-level cadence overrides the kernel
+      default when more aggressive; do NOT remove the redis-py
+      ``socket_keepalive_options`` block — without it the kubelet
+      default (7200 s) wins and the next operator tick crosses the NAT
+      idle timeout (350–900 s).
     """
 
     def __init__(
@@ -415,11 +512,35 @@ class ReadOnlyRedisClient:
             ca_bundle = _resolve_redis_tls_ca_bundle()
             if ca_bundle is not None:
                 tls_kwargs["ssl_ca_certs"] = ca_bundle
+        # Issue #723 — keepalive + health check. The dict keys are
+        # ``socket.TCP_KEEP{IDLE,INTVL,CNT}`` (int constants) — redis-py
+        # passes them straight to ``sock.setsockopt(IPPROTO_TCP, k, v)``,
+        # so string keys ("TCP_KEEPIDLE") would raise ``TypeError`` at the
+        # first socket reconnect; we use the int constants from the
+        # ``socket`` module. The full triad rides every outbound socket
+        # this client opens, so the same keepalive cadence covers the
+        # SLA tick (60 s), the watchdog tick (60 s), and the
+        # ``web_background`` stall detector (60 s). Interval and probe
+        # count are local constants — only the operationally-meaningful
+        # idle knob (``REDIS_TCP_KEEPIDLE_SECONDS``) is overridable per
+        # cluster. ``health_check_interval`` is a redis-py PING cadence
+        # the pool runs between commands: a stale pool (kernel missed a
+        # RST mid-idle) is PING-evicted before the next tick hits a
+        # half-open connection.
+        keep_idle = _resolve_redis_tcp_keepidle_seconds()
+        socket_keepalive_options: dict[int, int] = {
+            socket.TCP_KEEPIDLE: keep_idle,
+            socket.TCP_KEEPINTVL: REDIS_TCP_KEEPINTVL_SECONDS,
+            socket.TCP_KEEPCNT: REDIS_TCP_KEEPCNT,
+        }
         self._redis = connection or redis.Redis.from_url(
             redis_url,
             decode_responses=True,
             socket_timeout=socket_timeout_seconds,
             socket_connect_timeout=socket_timeout_seconds,
+            socket_keepalive=True,
+            socket_keepalive_options=socket_keepalive_options,
+            health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
             **tls_kwargs,
         )
         self._now = now_fn

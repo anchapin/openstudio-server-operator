@@ -55,6 +55,18 @@ from openstudio_operator.openstudio_client import OpenStudioApiError
 from openstudio_operator.redis_client import RedisClientError
 from openstudio_operator.status_store import StatusStore, StatusStoreError
 
+#: Issue #717 — graceful-shutdown guard: set by the SIGTERM handler in
+#: ``__main__.py``, checked at the start of every ``run_oscm_tick``
+#: invocation so mid-tick writes are not interrupted by a new tick starting
+#: after the signal arrives.
+_shutdown_requested = False
+
+
+def is_shutdown_requested() -> bool:
+    """Return whether SIGTERM has been received and graceful shutdown is in progress."""
+    return _shutdown_requested
+
+
 #: Process-wide registry of OSCM spawning handlers, keyed by handler id
 #: (the kopf ``id`` attribute on the timer registry entry). Every OSCM
 #: spawning handler module calls :func:`register` at module import time;
@@ -368,6 +380,12 @@ def run_oscm_tick(
     events with no cadence against which a staleness gap could be
     thresholded.
     """
+    # Issue #717 — graceful shutdown: skip new ticks once SIGTERM has been received.
+    # The in-progress tick completes naturally so in-flight status writes are not
+    # interrupted. The singleton guard also prevents new ticks from starting (D05).
+    if _shutdown_requested:
+        logger.debug("shutdown requested — %s idle this tick", idle_label)
+        return None
     config = OperatorConfig.from_spec(spec)
     # Issue #492 — config-state posture gauges: stamped immediately
     # after the config parse succeeds and BEFORE the idle check / the

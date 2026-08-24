@@ -29,8 +29,17 @@ mirrors the CLI's own sequence (``kopf/cli.py``):
 from __future__ import annotations
 
 import argparse
+import logging
+import signal
+import sys
 
 import kopf
+
+#: Issue #717 — graceful-shutdown flag shared with the tick runner.
+#: Set by the SIGTERM handler below; checked at the start of every
+#: ``run_oscm_tick`` invocation to skip new ticks while in-flight work
+#: completes.
+from openstudio_operator._oscm_handlers import _shutdown_requested  # noqa: F401
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -51,11 +60,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _handle_sigterm(signum: int, frame: object) -> None:
+    """Issue #717 — SIGTERM graceful-shutdown handler.
+
+    Sets the shared shutdown flag so in-flight status writes can complete
+    before the process exits. New ticks are prevented from starting by the
+    ``_shutdown_requested`` check at the top of ``run_oscm_tick``. The kopf
+    framework handles its own graceful shutdown of child watchers; we just
+    ensure mid-tick writes are not interrupted.
+    """
+    # Access the module-level flag via the import to avoid shadowing the
+    # binding name.  ``frame`` is unused but required by the signal signature.
+    from openstudio_operator import _oscm_handlers
+
+    _oscm_handlers._shutdown_requested = True
+    logging.getLogger(__name__).info("SIGTERM received, initiating graceful shutdown")
+    sys.exit(0)
+
+
 def main() -> None:
     """Run the operator with #681's read-only-main-resource persistence."""
     args = _parse_args()
     # Step 1 — logging, with the exact no-flags ``kopf run`` CLI defaults.
     kopf.configure(log_format=kopf.LogFormat.FULL)
+
+    # Issue #717 — register SIGTERM handler before starting kopf so the flag
+    # is set before any timer tick can read it.
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # Step 2 — import the handlers package (registrations + boot wiring).
     # Function-local on purpose: importing this module (tests, tooling) must

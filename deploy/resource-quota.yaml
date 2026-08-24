@@ -68,9 +68,10 @@
 # deploy/ manifest whose container requests/limits exceed the
 # defaults below).
 #
-# Scope guard (#400): the operator's own requests stay at
-# requests.cpu: 100m, memory: 128Mi (deploy/operator-deployment.yaml)
-# and the helm chart's upstream values are untouched. Both objects
+# Scope guard (#400): the operator's own requests were folded from the
+# 2026-08-24 live emergency patch into deploy/operator-deployment.yaml
+# (requests.cpu: 250m, memory: 512Mi — CAMPAIGN-RECORD-20260824.md); the
+# helm chart's upstream values are untouched. Both objects
 # are namespaced core/v1 and need no extra RBAC; a cluster admin can
 # apply this file alongside scripts/manifests/00-namespace.yaml.
 
@@ -82,18 +83,20 @@ metadata:
 spec:
   hard:
     # Sizing rationale (#580, extending #400): the burst envelope at
-    # REAL requests is 2.5 CPU / 6.375Gi (4 chart pods + 5 workers at
+    # REAL requests is ~2.75 CPU / ~6.76Gi (4 chart pods + 5 workers at
     # maxReplicaCount + operator + prune pod, every one declaring its
     # requests); the limits-side aggregate — with the LimitRange
     # injecting the 2 CPU default limit into the chart pods that omit
-    # limits.cpu — is 18.75 CPU / 19Gi. 4/8Gi/20/20Gi cover both with
-    # headroom; full arithmetic in the header comment above and in
+    # limits.cpu — is ~19.25 CPU / ~20.75Gi after the 2026-08-24 campaign
+    # folded the operator's live limits (1 CPU / 2Gi) into the manifest.
+    # 4/8Gi/20/22Gi cover both with headroom; full arithmetic in the
+    # header comment above and in
     # tests/test_deploy_manifests.py (the envelope is computed from
     # the manifests at test time, so any drift fails CI).
     requests.cpu: "4"
     requests.memory: 8Gi
     limits.cpu: "20"
-    limits.memory: 20Gi
+    limits.memory: 22Gi
 ---
 apiVersion: v1
 kind: LimitRange

@@ -122,6 +122,33 @@ def _set_redis_key_layout_status(value: float) -> None:
     REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
 
 
+def _validate_item_meta(
+    item: object,
+) -> tuple[dict, str, str] | None:
+    """Validate item has dict shape and extract namespace/name for the CR.
+
+    Issue #726 — consolidates the three formerly-separate skipped branches
+    into one helper. Issue #738 — ``kopf.Body`` is a ``Mapping``, not a
+    ``dict``, so the top-level check uses ``Mapping`` instead of ``dict``.
+    Returns a 3-tuple ``(meta, ns, nm)`` when the item is well-formed, or
+    ``None`` when it is not (in which case the gauge has already been set
+    to ``0.0`` by this function).
+    """
+    if not isinstance(item, Mapping):
+        _set_redis_key_layout_status(0.0)
+        return None
+    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
+    if not isinstance(meta, dict):
+        _set_redis_key_layout_status(0.0)
+        return None
+    ns = str(meta.get("namespace") or "")
+    nm = str(meta.get("name") or "")
+    if not ns or not nm:
+        _set_redis_key_layout_status(0.0)
+        return None
+    return (meta, ns, nm)
+
+
 def _key_layout_validation_is_fresh(*, now: float | None = None) -> bool:
     """Issue #590 — whether the #490 freshness stamp is within the cadence.
 
@@ -204,18 +231,13 @@ def _check_redis_key_layout_for_cr(
     production-scale fleets). The bounded diagnostic SCAN runs only on
     the failure path, to build the error-message evidence.
     """
-    if not isinstance(item, Mapping):
-        _set_redis_key_layout_status(0.0)
+    # Issue #726 — consolidate three skipped branches into one helper guard.
+    # Issue #738 — _validate_item_meta uses Mapping (not dict) for the
+    # top-level check because kopf.Body is a Mapping.
+    validated = _validate_item_meta(item)
+    if validated is None:
         return "skipped"
-    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
-    if not isinstance(meta, dict):
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
-    ns = str(meta.get("namespace") or "")
-    nm = str(meta.get("name") or "")
-    if not ns or not nm:
-        _set_redis_key_layout_status(0.0)
-        return "skipped"
+    _meta, ns, nm = validated
     spec = item.get("spec") or {}
     try:
         # Issue #567 — parse through OperatorConfig (the single config
