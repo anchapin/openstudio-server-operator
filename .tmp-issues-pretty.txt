@@ -1,0 +1,671 @@
+==== ISSUE #727 — Extract per-outcome metric summation helpers in test_dryrun_ ====
+  `tests/test_dryrun_walkthrough.py:122-159` declares four near-identical helpers — `soft_stops_total`, `workers_recycled_total`, `worker_pods_evicted_total`, `analyses_deleted_total` — each summing every label series of one labeled Counter via `labelled_metric(name, {label: value})` for the outcomes listed in the metric's docstring. The four helpers share the same 5-line shape: iterate a tuple of label values, accumulate `labelled_metric(name, {label: v})` for each, return the sum. The label tuples themselves are scattered across the four helpers (e.g. `("issued", "dry-run")` for soft stops, `("analysis-completed", "interval-elapsed")` for recycles, `("evicted", "evicted-partial", "no-matching-pods", "dry-run")` for evictions), and the per-metric tuples drift separately from the production code's metric docstring in `metrics.py` — a new outcome added at the metric site (`metrics.py:107-122` for `SOFT_STOPS_TOTAL`) silently disappears from this walkthrough until a test breaks.
+
+Extract one `sum_labelled_counter(name: str, label: str, values: tuple[str, ...]) -> float` helper and a `LABELED_COUNTER_OUTCOMES: dict[str, tuple[str, ...]]` constant keyed by metric name (the single source of truth that the walkthrough test reads and that the metric docstring cites).
+
+Acceptance criterion: the four helpers collapse to four `LABELED_COUNTER_OUTCOMES` constant entries, and any future outcome added to `metrics.py` is discovered here by adding one line to the constant.
+
+Scope guard: Do NOT change the assertion semantics; this is a helper-extraction refactor only.
+
+==== ISSUE #726 — Consolidate the three 'skipped' branches in _check_redis_key ====
+  `handlers/redis_layout_check.py:206-217` duplicates the same three-line pattern three times in a row: each branch calls `_set_redis_key_layout_status(0.0)` then returns `"skipped"`. The pre-checks for `isinstance(item, dict)`, `isinstance(meta, dict)`, and `not ns or not nm` each carry their own copy of this block (with a different `if` condition), making the function's 157 lines longer than necessary and giving future contributors three places to keep in sync if `_set_redis_key_layout_status` ever changes shape. The pattern is small (3 lines) but the function's tail-end-else (lines 242-297) carries three more `except` branches each ending with the same `_set_redis_key_layout_status(0.0); return "<verdict>"` shape — six near-identical terminal-stamp blocks in one function.
+
+Extract a small `_skip_with_log(reason: str) -> str` helper (or a `@dataclass`-shaped return that bundles status + log line) and a similar `_fail_with_log(value: float, verdict: str, log: str) -> str`.
+
+Acceptance criterion: the function body shrinks below 100 lines and the 6 stamp-and-return pairs collapse into 6 calls of one helper each, with the same `/metrics` surface preserved (the test file `tests/test_singleton_registry_coverage.py::test_check_redis_key_layout_for_cr_covers_all_status_branches` continues to pass byte-for-byte).
+
+Scope guard: Do NOT change the metric stamp values or the verdict strings; this is a code-shape refactor only.
+
+==== ISSUE #723 — Add socket_keepalive + health_check_interval to Redis client ====
+  `ReadOnlyRedisClient.__init__` (`redis_client.py:395-425`) constructs `redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=socket_timeout_seconds, socket_connect_timeout=socket_timeout_seconds, **tls_kwargs)` with no `socket_keepalive`, `socket_keepalive_options`, or `health_check_interval`. In a Kubernetes cluster where the operator pod lives behind a Service and the Redis Service is fronted by a Cloud NAT (EKS, GKE, AKS), idle TCP connections past the NAT's idle timeout (typically 350-900 s) are silently dropped without an RST.
+
+The next operator tick (web_background's 60-s cadence, watchdog's 60-s cadence) hits a half-open connection; redis-py retries once and raises `ConnectionError` after the read times out — the tick fails (counted skip-tick, `HANDLER_TICK_FAILURES_TOTAL` bumps), the operator idles for one extra cadence while the connection re-establishes, and the SLA clock / requeue budget is delayed by 60 s.
+
+The kubernetes-python client (and the `BoundedK8sRequest` wrapper, #579) similarly defaults to no keepalive but the K8s API surface is in-cluster (kubelet → kube-apiserver) without NAT traversal in most deployments, making the failure mode rare; the Redis client traverses the cluster's network policy and may hit a NAT boundary (or a cloud-provider L4 LB with an idle drop rule).
+
+Acceptance criterion: add `socket_keepalive=True`, `socket_keepalive_options=dict(TCP_KEEPIDLE=60, TCP_KEEPINTVL=10, TCP_KEEPCNT=3)`, and a configurable `health_check_interval` (default 30 s) to `ReadOnlyRedisClient.__init__`; document a `REDIS_TCP_KEEPIDLE_SECONDS` env var as the cluster-admin override; add a regression test that asserts the kwargs are forwarded to `redis.Redis.from_url`.
+
+The operator-pod manifest's `tcpKeepalive` envelope is the cluster-side companion (`deploy/operator-deployment.yaml`); both sides need the constant.
+
+Scope guard: Do NOT touch the OpenStudio REST client's timeouts (those are #579's territory); this issue is Redis-client-only.
+
+==== ISSUE #721 — Add jitter ceiling to StatusStore 409 backoff so a sustained ====
+  `status_store._conflict_backoff` (`status_store.py:183`) computes the backoff as `_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random())` — the jitter is multiplicative only, with NO upper bound. After `MAX_CONFLICT_RETRIES = 5` attempts, the worst-case cumulative sleep is `1.0 * (1 + 2 + 4 + 8) * 1.5 = 22.5 s` of pure sleep BEFORE the conflict is escalated to `StatusStoreConflictError`.
+
+The SLA poll cadence is 30 s (`SLA_POLL_INTERVAL_SECONDS`); a sustained 409 storm on a status PATCH during a tick can spend 22.5 s sleeping inside the wrapper's RMW cycle, leaving only 7.5 s for the actual REST/Redis work — or worse, the cumulative sleep plus the actual work exhausts the cadence budget so the next kopf tick cannot start on time (kopf's timer cadence is wall-clock-aligned; a tick that overruns is silently skipped, no count).
+
+The `BoundedK8sRequest` (#579) explicitly cites this concern as motivation but only for the network surface; the status-store retry loop has the same concern on the `.status` subresource path.
+
+Acceptance criterion: bound the conflict-sleep ceiling to `min(_conflict_backoff(attempt), MAX_CONFLICT_SLEEP_SECONDS)` where the ceiling is well inside the shortest timer cadence (e.g. 2.0 s, making worst-case cumulative 9 s). Add a regression test that monkey-patches `_sleep` to capture the sleeps, forces a 5-409 storm, and asserts `sum(sleeps) < SLA_POLL_INTERVAL_SECONDS * 0.5`.
+
+Scope guard: Do NOT change the retry COUNT (`MAX_CONFLICT_RETRIES`); only the per-attempt sleep ceiling is in scope.
+
+==== ISSUE #720 — CI gate: fail on any deploy manifest that does not carry PSS ====
+  The operator's `deploy/operator-deployment.yaml`, `deploy/storage-cronjob.yaml`, `deploy/keda-scaledobject.yaml`'s TriggerAuthentication Secret reference, and `scripts/manifests/04-web.yaml` / `05-web-background.yaml` / `06-worker.yaml` all carry container-level `runAsNonRoot: true` + `seccompProfile: RuntimeDefault` + `allowPrivilegeEscalation: false` + `capabilities.drop: ["ALL"]` + `readOnlyRootFilesystem: true` — the full PSS-restricted baseline. The kind recipe (`scripts/manifests/`) and the helm-chart-managed pods that ship in the kind validation cluster are similarly hardened (issue #388).
+
+But `scripts/manifests/` is NOT a deploy artifact — it's a standalone kind-recipe overlay that may drift independently of `deploy/`. The drift fence today is `tests/test_deploy_manifests.py` but only for the `deploy/` manifests. A future maintainer who adds a new manifest under either `deploy/` or `scripts/manifests/` (e.g. a new sidecar for the prune CronJob, or a new `X-VAP` admission policy that ships its own example Deployment) without applying the PSS-restricted baseline silently opens a backdoor: PSS `enforce=restricted` on the namespace (#498) would reject the new pod at admission, but only after the `kubectl apply` reaches the cluster — the operator's CI never catches the manifest-level regression.
+
+Extend `tests/test_deploy_manifests.py` (or add a sibling test) to AST-walk every `*.yaml` under `deploy/` AND `scripts/manifests/`, parse every PodSpec / container, and assert the four-field PSS-restricted baseline (non-root + no-priv-escalation + drop-ALL-caps + read-only-root-FS) is present on every container. Fenced the same way the existing #563 / #641 cross-fences work.
+
+Acceptance criterion: CI gate wired into `lint` (or a new `pss-baseline` test job), clear error message naming the offending manifest + container when the gate fires.
+
+Scope guard: Do NOT modify the existing #388 kind-recipe manifests in this PR — the gate only ADDS the cross-walk; the manifests are presumed compliant (verified separately on each release).
+
+==== ISSUE #719 — Add a CI gate that asserts `deploy/secret-read-admission-pol ====
+  The `deploy/secret-read-admission-policy.yaml` ValidatingAdmissionPolicy narrows the operator SA's Secret mutations to names starting with `openstudio-redis*`. The `deploy/rbac.yaml` `secrets: get` grant is `resourceNames: ["openstudio-redis"]` — exact-name, no glob — so a CR naming a custom `openstudio-redis-foo` Secret is apply-legal under the CRD pattern (#463) and fails at READ time as designed (the `RedisSecretRefForbidden` Warning event surfaces this). But the ONLY gate that today proves the VAP narrows the same naming convention as the RBAC `resourceNames` is `tests/test_deploy_manifests.py` — and that test must be inspected to confirm.
+
+A future maintainer who edits one file (e.g. adds `openstudio-redis-canary` to the RBAC `resourceNames` to onboard a tenant) and forgets the VAP yields a fail-open path where the SA CAN mutate `openstudio-redis-canary` even though its READ scope is also widened — a coherent policy, but every widening must be deliberate.
+
+Add a cross-fence test that AST-loads both `deploy/rbac.yaml` and `deploy/secret-read-admission-policy.yaml`, extracts (1) the `resourceNames` list from the rbac rules, (2) the `startsWith(...)` literal from the VAP `validations[*].expression`, and asserts every name listed in (1) matches the (2) prefix. Same shape as the existing #641 cross-fence for `RCLONE_IMAGE`.
+
+Acceptance criterion: test file under `tests/test_secret_read_vap_resourceNames_parity.py`, CI gate wired into the `lint` job.
+
+Scope guard: Do NOT modify the VAP itself; the gate only AST-validates both files' names are coherent.
+
+==== ISSUE #717 — Add SIGTERM graceful-shutdown handler so mid-tick writes are ====
+  The operator runs as a Kubernetes Deployment (single-replica, Recreate strategy, AGENTS.md). kopf's own teardown is event-driven; the operator has no `signal.SIGTERM` / `atexit` handler in `handlers/__init__.py` or `prune_entrypoint.py`. Three consequences matter against the project goals:
+
+(1) A SIGTERM mid-tick (kubelet rolling the pod or a node-drain Evict) drops the current timer body — accepted by the D12 idempotency design (the persisted `.status` anchors are the source of truth and a fresh process re-reads them).
+
+(2) BUT the in-memory `QueuedKopfEventSink._queue` (`events_sinks.py`) holds entries that were ACCEPTED into the persisted mirror just before SIGTERM; while the persisted mirror is the at-least-once contract and a fresh process emits them exactly once via persisted-first drain, the queue is lost between drain and SIGTERM — fine for current semantics, BUT the marker writes that depend on a successful RMW (`mark_soft_stop_escalated`, the #649 ineffective-restart counter, the #402 deferred-event append) can lose their final byte if SIGTERM lands mid-write.
+
+(3) The `WorkerPodApi.delete_namespaced_pod` loop (`analysis_sla.py:566-585`) is per-pod try/except (issue #118 noted); a SIGTERM during the loop loses the partial-eviction accounting AND the `mark_soft_stop_escalated` write that follows. The D12 accepted race ("re-attempt on next tick") holds for a clean crash, but a SIGTERM during a tick that already wrote the eviction(s) but not the marker leaves the eviction REAL and the marker ABSENT — the next tick re-fires the same evict list.
+
+Install a `signal.SIGTERM` handler that (a) prevents new tick invocations (kopf's shutdown event), (b) waits for the in-flight tick to complete with a bounded grace (`terminationGracePeriodSeconds` minus 5 s), (c) flushes any pending status-store writes from the in-flight tick body.
+
+Acceptance criterion: Add a regression test that injects SIGTERM between the pod-delete loop and `mark_soft_stop_escalated` and asserts the marker is written before exit (or that the next-tick re-fire is correctly recorded as the SAME restart, not a second restart).
+
+Scope guard: Do NOT add `@kopf.on.delete` or `@kopf.daemon` handlers (the #681 persistence-fence rule); this issue only installs SIGTERM handling at the process level.
+
+==== ISSUE #715 — Restrict the openstudio-redis Secret READ path to a narrower ====
+  `deploy/rbac.yaml` grants the operator SA `secrets: get` with `resourceNames: ["openstudio-redis"]` — exact-name. The `deploy/secret-read-admission-policy.yaml` VAP narrows MUTATIONS (CREATE/UPDATE/DELETE) of the operator SA to names starting with `openstudio-redis*`. The SCOPE HONESTY comment in that VAP admits (correctly, per the VAP design): GETs never reach admission, so a compromised operator pod holding the SA token can read any Secret in the namespace whose `resourceNames` is satisfied — including, today, `openstudio-mongo` (Mongo root creds) and the rclone archival credential Secrets. The #463 acceptance criterion accepted the post-`resourceNames` shape (pre-#606 was namespace-wide `get`, post-#606 is name-bounded), so this is by design — but the threat model the AGENTS.md `Working rules` block describes ("a compromised operator pod could read ANY Secret in `openstudio-server`") is no longer fully closed by RBAC alone.
+
+Add a SECOND narrower `Role`/`RoleBinding` pair named `openstudio-redis-secret-reader-role` that grants `secrets: get` ONLY on `openstudio-redis` (single name) AND a separate `RoleBinding` that is the ONLY grant wired to the operator SA's `secrets` verbs — and DELETE the `secrets: get` grant from `deploy/rbac.yaml`'s main `Role`. The two-tier Role split moves the name constraint from a comment in `resourceNames` to the only Role the operator SA carries; the SA can no longer acquire a broader `get secrets` grant through any in-tree path.
+
+Acceptance criterion: AST test that asserts the operator SA's effective `secrets` verbs come ONLY from the narrower Role, RBAC regression test that fails if `deploy/rbac.yaml`'s Role ever grows a broader `secrets` rule.
+
+Scope guard: Do NOT modify the VAP (`deploy/secret-read-admission-policy.yaml`); #606 owns the VAP surface. Do NOT touch the helm-chart-managed Mongo/Redis Secret manifests; #150/#219 own the password-literal fence.
+
+==== ISSUE #713 — Add SA token automount disable to operator Deployment and pr ====
+  The operator's `deploy/operator-deployment.yaml` and `deploy/storage-cronjob.yaml` both bind `serviceAccountName: openstudio-operator-sa` / `openstudio-storage-pruner-sa` but never set `automountServiceAccountToken: false` on the pod spec. Only the archival Job template (`src/openstudio_operator/archival.py:243`) flips this flag. The operator's namespaced RBAC includes `pods/delete`, `deployments/patch`, the #463 `secrets/get` (resourceNames-bounded), `events/create`, and the #228 `.status` RMW — a kubelet-mounted SA token at `/var/run/secrets/kubernetes.io/serviceaccount/token` is exactly the credential a compromised operator pod needs to authenticate as the SA against the kube-apiserver from a side-loaded binary (the D11 / VAP fences only gate cluster-level API verbs, not possession of the token itself).
+
+The archival Job already proves the pattern; extending it to the operator Deployment and prune CronJob closes the gap for both privileged actors. Add `automountServiceAccountToken: false` to the pod-level `spec` of both manifests (mirroring `archival.py:243`'s comment that the prune CronJob intentionally keeps the mount because it needs API access — but the operator Deployment can be reviewed for whether its own StatusStore RMW actually requires it or can route through a sub-actor).
+
+Acceptance criterion: AST-gated test that fails CI on any operator-owned pod template missing the flag, plus a release-notes callout for the #228 RBAC interaction. Issue this as a follow-up to the existing #228/#293/#294 hardening series.
+
+Scope guard: Do NOT touch the helm-chart-managed pods in `scripts/manifests/` (those are external to the operator); #295 owns that surface.
+
+==== ISSUE #712 — CHANGELOG + AGENTS.md test-count bump + kind integration tes ====
+  Blocked by #711 (regression tests). The closing-init doc-sync + kind-validation
+PR for the `stop_analysis` wiring per #707 (epic). Closes the loop on the
+auto-improvement-loop's "init" step once the implementation lands.
+
+## What to ship
+
+### 1. CHANGELOG entry
+
+`CHANGELOG.md` (Keep-a-Changelog format; see #177 for the format convention):
+
+```markdown
+## [Unreleased]
+
+### Changed
+- Wire the `stop_analysis` waiting-variant stop (POST /analyses/{id}/action
+  with `analysis_action=stop`) into the {{sla|retention}} handler. Adds
+  `status.stoppedAnalyses[id]` anchor map (D04), dryRun gate with marked
+  `AnalysisStopped` Event (D11), and `openstudio_operator_stops_total{outcome}`
+  counter. Closes #707, resolves #49 follow-up, fixes the stale line-number
+  reference in audit-dryrun-idempotency.md §1.1 row R2.
+```
+
+Substitute `{{sla|retention}}` for the call site chosen in #709.
+
+### 2. AGENTS.md test-count bump (mandatory before push)
+
+The wiring adds ~6 regression tests in #711. Run:
+
+```bash
+.venv/bin/pytest --collect-only 2>&1 | tail -1
+ls tests/test_*.py | wc -l
+```
+
+Update BOTH the AGENTS.md `# N tests across M files` claim AND the
+`docs/onboarding.md` matching claim in a SEPARATE commit BEFORE the
+substantive CHANGELOG commit. Per the #151 + #220 CI guard convention
+(extended to all 4 claim locations in #423), a missing bump fails CI.
+
+```bash
+sed -i 's|#  *\([0-9]\+\) tests across|# \1 tests across|' AGENTS.md docs/onboarding.md
+sed -i "s|[0-9]\+ tests across [0-9]\+ files|$(.venv/bin/pytest --collect-only 2>&1 | tail -1 | awk '{print $1}') tests across $(ls tests/test_*.py | wc -l | tr -d ' ') files|" AGENTS.md docs/onboarding.md
+```
+
+The double-space-normalisation regex (`#  *\1`) guards against the
+double-space hazard documented in the auto-improvement-loop SKILL.md.
+
+### 3. README metrics table update
+
+`README.md#metrics` lists every counter/gauge/histogram. Add a row for
+`openstudio_operator_stops_total{outcome}` mirroring the
+`openstudio_operator_soft_stops_total` row (#8) format:
+
+```
+| \`openstudio_operator_stops_total{outcome}\` | counter (labelled) | \`{{sla|retention}} handler\` · #707 | Waiting-variant stop issued (or dry-run / completed / timeout outcome). Labelled by \`outcome\` ∈ {\`"issued"\`, \`"dry-run"\`, \`"completed"\`, \`"timeout"\`}. Sustained nonzero rate on \`outcome="timeout"\` is the canonical "stop wait exceeded" alert — server is not draining in-flight runs within the bounded budget. Pair with \`openstudio_operator_stopped_analyses_entries\` to see how close the cap is to its bound. |
+```
+
+### 4. docs/kind-validation.md evidence table
+
+The kind validation evidence table needs a new row showing the
+`stop_analysis` wiring was exercised end-to-end on a real cluster
+(`scripts/create-kind-cluster.sh` + `scripts/deploy-openstudio-stack.sh`):
+
+| Module | Pre-merge evidence | Post-merge evidence |
+|--------|---------------------|----------------------|
+| `{{sla\|retention}}` — `stop_analysis` wiring | Dry-run tick: anchor written with `outcome="dry-run"`, no REST call, suppressed_count++ | Live tick on kind: `AnalysisStopped` Event posted, anchor outcome="issued", `/analyses/{id}/status.json` reports `completed` within budget, anchor pruned on reconciliation |
+
+This row gates the kind-validation CI smoke test
+(`tests/test_kind_validation_evidence.py` if it exists; otherwise
+`docs/kind-validation.md` is parsed by the existing
+`tests/test_documentation_drift.py`).
+
+### 5. docs/contracts/openstudio-server-v3.11.0-rest.md
+
+The verified REST contract doc should already list
+`POST /analyses/{id}/action` with `analysis_action=stop` (issue #49
+verification confirmed the contract). Re-verify the line is still present;
+if it is, no edit. If it's been pruned during a contract-doc refresh
+(per #305 doc-drift precedents), add it back citing this wiring.
+
+## Acceptance criterion
+
+- [ ] `CHANGELOG.md` has the entry above; cross-references #707, #49,
+      and the resolved call-site issue (#709).
+- [ ] `AGENTS.md` and `docs/onboarding.md` test-count claims both bumped
+      to match `pytest --collect-only` + `ls tests/test_*.py | wc -l`.
+- [ ] `README.md#metrics` table gains the `openstudio_operator_stops_total`
+      row.
+- [ ] `docs/kind-validation.md` evidence table gains the wiring-exercised
+      row.
+- [ ] Local kind cluster run (if available) shows the wiring produces the
+      expected `AnalysisStopped` Event and the anchor is pruned on the
+      reconciliation tick.
+- [ ] No `--admin` merges required; ruff + pytest green on the resulting PR.
+
+## Scope guard
+
+This issue does NOT change production code. The wiring PR (#710) and
+regression tests (#711) are EXPLICITLY out of scope — this is the closing
+doc-sync + kind-validation PR.
+
+Refs #707 (epic). Blocked by #711 (regression tests).
+
+==== ISSUE #711 — Regression tests: one-shot, dryRun suppression, restart-surv ====
+  Blocked by #710 (D11 gate wiring). Adds the regression fence for the
+`stop_analysis` wiring per #707 (epic).
+
+## Tests to ship
+
+### 1. One-shot semantics (mirrors `test_soft_stop_fires_exactly_once_across_ticks`)
+
+```python
+def test_stop_analysis_fires_exactly_once_across_ticks(...):
+    # Tick 1: started analysis, no anchor → POST stop_analysis, write anchor with
+    #         outcome="issued".
+    # Tick 2: still started within budget → anchor exists, NO new POST.
+    # Tick 3: still started past budget → anchor outcome flipped to "timeout",
+    #         fall through to escalation.
+    # Assert: client.stop_analysis called exactly ONCE across ticks 1-2.
+    # Assert: tick 3 calls client.delete_namespaced_pod (or
+    #         delete_analysis for Candidate B) exactly once.
+```
+
+### 2. dryRun suppression (mirrors `test_dry_run_suppresses_rest_call_and_marks_event`)
+
+```python
+def test_dry_run_suppresses_stop_analysis_rest_call_and_marks_event(...):
+    # spec.dryRun=True, analysis started, anchor missing.
+    # Assert: client.stop_analysis NOT called.
+    # Assert: EventEmitter.emit NOT called (post-#164 short-circuit).
+    # Assert: EventEmitter.suppressed_count incremented.
+    # Assert: anchor written with outcome="dry-run".
+    # Assert: openstudio_operator_stops_total{outcome="dry-run"} += 1.
+```
+
+### 3. Restart survival (mirrors `test_anchor_survives_operator_restart`)
+
+```python
+def test_stop_anchor_survives_operator_restart(...):
+    # Tick 1 in process A: anchor written with outcome="issued".
+    # Simulate process restart: re-construct StatusStore from persisted
+    # `.status.stoppedAnalyses` (FakeCustomObjectsApi patch_conflicts handler
+    # returns the persisted CR body on GET).
+    # Tick 1 in process B: anchor re-read, NO new POST.
+    # Assert: client.stop_analysis called exactly ONCE across both processes.
+    # Assert: tick in process B increments
+    #         openstudio_operator_stops_total{outcome="issued"} ZERO additional
+    #         times (the issued counter is per-tick; only the
+    #         `completed`/`timeout` outcomes fire on reconciliation).
+```
+
+### 4. No-double-fire on dryRun flip
+
+```python
+def test_flipping_dry_run_off_does_not_reissue_stop(...):
+    # Tick 1: dry_run=True → anchor written with outcome="dry-run", no REST call.
+    # Flip CR: spec.dryRun=False.
+    # Tick 2: dry_run=False, anchor already exists → must NOT POST (the anchor
+    #         is the idempotency record; flipping dryRun off does NOT
+    #         "un-suppress" a previously suppressed action).
+    # Assert: client.stop_analysis called ZERO times across ticks 1-2.
+    # Assert: anchor outcome remains "dry-run" (never upgraded to "issued" just
+    #         because dryRun was flipped).
+    # Audit doc D04 §111 says: "Dry-run anchors use outcome=\"dry-run\" — still
+    # one-shot, so flipping dryRun off never double-stops." This test pins that
+    # invariant for stop_analysis specifically.
+```
+
+### 5. Status cap eviction ordering (mirrors the softStops #648 audit)
+
+```python
+def test_status_stopped_analyses_map_cap_eviction(...):
+    # Fill status.stoppedAnalyses to STATUS_MAP_MAX_ENTRIES (10000) with
+    # deterministic UUID keys.
+    # Insert one more entry.
+    # Assert: oldest entries (sorted by UUID key, per #648 documented semantics)
+    # evicted first.
+    # Assert: openstudio_operator_status_map_caps_total{map_name="stoppedAnalyses"}
+    #         incremented exactly once.
+```
+
+### 6. Audit doc R2 fence
+
+```python
+def test_audit_doc_row_r2_is_gated(...):
+    # Parse docs/audit-dryrun-idempotency.md §1.1.
+    # Assert: row R2 status column reads exactly "GATED" (not DORMANT, not "n/a").
+    # Assert: row R2 cites the gate line (handlers/analysis_sla.py:XXX or
+    #         retention.py:YYY).
+    # Assert: row R2 line-reference to openstudio_client.py is current (>= :350)
+    #         — guards against the audit-doc drift the wiring PR corrects.
+```
+
+## Acceptance criterion
+
+- [ ] All six tests in `tests/test_<chosen_handler>.py` (or
+      `tests/test_stop_analysis.py` as a new file if cleaner).
+- [ ] CI fence added: the audit-doc-R2-status test is in the same drift-gate
+      batch as the existing audit-doc inventory test
+      (`tests/test_audit_dryrun_idempotency.py` if it exists, or
+      `tests/test_documentation_drift.py` per #659 precedent).
+- [ ] No new mocking library; reuses `tests/_fakes.py` (`FakeCustomObjectsApi`,
+      `FakeBatchV1Api`, `FakePodsCoreV1Api`, `make_cr`, `make_emit` per #531,
+      #567, #653 consolidation).
+- [ ] Ruff clean, pytest green on the resulting PR.
+- [ ] Tests pass both with the Candidate A and Candidate B call sites —
+      parameterized via a `pytest.fixture` that injects the handler under test.
+
+## Scope guard
+
+This issue does NOT change production code or audit-doc text. It is the
+regression-fence PR scope only. The wiring PR (#710) and the audit-doc update
+in #710 are tested by this issue.
+
+Refs #707 (epic). Blocked by #710 (D11 gate wiring) and #709 (call-site).
+
+==== ISSUE #710 — Wire dryRun gate + marked Warning Event for stop_analysis; f ====
+  Blocked by #708 (D04 status-anchor plumbing) and #709 (call-site decision).
+Implements the D11 (dryRun gate) half of the wiring contract per #707 (epic).
+
+## What to ship
+
+### 1. dryRun gate (D11)
+
+Mirror the `soft_stop_analysis` pattern at `handlers/analysis_sla.py:381-401` and
+the SLA handler's tick logic at `:373-403`:
+
+```python
+dry_run = config.dry_run
+message = f"stop issued for analysis {analysis_id}"
+outcome = _OUTCOME_ISSUED
+
+if dry_run:
+    message += " — stop suppressed (spec.dryRun)"
+    outcome = _OUTCOME_DRY_RUN
+else:
+    client.stop_analysis(analysis_id)
+
+emit.emit(
+    type="AnalysisStopped",
+    reason="stop issued" if not dry_run else "dry-run stop",
+    message=message,
+)
+```
+
+The marked Event MUST use the `AnalysisStopped` type with the
+`"— stop suppressed (spec.dryRun)"` suffix when `dry_run=True`, mirroring the
+"`— soft stop suppressed (spec.dryRun)"` pattern. Post-#164:
+when `dry_run=True` the `EventEmitter.emit` call short-circuits — the
+`AnalysisStopped` Event is NOT posted to the kube-apiserver;
+`EventEmitter.suppressed_count` increments instead.
+
+### 2. Anchor write (D04)
+
+```python
+now = datetime.now(timezone.utc)
+record = StopRecord(
+    issued_at=now,
+    outcome=outcome,            # "issued" | "dry-run"
+    stopped_at=None,            # populated on the subsequent tick when server reports completed
+)
+store.set_stop_record(analysis_id, record)
+```
+
+Anchor key MUST be `(namespace, name, "stoppedAnalyses")` per the per-CR cache
+convention (#497, #364 delete+recreate fence).
+
+### 3. Outcome reconciliation
+
+The chosen handler's tick must:
+1. Look up the anchor via `store.get_stop_record(analysis_id)` BEFORE issuing a
+   new POST (one-shot semantics).
+2. On the next tick, GET `/analyses/{id}/status.json`:
+   - `status == "completed" | "na"` → update anchor with `stopped_at=now`,
+     `outcome="completed"`, prune the anchor in the same tick.
+   - `status == "started"` AND `now - issued_at > stopWaitTimeoutSeconds` →
+     update anchor with `stopped_at=now`, `outcome="timeout"`, fall through
+     to the existing escalation path (pod eviction or delete cascade).
+   - `status == "started"` AND within budget → leave anchor alone, no new POST.
+
+### 4. Audit doc update
+
+`docs/audit-dryrun-idempotency.md` §1.1 row R2 (currently DORMANT, line 49)
+must be updated IN THE SAME PR:
+
+- Status column: `DORMANT` → `GATED`.
+- Body: cite the gate line (`handlers/analysis_sla.py:XXX` for Candidate A or
+  `retention.py:YYY` for Candidate B).
+- Message suffix: `"— stop suppressed (spec.dryRun)"`.
+- Anchor row reference: link the `status.stoppedAnalyses[id] = StopRecord`
+  shape per #708.
+
+**STALE DRIFT CORRECTION (same PR):** Row R2 cites `openstudio_client.py:209`
+as the definition line; the actual line is `:355` (the method was renumbered
+during a refactor). The drift is independent of the wiring but lands in the
+same PR per the codebase's "fix the surrounding fence when you touch it"
+pattern (see #660, #661 for prior precedents).
+
+### 5. New counter: `openstudio_operator_stops_total{outcome}`
+
+Mirrors `openstudio_operator_soft_stops_total` (audit doc §2; metrics.py).
+Labelled by `outcome` ∈ {`"issued"`, `"dry-run"`, `"completed"`, `"timeout"`}.
+The first two are incremented at the time of the POST (or its suppression);
+the latter two on the reconciliation tick.
+
+Add to `_metrics_inventory.py::EXPECTED_COUNTER_FAMILIES` (per #406
+shared-canonical-source convention).
+
+## Acceptance criterion
+
+- [ ] `stop_analysis` invoked from the chosen handler under the same
+      `if not dry_run:` gate pattern as `soft_stop_analysis`.
+- [ ] `AnalysisStopped` Event emitted with the
+      `— stop suppressed (spec.dryRun)` suffix when dry_run=True.
+- [ ] Anchor written via `StatusStore.set_stop_record` BEFORE the REST call.
+- [ ] Outcome reconciliation tick handles all four outcomes
+      (issued / dry-run / completed / timeout).
+- [ ] `audit-dryrun-idempotency.md` §1.1 row R2 reads `GATED` with gate line cited.
+- [ ] Stale line-number drift (`openstudio_client.py:209` → `:355`) corrected.
+- [ ] `openstudio_operator_stops_total{outcome}` appears in `/metrics` with
+      all four label values exercised in tests.
+
+## Scope guard
+
+This issue does NOT add regression tests (those are #710) or update
+CHANGELOG/AGENTS.md (those are #711). This issue is the implementation PR
+scope only.
+
+Refs #707 (epic). Blocked by #708 (anchor plumbing) and #709 (call-site).
+
+==== ISSUE #709 — Decide call site for stop_analysis: SLA escalation fallback  ====
+  Tracking the design decision that unblocks #710 (D11 gate wiring) and #711
+(regression tests) per #707 (epic).
+
+## Context
+
+`stop_analysis` (POST `/analyses/{id}/action` with `analysis_action=stop`) is a
+**waiting-variant** stop — it sets `run_flag` false and waits for in-flight runs
+to complete. This is semantically distinct from the existing two stops:
+
+| Method | Wait? | Used by today |
+|--------|-------|---------------|
+| `soft_stop_analysis` (GET `/analyses/{id}/soft_stop`) | No (returns immediately, in-flight runs continue) | `handlers/analysis_sla.py:381` — primary SLA action |
+| `stop_analysis` (POST `/analyses/{id}/action`) | **Yes** (sets `run_flag` false + waits) | **no call sites** |
+| `delete_analysis` (DELETE `/analyses/{id}`) | n/a (cascade) | `retention.py` — NFS cleanup |
+
+## Two candidates
+
+### Candidate A — SLA escalation fallback (handlers/analysis_sla.py)
+
+After the SLA handler's `gracefulStopTimeoutMinutes` grace period expires and the
+analysis is STILL `started`, try ONE `stop_analysis` POST before escalating to
+pod eviction. Bounded budget (e.g., `stopWaitTimeoutSeconds = 60`) for the wait;
+on timeout, fall through to the existing pod-eviction path.
+
+**Pros**
+- Reduces wedged-pod evictions: analyses that just need a few more seconds to
+  finish naturally get to finish.
+- No new CRD field needed — the trigger is the existing SLA grace expiry.
+- Pure UX improvement; same control surface.
+
+**Cons**
+- Adds wall-clock time to the SLA tick (must wait up to the budget per analysis).
+  Acceptable since soft_stop has already failed to act fast enough.
+- Cross-cuts the SLA handler — bigger test surface than a brand-new handler.
+
+### Candidate B — Retention pre-delete gate (retention.py)
+
+When the prune CronJob's verification tick sees a `started` analysis scheduled
+for delete, issue `stop_analysis` first; wait until the analysis reaches
+`completed` / `na`; then issue `delete_analysis`. Bounded by a configurable
+`preDeleteDrainTimeoutMinutes` (default 30); on timeout, log a Warning Event
+and proceed with the delete anyway (preserves current operational guarantee).
+
+**Pros**
+- Zero in-flight runs killed by NFS cascade — semantically "graceful".
+- Matches user mental model: "delete" implies "let me drain first".
+- Isolated to retention — test surface is small (one new tick phase).
+
+**Cons**
+- Adds up to `preDeleteDrainTimeoutMinutes` wall-clock per `started` analysis
+  in the prune window. If many `started` analyses are scheduled for delete, the
+  prune tick's wall time grows linearly.
+- New CRD `spec.retention.preDeleteDrainTimeoutMinutes` field becomes a
+  precedent for per-tenant retention knobs (gate against spec-bloat).
+
+## Decision criteria
+
+| Question | Candidate A | Candidate B |
+|----------|-------------|-------------|
+| Which operator-level guarantee is the SLA / retention contract currently failing to provide? | Pod-eviction false positives (analyses evicted that would have finished naturally) | NFS cascade kills in-flight runs |
+| Is the underlying wait bounded? | Yes (`stopWaitTimeoutSeconds`) | Yes (`preDeleteDrainTimeoutMinutes`) |
+| Is the failure mode understood? | Yes — fall through to existing pod-eviction path | Yes — proceed with delete after timeout |
+| Does it add a new CRD field? | No | Yes (`spec.retention.preDeleteDrainTimeoutMinutes`) |
+| Test surface delta | Medium (extends SLA handler tests) | Small (new retention tick phase tests) |
+
+## Acceptance criterion
+
+This issue closes when:
+1. One of the two candidates is selected.
+2. The rationale (1-2 paragraphs) is recorded in this issue body under
+   "Decision".
+3. The choice is cross-linked into #707's epic body in the "Call site" section.
+
+## Scope guard
+
+This issue does NOT change any code or contracts. It is the design decision
+gate that unblocks #710 (D11 gate wiring + audit doc update) and #711
+(regression tests) / #712 (CHANGELOG + AGENTS.md + kind). Independent of
+#708 (D04 anchor plumbing can land in parallel — the anchor shape is
+call-site-agnostic).
+
+==== ISSUE #708 — Add status.stoppedAnalyses[id] anchor map + StatusStore plum ====
+  Independent of #709 (call site decision). Implements the D04 (status-anchored
+idempotency) half of the `stop_analysis` wiring contract per #707.
+
+## What to ship
+
+### 1. New `.status` map: `stoppedAnalyses`
+
+Add a fifth `.status` map alongside `softStops`, `requeues`, `startedSince`,
+`archivedAnalyses`:
+
+```python
+# status_store.py
+@dataclass
+class StopRecord:
+    issued_at: datetime          # tz-aware UTC; the SLA-clock origin for D04
+    outcome: str                 # "issued" | "dry-run" | "completed" | "timeout"
+    stopped_at: datetime | None  # populated when server reports completed
+    # (or when the bounded wait expires — outcome="timeout")
+```
+
+Map shape: `status.stoppedAnalyses[analysis_id] = StopRecord(...)`.
+
+### 2. Extend `STATUS_MAP_MAX_ENTRIES` cap accounting
+
+The cap at `STATUS_MAP_MAX_ENTRIES = 10000` (status_store.py, evict-oldest-first)
+must now apply to a fifth map. The cap-eviction logic at `_set_map_entry` already
+iterates all known maps; just add `stoppedAnalyses` to the iteration. Verify the
+eviction order semantics are unchanged (oldest-first sorted by key, UUIDs are
+deterministic but not age-aware — same caveat as `softStops`).
+
+### 3. New `StatusStore.get_stop_record(analysis_id)` and `set_stop_record(...)`
+
+Mirror the `SoftStopRecord` API surface (`status_store.py:209-225`):
+
+```python
+def get_stop_record(self, analysis_id: str) -> StopRecord | None: ...
+def set_stop_record(self, analysis_id: str, record: StopRecord) -> bool: ...
+def prune_stop_record(self, analysis_id: str) -> bool: ...  # for anchor retirement
+```
+
+All three must use the existing RMW envelope (`_read_status` → typed merge →
+`_patch_status` with 409 retry). Anchor retirement (`prune_stop_record`) must be
+the same idempotency-preserving pattern as `prune_soft_stop_record`.
+
+### 4. CRD `.status` shape update
+
+The CRD `openstudioclustermanagers.energy.nrel.gov` `v1alpha1` `status` schema
+gains a `stoppedAnalyses` field (`Map<string, StopRecord>`). Update `deploy/crd.yaml`
+to match. (The CRD identity — group/version/kind — is unchanged; see #495.)
+
+### 5. New Prometheus gauge: `openstudio_operator_stopped_analyses_entries`
+
+Mirrors `openstudio_operator_status_map_entries` (#489) but `map_name="stoppedAnalyses"`.
+Stamped on every read (RMW fresh GETs + plain getters). Cardinality bounded by D05
+(one series per CR-map pair).
+
+## Acceptance criterion
+
+- [ ] `status_store.py` exposes `get_stop_record` / `set_stop_record` / `prune_stop_record`.
+- [ ] `STATUS_MAP_MAX_ENTRIES` cap-eviction covers the new map.
+- [ ] `deploy/crd.yaml` `.status.stoppedAnalyses` field documented.
+- [ ] `openstudio_operator_stopped_analyses_entries{namespace,name}` gauge
+      appears in `/metrics` with `map_name="stoppedAnalyses"`.
+- [ ] Unit tests for: round-trip RMW, cap-eviction ordering, 409-retry envelope.
+- [ ] `_metrics_inventory.py::EXPECTED_GAUGE_FAMILIES` updated per the #406
+      shared-canonical-source convention.
+
+## Scope guard
+
+This issue does NOT wire the actual `stop_analysis` REST call — that lands in
+#708 (dryRun gate + marked Event). This issue is the data-layer plumbing only.
+
+Refs #707 (epic). Independent of #709 (call-site decision) — the anchor map
+shape is call-site-agnostic; the keys are `(namespace, name, analysis_id)`
+regardless of which handler issues the POST.
+
+==== ISSUE #707 — [epic] Wire `stop_analysis` (waiting-variant stop) into the  ====
+  The waiting-variant stop (POST `/analyses/{id}/action` with `analysis_action=stop`,
+set `run_flag` false + wait for in-flight runs to complete) is contract-complete and
+tested in `OpenStudioClient.stop_analysis` (openstudio_client.py:355-380) but has
+**zero call sites** per `docs/architecture-plan.md:147` and the resolution of #49
+(which decided its *fate* — keep for contract completeness — but did not wire it).
+
+`audit-dryrun-idempotency.md` §1.1 row R2 is currently **DORMANT**.
+
+## Why this is now actionable
+
+The hard preconditions the contract requires (D11 dryRun-gate + D04 status-anchor +
+audit-doc update in the same PR) all have working reference implementations:
+
+- **D11 reference**: `soft_stop_analysis` in `handlers/analysis_sla.py:381-401` —
+  `if not dry_run:` gate + marked `AnalysisSoftStopped` Warning Event +
+  `outcome="dry-run"` anchor.
+- **D04 reference**: `status.softStops[id]` anchor map (`status_store.py:209-225`,
+  `SoftStopRecord`; `StatusStore.prune` for cap eviction per #648).
+- **Audit-doc reference**: rows R1, R3, R4, K1-K5 already show the GATED shape —
+  copy the schema.
+
+The wiring is mechanical — the design *decision* is which handler gets the call site.
+
+## Two viable call sites (decision in sub-issue #709)
+
+1. **SLA escalation fallback** (`handlers/analysis_sla.py`, between soft-stop and pod
+   eviction). After `gracefulStopTimeoutMinutes` of still-`started`, try one
+   `stop_analysis` POST and wait for it; only escalate to pod eviction if the
+   in-flight runs do not finish in a bounded budget. *Effect: fewer wedged-pod
+   evictions on analyses that just need a few more seconds to finish naturally.*
+
+2. **Retention pre-delete gate** (`retention.py`, before `delete_analysis`). When the
+   prune CronJob sees a `started` analysis at verification tick time, issue
+   `stop_analysis` first, wait for the analysis to reach `completed`/`na`, then
+   `delete_analysis`. *Effect: zero in-flight runs killed by NFS cascade; storage
+   semantics become "graceful" rather than "forceful".*
+
+Both paths use the same wiring shape (D11 gate + D04 anchor + marked Event). The
+choice is purely a UX question (which operator-level guarantee to prioritize) and
+*must be made before any code lands* — the config field name, anchor key shape, and
+metric labels all branch on it.
+
+## Scope guard
+
+This epic does **not** change:
+
+- The OpenStudio Server REST contract (verified against v3.11.0 — see
+  `docs/contracts/openstudio-server-v3.11.0-rest.md`).
+- `soft_stop_analysis` semantics (the SLA handler's primary stop path).
+- `delete_analysis` semantics (retention's NFS-cascade cleanup path).
+- The K8s-side pod-eviction path (K1 in §1.1) — that stays as-is for the
+  failure case where `stop_analysis` itself does not return.
+- Any CRD `spec` field shape beyond a single, optional `stoppedAnalyses` map
+  read into the `.status` subresource by the new wiring.
+
+## Sub-issues (auto-numbered; dependencies explicit)
+
+| Issue | Title | Files touched | Depends on |
+|-------|-------|---------------|------------|
+| #708 | Add `status.stoppedAnalyses[id]` anchor map + `StatusStore` plumbing (D04) | `status_store.py`, `config.py`, CRD `.status` shape | — |
+| #709 | Decide call site for `stop_analysis` (SLA escalation vs retention pre-delete) | design doc only | — |
+| #710 | Wire dryRun gate + marked Warning Event + audit doc R2 DORMANT→GATED (D11 + doc) | chosen handler + `audit-dryrun-idempotency.md` | #708, #709 |
+| #711 | Regression tests: one-shot, dryRun suppression, restart-survival, no-double-fire | `tests/test_<chosen_handler>.py`, fakes | #710 |
+| #712 | CHANGELOG + AGENTS.md test-count bump + kind integration test | `CHANGELOG.md`, `AGENTS.md`, `tests/`, `docs/kind-validation.md` | #711 |
+
+## Acceptance criteria for this epic to close
+
+- [ ] Call site decided (#709) and the decision recorded in this issue body.
+- [ ] `stop_analysis` invoked from the chosen handler with full D11 + D04 contract (#710).
+- [ ] Audit doc §1.1 row R2 reads `GATED` with the gate line cited (#710).
+- [ ] Stale line-number drift in the audit doc (`openstudio_client.py:209` →
+      `:355`) corrected in the same PR (#710).
+- [ ] All six regression tests in #711 green; CI fence added.
+- [ ] No `--admin` merges required; ruff + pytest green on the resulting PR.
+- [ ] `CHANGELOG.md` entry cross-references this issue and the resolved call-site
+      issue (#709) (#712).
+
+==== ISSUE #689 — Drop rclone .trivyignore entries once a release ships with p ====
+  rclone 1.75.0 (the current stable, pinned via #686) is still built with a Go toolchain that predates the fixes for the 8 HIGH findings the #642 gate surfaced: CVE-2026-33818, CVE-2026-39821, CVE-2026-46600, CVE-2026-56853, CVE-2026-56858, CVE-2026-56859, CVE-2026-56860, CVE-2026-56862 (Go stdlib net/http, crypto/tls, html/template, encoding/xml, net/url DoS-class + x/net/idna Punycode privilege escalation — fixes shipped in Go 1.25.13 / 1.26.6).
+
+They are triaged into \`.trivyignore\` (justification: no fixed rclone release exists yet; the archival Job is a short-lived CronJob-spawned pod with egress restricted to object-storage TCP/443 + RFC1918/IMDS excepts per #477, non-internet-facing; the DoS-reachable surface requires crafted inputs on protocols rclone does not serve inbound).
+
+**Acceptance criterion:** when a rclone release built with Go >= 1.25.13/1.26.6 ships, bump \`RCLONE_IMAGE\` per the #642 runbook, remove the eight entries from \`.trivyignore\`, and the audit job stays green. The weekly Dependabot signal PRs exercise the gate, so staleness will re-surface loudly if the entries linger past a fixed release.
+

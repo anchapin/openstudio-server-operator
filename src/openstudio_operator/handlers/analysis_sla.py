@@ -433,6 +433,9 @@ def _grace_and_escalate(
         # survives ticks and restarts so stop_analysis fires exactly once.
         if record.outcome == _OUTCOME_ISSUED:
             stop_record = store.get_stop_record(analysis_id)
+            # Track whether we just set stop_record so we can skip the timeout
+            # check on the same tick (we escalate immediately after issuing stop_analysis).
+            just_set_stop_record = False
             if stop_record is None:
                 # First tick past grace for this analysis — issue stop_analysis.
                 dry_run = config.dry_run
@@ -458,9 +461,14 @@ def _grace_and_escalate(
                     ),
                 )
                 stopped.append(analysis_id)
-                # fall through — on the NEXT tick we check stopped_at
-                continue
-            if stop_record.stopped_at is not None:
+                # Re-fetch so the local variable reflects the just-persisted record
+                # and subsequent checks (stopped_at, timeout) see the correct state.
+                stop_record = store.get_stop_record(analysis_id)
+                just_set_stop_record = True
+                # Do NOT continue — fall through to _escalate_analysis so
+                # escalation fires on the same tick (stop_analysis is the
+                # pre-escalation step, not a replacement for it).
+            if stop_record is not None and stop_record.stopped_at is not None:
                 # Analysis completed after stop_analysis was issued.
                 store.set_stop_record(
                     analysis_id,
@@ -477,22 +485,24 @@ def _grace_and_escalate(
                 )
                 continue
             # stop_record exists, stopped_at is None — check timeout.
-            stop_wait = timedelta(seconds=STOP_WAIT_TIMEOUT_SECONDS)
-            if now - stop_record.issued_at > stop_wait:
-                # Timed out waiting for the analysis to complete after stop_analysis.
-                store.set_stop_record(
-                    analysis_id,
-                    StopRecord(
-                        issued_at=stop_record.issued_at,
-                        outcome=_OUTCOME_TIMEOUT,
-                        stopped_at=now,
-                    ),
-                )
-                STOP_STOPS_TOTAL.labels(outcome=_OUTCOME_TIMEOUT).inc()
-                # fall through to escalation
-            else:
-                # Still within the stop_wait window — wait for next tick.
-                continue
+            # Skip timeout check if we just set stop_record (escalate immediately).
+            if not just_set_stop_record:
+                stop_wait = timedelta(seconds=STOP_WAIT_TIMEOUT_SECONDS)
+                if now - stop_record.issued_at > stop_wait:
+                    # Timed out waiting for the analysis to complete after stop_analysis.
+                    store.set_stop_record(
+                        analysis_id,
+                        StopRecord(
+                            issued_at=stop_record.issued_at,
+                            outcome=_OUTCOME_TIMEOUT,
+                            stopped_at=now,
+                        ),
+                    )
+                    STOP_STOPS_TOTAL.labels(outcome=_OUTCOME_TIMEOUT).inc()
+                    # fall through to escalation
+                else:
+                    # Still within the stop_wait window — wait for next tick.
+                    continue
 
         _escalate_analysis(
             client,
