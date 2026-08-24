@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 
 import kopf
 
@@ -127,11 +128,13 @@ def _validate_item_meta(
     """Validate item has dict shape and extract namespace/name for the CR.
 
     Issue #726 — consolidates the three formerly-separate skipped branches
-    into one helper. Returns a 3-tuple ``(meta, ns, nm)`` when the item is
-    well-formed, or ``None`` when it is not (in which case the gauge has
-    already been set to 0.0 by this function).
+    into one helper. Issue #738 — ``kopf.Body`` is a ``Mapping``, not a
+    ``dict``, so the top-level check uses ``Mapping`` instead of ``dict``.
+    Returns a 3-tuple ``(meta, ns, nm)`` when the item is well-formed, or
+    ``None`` when it is not (in which case the gauge has already been set
+    to ``0.0`` by this function).
     """
-    if not isinstance(item, dict):
+    if not isinstance(item, Mapping):
         _set_redis_key_layout_status(0.0)
         return None
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
@@ -229,6 +232,8 @@ def _check_redis_key_layout_for_cr(
     the failure path, to build the error-message evidence.
     """
     # Issue #726 — consolidate three skipped branches into one helper guard.
+    # Issue #738 — _validate_item_meta uses Mapping (not dict) for the
+    # top-level check because kopf.Body is a Mapping.
     validated = _validate_item_meta(item)
     if validated is None:
         return "skipped"
