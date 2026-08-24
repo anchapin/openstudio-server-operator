@@ -94,7 +94,7 @@ past the ~5m Prometheus lookback.
 `tests/test_metrics_endpoint.py` and `tests/test_walk_metrics_registry.py`
 (#406) — exactly; the tests assert `declared == expected` on every CI run, so
 adding a counter, gauge, or histogram here without adding it there (or vice
- versa) fails CI loudly. **Current shape: 21 counters + 18 gauges + 5 histograms
+ versa) fails CI loudly. **Current shape: 22 counters + 18 gauges + 5 histograms
 (post-#649 ineffective-restart circuit-breaker counter; post-#171 status-map defensive cap; post-#179 datapoint-budget distribution;
 post-#237 EventEmitter dry-run gate Prometheus surface; post-#238 Resque queue
 depth gauges; post-#239 singleton-guard election outcome counter; post-#253
@@ -419,7 +419,7 @@ on failed Jobs; treat the counter as best-effort.
 │   ├── retention.py            # prune pipeline (invoked by storage-cronjob.yaml; #78)
 │   ├── prune_entrypoint.py     # CronJob entrypoint for prune (entry_points = prune_entrypoint:run)
 │   ├── singleton.py            # passive oldest-CR-per-namespace guard (D05) + boot wrap-count/expected-handler gauge pair (#491, #570)
-│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (21+18+5)
+│   ├── metrics.py              # Prometheus counters + gauges + histograms + /metrics endpoint (22+18+5)
 │   ├── logging_setup.py        # JSON `logging.Formatter` + idempotent installer (#256); called from `handlers/__init__.py` (operator) and `prune_entrypoint.py::main` (CronJob)
 │   ├── events.py               # `EventEmitter` class (one instance per tick); the dry-run gate (D11) + suppressed-event counter live here, not at call sites (#164); emission type aliases `TickEmitter`/`EventSink` + `emit_kopf_event` (#496)
 │   ├── events_sinks.py         # `QueuedKopfEventSink` — collapses the three near-identical queue/drain mechanisms from `handlers/__init__.py` (#234)

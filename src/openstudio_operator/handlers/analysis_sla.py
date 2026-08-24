@@ -114,6 +114,7 @@ from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     KUBE_API_REQUEST_DURATION_SECONDS,
     SOFT_STOPS_TOTAL,
+    STOP_STOPS_TOTAL,
     WORKER_PODS_EVICTED_TOTAL,
     observe_duration,
 )
@@ -122,6 +123,7 @@ from openstudio_operator.singleton import operator_core_api, operator_custom_obj
 from openstudio_operator.status_store import (
     SoftStopRecord,
     StatusStore,
+    StopRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,13 @@ ANALYSIS_SOFT_STOPPED_EVENT = "AnalysisSoftStopped"
 #: Escalation Event (#9). The plan doc names only ``AnalysisSoftStopped`` /
 #: ``WorkerRecycled``; this name follows the same <Subject><Action> shape.
 ANALYSIS_ESCALATED_EVENT = "AnalysisEscalated"
+#: Stop-analysis Event (issue #707). Emitted when the SLA escalation fallback
+#: issues a POST /analyses/{id}/action stop (waiting-variant stop).
+ANALYSIS_STOPPED_EVENT = "AnalysisStopped"
+
+#: Bounded wait for the stop_analysis (waiting-variant stop) POST before
+#: falling through to pod eviction (issue #707, Candidate A).
+STOP_WAIT_TIMEOUT_SECONDS = 60
 
 _STARTED = "started"
 #: First-sight observation outcome (issue #83 D1): the SLA clock anchor is the
@@ -152,6 +161,9 @@ _STARTED = "started"
 _OUTCOME_WATCHING = "watching"
 _OUTCOME_ISSUED = "issued"
 _OUTCOME_DRY_RUN = "dry-run"
+#: stop_analysis outcomes (issue #707).
+_OUTCOME_COMPLETED = "completed"
+_OUTCOME_TIMEOUT = "timeout"
 #: Escalation outcomes persisted on the anchor's ``escalationOutcome``.
 ESCALATION_EVICTED = "evicted"
 ESCALATION_EVICTED_PARTIAL = "evicted-partial"
@@ -161,12 +173,14 @@ ESCALATION_DRY_RUN = "dry-run"
 
 @dataclass
 class SlaTickResult:
-    """Outcome of one SLA tick — the #8 return value extended by #9."""
+    """Outcome of one SLA tick — the #8 return value extended by #9 and #707."""
 
     #: Analysis ids soft-stopped (anchor written) this tick.
     soft_stopped: list[str]
     #: Analysis ids escalated to worker-pod eviction this tick.
     escalated: list[str]
+    #: Analysis ids for whom stop_analysis was issued this tick (issue #707).
+    stopped: list[str]
 
 
 class WorkerPodApi(PodLister, Protocol):
@@ -277,7 +291,7 @@ def run_sla_tick(
     """
     if not config.analysis_policy.auto_soft_stop:
         logger.debug("analysisPolicy.autoSoftStop is false — SLA monitor passive this tick")
-        return SlaTickResult(soft_stopped=[], escalated=[])
+        return SlaTickResult(soft_stopped=[], escalated=[], stopped=[])
     soft_stops = store.get_soft_stops()
     analyses = client.list_analyses()
     # Issue #179 — observe the per-tick analysis count from the SLA
@@ -307,7 +321,7 @@ def run_sla_tick(
             SoftStopRecord(issued_at=now, outcome=_OUTCOME_WATCHING),
         )
         started_ids.add(analysis_id)
-    soft_stopped, escalated = _grace_and_escalate(
+    soft_stopped, escalated, stopped = _grace_and_escalate(
         client,
         store,
         config,
@@ -318,7 +332,7 @@ def run_sla_tick(
         pod_api=pod_api,
         redis_client=redis_client,
     )
-    return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated)
+    return SlaTickResult(soft_stopped=soft_stopped, escalated=escalated, stopped=stopped)
 
 
 def _grace_and_escalate(
@@ -332,7 +346,7 @@ def _grace_and_escalate(
     namespace: str,
     pod_api: WorkerPodApi | None,
     redis_client: RedisClientLike | None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Walk persisted anchors: prune the finished, soft-stop the over-runtime, escalate the stuck.
 
     Issue #83 D1: the SLA clock anchor is the operator-observed first sight
@@ -360,6 +374,7 @@ def _grace_and_escalate(
     max_runtime = timedelta(minutes=config.analysis_policy.max_duration_minutes)
     soft_stopped: list[str] = []
     escalated: list[str] = []
+    stopped: list[str] = []
     for analysis_id, record in store.get_soft_stops().items():
         if analysis_id not in started_ids:
             # Left `started` (completed / post-processing / …) or vanished from
@@ -410,6 +425,85 @@ def _grace_and_escalate(
             continue
         if runtime <= grace:
             continue  # non-blocking grace still running — wait, mutate nothing
+
+        # Issue #707 (Candidate A — SLA escalation fallback): after soft_stop
+        # has been issued (outcome="issued") and grace has expired, try
+        # stop_analysis (waiting-variant stop) as the last resort before pod
+        # eviction. The stop_record anchor is the one-shot mechanism — it
+        # survives ticks and restarts so stop_analysis fires exactly once.
+        if record.outcome == _OUTCOME_ISSUED:
+            stop_record = store.get_stop_record(analysis_id)
+            # Track whether we just set stop_record so we can skip the timeout
+            # check on the same tick (we escalate immediately after issuing stop_analysis).
+            just_set_stop_record = False
+            if stop_record is None:
+                # First tick past grace for this analysis — issue stop_analysis.
+                dry_run = config.dry_run
+                if not dry_run:
+                    client.stop_analysis(analysis_id)
+                message = (
+                    f"Analysis {analysis_id} still started after graceful stop; "
+                    "issuing stop_analysis"
+                )
+                if dry_run:
+                    message += " — stop suppressed (spec.dryRun)"
+                emit("Warning", ANALYSIS_STOPPED_EVENT, message)
+                STOP_STOPS_TOTAL.labels(
+                    outcome=_OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED
+                ).inc()
+                store.set_stop_record(
+                    analysis_id,
+                    StopRecord(
+                        issued_at=now,
+                        outcome=(
+                            _OUTCOME_DRY_RUN if dry_run else _OUTCOME_ISSUED
+                        ),
+                    ),
+                )
+                stopped.append(analysis_id)
+                # Re-fetch so the local variable reflects the just-persisted record
+                # and subsequent checks (stopped_at, timeout) see the correct state.
+                stop_record = store.get_stop_record(analysis_id)
+                just_set_stop_record = True
+                # Do NOT continue — fall through to _escalate_analysis so
+                # escalation fires on the same tick (stop_analysis is the
+                # pre-escalation step, not a replacement for it).
+            if stop_record is not None and stop_record.stopped_at is not None:
+                # Analysis completed after stop_analysis was issued.
+                store.set_stop_record(
+                    analysis_id,
+                    StopRecord(
+                        issued_at=stop_record.issued_at,
+                        outcome=_OUTCOME_COMPLETED,
+                        stopped_at=stop_record.stopped_at,
+                    ),
+                )
+                store.prune_stop_record(analysis_id)
+                logger.info(
+                    "stop_record for %s pruned (analysis completed after stop_analysis)",
+                    analysis_id,
+                )
+                continue
+            # stop_record exists, stopped_at is None — check timeout.
+            # Skip timeout check if we just set stop_record (escalate immediately).
+            if not just_set_stop_record:
+                stop_wait = timedelta(seconds=STOP_WAIT_TIMEOUT_SECONDS)
+                if now - stop_record.issued_at > stop_wait:
+                    # Timed out waiting for the analysis to complete after stop_analysis.
+                    store.set_stop_record(
+                        analysis_id,
+                        StopRecord(
+                            issued_at=stop_record.issued_at,
+                            outcome=_OUTCOME_TIMEOUT,
+                            stopped_at=now,
+                        ),
+                    )
+                    STOP_STOPS_TOTAL.labels(outcome=_OUTCOME_TIMEOUT).inc()
+                    # fall through to escalation
+                else:
+                    # Still within the stop_wait window — wait for next tick.
+                    continue
+
         _escalate_analysis(
             client,
             store,
@@ -423,7 +517,7 @@ def _grace_and_escalate(
             redis_client=redis_client,
         )
         escalated.append(analysis_id)
-    return soft_stopped, escalated
+    return soft_stopped, escalated, stopped
 
 
 def _resque_matched_worker_pods(

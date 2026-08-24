@@ -303,6 +303,12 @@ def _escalation_path_responses(analysis_id: str) -> None:
         f"{BASE}/analyses/{analysis_id}/status.json",
         json={"analysis": {"_id": analysis_id, "id": analysis_id, "status": "started"}},
     )
+    # issue #707: stop_analysis pre-escalation step
+    responses.post(
+        f"{BASE}/analyses/{analysis_id}/action",
+        json={"status": "ok"},
+        status=200,
+    )
 
 
 class _FakeRedisForDryRun:
@@ -467,18 +473,20 @@ def test_dryrun_escalation_is_strict_suppression():
     # dryRun=True
     api_dry, pods_dry, events_dry, delta_dry = run_one(spec_dry, real=False)
     assert pods_dry.deletes == []
-    assert len(events_dry) == 1
-    assert events_dry[0][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
-    assert "suppressed (spec.dryRun)" in events_dry[0][2]
+    # issue #707: two events — AnalysisStopped (stop suppressed) then AnalysisEscalated (pod deletions suppressed)
+    assert len(events_dry) == 2
+    assert events_dry[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
+    assert "suppressed (spec.dryRun)" in events_dry[-1][2]
     assert delta_dry == 1
     assert api_dry.obj["status"]["softStops"][analysis_id]["escalationOutcome"] == "dry-run"
 
     # dryRun=False (real eviction)
     api_real, pods_real, events_real, delta_real = run_one(spec_real, real=True)
     assert [d["name"] for d in pods_real.deletes] == ["worker-1"]
-    assert len(events_real) == 1
-    assert events_real[0][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
-    assert "suppressed (spec.dryRun)" not in events_real[0][2]
+    # issue #707: two events — AnalysisStopped then AnalysisEscalated
+    assert len(events_real) == 2
+    assert events_real[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
+    assert "suppressed (spec.dryRun)" not in events_real[-1][2]
     assert delta_real == 1
     assert api_real.obj["status"]["softStops"][analysis_id]["escalationOutcome"] == "evicted"
 
