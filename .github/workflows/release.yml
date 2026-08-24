@@ -10,6 +10,9 @@ on:
 
 permissions:
   contents: write
+  # Issue #701: the pin step opens + auto-merges the re-pin PR (the bot
+  # cannot push develop directly under the ruleset).
+  pull-requests: write
   packages: write
   # id-token: write is required for cosign keyless signing (Sigstore Fulcio).
   # Without this permission the cosign sign step would fail with
@@ -210,6 +213,8 @@ jobs:
       - name: Pin operator image by SHA256 digest
         id: pin
         env:
+          # Issue #574: github.* reaches the shell only via env:.
+          GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
@@ -240,11 +245,52 @@ jobs:
             echo "No changes after sed (both manifests already pin the same digest); nothing to commit."
             exit 0
           fi
+          # Issue #701: the github-actions bot is NOT a bypass actor on the
+          # develop ruleset (require-ci-on-develop-prs), so pushing the
+          # develop ref directly is rejected ("required status checks
+          # are expected") — the exact failure that silently froze the
+          # committed digest at the pre-#149 baseline alongside the #699
+          # sed bug. The pin therefore lands via a PR: push a floating
+          # bot branch, open a PR (scope-guard-compliant body — the #301
+          # lint gate checks it), and enable auto-merge; the required
+          # lint+test checks run on the PR and the squash-merge lands the
+          # pin once green. If repo-level auto-merge is disabled, the PR
+          # simply waits for a one-click owner merge — the digest is
+          # still visible + reviewable either way.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy/operator-deployment.yaml deploy/storage-cronjob.yaml
           git commit -m "build: refs #149 #291 — pin operator + cronjob image by SHA256 digest (${DIGEST})"
-          git push origin develop
+          PIN_BRANCH="bot/digest-repin"
+          # Floating branch: force-push the single pin commit on top of the
+          # just-checked-out develop head so stale branches can't accumulate.
+          git push --force origin "HEAD:refs/heads/${PIN_BRANCH}"
+          PR_URL=$(gh pr create --base develop --head "${PIN_BRANCH}" \
+            --title "build: pin operator + cronjob image by SHA256 digest (${DIGEST:0:19}…)" \
+            --body "Refs #149 #291 #699 #701 — automated digest re-pin from release.yml (publish-dev).
+
+          ## What
+          - Re-pins \`deploy/operator-deployment.yaml\` + \`deploy/storage-cronjob.yaml\` to the just-published, signed, trivy-scanned dev image digest \`${DIGEST}\`.
+
+          Scope guard: touches only the two image-digest lines owned by #149/#291; the sed/push mechanics are owned by #701 and nothing else in deploy/ or src/ is unchanged." \
+            2>/dev/null || true)
+          if [ -n "${PR_URL}" ]; then
+            PR_NUMBER="${PR_URL##*/}"
+            gh pr merge "${PR_NUMBER}" --auto --squash \
+              --subject "build: refs #149 #291 — pin operator + cronjob image by SHA256 digest (${DIGEST})"
+            echo "Re-pin PR ${PR_URL} opened with auto-merge enabled."
+          else
+            # Already-open PR from a prior run: re-target auto-merge on it.
+            PR_NUMBER=$(gh pr list --head "${PIN_BRANCH}" --json number --jq '.[0].number')
+            if [ -n "${PR_NUMBER}" ]; then
+              gh pr merge "${PR_NUMBER}" --auto --squash \
+                --subject "build: refs #149 #291 — pin operator + cronjob image by SHA256 digest (${DIGEST})"
+              echo "Existing re-pin PR #${PR_NUMBER} re-armed with auto-merge."
+            else
+              echo "ERROR: could not create or find the re-pin PR." >&2
+              exit 1
+            fi
+          fi
 
   publish-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
