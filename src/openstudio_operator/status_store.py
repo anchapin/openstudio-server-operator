@@ -69,6 +69,7 @@ SOFT_STOPS = "softStops"
 REQUEUES = "requeues"
 STARTED_SINCE = "startedSince"
 ARCHIVED_ANALYSES = "archivedAnalyses"
+STOPPED_ANALYSES = "stoppedAnalyses"
 LAST_RECYCLE_AT = "lastRecycleAt"
 LAST_WEB_BACKGROUND_RESTART_AT = "lastWebBackgroundRestart"
 STALL_WINDOW_STARTED_AT = "stallWindowStartedAt"
@@ -104,7 +105,7 @@ STATUS_MAP_MAX_ENTRIES = 10_000
 #: The tuple drives the per-map size-gauge stamp in ``_read_status`` so the
 #: vocabulary of ``STATUS_MAP_ENTRIES{map_name}`` is the exact ``.status``
 #: map key set (same vocabulary as ``STATUS_MAP_CAPS_TOTAL{map_name}``).
-_STATUS_MAP_FIELDS = (SOFT_STOPS, REQUEUES, STARTED_SINCE, ARCHIVED_ANALYSES)
+_STATUS_MAP_FIELDS = (SOFT_STOPS, REQUEUES, STARTED_SINCE, ARCHIVED_ANALYSES, STOPPED_ANALYSES)
 
 #: Issue #171 — event reason for the cap-eviction Warning Event. A single
 #: short string so dashboard filters / alert rules can match it.
@@ -333,6 +334,44 @@ class ArchivedAnalysisRecord:
             spawned_at=(
                 None if spawned_at is None else _parse_utc(spawned_at, f"{context}.spawnedAt")
             ),
+        )
+
+
+@dataclass(frozen=True)
+class StopRecord:
+    """Value of ``status.stoppedAnalyses[analysis_id]`` — stop_analysis anchor (issue #708).
+
+    The map is the D04 (status-anchored idempotency) half of the stop_analysis
+    wiring contract: records the operator's stop action so a server-side
+    completion is observable (via ``stopped_at``) and the stop is not re-issued
+    on a subsequent tick. The optional ``stopped_at`` is populated when the
+    server reports the analysis has left the ``started`` set.
+
+    Outcome vocabulary: ``issued`` (stop requested, server hasn't confirmed),
+    ``dry-run`` (suppressed by spec.dryRun), ``completed`` (server confirmed
+    the analysis left ``started``), ``timeout`` (grace period expired without
+    server confirming).
+    """
+
+    issued_at: datetime
+    outcome: str
+    stopped_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        encoded: dict[str, Any] = {"issuedAt": _to_utc(self.issued_at).isoformat(), "outcome": self.outcome}
+        if self.stopped_at is not None:
+            encoded["stoppedAt"] = _to_utc(self.stopped_at).isoformat()
+        return encoded
+
+    @classmethod
+    def from_dict(cls, raw: Any, context: str) -> StopRecord:
+        if not isinstance(raw, Mapping):
+            raise StatusStoreError(f"{context}: expected object, got {type(raw).__name__}")
+        stopped_at = raw.get("stoppedAt")
+        return cls(
+            issued_at=_parse_utc(_required(raw, "issuedAt", context), f"{context}.issuedAt"),
+            outcome=str(_required(raw, "outcome", context)),
+            stopped_at=None if stopped_at is None else _parse_utc(stopped_at, f"{context}.stoppedAt"),
         )
 
 
@@ -751,6 +790,29 @@ class StatusStore:
         """
         self._set_map_entry(ARCHIVED_ANALYSES, analysis_id, None)
 
+    # --- stoppedAnalyses (issue #708) -----------------------------------------
+
+    def get_stop_record(self, analysis_id: str) -> StopRecord | None:
+        raw = self._read_map(STOPPED_ANALYSES).get(analysis_id)
+        return (
+            None
+            if raw is None
+            else StopRecord.from_dict(raw, f"status.{STOPPED_ANALYSES}[{analysis_id!r}]")
+        )
+
+    def set_stop_record(self, analysis_id: str, record: StopRecord) -> None:
+        self._set_map_entry(STOPPED_ANALYSES, analysis_id, record.to_dict())
+
+    def prune_stop_record(self, analysis_id: str) -> None:
+        """Delete ``status.stoppedAnalyses[analysis_id]`` — anchor retirement (#708).
+
+        Counterpart to :meth:`set_stop_record` for the stop_analysis wiring:
+        an anchored analysis that left ``started`` (completed, post-processing,
+        …) or vanished from the API has no further stop business, so its
+        anchor is dropped. Idempotent: clearing an absent key writes nothing.
+        """
+        self._set_map_entry(STOPPED_ANALYSES, analysis_id, None)
+
     # --- deferredEvents (#402) -------------------------------------------------
 
     def get_deferred_events(self) -> list[dict[str, str]]:
@@ -908,6 +970,7 @@ class StatusStore:
         scopes: list[tuple[str, set[str] | None]] = [
             (SOFT_STOPS, analysis_live),
             (ARCHIVED_ANALYSES, analysis_live),
+            (STOPPED_ANALYSES, analysis_live),
             (REQUEUES, datapoint_live),
             (STARTED_SINCE, datapoint_live),
         ]
