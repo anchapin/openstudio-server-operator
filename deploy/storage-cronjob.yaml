@@ -161,7 +161,7 @@ spec:
               # retain whatever image was already on the node — a swap to a malicious image
               # would silently persist across restarts because the digest-pinning invariant
               # is the regression fence for both manifests.
-              image: ghcr.io/anchapin/openstudio-server-operator@sha256:b24d8dce0915d1ba9ce8322e9be29a74e43646f8c3d923665ddbd1c3be2ddd32
+              image: ghcr.io/anchapin/openstudio-server-operator@sha256:7f14723ea62728311cc2fc2b04257425a24da2aa0b57e39d2fa68edfe5e700db
               imagePullPolicy: Always
               command: ["python", "-m", "openstudio_operator.prune_entrypoint"]
               env:
