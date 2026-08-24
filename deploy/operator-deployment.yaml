@@ -148,6 +148,31 @@ spec:
             # empty file fails CLOSED (every /metrics request 401s).
             - name: OPENSTUDIO_METRICS_TOKEN_FILE
               value: ""
+            # Issue #723 — the Redis client is hardened against Cloud NAT
+            # (EKS/GKE/AKS) idle-drop fences via ``socket_keepalive=True`` +
+            # the ``TCP_KEEPIDLE``/``TCP_KEEPINTVL``/``TCP_KEEPCNT`` triad
+            # + ``health_check_interval`` PING, all wired in
+            # ``src/openstudio_operator/redis_client.py`` (the client-side
+            # half). The cluster-side companion is the kubelet/CRI
+            # kernel ``net.ipv4.tcp_keepalive_time`` sysctl
+            # (cluster-admin-applied via kubelet flags or a
+            # ``securityContext.sysctls`` PolicyAdmission gate, NOT a
+            # core/v1 ``V1Container`` / ``V1PodSpec`` field as of
+            # v1.32 — there is no pod-level ``tcpKeepalive`` envelope to
+            # set on this Deployment). The default 60 s idle keeps
+            # every connection fresh through the kubelet's default
+            # 7200 s kernel idle and any reasonable NAT idle timeout
+            # (350–900 s on Cloud NAT / GCP NAT). Set this env to a
+            # positive integer seconds value to override per cluster;
+            # an unparseable / non-positive value aborts every tick
+            # with ``OperatorConfigError`` (same fail-closed contract
+            # as #476 / #296). The interval / probe count / health
+            # check interval are local constants and a cluster-wide
+            # kernel sysctl respectively — not env-overridable. The
+            # operationally-meaningful knob is the only one we expose,
+            # to avoid per-cluster drift on the #476-style #723 fence.
+            - name: REDIS_TCP_KEEPIDLE_SECONDS
+              value: ""
           ports:
             - name: metrics
               containerPort: 9090 # conventional Prometheus port; keep in sync with
@@ -197,12 +222,19 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           resources:
+            # 2026-08-24 scale-up campaign (CAMPAIGN-RECORD-20260824.md in the
+            # operator-deploy-scratch dir): kopf informer cache OOMKilled
+            # repeatedly (9 restarts) once the watched fleet exceeded ~2800
+            # pods under the previous 256Mi limit. Live values below were
+            # applied as an emergency kubectl patch at fleet ~2800 and are
+            # now folded into the manifest so every future apply carries
+            # them. Do NOT redeploy the old 100m/128Mi + 500m/256Mi block.
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 250m
+              memory: 512Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: "1"
+              memory: 2Gi
           volumeMounts:
             - name: tmp
               mountPath: /tmp

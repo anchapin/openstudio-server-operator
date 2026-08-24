@@ -12,6 +12,7 @@ Layers of read-only proof exercised here:
 import inspect
 import logging
 import re
+import socket
 import time
 from datetime import UTC, datetime
 
@@ -23,10 +24,12 @@ from prometheus_client import REGISTRY
 import openstudio_operator.handlers as handlers_pkg
 from openstudio_operator import metrics as _metrics_module
 from openstudio_operator import redis_client
+from openstudio_operator.config import OperatorConfigError as ConfigError
 from openstudio_operator.config import RedisSecretRef
 from openstudio_operator.handlers.redis_layout_check import (
     _check_redis_key_layout_for_cr,
     _redis_key_layout_check,
+    _validate_item_meta,
 )
 from openstudio_operator.redis_client import (
     READ_ONLY_COMMANDS,
@@ -689,6 +692,114 @@ def test_rediss_url_non_pem_ca_bundle_raises_config_error(monkeypatch, tmp_path)
         ReadOnlyRedisClient("rediss://queue:6379")
 
 
+# --- Issue #723 — Redis socket_keepalive + health_check_interval -------------
+#
+# Regression fence for the #723 acceptance criterion. Without these
+# kwargs, an idle outbound connection past the Cloud NAT idle window
+# (EKS/GKE/AKS: 350–900 s) is silently dropped without an RST; the next
+# operator tick hits a half-open socket, redis-py retries once, the
+# 5 s ``socket_timeout`` elapses → ``HANDLER_TICK_FAILURES_TOTAL`` bumps
+# by one → the SLA clock / requeue budget is delayed by a full timer
+# cadence (60 s) while the pool re-establishes. ``SO_KEEPALIVE`` plus the
+# three kernel constants keeps every connection fresh; the periodic
+# ``health_check_interval`` PING catches any drift the kernel misses.
+#
+# The kwargs land on the redis-py ``ConnectionPool.connection_kwargs``
+# dict — the same fixture shape the ``test_rediss_url_*`` tests above
+# use to introspect the TLS path — so we read them straight back off the
+# constructed client (cheap; no extra mocking). String keys would be a
+# regression: redis-py passes them straight to ``setsockopt(IPPROTO_TCP,
+# key, value)`` where the optname is an int — assert the int-value form.
+
+
+def test_socket_keepalive_options_default_values(monkeypatch):
+    """Issue #723 acceptance: the plaintext path forwards the keepalive
+    triad and ``health_check_interval=30`` to redis-py. The kernel-level
+    TCP options land on ``connection_kwargs`` exactly as named — int
+    constants from the :mod:`socket` module, not string keys (redis-py
+    passes them straight to ``setsockopt(IPPROTO_TCP, key, value)``,
+    where string keys would raise ``TypeError``)."""
+    monkeypatch.delenv("REDIS_TCP_KEEPIDLE_SECONDS", raising=False)
+
+    client = ReadOnlyRedisClient("redis://queue:6379")
+    pool = client._redis.connection_pool
+
+    assert pool.connection_kwargs["socket_keepalive"] is True
+    assert pool.connection_kwargs["health_check_interval"] == 30
+
+    options = pool.connection_kwargs["socket_keepalive_options"]
+    assert options[socket.TCP_KEEPIDLE] == 60
+    assert options[socket.TCP_KEEPINTVL] == 10
+    assert options[socket.TCP_KEEPCNT] == 3
+
+
+def test_socket_keepalive_options_keepidle_env_override(monkeypatch):
+    """Issue #723 acceptance: ``REDIS_TCP_KEEPIDLE_SECONDS`` flows through
+    to the connection-pool kwargs; the other three constants are not
+    overridable (they are node-level sysctl territory by design — see the
+    inline constant comment block). The override is the cluster-admin
+    knob for the operationally-meaningful idle window."""
+    monkeypatch.setenv("REDIS_TCP_KEEPIDLE_SECONDS", "120")
+
+    client = ReadOnlyRedisClient("redis://queue:6379")
+    options = client._redis.connection_pool.connection_kwargs[
+        "socket_keepalive_options"
+    ]
+
+    assert options[socket.TCP_KEEPIDLE] == 120
+    # Interval and count are local constants: not overridable.
+    assert options[socket.TCP_KEEPINTVL] == 10
+    assert options[socket.TCP_KEEPCNT] == 3
+
+
+def test_socket_keepalive_options_keepidle_env_garbage_raises_config_error(
+    monkeypatch,
+):
+    """The truthy-string fallthrough the #476 TLS path explicitly forbids
+    would silently accept ``"True"``/``"1"``/``"yes"`` as a positive
+    integer — a single-character non-numeric like ``"now"`` must refuse
+    at construction rather than silently skewing the keepalive probe
+    cadence (one minute vs. ~one hour is the practical drift)."""
+    monkeypatch.setenv("REDIS_TCP_KEEPIDLE_SECONDS", "now")
+    with pytest.raises(ConfigError, match="not a valid integer"):
+        ReadOnlyRedisClient("redis://queue:6379")
+
+
+def test_socket_keepalive_options_keepidle_env_nonpositive_raises_config_error(
+    monkeypatch,
+):
+    """A zero or negative idle window makes the keepalive probes
+    degenerate (TCP interprets 0 as "disable" on Linux) — refuse at
+    construction rather than silently disabling the keepalive path the
+    test above just asserted."""
+    monkeypatch.setenv("REDIS_TCP_KEEPIDLE_SECONDS", "0")
+    with pytest.raises(ConfigError, match="positive integer"):
+        ReadOnlyRedisClient("redis://queue:6379")
+
+
+def test_socket_keepalive_options_rediss_path_keeps_defaults(monkeypatch):
+    """The TLS path (``rediss://``) inherits the same keepalive kwargs
+    as the plaintext path — same NAT idle-drop problem, same fix;
+    fakeredis-injected tests and no-auth dev clusters still get the
+    defaults because TLS-CA-resolve and keepalive-resolve are independent
+    code paths (the #476 docstring's byte-for-byte-intact pledge only
+    covers the *TLS* knobs, not the keepalive ones)."""
+    monkeypatch.delenv("REDIS_TCP_KEEPIDLE_SECONDS", raising=False)
+    monkeypatch.delenv("REDIS_TLS_CA_BUNDLE", raising=False)
+
+    client = ReadOnlyRedisClient("rediss://queue:6379")
+    options = client._redis.connection_pool.connection_kwargs[
+        "socket_keepalive_options"
+    ]
+
+    assert options[socket.TCP_KEEPIDLE] == 60
+    assert options[socket.TCP_KEEPINTVL] == 10
+    assert options[socket.TCP_KEEPCNT] == 3
+    assert client._redis.connection_pool.connection_kwargs[
+        "health_check_interval"
+    ] == 30
+
+
 def test_redis_errors_are_wrapped_as_client_errors(fake, client, monkeypatch):
     def _boom(*args, **kwargs):
         raise redis.exceptions.ConnectionError("queue fabric unreachable")
@@ -1278,6 +1389,27 @@ def test_redis_key_layout_check_skips_nameless_item(
     assert status == "skipped", (
         f"Expected status='skipped' on a nameless item; got {status!r}. "
         f"Captured: {caplog.text!r}. See issue #163."
+    )
+
+
+def test_validate_item_meta_returns_none_for_missing_namespace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #726: _validate_item_meta returns None for an item missing namespace.
+
+    The helper must emit _set_redis_key_layout_status(0.0) and return None
+    when the item has metadata but no namespace field. The regression: all
+    three skipped branches previously duplicated the gauge-set + return
+    pattern; this test asserts the consolidated helper still guards correctly.
+    """
+    item = {"metadata": {"name": "test-osc"}}  # missing namespace
+    result = _validate_item_meta(item)
+    assert result is None, f"Expected None for missing namespace; got {result!r}"
+    # The gauge must be set to 0.0 by the helper.
+    from openstudio_operator.metrics import REDIS_KEY_LAYOUT_STATUS
+
+    assert REDIS_KEY_LAYOUT_STATUS._value.get() == 0.0, (
+        "Gauge must be set to 0.0 when helper returns None"
     )
 
 

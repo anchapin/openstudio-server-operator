@@ -1137,6 +1137,38 @@ def test_storage_cronjob_carries_metrics_token_file_env():
     )
 
 
+def test_operator_deployment_carries_redis_keepidle_env_var():
+    """Issue #723 acceptance: the operator Deployment must ship the
+    ``REDIS_TCP_KEEPIDLE_SECONDS`` env var (empty-by-default) so the
+    cluster admin has a one-knob override for the operationally-common
+    TCP keepalive cadence without rebuilding the image. The default-empty
+    value preserves the in-source module constant
+    (``REDIS_TCP_KEEPIDLE_SECONDS = 60``) — same fail-closed contract as
+    #296 / #476 / #401: an unparseable / non-positive value aborts every
+    tick with ``OperatorConfigError`` rather than silently skewing the
+    redis-py's probe cadence. Without this env var, only the per-tick
+    fail-closed 401 / TLS / keepidle surface exists; per-cluster drift
+    would require a full re-install — the regression fence for the
+    #723 acceptance criterion."""
+    op_container = OPERATOR_DEPLOYMENT["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in op_container.get("env") or []}
+    assert "REDIS_TCP_KEEPIDLE_SECONDS" in env, (
+        "operator-deployment.yaml must ship the REDIS_TCP_KEEPIDLE_SECONDS "
+        "env var (empty-by-default override of the in-source module "
+        "constant — issue #723 cluster-admin knob for the operationally "
+        "common TCP keepalive cadence). Mirrors OPENSTUDIO_TLS_CA_BUNDLE (#296), "
+        "OPENSTUDIO_METRICS_TOKEN_FILE (#401), REDIS_TLS_CA_BUNDLE (#476): "
+        "fail-closed empty-by-default, the only env-overridable knob."
+    )
+    assert env["REDIS_TCP_KEEPIDLE_SECONDS"] == "", (
+        "REDIS_TCP_KEEPIDLE_SECONDS must default to empty (in-source "
+        "REDIS_TCP_KEEPIDLE_SECONDS = 60 takes over — #723 fence parity "
+        "with #296 / #401 / #476); a non-empty default would silently "
+        "force a Secret-or-ConfigMap-shaped deployment story the stock "
+        "install does not require."
+    )
+
+
 def test_storage_cronjob_pod_labels_match_ingress_policy_selectors():
     """Issue #306 regression fence: the CronJob pod template must carry
     every label the new ingress policy requires. The CronJob carries
@@ -1281,6 +1313,149 @@ def test_all_workloads_have_pod_level_securitycontext():
     assert not offenders, (
         "workloads missing #161 pod-level securityContext baseline: "
         f"{offenders}"
+    )
+
+
+# ---- Issue #720: PSS-restricted compatibility gate ----------------------
+#
+# The namespace carries `pod-security.kubernetes.io/enforce: restricted`
+# (deploy/namespace-labels.yaml). Every workload pod spec under deploy/
+# must be compatible with that profile — i.e. the pod spec must pass
+# PSS `restricted` validation if the namespace has enforce=restricted.
+# This is the regression fence that prevents the operator from shipping a
+# manifest that would be rejected by the namespace policy at apply time.
+#
+# PSS `restricted` requires at the container level:
+#   allowPrivilegeEscalation != true (default false → pass)
+#   capabilities.drop includes ALL
+#   readOnlyRootFilesystem == true (where applicable)
+#   seccompProfile.type == "RuntimeDefault" or "Localhost" (K8s 1.19+)
+# And at the pod level:
+#   runAsNonRoot == true
+#   runAsUser / runAsGroup is non-zero
+#   seccompProfile.type == "RuntimeDefault" or "Localhost"
+#   No hostPath volumes (emptyDir is fine; hostPath is not)
+
+
+def _iter_deploy_workload_volumes():
+    """Yield (manifest_name, kind, name, volume_dict) for every volume in
+    every pod spec under deploy/. Used by the PSS-restricted hostPath gate.
+
+    Mirrors _iter_deploy_workload_pod_specs() in scope and defensive
+    handling — same skipped helm-overlay files, same YAML-error resilience."""
+    manifests = [
+        ("deploy/", DEPLOY.glob("*.yaml")),
+        (
+            "scripts/manifests/",
+            sorted((Path(__file__).resolve().parents[1] / "scripts" / "manifests").glob("*.yaml")),
+        ),
+    ]
+    skipped_helm_overlay_files = {"01-mongo.yaml", "02-redis.yaml"}
+    for prefix, paths in manifests:
+        for path in paths:
+            if prefix == "deploy/":
+                label_prefix = ""
+            else:
+                label_prefix = prefix
+                if path.name in skipped_helm_overlay_files:
+                    continue
+            try:
+                docs = list(yaml.safe_load_all(path.read_text()))
+            except yaml.YAMLError:
+                continue
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                name = doc.get("metadata", {}).get("name", "<unnamed>")
+                label = f"{label_prefix}{path.name}"
+                if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+                    pod_spec = (
+                        doc.get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                    )
+                    for vol in pod_spec.get("volumes") or []:
+                        yield label, kind, name, vol
+                elif kind == "CronJob":
+                    pod_spec = (
+                        doc.get("spec", {})
+                        .get("jobTemplate", {})
+                        .get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                    )
+                    for vol in pod_spec.get("volumes") or []:
+                        yield label, kind, name, vol
+
+
+def test_all_deploy_podspecs_compatible_with_restricted_pss():
+    """Issue #720 acceptance: every pod spec under deploy/ must pass PSS
+    `restricted` validation if the namespace carries
+    ``pod-security.kubernetes.io/enforce: restricted``
+    (deploy/namespace-labels.yaml). A manifest that violates the
+    restricted profile would be rejected by the namespace policy at
+    apply time — this regression fence catches it in CI instead.
+
+    The check covers:
+      - Container securityContext: runAsNonRoot, allowPrivilegeEscalation,
+        capabilities.drop (ALL), seccompProfile (RuntimeDefault or
+        Localhost), readOnlyRootFilesystem
+      - Pod securityContext: runAsNonRoot, runAsUser, seccompProfile
+      - Volumes: no hostPath (emptyDir is the only allowed volume type)
+
+    This test does NOT repeat the full six-field container hardening
+    check — ``test_every_deploy_workload_container_has_hardening_baseline``
+    already owns that. It adds the PSS-specific gates: seccompProfile
+    accepts "Localhost" (not just "RuntimeDefault", per K8s 1.19+),
+    and no hostPath volumes."""
+    container_offenders = []
+    for path_name, kind, name, container in _iter_workload_containers():
+        sc = container.get("securityContext") or {}
+        problems = []
+        # runAsNonRoot is required at container level for restricted
+        if sc.get("runAsNonRoot") is not True:
+            problems.append(f"runAsNonRoot={sc.get('runAsNonRoot')!r} (must be True)")
+        # allowPrivilegeEscalation must be explicitly False (not just default-false)
+        if sc.get("allowPrivilegeEscalation") is not False:
+            problems.append(
+                f"allowPrivilegeEscalation={sc.get('allowPrivilegeEscalation')!r} "
+                "(must be False)"
+            )
+        # capabilities.drop must include ALL
+        caps = sc.get("capabilities") or {}
+        if caps.get("drop") != ["ALL"]:
+            problems.append(f"capabilities.drop={caps.get('drop')!r} (must be ['ALL'])")
+        # seccompProfile: restricted accepts RuntimeDefault OR Localhost (K8s 1.19+)
+        seccomp = sc.get("seccompProfile") or {}
+        if seccomp.get("type") not in ("RuntimeDefault", "Localhost"):
+            problems.append(
+                f"seccompProfile.type={seccomp.get('type')!r} "
+                "(must be 'RuntimeDefault' or 'Localhost')"
+            )
+        # readOnlyRootFilesystem where applicable (containers that need writes use emptyDir)
+        if sc.get("readOnlyRootFilesystem") is not True:
+            problems.append(
+                f"readOnlyRootFilesystem={sc.get('readOnlyRootFilesystem')!r} "
+                "(must be True for PSS restricted)"
+            )
+        if problems:
+            container_offenders.append(
+                (path_name, kind, name, container.get("name"), problems)
+            )
+
+    # Volume-level check: no hostPath volumes (emptyDir is fine)
+    volume_offenders = []
+    for path_name, kind, name, vol in _iter_deploy_workload_volumes():
+        if "hostPath" in vol:
+            volume_offenders.append(
+                (path_name, kind, name, vol.get("name"), "hostPath volume present")
+            )
+
+    offenders = container_offenders + volume_offenders
+    assert not offenders, (
+        "pod specs not compatible with PSS restricted profile "
+        f"(issue #720): {offenders}"
     )
 
 
@@ -4919,7 +5094,7 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
 
 
 # ---------------------------------------------------------------------------
-# Issue #606 — the operator Role's secrets:get grant is exact-name-bounded
+# Issue #606 — the operator's secrets:get grant is exact-name-bounded
 # by RBAC resourceNames (the GET-path fence #572's admission layer could
 # not provide: VAPs run on the mutating path only, and RBAC authz precedes
 # admission regardless). Pre-#606 the grant was namespace-wide get, so a
@@ -4934,10 +5109,21 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
 # the rule's resourceNames — a deliberate, visible, reviewable RBAC
 # change. The tests below pin the rule shape and its consistency with
 # the shipped tooling + the CRD convention.
+#
+# Issue #715 — the `secrets: get` rule that lived in the cross-cutting
+# `openstudio-operator-role` pre-#715 moved to its own narrower Role
+# (`openstudio-redis-secret-reader-role`) so the operator SA's
+# `secrets` verbs flow from a dedicated surface only. The rule itself,
+# the resourceNames fence, and the consistency checks below are
+# unchanged — only the rule's HOME in rbac.yaml moved. The helper
+# `_operator_role_secrets_rule()` now resolves the narrower Role by
+# name; the test names keep the #606 framing because the invariant
+# under test is the #606 RBAC fence (the #715 refactor is the move, not
+# a new fence).
 # ---------------------------------------------------------------------------
 
 #: The canonical Secret name(s) the shipped tooling creates — the exact
-#: set the default Role grants. Derived from deploy/redis-credentials-
+#: set the narrower Role grants. Derived from deploy/redis-credentials-
 #: secret.yaml (the committed manifest) and scripts/rotate_redis_password.
 #: sh (SECRET_NAME — the live-Secret rotation path), NOT hand-invented:
 #: if the ecosystem ever ships a second canonical name, both this tuple
@@ -4947,17 +5133,35 @@ _CANONICAL_REDIS_SECRET_NAMES = ["openstudio-redis"]
 
 
 def _operator_role_secrets_rule():
-    """Return the operator Role's single ``secrets`` rule (issue #606)."""
-    matches = [
-        rule
-        for rule in OPERATOR_ROLE["rules"]
-        if rule["apiGroups"] == [""] and rule["resources"] == ["secrets"]
-    ]
+    """Return the operator's single ``secrets`` rule.
+
+    Pre-#715: the rule lived in ``openstudio-operator-role`` (the
+    cross-cutting namespaced Role). Post-#715: the rule lives in
+    ``openstudio-redis-secret-reader-role`` (the dedicated narrower
+    Role). The helper resolves the rule by searching all Roles in
+    ``deploy/rbac.yaml`` for the one carrying the canonical
+    ``secrets/get/openstudio-redis`` shape, so a future PR that moves
+    the rule again does not need to touch this helper.
+    """
+    matches = []
+    for doc in OPERATOR_RBAC_DOCS:
+        if not doc or doc.get("kind") != "Role":
+            continue
+        for rule in doc.get("rules") or []:
+            if (
+                rule.get("apiGroups") == [""]
+                and rule.get("resources") == ["secrets"]
+                and rule.get("verbs") == ["get"]
+                and rule.get("resourceNames") == _CANONICAL_REDIS_SECRET_NAMES
+            ):
+                matches.append((doc["metadata"]["name"], rule))
     assert len(matches) == 1, (
-        f"expected exactly one secrets rule in the operator Role, got "
-        f"{matches!r} (issue #606)"
+        f"expected exactly one Role in deploy/rbac.yaml carrying the "
+        f"{{apiGroups:[''], resources:['secrets'], verbs:['get'], "
+        f"resourceNames:{_CANONICAL_REDIS_SECRET_NAMES!r}}} shape "
+        f"(issues #606/#715), got {matches!r}"
     )
-    return matches[0]
+    return matches[0][1]
 
 
 def test_operator_role_secrets_get_bounded_to_canonical_resourcenames():

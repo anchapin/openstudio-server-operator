@@ -36,6 +36,7 @@ import responses
 from prometheus_client import REGISTRY
 
 from _fakes import FakePodsCoreV1Api, _merge_patch, calls_to, make_cr, make_emit
+from openstudio_operator import metrics as _metrics
 from openstudio_operator._k8s import MERGE_PATCH_CONTENT_TYPE, RESTARTED_AT_ANNOTATION
 from openstudio_operator.archival import archival_job_name
 from openstudio_operator.config import (
@@ -119,44 +120,84 @@ def labelled_metric(name: str, labels: dict[str, str]) -> float:
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
+# Issue #727 — per-outcome summation helper. The metric docstrings in
+# ``metrics.py`` are the source of truth for which labelled outcomes each
+# Counter publishes (one ``<outcome>`` or ``<trigger>`` value per ``inc()``
+# site). ``LABELED_COUNTER_OUTCOMES`` is the test-side mirror of those
+# docstrings, keyed by metric name to a ``(label_name, values)`` pair.
+# The four ``*_total()`` helpers below collapse to a single
+# ``sum_labelled_counter`` call so the label-value tuple lives in exactly
+# one place; the parity test at the bottom of this module enforces that
+# the dict stays in lockstep with the metric docstrings.
+LABELED_COUNTER_OUTCOMES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "openstudio_operator_soft_stops_total": (
+        "outcome",
+        ("issued", "dry-run"),
+    ),
+    "openstudio_operator_workers_recycled_total": (
+        "trigger",
+        ("analysis-completed", "interval-elapsed"),
+    ),
+    "openstudio_operator_worker_pods_evicted_total": (
+        "outcome",
+        ("evicted", "evicted-partial", "no-matching-pods", "dry-run"),
+    ),
+    "openstudio_operator_analyses_deleted_total": (
+        "outcome",
+        ("deleted",),
+    ),
+}
+
+
+def sum_labelled_counter(
+    name: str, label: str, values: tuple[str, ...]
+) -> float:
+    """Sum every series of a labelled Counter for the given label values.
+
+    Issue #309 — counters gained labels so the bare ``metric(name)`` form
+    no longer works for the four action counters. The label-values tuple
+    is the canonical list maintained in :data:`LABELED_COUNTER_OUTCOMES`
+    — the metric docstring in ``metrics.py`` is the source of truth
+    (parity enforced by
+    ``test_labeled_counter_outcomes_match_metric_docstrings``).
+    """
+    return sum(labelled_metric(name, {label: v}) for v in values)
+
+
 def soft_stops_total() -> float:
     """Sum every ``outcome`` series of ``soft_stops_total`` (issue #309)."""
-    total = 0.0
-    for outcome in ("issued", "dry-run"):
-        total += labelled_metric(
-            "openstudio_operator_soft_stops_total", {"outcome": outcome}
-        )
-    return total
+    label, values = LABELED_COUNTER_OUTCOMES["openstudio_operator_soft_stops_total"]
+    return sum_labelled_counter("openstudio_operator_soft_stops_total", label, values)
 
 
 def workers_recycled_total() -> float:
     """Sum every ``trigger`` series of ``workers_recycled_total`` (issue #309)."""
-    total = 0.0
-    for trigger in ("analysis-completed", "interval-elapsed"):
-        total += labelled_metric(
-            "openstudio_operator_workers_recycled_total", {"trigger": trigger}
-        )
-    return total
+    label, values = LABELED_COUNTER_OUTCOMES[
+        "openstudio_operator_workers_recycled_total"
+    ]
+    return sum_labelled_counter(
+        "openstudio_operator_workers_recycled_total", label, values
+    )
 
 
 def worker_pods_evicted_total() -> float:
     """Sum every ``outcome`` series of ``worker_pods_evicted_total`` (issue #309)."""
-    total = 0.0
-    for outcome in ("evicted", "evicted-partial", "no-matching-pods", "dry-run"):
-        total += labelled_metric(
-            "openstudio_operator_worker_pods_evicted_total", {"outcome": outcome}
-        )
-    return total
+    label, values = LABELED_COUNTER_OUTCOMES[
+        "openstudio_operator_worker_pods_evicted_total"
+    ]
+    return sum_labelled_counter(
+        "openstudio_operator_worker_pods_evicted_total", label, values
+    )
 
 
 def analyses_deleted_total() -> float:
     """Sum every ``outcome`` series of ``analyses_deleted_total`` (issue #309)."""
-    total = 0.0
-    for outcome in ("deleted",):
-        total += labelled_metric(
-            "openstudio_operator_analyses_deleted_total", {"outcome": outcome}
-        )
-    return total
+    label, values = LABELED_COUNTER_OUTCOMES[
+        "openstudio_operator_analyses_deleted_total"
+    ]
+    return sum_labelled_counter(
+        "openstudio_operator_analyses_deleted_total", label, values
+    )
 
 
 def fresh_cos() -> dict[str, float]:
@@ -936,6 +977,97 @@ def test_dryrun_web_background_restart_is_strict_suppression():
     assert api_real.obj["status"]["lastWebBackgroundRestart"] == (NOW + timedelta(minutes=10)).isoformat()
 
     assert metric("openstudio_operator_web_background_restarts_total") - cos_before == 2
+
+
+# --- Issue #727 drift-fence: LABELED_COUNTER_OUTCOMES � metric docstrings ------
+
+
+def test_labeled_counter_outcomes_match_metric_docstrings():
+    """Issue #727 — drift-fence for :data:`LABELED_COUNTER_OUTCOMES`.
+
+    The metric docstrings in ``metrics.py`` are the source of truth for
+    which labelled outcomes each Counter publishes — every ``inc(...)``
+    site uses one of those string values. ``LABELED_COUNTER_OUTCOMES``
+    is the test-side mirror of those docstrings; the four ``*_total()``
+    helpers above read from it via :func:`sum_labelled_counter`.
+
+    This test walks each metric's docstring for backtick-quoted
+    identifier-shaped strings (e.g. ``dry-run``, ``evicted-partial``),
+    filters out the label name itself (the "Labelled by ``outcome``"
+    marker) plus a small set of code-reference / narrative tokens that
+    share the same backtick identifier shape, and asserts the remaining
+    set equals the outcomes tuple in ``LABELED_COUNTER_OUTCOMES``.
+
+    Contract: a future outcome added at the metric site (the docstring
+    cites a new ``<backtick>`` value) fails THIS test until the dict is
+    updated to match — forcing the test author to acknowledge the new
+    outcome before the walkthrough goes silent on it.
+    """
+    import re
+
+    backticked_identifier = re.compile(r"``([a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)``")
+
+    # Code-reference / narrative tokens that share the backtick-identifier
+    # shape in the docstrings but aren't outcomes. Add to this set only
+    # when a docstring legitimately gains a new non-outcome identifier —
+    # the per-metric assertion below fails FIRST if a real outcome is
+    # added, forcing acknowledgment of the new outcome in
+    # ``LABELED_COUNTER_OUTCOMES``.
+    narrative_tokens = {
+        "issue",  # "issue #309" / "issue #10"
+        "incremented",  # "Incremented at the ..."
+        "run_sla_tick", "run_recycler_tick", "run_retention_tick", "run_stall_tick",
+        "_escalate_analysis", "_stall_condition_holds", "_armed_trigger",
+        "inc", "evicted_count", "failed_count",
+    }
+
+    cases = [
+        (_metrics.SOFT_STOPS_TOTAL, "openstudio_operator_soft_stops_total"),
+        (
+            _metrics.WORKERS_RECYCLED_TOTAL,
+            "openstudio_operator_workers_recycled_total",
+        ),
+        (
+            _metrics.WORKER_PODS_EVICTED_TOTAL,
+            "openstudio_operator_worker_pods_evicted_total",
+        ),
+        (
+            _metrics.ANALYSES_DELETED_TOTAL,
+            "openstudio_operator_analyses_deleted_total",
+        ),
+    ]
+
+    for counter, metric_name in cases:
+        # The walkthrough must keep its dict entry for this Counter.
+        assert metric_name in LABELED_COUNTER_OUTCOMES, (
+            f"LABELED_COUNTER_OUTCOMES missing entry for {metric_name!r}; "
+            f"the walkthrough still needs to sum this Counter"
+        )
+
+        label_names = list(getattr(counter, "_labelnames", ()))
+        assert len(label_names) == 1, (
+            f"{metric_name}: expected a single label name, got {label_names!r}"
+        )
+        label_name = label_names[0]
+
+        docstring = counter._documentation or ""
+        backticked = set(backticked_identifier.findall(docstring))
+        # Outcomes = backticked identifiers, minus the label name, minus
+        # the narrative tokens (code references + English narrative words).
+        docstring_outcomes = backticked - {label_name} - narrative_tokens
+
+        dict_label, dict_values = LABELED_COUNTER_OUTCOMES[metric_name]
+        assert dict_label == label_name, (
+            f"{metric_name}: LABELED_COUNTER_OUTCOMES label {dict_label!r} "
+            f"disagrees with metric _labelnames {label_name!r}"
+        )
+        assert set(dict_values) == docstring_outcomes, (
+            f"{metric_name}: LABELED_COUNTER_OUTCOMES outcomes "
+            f"{sorted(dict_values)!r} disagrees with metric docstring "
+            f"outcomes {sorted(docstring_outcomes)!r}. "
+            f"Update LABELED_COUNTER_OUTCOMES to add the new outcome "
+            f"(or fix the docstring)."
+        )
 
 
 # --- End-to-end walkthrough: all modules in one tick ---------------------------
