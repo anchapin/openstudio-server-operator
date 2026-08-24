@@ -230,7 +230,7 @@ jobs:
           # enforces equality.
           CHANGED=0
           for MANIFEST in deploy/operator-deployment.yaml deploy/storage-cronjob.yaml; do
-            sed -i.bak "s|image: ${IMAGE}:.*|image: ${IMAGE}@${DIGEST}|" "${MANIFEST}"
+            sed -i.bak "s|image: ${IMAGE}[:@].*|image: ${IMAGE}@${DIGEST}|" "${MANIFEST}"
             rm -f "${MANIFEST}.bak"
             if ! git diff --quiet "${MANIFEST}"; then
               CHANGED=1
