@@ -1742,6 +1742,42 @@ def test_network_policy_link_local_and_cgnat_egress_excluded_for_storage():
                 )
 
 
+def test_network_policy_storage_egress_carries_ipv6_except_parity():
+    """Issue #644: the storage-egress allow MUST carry BOTH the v4
+    ``0.0.0.0/0`` and a parallel IPv6 ``::/0`` ipBlock entry in the same
+    egress rule — on dual-stack CNIs the v4 rule does not constrain IPv6
+    egress at all, and the AWS IMDSv6 endpoint fd00:ec2::254 (Nitro)
+    would be reachable by a compromised credential-bearing rclone. The
+    ``::/0`` except set must cover ULA fc00::/7 (which contains
+    fd00::/8, hence the IMDSv6 endpoint — no /128 needed) and link-local
+    fe80::/10. Harmless no-op on IPv4-only clusters; asserted so a
+    future edit that drops the IPv6 half of the parity fails here."""
+    storage_policies = [
+        d for d in NETPOL_DOCS
+        if "storage-egress" in d["metadata"]["name"]
+    ]
+    assert storage_policies, "no storage-egress NetworkPolicy found"
+    storage = storage_policies[0]
+    cidrs = set()
+    for rule in storage["spec"]["egress"]:
+        for to in rule.get("to", []):
+            ip_block = to.get("ipBlock", {})
+            if ip_block.get("cidr") == "::/0":
+                cidrs.add("::/0")
+                excepts = set(ip_block.get("except", []))
+                required_v6 = {"fc00::/7", "fe80::/10"}
+                assert required_v6.issubset(excepts), (
+                    f"::/0 egress is missing ULA/link-local exceptions "
+                    f"(issue #644): {excepts}"
+                )
+            if ip_block.get("cidr") == "0.0.0.0/0":
+                cidrs.add("0.0.0.0/0")
+    assert cidrs == {"0.0.0.0/0", "::/0"}, (
+        f"storage-egress must carry BOTH v4 and v6 ipBlock entries "
+        f"(issue #644); found: {sorted(cidrs)}"
+    )
+
+
 # ---- Issue #166: /metrics ingress is restricted -------------------
 #
 # The operator exposes /metrics on port 9090 in plaintext with no auth
