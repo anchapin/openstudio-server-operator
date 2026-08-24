@@ -53,6 +53,46 @@ peer fix (`#578`), bounded K8s request timeouts (`#579`), the
 KEDA-burst quota envelope (`#580`), and the persisted stall window
 (`#582`).
 
+### Added
+- **`#716`** — `openstudio_client._TRANSIENT_EXCEPTIONS` widened to
+  cover every `requests` transient subclass documented by the
+  library: `ChunkedEncodingError`, `ContentDecodingError`, and
+  `SSLError` join the pre-existing `(ConnectionError, Timeout)`
+  pair. The pre-#716 narrow tuple was narrower than the module
+  docstring's "5xx, connection errors, timeouts" claim — a live
+  `ChunkedEncodingError` mid-stream or a TLS-handshake `SSLError`
+  was re-raised as `OpenStudioApiError` after a single attempt,
+  costing the operator one retry-cycle of resilience on the SLA /
+  watchdog polls. The pre-existing
+  `test_retries_connection_error_then_succeeds` pattern is
+  replicated for every new subclass, plus a combined
+  exhaustion test that round-trips every subclass through the
+  full 4-attempt envelope. Mirrors the K8s-side
+  `BoundedK8sRequest` translation (`#579`) which folds `urllib3`
+  `MaxRetryError` into `SKIP_TICK_EXCEPTIONS`.
+- **`#714`** — `OpenStudioClient.__init__` now pins
+  `self._session.trust_env = False` to prevent the `requests`
+  library from honoring `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` /
+  `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`
+  environment variables. The in-cluster REST traffic now stays on
+  the explicit `self._base` URL with no proxy fallback, closing the
+  MITM surface a compromised or misconfigured host env would open.
+  Cluster admins who need a corporate proxy MUST mount it as a
+  sidecar or route through the existing `OPENSTUDIO_TLS_CA_BUNDLE`
+  env var (`#242` contract) rather than rely on `HTTPS_PROXY`.
+  New regression test
+  `test_session_trust_env_is_disabled` pins the behavior.
+- **`#718`** — the last local K8s-API stand-in
+  (`tests/test_prune_entrypoint.py::FakeCoreV1Api`) was promoted
+  into `tests/_fakes.py`, completing the `#474` / `#653` fakes
+  consolidation arc (`FakeCustomObjectsApi`, `FakeAppsV1Api`,
+  `FakeBatchV1Api`, `FakePodsCoreV1Api`, `FakeSecretsCoreV1Api`,
+  `FakeCoreV1Api` — every K8s-API surface now has exactly one
+  in-tree definition). New AST gate
+  `tests/test_singleton_registry_coverage.py::test_all_k8s_api_fakes_live_in_tests_fakes_py`
+  prevents re-introducing a duplicate `class Fake<...>Api`
+  definition in any `tests/test_*.py` file.
+
 ### Changed
 - **`#653`** — the `#531`/`#567` fakes consolidation finished:
   shared `FakeBatchV1Api` (strict 404-on-missing delete, `fail_with`
