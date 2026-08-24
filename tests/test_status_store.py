@@ -23,6 +23,7 @@ from openstudio_operator.status_store import (
     StatusStore,
     StatusStoreConflictError,
     StatusStoreError,
+    StopRecord,
 )
 
 NAMESPACE = "openstudio-server"
@@ -45,6 +46,14 @@ def make_archived() -> ArchivedAnalysisRecord:
         backend="s3",
         bucket="os-archives",
         verified_at=datetime(2026, 8, 18, 10, 0, 0, tzinfo=UTC),
+    )
+
+
+def make_stop(outcome: str = "issued", stopped_at: datetime | None = None) -> StopRecord:
+    return StopRecord(
+        issued_at=datetime(2026, 8, 18, 8, 0, 0, tzinfo=UTC),
+        outcome=outcome,
+        stopped_at=stopped_at,
     )
 
 
@@ -232,11 +241,70 @@ def test_archived_analysis_round_trip_and_wire_format(store, api):
     }
 
 
+# --- stoppedAnalyses (issue #708) --------------------------------------------
+
+
+def test_stop_record_round_trip_and_wire_format(store, api):
+    record = make_stop(outcome="issued")
+    store.set_stop_record("a1", record)
+    assert store.get_stop_record("a1") == record
+    assert api.obj["status"]["stoppedAnalyses"]["a1"] == {
+        "issuedAt": "2026-08-18T08:00:00+00:00",
+        "outcome": "issued",
+    }
+
+
+def test_stop_record_with_stopped_at_round_trip_and_wire_format(store, api):
+    stopped_at = datetime(2026, 8, 18, 8, 30, 0, tzinfo=UTC)
+    record = make_stop(outcome="completed", stopped_at=stopped_at)
+    store.set_stop_record("a1", record)
+    assert store.get_stop_record("a1") == record
+    assert api.obj["status"]["stoppedAnalyses"]["a1"] == {
+        "issuedAt": "2026-08-18T08:00:00+00:00",
+        "outcome": "completed",
+        "stoppedAt": "2026-08-18T08:30:00+00:00",
+    }
+
+
+def test_prune_stop_record_drops_finished_analysis(store, api):
+    api.obj["status"] = {
+        "stoppedAnalyses": {
+            "a1": make_stop("completed").to_dict(),
+            "a2": make_stop("issued").to_dict(),
+        },
+    }
+
+    store.prune(live_analysis_ids={"a2"})  # a1 completed → no longer live
+
+    assert store.get_stop_record("a1") is None
+    assert store.get_stop_record("a2") is not None
+
+
+def test_prune_stop_record_is_idempotent(store, api):
+    api.obj["status"] = {"stoppedAnalyses": {"a1": make_stop("timeout").to_dict()}}
+    store.prune(live_analysis_ids={"a1"})
+    patches_after = api.patch_calls
+    store.prune(live_analysis_ids={"a1"})  # nothing dead
+    assert api.patch_calls == patches_after
+
+
+def test_clear_stop_record_deletes_only_that_key_and_is_idempotent(store, api):
+    store.set_stop_record("a1", make_stop("issued"))
+    store.set_stop_record("a2", make_stop("dry-run"))
+    store.prune_stop_record("a1")
+    assert store.get_stop_record("a1") is None
+    assert store.get_stop_record("a2") is not None
+    patches_after_clear = api.patch_calls
+    store.prune_stop_record("a1")  # absent key: no write
+    assert api.patch_calls == patches_after_clear
+
+
 def test_missing_keys_return_none(store):
     assert store.get_soft_stop("nope") is None
     assert store.get_requeue("nope") is None
     assert store.get_started_since("nope") is None
     assert store.get_archived_analysis("nope") is None
+    assert store.get_stop_record("nope") is None
 
 
 def test_set_same_value_twice_writes_once(store, api):
@@ -244,6 +312,11 @@ def test_set_same_value_twice_writes_once(store, api):
     store.set_soft_stop("a1", record)
     store.set_soft_stop("a1", record)
     assert api.patch_calls == 1
+
+    stop = make_stop()
+    store.set_stop_record("a1", stop)
+    store.set_stop_record("a1", stop)
+    assert api.patch_calls == 2
 
 
 # --- Scalar get/set round-trips -------------------------------------------------
@@ -498,13 +571,15 @@ def test_prune_on_completion_drops_finished_analysis_entries(store, api):
     api.obj["status"] = {
         "softStops": {"a1": make_soft_stop("stopped").to_dict(), "a2": make_soft_stop().to_dict()},
         "archivedAnalyses": {"a1": make_archived().to_dict()},
+        "stoppedAnalyses": {"a1": make_stop("completed").to_dict(), "a3": make_stop("issued").to_dict()},
         "requeues": {"dp9": make_requeue().to_dict()},
     }
 
-    store.prune(live_analysis_ids={"a2"})  # a1 completed → no longer live
+    store.prune(live_analysis_ids={"a2", "a3"})  # a1 completed → no longer live
 
     assert set(store.get_soft_stops()) == {"a2"}
     assert store.get_archived_analyses() == {}
+    assert set(store.get_stop_record(id_) for id_ in ("a1", "a3")) == {None, make_stop("issued")}
     # The datapoint id-space was left alone (None).
     assert set(store.get_requeues()) == {"dp9"}
 
@@ -808,6 +883,7 @@ def test_status_map_entries_gauge_tracks_len_for_all_four_maps(api, store):
     store.set_requeue("dp1", make_requeue(count=2))
     store.set_started_since("dp1", datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC))
     store.set_archived_analysis("a1", make_archived())
+    store.set_stop_record("a1", make_stop())
 
     assert len(store.get_soft_stops()) == 2
     assert len(store.get_requeues()) == 1
@@ -818,6 +894,7 @@ def test_status_map_entries_gauge_tracks_len_for_all_four_maps(api, store):
     assert _gauge_map_entries("requeues") == 1.0
     assert _gauge_map_entries("startedSince") == 1.0
     assert _gauge_map_entries("archivedAnalyses") == 1.0
+    assert _gauge_map_entries("stoppedAnalyses") == 1.0
 
     # Exposition shape — labels alphabetical (map_name < name < namespace),
     # so a future label rename/reorder is caught here, not on the on-call's
@@ -846,6 +923,7 @@ def test_status_map_entries_gauge_stamped_on_plain_reads_without_writes(api, sto
     api.obj["status"] = {
         "archivedAnalyses": {f"a{i}": make_archived().to_dict() for i in range(7)},
         "softStops": {"x1": make_soft_stop().to_dict()},
+        "stoppedAnalyses": {"y1": make_stop().to_dict()},
     }
     # Pre-seed the absent-map series at a nonzero sentinel.
     metrics_module.STATUS_MAP_ENTRIES.labels(
@@ -856,6 +934,7 @@ def test_status_map_entries_gauge_stamped_on_plain_reads_without_writes(api, sto
 
     assert _gauge_map_entries("archivedAnalyses") == 7.0
     assert _gauge_map_entries("softStops") == 1.0
+    assert _gauge_map_entries("stoppedAnalyses") == 1.0
     assert _gauge_map_entries("requeues") == 0.0  # stamped 0 by the read
     assert _gauge_map_entries("startedSince") == 0.0
     assert api.patch_calls == 0  # pure reads — the gauge never forces a write

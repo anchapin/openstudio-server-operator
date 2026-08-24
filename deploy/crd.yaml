@@ -336,6 +336,10 @@ spec:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
                   description: "Map keyed by analysis id to archival records (backend, bucket, verified-upload timestamp)."
+                stoppedAnalyses:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "Map keyed by analysis id to stop records (issued-at timestamp, outcome, stopped-at timestamp when server confirmed completion, issue #708)."
                 lastRecycleAt:
                   type: string
                   format: date-time
