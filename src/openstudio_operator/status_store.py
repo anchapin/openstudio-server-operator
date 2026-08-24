@@ -81,6 +81,11 @@ DEFERRED_EVENTS = "deferredEvents"
 # module). Imported above; the CR ``.status`` subresource patch below uses it.
 MAX_CONFLICT_RETRIES = 5
 _BACKOFF_BASE_SECONDS = 1.0
+# Issue #721 — jitter ceiling bound so a sustained conflict storm can't stall
+# the SLA tick past its ~30s cadence.  At attempt=5 (MAX_CONFLICT_RETRIES) the
+# uncapped max would be 1.0 * 2^4 * 1.5 = 24s, but higher retry budgets or
+# future changes could exceed 30s without this cap.
+JITTER_CEILING_SECONDS = 30.0
 
 # Issue #171 — defensive cap on the four CR .status maps. The CRD schema
 # accepts unbounded maps (every field is ``x-kubernetes-preserve-unknown-fields``
@@ -186,7 +191,10 @@ class StatusStoreConflictError(StatusStoreError):
 
 
 def _conflict_backoff(attempt: int) -> float:
-    return _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random())
+    return min(
+        _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random()),
+        JITTER_CEILING_SECONDS,
+    )
 
 
 def _to_utc(value: datetime) -> datetime:

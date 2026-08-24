@@ -345,6 +345,29 @@ def test_ineffective_restarts_corrupt_value_raises(store, api, corrupt):
         store.get_web_background_ineffective_restarts()
 
 
+# --- Issue #721 — jitter ceiling on 409 backoff ---------------------------------
+
+
+def test_conflict_backoff_ceiling_is_30_seconds(monkeypatch):
+    """Issue #721: worst-case jitter (random.random → 1.0) at a high attempt
+    number must still be capped at JITTER_CEILING_SECONDS (30.0)."""
+    from openstudio_operator import status_store as ss
+
+    monkeypatch.setattr(f"{ss.__name__}.random.random", lambda: 1.0)
+    backoff = ss._conflict_backoff(20)  # would be enormous without ceiling
+    assert backoff == ss.JITTER_CEILING_SECONDS
+
+
+def test_conflict_backoff_respects_ceiling(monkeypatch):
+    """Issue #721: at attempt=10 the jittered exponential would exceed the
+    ceiling even at minimum jitter; the cap must apply."""
+    from openstudio_operator import status_store as ss
+
+    monkeypatch.setattr(f"{ss.__name__}.random.random", lambda: 0.0)
+    backoff = ss._conflict_backoff(10)  # 1.0 * 2^9 * 0.5 = 256 > 30
+    assert backoff == ss.JITTER_CEILING_SECONDS
+
+
 # --- Conflict-safe RMW ----------------------------------------------------------
 
 
