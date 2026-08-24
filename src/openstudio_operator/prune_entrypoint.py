@@ -275,10 +275,33 @@ def main(
         # kubeconfig already loaded and the ``ConfigException`` warning
         # path inside the factory (the placeholder-client branch) is
         # avoided in environments where ``load_kube_config`` succeeds.
-        load_operator_kube_config()
-        custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
-        batch_api = batch_api if batch_api is not None else operator_batch_api()
-        core_api = core_api if core_api is not None else operator_core_api()
+        #
+        # Issue #722 — wrap the kubeconfig load + factory calls inside the
+        # same ``_SKIP_TICK_EXCEPTIONS`` guard as the rest of the tick
+        # body. Pre-#722 a fresh CronJob pod with no ``~/.kube/config`` AND
+        # no in-cluster service-account env vars raised ``ConfigException``
+        # TWICE (once from ``load_incluster_config``, once from the
+        # ``load_kube_config`` fallback) and the second ``ConfigException``
+        # propagated out of ``load_operator_kube_config`` BEFORE the CR-list
+        # try/except — the CronJob exited with code 1 (raw traceback)
+        # rather than the documented exit-5 (D12 runtime failure). The
+        # guard below restores the exit-code contract by funneling the
+        # kubeconfig load failure into the same counted skip-tick path as
+        # the rest of the tick body.
+        try:
+            load_operator_kube_config()
+            custom_api = custom_api if custom_api is not None else operator_custom_objects_api()
+            batch_api = batch_api if batch_api is not None else operator_batch_api()
+            core_api = core_api if core_api is not None else operator_core_api()
+        except _SKIP_TICK_EXCEPTIONS as exc:
+            PRUNE_TICK_FAILURES_TOTAL.labels(reason=PRUNE_TICK_FAILURE_REASON_RUNTIME).inc()
+            logger.warning(
+                "prune tick skipped, retrying next schedule — kubeconfig load failed "
+                "(%s: %s); exit 5 (D12 runtime failure)",
+                type(exc).__name__,
+                exc,
+            )
+            return 5
 
     try:
         crs = _list_crs(custom_api, namespace)
