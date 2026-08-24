@@ -4915,7 +4915,7 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
 
 
 # ---------------------------------------------------------------------------
-# Issue #606 — the operator Role's secrets:get grant is exact-name-bounded
+# Issue #606 — the operator's secrets:get grant is exact-name-bounded
 # by RBAC resourceNames (the GET-path fence #572's admission layer could
 # not provide: VAPs run on the mutating path only, and RBAC authz precedes
 # admission regardless). Pre-#606 the grant was namespace-wide get, so a
@@ -4930,10 +4930,21 @@ def test_secret_read_admission_cel_allows_redis_names_and_other_actors():
 # the rule's resourceNames — a deliberate, visible, reviewable RBAC
 # change. The tests below pin the rule shape and its consistency with
 # the shipped tooling + the CRD convention.
+#
+# Issue #715 — the `secrets: get` rule that lived in the cross-cutting
+# `openstudio-operator-role` pre-#715 moved to its own narrower Role
+# (`openstudio-redis-secret-reader-role`) so the operator SA's
+# `secrets` verbs flow from a dedicated surface only. The rule itself,
+# the resourceNames fence, and the consistency checks below are
+# unchanged — only the rule's HOME in rbac.yaml moved. The helper
+# `_operator_role_secrets_rule()` now resolves the narrower Role by
+# name; the test names keep the #606 framing because the invariant
+# under test is the #606 RBAC fence (the #715 refactor is the move, not
+# a new fence).
 # ---------------------------------------------------------------------------
 
 #: The canonical Secret name(s) the shipped tooling creates — the exact
-#: set the default Role grants. Derived from deploy/redis-credentials-
+#: set the narrower Role grants. Derived from deploy/redis-credentials-
 #: secret.yaml (the committed manifest) and scripts/rotate_redis_password.
 #: sh (SECRET_NAME — the live-Secret rotation path), NOT hand-invented:
 #: if the ecosystem ever ships a second canonical name, both this tuple
@@ -4943,17 +4954,35 @@ _CANONICAL_REDIS_SECRET_NAMES = ["openstudio-redis"]
 
 
 def _operator_role_secrets_rule():
-    """Return the operator Role's single ``secrets`` rule (issue #606)."""
-    matches = [
-        rule
-        for rule in OPERATOR_ROLE["rules"]
-        if rule["apiGroups"] == [""] and rule["resources"] == ["secrets"]
-    ]
+    """Return the operator's single ``secrets`` rule.
+
+    Pre-#715: the rule lived in ``openstudio-operator-role`` (the
+    cross-cutting namespaced Role). Post-#715: the rule lives in
+    ``openstudio-redis-secret-reader-role`` (the dedicated narrower
+    Role). The helper resolves the rule by searching all Roles in
+    ``deploy/rbac.yaml`` for the one carrying the canonical
+    ``secrets/get/openstudio-redis`` shape, so a future PR that moves
+    the rule again does not need to touch this helper.
+    """
+    matches = []
+    for doc in OPERATOR_RBAC_DOCS:
+        if not doc or doc.get("kind") != "Role":
+            continue
+        for rule in doc.get("rules") or []:
+            if (
+                rule.get("apiGroups") == [""]
+                and rule.get("resources") == ["secrets"]
+                and rule.get("verbs") == ["get"]
+                and rule.get("resourceNames") == _CANONICAL_REDIS_SECRET_NAMES
+            ):
+                matches.append((doc["metadata"]["name"], rule))
     assert len(matches) == 1, (
-        f"expected exactly one secrets rule in the operator Role, got "
-        f"{matches!r} (issue #606)"
+        f"expected exactly one Role in deploy/rbac.yaml carrying the "
+        f"{{apiGroups:[''], resources:['secrets'], verbs:['get'], "
+        f"resourceNames:{_CANONICAL_REDIS_SECRET_NAMES!r}}} shape "
+        f"(issues #606/#715), got {matches!r}"
     )
-    return matches[0]
+    return matches[0][1]
 
 
 def test_operator_role_secrets_get_bounded_to_canonical_resourcenames():

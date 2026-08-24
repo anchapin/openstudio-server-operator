@@ -67,53 +67,16 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
-  # Read ONE Secret by name for Redis connection info (issue #463) —
-  # exact-name-bounded by RBAC resourceNames (issue #606).
-  #
-  # TENSION with the "operator never reads secrets" rule, documented here
-  # on purpose: `spec.redisCredentials.secretRef` names a Secret whose key
-  # holds the full redis:// URL, and the acceptance criterion requires the
-  # operator itself to resolve it (client_factory._resolve_redis_url — the
-  # rclone-style envFrom hand-off is not available for an in-process
-  # client constructor). This is the bounded exception, fenced in layers:
-  #
-  #   1. RBAC exact-name (this rule, #606): `get` ONLY, and only on the
-  #      canonical Secret name(s) the shipped tooling creates —
-  #      `openstudio-redis` (deploy/redis-credentials-secret.yaml +
-  #      scripts/rotate_redis_password.sh). Pre-#606 the grant was
-  #      namespace-wide `get`, so a compromised operator pod could read
-  #      ANY Secret here (Mongo credentials, rclone cloud creds, TLS
-  #      bundles, metrics bearer tokens) — the exfiltration path #606
-  #      closes. resourceNames is an exact-name list; RBAC has no
-  #      pattern slot.
-  #   2. CRD pattern (#463): `^openstudio-redis[a-z0-9-]*$` on
-  #      spec.redisCredentials.secretRef.name — a CR-write principal
-  #      cannot redirect the read at arbitrary names at apply time.
-  #   3. Admission mutation-fence (#572):
-  #      deploy/secret-read-admission-policy.yaml narrows this SA's
-  #      Secret MUTATIONS to `openstudio-redis*` names (RBAC-drift
-  #      insurance; VAPs cannot intercept GET — admission runs on the
-  #      mutating path only).
-  #   4. Single AST-gated construction site: the operator's one
-  #      `secrets: get` call lives in client_factory._resolve_redis_url
-  #      (tests/test_singleton_registry_coverage.py).
-  #
-  # Trade-off (#606 Option 1, fail-visible variant): the CRD pattern
-  # allows any `openstudio-redis*` name, but this Role grants GET on the
-  # canonical name(s) ONLY. A CR naming a custom `openstudio-redis-*`
-  # Secret is apply-legal and fails at READ time: 403 →
-  # RedisCredentialResolutionError → key-layout "unreachable" + counted
-  # skip-ticks + a one-time RedisSecretRefForbidden Warning Event telling
-  # the SRE the two remedies (singleton guard, #606). To allow a custom
-  # name, a cluster admin adds it to resourceNames below — a deliberate,
-  # visible, reviewable RBAC change. (Narrowing the CRD pattern to one
-  # fixed name instead would make the field pointless and break existing
-  # CRs at their next spec update; exact-name enforcement belongs at the
-  # RBAC layer — the mechanism Kubernetes provides for exactly this.)
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get"]
-    resourceNames: ["openstudio-redis"]
+  # NOTE (#715): the `secrets: get` rule that lived here pre-#715 moved
+  # to its own narrower Role (`openstudio-redis-secret-reader-role`)
+  # below, with its own narrower RoleBinding wired to the same operator
+  # SA. The operator's `secrets` verbs now come ONLY from that narrower
+  # Role — a future PR that re-merges a `secrets` rule into this broader
+  # Role fails `test_operator_role_has_no_secrets_rule` in
+  # tests/test_rbac_narrower_role.py. The full multi-layer rationale
+  # (RBAC resourceNames #606 / CRD pattern #463 / VAP mutation-fence
+  # #572 / AST-gated call site in client_factory._resolve_redis_url)
+  # lives with the narrower Role below where the rule itself lives.
   # NOTE (#77): the autoscaling/horizontalpodautoscalers rule is GONE.
   # The custom HPA-floor adjuster (#18) was removed; autoscaling is now
   # owned by KEDA (deploy/keda-scaledobject.yaml) which runs under its own
@@ -137,4 +100,93 @@ subjects:
 roleRef:
   kind: Role
   name: openstudio-operator-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ---- Issue #715: narrower Role carries the operator's only
+# `secrets: get` grant ----------------------------------------------
+#
+# Pre-#715 the operator's secrets: get lived in the broad
+# `openstudio-operator-role` (the cross-cutting namespaced Role carrying
+# every operator surface — OSCM, deployments, pods, events), bounded
+# only by `resourceNames: ["openstudio-redis"]`. #606 closed the
+# namespace-wide read by adding that constraint, but the `secrets`
+# verb was still one of seven rules in a single Role — a future PR
+# that adds another Secret name to `resourceNames` (e.g. for a new
+# credential backend), or that loosens the rule any other way, would
+# silently widen the read without anyone touching the dedicated
+# surface.
+#
+# #715 splits that rule into its own narrower Role+Binding pair. The
+# operator SA's effective `secrets` verbs now come ONLY from this Role
+# — the broad `openstudio-operator-role` carries no `secrets` rule at
+# all. The threat model the AGENTS.md "never reads secrets" rule
+# describes (a compromised operator pod could read ANY Secret in the
+# namespace) is closed by RBAC shape alone: any future PR that
+# re-merges a `secrets` verb into `openstudio-operator-role` fails
+# `test_operator_role_has_no_secrets_rule` and
+# `test_operator_sa_secrets_verbs_only_flow_through_narrower_role` in
+# tests/test_rbac_narrower_role.py.
+#
+# Same bounded exception (issue #463) — `client_factory._resolve_redis_url`
+# is the bounded read site. The four-layer fence that justified the
+# single in-Role rule pre-#715 carries over verbatim; only WHERE the
+# RBAC `secrets` rule lives changed (the audit footprint is smaller,
+# the operational behavior is identical):
+#
+#   1. RBAC exact-name (this rule, #606): `get` ONLY, and only on the
+#      canonical Secret name(s) the shipped tooling creates —
+#      `openstudio-redis` (deploy/redis-credentials-secret.yaml +
+#      scripts/rotate_redis_password.sh). Pre-#606 the grant was
+#      namespace-wide `get`, so a compromised operator pod could read
+#      ANY Secret here (Mongo credentials, rclone cloud creds, TLS
+#      bundles, metrics bearer tokens) — the exfiltration path #606
+#      closes. resourceNames is an exact-name list; RBAC has no
+#      pattern slot.
+#   2. CRD pattern (#463): `^openstudio-redis[a-z0-9-]*$` on
+#      spec.redisCredentials.secretRef.name — a CR-write principal
+#      cannot redirect the read at arbitrary names at apply time.
+#   3. Admission mutation-fence (#572):
+#      deploy/secret-read-admission-policy.yaml narrows this SA's
+#      Secret MUTATIONS to `openstudio-redis*` names (RBAC-drift
+#      insurance; VAPs cannot intercept GET — admission runs on the
+#      mutating path only).
+#   4. Single AST-gated construction site: the operator's one
+#      `secrets: get` call lives in client_factory._resolve_redis_url
+#      (tests/test_singleton_registry_coverage.py).
+#
+# Trade-off (#606 Option 1, fail-visible variant): the CRD pattern
+# allows any `openstudio-redis*` name, but this Role grants GET on the
+# canonical name(s) ONLY. A CR naming a custom `openstudio-redis-*`
+# Secret is apply-legal and fails at READ time: 403 →
+# RedisCredentialResolutionError → key-layout "unreachable" + counted
+# skip-ticks + a one-time RedisSecretRefForbidden Warning Event telling
+# the SRE the two remedies (singleton guard, #606). To allow a custom
+# name, a cluster admin adds it to resourceNames below — a deliberate,
+# visible, reviewable RBAC change. (Narrowing the CRD pattern to one
+# fixed name instead would make the field pointless and break existing
+# CRs at their next spec update; exact-name enforcement belongs at the
+# RBAC layer — the mechanism Kubernetes provides for exactly this.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openstudio-redis-secret-reader-role
+  namespace: openstudio-server
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames: ["openstudio-redis"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openstudio-redis-secret-reader-rb
+  namespace: openstudio-server
+subjects:
+  - kind: ServiceAccount
+    name: openstudio-operator-sa
+    namespace: openstudio-server
+roleRef:
+  kind: Role
+  name: openstudio-redis-secret-reader-role
   apiGroup: rbac.authorization.k8s.io
