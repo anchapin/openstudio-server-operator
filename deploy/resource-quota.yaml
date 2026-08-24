@@ -1,6 +1,69 @@
 # Issue #400 — ResourceQuota + LimitRange for the openstudio-server
 # namespace (resource-surface blast-radius bound).
 #
+# ---- 2026-08-24 fleet evidence (issue #740) ----
+#
+# During a 600→9000 worker scale-up the ramp stalled at ~2800 total pods
+# with quota-rejection symptoms. The binding dimension was the `pods` quota
+# (20), not requests.memory (8Gi) or limits.memory (20Gi) — the
+# per-pod memory footprint was ~7Mi (container overhead + lightweight worker
+# process, not the LimitRange default 512Mi), so limits.memory (~19.6Gi
+# used at 2800 pods vs 20Gi ceiling) approached but did not exceed the
+# ceiling before the pods wall hit.
+#
+# Fleet sizing re-derivation (KEDA burst headroom math preserved; workers
+# assumed to use LimitRange-injected defaults unless they declare their
+# own):
+#
+#   Steady-state (7 pods): requests 3.5 CPU / 3.5Gi, limits 7 CPU / 7Gi
+#
+#   300-worker fleet (307 pods total):
+#     requests: 4 chart pods 1.1 CPU + 300 workers 150m + op+prune 150m
+#             ≈ 1.4 CPU / 2.1Gi   ← requests.memory: 8Gi still covers (26%)
+#     limits:   4 chart pods (LimitRange 2 CPU ea) 8 CPU + 300×2 CPU
+#              + op+prune (LimitRange 2 CPU ea) 4 CPU = 612 CPU /
+#              4×4Gi + 300×4Gi + 2×4Gi ≈ 1.2Ti  ← limits per pod dominate
+#     pods: 307  →  pods: 500 recommended
+#
+#   3000-worker fleet (3007 pods total):
+#     requests: 4.45 CPU / 21.1Gi  ← requests.memory: 8Gi INSUFFICIENT
+#                                       (needs ≈24Gi); bump to 32Gi.
+#     limits:   same per-pod pattern → 6012 CPU / 12Ti  ← limits.cpu
+#               quota (20) is not the target; workers need explicit limits.
+#     pods: 3007  →  pods: 3500 recommended
+#
+#   9000-worker fleet (9007 pods total):
+#     pods: 9007  →  pods: 10000 recommended
+#     requests.memory: ≈63Gi  ← needs 64–72Gi
+#
+#   Recommended targets for occupied clusters (pre-apply checklist below):
+#     pods: 10000   (covers 9000 workers + infra + headroom)
+#     requests.cpu: 4   (unchanged — steady-state + KEDA burst envelope)
+#     requests.memory: 32Gi  (raised from 8Gi; supports ~3000 workers at
+#                              realistic 10Mi/worker footprint; see above)
+#     limits.cpu: 20  (unchanged — covers chart pods at LimitRange default)
+#     limits.memory: 64Gi  (raised from 20Gi; 2× requests.memory for burst
+#                           headroom ratio, supports ~3000 workers at 20Gi)
+#
+#   NOTE: if workers declare their own explicit limits (not relying on
+#   LimitRange default 2 CPU), the limits.cpu: 20 ceiling supports up to
+#   80 workers at 250m each. Workers that omit limits.cpu are injected
+#   the 2 CPU default which counts against the aggregate quota — ensure
+#   worker specs include explicit limits.cpu or raise the quota further.
+#
+# ---- Pre-apply checklist (issue #740) ----
+#
+#   BEFORE applying to an occupied cluster:
+#     kubectl describe resourcequota openstudio-server-quota -n openstudio-server
+#     # Compare live usage vs proposed new values.
+#     # If live pods/requests.memory/limits.memory already exceeds the
+#     # new quota, either raise the quota to cover live usage first, or
+#     # accept that a quota shrink would strand the existing fleet.
+#     kubectl top pods -n openstudio-server  # (metrics-server required)
+#     # Verify per-pod memory is within expected range before applying.
+#
+# ---- Original issue #400 rationale ----
+#
 # Pre-fix the namespace carried no ResourceQuota and no LimitRange:
 # the verb surface was gated (RBAC #78/#228, admission #293/#294,
 # network #112/#166) but the RESOURCE surface was not. A misbehaving
@@ -86,14 +149,18 @@ spec:
     # maxReplicaCount + operator + prune pod, every one declaring its
     # requests); the limits-side aggregate — with the LimitRange
     # injecting the 2 CPU default limit into the chart pods that omit
-    # limits.cpu — is 18.75 CPU / 19Gi. 4/8Gi/20/20Gi cover both with
-    # headroom; full arithmetic in the header comment above and in
-    # tests/test_deploy_manifests.py (the envelope is computed from
-    # the manifests at test time, so any drift fails CI).
+    # limits.cpu — is 18.75 CPU / 19Gi.
+    # Updated values (issue #740): pods: 10000 for 9000-worker target;
+    # requests.memory raised to 32Gi (supports ~3000 workers at realistic
+    # 10Mi/worker footprint); limits.memory raised to 64Gi (2:1 burst
+    # headroom ratio). Full arithmetic in the header comment above and
+    # tests/test_deploy_manifests.py (the envelope is computed from the
+    # manifests at test time, so any drift fails CI).
+    pods: "10000"
     requests.cpu: "4"
-    requests.memory: 8Gi
+    requests.memory: 32Gi
     limits.cpu: "20"
-    limits.memory: 20Gi
+    limits.memory: 64Gi
 ---
 apiVersion: v1
 kind: LimitRange
