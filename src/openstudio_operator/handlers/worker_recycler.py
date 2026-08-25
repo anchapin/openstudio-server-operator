@@ -71,6 +71,7 @@ from openstudio_operator._oscm_handlers import (
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.handlers.redis_layout_check import _check_redis_key_layout_for_cr
 from openstudio_operator.metrics import WORKERS_RECYCLED_TOTAL
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.singleton import operator_apps_api, operator_custom_objects_api
@@ -221,6 +222,10 @@ def worker_recycler(
         deps: _RecyclerTimerClients,
         now: datetime,
     ) -> str | None:
+        # Issue #778 — worker_recycler does not read Redis directly, but
+        # adding the layout check here ensures any drift is surfaced on every
+        # tick without waiting for web_background_monitor's 5-minute rider.
+        _check_redis_key_layout_for_cr(body, logger=logger)
         return run_recycler_tick(
             deps.client,
             store,

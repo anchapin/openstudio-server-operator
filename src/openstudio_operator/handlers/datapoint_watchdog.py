@@ -111,6 +111,7 @@ from openstudio_operator._oscm_handlers import (
 from openstudio_operator.client_factory import get_openstudio_client
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import EventEmitter
+from openstudio_operator.handlers.redis_layout_check import _check_redis_key_layout_for_cr
 from openstudio_operator.metrics import (
     ANALYSIS_DATAPOINT_COUNT,
     DATAPOINTS_REQUEUE_EXHAUSTED_TOTAL,
@@ -515,6 +516,12 @@ def zombie_datapoint_watchdog(
         deps: OpenStudioClient,
         now: datetime,
     ) -> list[str]:
+        # Issue #778 — datapoint_watchdog reads no Redis keys directly, but
+        # other handlers that do (web_background_monitor, analysis_sla) depend
+        # on the shared Resque layout. Validate on every tick so any drift is
+        # surfaced immediately rather than waiting for the web_background_monitor's
+        # 5-minute revalidation rider.
+        _check_redis_key_layout_for_cr(body, logger=logger)
         return run_watchdog_tick(
             deps,
             store,
