@@ -105,6 +105,8 @@ STATUS_MAP_MAX_ENTRIES = 10_000
 #: The tuple drives the per-map size-gauge stamp in ``_read_status`` so the
 #: vocabulary of ``STATUS_MAP_ENTRIES{map_name}`` is the exact ``.status``
 #: map key set (same vocabulary as ``STATUS_MAP_CAPS_TOTAL{map_name}``).
+STATUS_ENTRY_MAX_AGE_DAYS = 30  # Issue #795
+
 _STATUS_MAP_FIELDS = (SOFT_STOPS, REQUEUES, STARTED_SINCE, ARCHIVED_ANALYSES, STOPPED_ANALYSES)
 
 #: Issue #171 — event reason for the cap-eviction Warning Event. A single
@@ -644,6 +646,35 @@ class StatusStore:
             return {"status": {field: value}}
 
         self._mutate(build_patch)
+
+    def _prune_stale_entries(self, status: dict[str, Any]) -> dict[str, Any]:
+        cutoff = datetime.now(tz=UTC) - timedelta(days=STATUS_ENTRY_MAX_AGE_DAYS)
+        for field in _STATUS_MAP_FIELDS:
+            raw = status.get(field)
+            if not isinstance(raw, dict):
+                continue
+            to_remove = []
+            for key, entry in raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                ts = (
+                    entry.get("verifiedAt")
+                    or entry.get("spawnedAt")
+                    or entry.get("issuedAt")
+                    or entry.get("queuedAt")
+                    or entry.get("startedAt")
+                )
+                if ts is None:
+                    continue
+                try:
+                    entry_time = parse_iso_utc(ts)
+                    if entry_time < cutoff:
+                        to_remove.append(key)
+                except (ValueError, TypeError):
+                    to_remove.append(key)
+            for key in to_remove:
+                del raw[key]
+        return status
 
     # --- softStops ----------------------------------------------------------
 
