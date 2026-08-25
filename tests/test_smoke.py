@@ -175,7 +175,9 @@ def test_config_from_spec_camelcase():
 
 
 def test_config_from_spec_empty_equals_defaults():
-    assert OperatorConfig.from_spec({}) == OperatorConfig()
+    assert OperatorConfig.from_spec({"serverUrl": "http://web"}) == OperatorConfig(
+        server_url="http://web"
+    )
 
 
 # --- Issue #463 — spec.redisCredentials.secretRef parsing ---------------------
@@ -185,6 +187,7 @@ def test_config_parses_redis_credentials_secret_ref():
     """Issue #463: a well-formed secretRef maps to RedisSecretRef(name, key)."""
     cfg = OperatorConfig.from_spec(
         {
+            "serverUrl": "http://web",
             "redisCredentials": {
                 "secretRef": {"name": "openstudio-redis", "key": "redis-url"}
             }
@@ -199,7 +202,7 @@ def test_config_redis_credentials_absent_by_default():
     """No redisCredentials in the spec → secret_ref None (inline URL path)."""
     assert OperatorConfig().redis_credentials.secret_ref is None
     assert (
-        OperatorConfig.from_spec({"redisUrl": "redis://queue:6379"}).redis_credentials
+        OperatorConfig.from_spec({"serverUrl": "http://web", "redisUrl": "redis://queue:6379"}).redis_credentials
     ).secret_ref is None
 
 
@@ -211,20 +214,20 @@ def test_config_rejects_malformed_secret_ref():
     credential misconfiguration must never be silently treated as absent.
     """
     with pytest.raises(ValueError, match="secretRef"):
-        OperatorConfig.from_spec({"redisCredentials": {"secretRef": {"name": "s"}}})
+        OperatorConfig.from_spec({"serverUrl": "http://web", "redisCredentials": {"secretRef": {"name": "s"}}})
     with pytest.raises(ValueError, match="secretRef"):
         OperatorConfig.from_spec(
-            {"redisCredentials": {"secretRef": {"name": "s", "key": ""}}}
+            {"serverUrl": "http://web", "redisCredentials": {"secretRef": {"name": "s", "key": ""}}}
         )
     with pytest.raises(ValueError, match="secretRef"):
-        OperatorConfig.from_spec({"redisCredentials": {"secretRef": "openstudio-redis"}})
+        OperatorConfig.from_spec({"serverUrl": "http://web", "redisCredentials": {"secretRef": "openstudio-redis"}})
 
 
 def test_config_tolerates_empty_redis_credentials_object():
     """``redisCredentials: {}`` (secretRef absent) is NOT malformed — CRD
     ``required`` only fires when the object is set, so ``{}`` is the same
     as omitting the field (K8s structural pruning default-fills it)."""
-    cfg = OperatorConfig.from_spec({"redisCredentials": {}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "redisCredentials": {}})
     assert cfg.redis_credentials.secret_ref is None
 
 

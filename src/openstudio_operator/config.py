@@ -179,7 +179,17 @@ class OperatorConfig:
 
     @classmethod
     def from_spec(cls, spec: dict) -> OperatorConfig:
-        """Build config from a CR ``spec`` dict (camelCase keys per the CRD)."""
+        """Build config from a CR ``spec`` dict (camelCase keys per the CRD).
+
+        Issue #776 — schema-evolution guard: required fields (``serverUrl``)
+        must be present and non-empty. If absent, the caller (run_oscm_tick)
+        emits a ``RequiredFieldAbsent`` Warning event and returns ``None`` so
+        the operator idles rather than silently using an empty default. This
+        pattern guards any future required fields added to the CRD: each new
+        required field must be checked in ``run_oscm_tick`` before returning
+        the config to the handler, surfacing the gap as a Warning event rather
+        than silently misconfiguring.
+        """
         analysis = spec.get("analysisPolicy", {})
         datapoint = spec.get("datapointPolicy", {})
         worker = spec.get("workerPolicy", {})
