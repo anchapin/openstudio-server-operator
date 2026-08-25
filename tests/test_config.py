@@ -114,13 +114,13 @@ def test_from_spec_partial_sub_dict_keeps_sibling_defaults() -> None:
     mean a partially-populated sub-dict (common in hand-edited CRs) must not
     disturb the untouched fields.
     """
-    cfg = OperatorConfig.from_spec({"analysisPolicy": {"maxDurationMinutes": 90}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "analysisPolicy": {"maxDurationMinutes": 90}})
     assert cfg.analysis_policy.max_duration_minutes == 90
     assert cfg.analysis_policy.graceful_stop_timeout_minutes == 15
     assert cfg.analysis_policy.auto_soft_stop is True
     assert cfg.analysis_policy.force_delete_on_escalation is False
 
-    cfg = OperatorConfig.from_spec({"storagePolicy": {"backend": "gcs"}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "storagePolicy": {"backend": "gcs"}})
     assert cfg.storage_policy.backend == "gcs"
     assert cfg.storage_policy.archive_to_s3 is False
     assert cfg.storage_policy.bucket is None
@@ -147,8 +147,9 @@ def test_from_spec_missing_policy_sub_dicts_use_module_defaults() -> None:
 
 def test_from_spec_empty_policy_sub_dict_equals_missing() -> None:
     """``analysisPolicy: {}`` is equivalent to the key being absent."""
-    with_key = OperatorConfig.from_spec({"analysisPolicy": {}})
-    without_key = OperatorConfig.from_spec({})
+    base = {"serverUrl": "http://web"}
+    with_key = OperatorConfig.from_spec({**base, "analysisPolicy": {}})
+    without_key = OperatorConfig.from_spec(base)
     assert with_key == without_key
 
 
@@ -163,7 +164,7 @@ def test_from_spec_does_not_coerce_string_integers() -> None:
     hand-crafted spec already slipped past it. Downstream hazard if it does:
     ``timedelta(minutes="180")`` raises ``TypeError`` inside the handler tick.
     """
-    cfg = OperatorConfig.from_spec({"analysisPolicy": {"maxDurationMinutes": "180"}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "analysisPolicy": {"maxDurationMinutes": "180"}})
     assert cfg.analysis_policy.max_duration_minutes == "180"
     assert isinstance(cfg.analysis_policy.max_duration_minutes, str)
 
@@ -178,10 +179,10 @@ def test_from_spec_invalid_backend_passes_through_unvalidated() -> None:
     archival-Job build time for an unknown backend. Config-level pass-through
     means the failure surfaces when archival is attempted, not at spec parse.
     """
-    cfg = OperatorConfig.from_spec({"storagePolicy": {"backend": "ftp"}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "storagePolicy": {"backend": "ftp"}})
     assert cfg.storage_policy.backend == "ftp"
     for valid in ("s3", "gcs", "azure"):
-        parsed = OperatorConfig.from_spec({"storagePolicy": {"backend": valid}})
+        parsed = OperatorConfig.from_spec({"serverUrl": "http://web", "storagePolicy": {"backend": valid}})
         assert parsed.storage_policy.backend == valid
 
 
@@ -195,13 +196,13 @@ def test_from_spec_max_auto_requeues_zero_parses_to_warn_only_budget() -> None:
     0, distinct from the default 3 and from absence); the behavioral test is
     ``tests/test_datapoint_watchdog.py::test_max_auto_requeues_zero_is_warn_only_mode``.
     """
-    cfg = OperatorConfig.from_spec({"datapointPolicy": {"maxAutoRequeues": 0}})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "datapointPolicy": {"maxAutoRequeues": 0}})
     max_requeues = cfg.datapoint_policy.max_auto_requeues
     assert max_requeues == 0
     assert isinstance(max_requeues, int) and not isinstance(max_requeues, bool)
     assert not (0 < max_requeues)  # the warn-only gate: budget starts exhausted
     # Absent key keeps the default budget of 3 (requeue up to 3 times).
-    assert OperatorConfig.from_spec({}).datapoint_policy.max_auto_requeues == 3
+    assert OperatorConfig.from_spec({"serverUrl": "http://web"}).datapoint_policy.max_auto_requeues == 3
 
 
 def test_from_spec_redis_credentials_null_tolerated() -> None:
@@ -211,7 +212,7 @@ def test_from_spec_redis_credentials_null_tolerated() -> None:
     as absence — inline ``spec.redisUrl`` remains the credential source
     (#463). Complements test_smoke.py's absent/``{}``/malformed shapes.
     """
-    cfg = OperatorConfig.from_spec({"redisCredentials": None})
+    cfg = OperatorConfig.from_spec({"serverUrl": "http://web", "redisCredentials": None})
     assert cfg.redis_credentials.secret_ref is None
 
 
@@ -228,9 +229,9 @@ def test_from_spec_null_policy_sub_dict_raises_attribute_error() -> None:
     flagged as a follow-up in the #482 report.
     """
     with pytest.raises(AttributeError, match="'NoneType' object has no attribute 'get'"):
-        OperatorConfig.from_spec({"analysisPolicy": None})
+        OperatorConfig.from_spec({"serverUrl": "http://web", "analysisPolicy": None})
     with pytest.raises(AttributeError, match="'NoneType' object has no attribute 'get'"):
-        OperatorConfig.from_spec({"storagePolicy": None})
+        OperatorConfig.from_spec({"serverUrl": "http://web", "storagePolicy": None})
 
 
 def test_from_spec_ignores_unknown_keys() -> None:

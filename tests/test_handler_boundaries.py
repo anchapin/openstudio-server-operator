@@ -474,7 +474,7 @@ def test_handler_wrapper_observe_tick_duration() -> None:
         before = _histogram_count_for(histogram, module=module)
         fn(
             body={"metadata": {"name": "x", "namespace": "ns"}},
-            spec={"serverUrl": "", "redisUrl": ""},
+            spec={"serverUrl": "http://web.test", "redisUrl": "redis://queue:6379"},
             namespace="ns",
             name="x",
             logger=_SENTINEL_LOGGER,

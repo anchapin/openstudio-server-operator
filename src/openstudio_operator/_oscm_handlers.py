@@ -386,6 +386,30 @@ def run_oscm_tick(
     if _shutdown_requested:
         logger.debug("shutdown requested — %s idle this tick", idle_label)
         return None
+    # Issue #776 — schema-evolution guard: serverUrl is a required field.
+    # If absent or empty, emit a Warning and return None (idle path) so the
+    # operator fails loudly rather than silently misconfiguring.
+    if not spec.get("serverUrl"):
+        logger.warning(
+            "spec.serverUrl is required but is absent or empty — "
+            "%s idle this tick",
+            idle_label,
+        )
+        from openstudio_operator.metrics import (
+            HANDLER_LAST_TICK_TIMESTAMP,
+            stamp_config_posture_gauges,
+        )
+
+        stamp_config_posture_gauges(
+            namespace=namespace,
+            name=name,
+            dry_run=spec.get("dryRun", False),
+            server_url_set=False,
+            redis_url_set=bool(spec.get("redisUrl")),
+            auto_soft_stop=spec.get("analysisPolicy", {}).get("autoSoftStop", True),
+        )
+        HANDLER_LAST_TICK_TIMESTAMP.labels(module=module).set(time.time())
+        return None
     config = OperatorConfig.from_spec(spec)
     # Issue #492 — config-state posture gauges: stamped immediately
     # after the config parse succeeds and BEFORE the idle check / the
