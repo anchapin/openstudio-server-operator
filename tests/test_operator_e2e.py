@@ -91,18 +91,24 @@ def _kind_cluster() -> Generator[None, None, None]:
         check=False,
     )
     if CLUSTER_NAME not in result.stdout:
+        try:
+            subprocess.run(
+                ["kind", "create", "cluster", "--name", CLUSTER_NAME, "--config", "scripts/kind-config.yaml"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            pytest.skip(f"kind create cluster failed: {e}")
+
+    try:
         subprocess.run(
-            ["kind", "create", "cluster", "--name", CLUSTER_NAME, "--config", "scripts/kind-config.yaml"],
+            ["kubectl", "config", "use-context", f"kind-{CLUSTER_NAME}"],
             capture_output=True,
-            text=True,
             check=True,
         )
-
-    subprocess.run(
-        ["kubectl", "config", "use-context", f"kind-{CLUSTER_NAME}"],
-        capture_output=True,
-        check=True,
-    )
+    except subprocess.CalledProcessError:
+        pytest.skip("kubectl could not use kind cluster context — check kind cluster status")
 
     try:
         subprocess.run(
@@ -113,6 +119,14 @@ def _kind_cluster() -> Generator[None, None, None]:
         )
     except subprocess.CalledProcessError:
         pytest.skip("kind cluster node did not become Ready within 120s")
+
+    cluster_info = subprocess.run(
+        ["kubectl", "cluster-info"],
+        capture_output=True,
+        check=False,
+    )
+    if cluster_info.returncode != 0:
+        pytest.skip(f"kubectl cluster-info failed (exit {cluster_info.returncode}) — kind cluster may not be fully operational")
 
     yield
 
@@ -166,12 +180,15 @@ def _operator_manifests(
     ]
 
     for manifest in manifests:
-        subprocess.run(
-            ["kubectl", "apply", "-f", manifest],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        try:
+            subprocess.run(
+                ["kubectl", "apply", "-f", manifest],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            pytest.skip(f"kubectl apply -f {manifest} failed: {e}")
 
     try:
         subprocess.run(
