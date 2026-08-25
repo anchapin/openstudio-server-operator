@@ -81,3 +81,8 @@ testpaths = ["tests"]
 # >30 s) is enforced by a `pytest_terminal_summary` hook in
 # `tests/conftest.py` — the addopts just make the slow tests visible.
 addopts = "-q --durations=10 --durations-min=1.0"
+# Exclude e2e tests from normal runs; they require kind and a live cluster.
+# Run them explicitly with: pytest -m e2e
+markers = [
+    "e2e: end-to-end tests requiring a kind cluster (run explicitly with -m e2e)",
+]
