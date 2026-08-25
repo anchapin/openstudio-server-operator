@@ -186,6 +186,24 @@ ANALYSES_ARCHIVED_TOTAL = Counter(
     "adopted completions included)",
 )
 
+# Issue #782 — archival Job failure counter. Incremented when the operator
+# observes a Failed archival Job (the prune entrypoint or the operator's
+# retention tick). Provides an in-process signal independent of
+# kube-state-metrics: the canonical PruneJobFailed alert keys on
+# ``kube_job_status_failed`` from KSM, which silently cannot fire when
+# KSM is absent. This counter bridges that gap so a KSM-absent cluster
+# still surfaces archival failures at ``/metrics``. Labelled by ``namespace``
+# to distinguish failures across namespaces in multi-tenant clusters.
+ARCHIVAL_JOBS_FAILED_TOTAL = Counter(
+    "openstudio_operator_archival_jobs_failed_total",
+    "Archival Jobs observed in Failed state by the operator or prune "
+    "entrypoint (issue #782). Provides a KSM-independent signal for "
+    "archival failure when kube-state-metrics is absent — the "
+    "OpenStudioOperatorPruneJobFailed alert keys on "
+    "kube_job_status_failed and cannot fire without KSM.",
+    labelnames=["namespace"],
+)
+
 ANALYSES_DELETED_TOTAL = Counter(
     "openstudio_operator_analyses_deleted_total",
     "Analyses deleted by the retention pipeline after verified archival "

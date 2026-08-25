@@ -124,7 +124,11 @@ from kubernetes.client import ApiException
 from openstudio_operator.archival import archival_job_name, build_archival_job
 from openstudio_operator.config import OperatorConfig
 from openstudio_operator.events import TickEmitter
-from openstudio_operator.metrics import ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL
+from openstudio_operator.metrics import (
+    ANALYSES_ARCHIVED_TOTAL,
+    ANALYSES_DELETED_TOTAL,
+    ARCHIVAL_JOBS_FAILED_TOTAL,
+)
 from openstudio_operator.openstudio_client import OpenStudioClient
 from openstudio_operator.status_store import (
     ArchivedAnalysisRecord,
@@ -475,6 +479,9 @@ def _spawn_archival(
         # D11 (#42): the cleanup delete is a cluster mutation — suppressed
         # under spec.dryRun; the failed Job stays for forensics and the
         # first real spawn tick after dryRun lifts performs the removal.
+        # Issue #782 — bump the KSM-independent failure counter so a
+        # KSM-absent cluster still surfaces archival failures at /metrics.
+        ARCHIVAL_JOBS_FAILED_TOTAL.labels(namespace=namespace).inc()
         if not config.dry_run:
             batch_api.delete_namespaced_job(job_name, namespace, propagation_policy="Foreground")
             logger.info("removed failed archival Job %s — respawning (retry)", job_name)
