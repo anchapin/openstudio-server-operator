@@ -76,6 +76,7 @@ import dataclasses
 import functools
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TypeVar
@@ -996,9 +997,56 @@ def singleton_guard_startup(logger: kopf.Logger, **_: object) -> None:
 #: classifies watch events ("did anything BUT ``.status`` change since the
 #: last event we fully processed?"), and every branch that doubts it
 #: falls back to the full relist. Entries are dropped on ``DELETED`` watch
-#: events so CR churn cannot grow it unboundedly (same lifecycle as
-#: ``dry_run_audit._last_dry_run``).
-_guard_last_seen_surface: dict[tuple[str, str], tuple] = {}
+#: events.
+#:
+#: Issue #786 — bounded LRU cache: grows on every MODIFIED event without
+#: a size cap or LRU eviction. In a GitOps pipeline that repeatedly
+#: deletes and recreates CRs, the cache grows monotonically for the
+#: operator's entire lifetime — a memory DoS vector. The cache is now
+#: bounded with LRU eviction when the size exceeds the ceiling.
+_MAX_GUARD_CACHE_ENTRIES = 1000
+
+
+class _BoundedGuardCache:
+    """LRU cache with a hard size ceiling (issue #786).
+
+    Entries are ordered by insertion time (most recent at end). On
+    ``__setitem__``, if the size exceeds :data:`_MAX_GUARD_CACHE_ENTRIES`,
+    the oldest entries are evicted until the size is within the limit.
+    """
+
+    def __init__(self) -> None:
+        self._data: OrderedDict[tuple[str, str], tuple] = OrderedDict()
+
+    def get(self, key: tuple[str, str]) -> tuple | None:
+        """Get an entry, bumping it to the end (most recent) if found."""
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        return None
+
+    def set(self, key: tuple[str, str], value: tuple) -> None:
+        """Set an entry, evicting oldest if the ceiling is exceeded."""
+        if key in self._data:
+            self._data.move_to_end(key)
+            self._data[key] = value
+            return
+        self._data[key] = value
+        while len(self._data) > _MAX_GUARD_CACHE_ENTRIES:
+            self._data.popitem(last=False)
+
+    def pop(self, key: tuple[str, str], default: tuple | None = None) -> tuple | None:
+        """Remove an entry if present."""
+        return self._data.pop(key, default)
+
+    def __contains__(self, key: tuple[str, str]) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+_guard_last_seen_surface: _BoundedGuardCache = _BoundedGuardCache()
 
 
 def _cr_policy_surface(body: Mapping) -> tuple:
@@ -1102,4 +1150,4 @@ def singleton_guard_event(
     # Record the surface ONLY after a full check ran for it — the entry
     # asserts "this surface was processed by a real relist", which is the
     # invariant ``_skip_guard_relist`` relies on.
-    _guard_last_seen_surface[key] = _cr_policy_surface(body)
+    _guard_last_seen_surface.set(key, _cr_policy_surface(body))
