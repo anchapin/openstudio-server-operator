@@ -1,0 +1,19 @@
+{
+  "repo": "anchapin/openstudio-server-operator",
+  "base_branch": "develop",
+  "current_wave": 3,
+  "waves": [
+    {
+      "wave": 1,
+      "issues": [792, 793],
+      "prs": [802, 803],
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "issues": [775, 776, 778],
+      "prs": [803, 804, 805],
+      "status": "completed"
+    }
+  ]
+}
