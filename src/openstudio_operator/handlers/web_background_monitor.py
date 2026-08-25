@@ -298,39 +298,26 @@ RESQUE_KEY_LAYOUT_UNKNOWN_EVENT = "ResqueKeyLayoutUnknown"
 #: :data:`openstudio_operator._constants.LAYOUT_WARNING_GRACE_SECONDS`.
 _LAYOUT_WARNING_GRACE_SECONDS = LAYOUT_WARNING_GRACE_SECONDS
 
-#: Process-lifetime flags for the leg-2 safeguard (issue #44): the
-#: high-water mark of distinct workers ever observed (drives the monotonic
-#: gauge), the first tick the empty-registry state began (for the
-#: grace-period check), and a one-shot warning emission flag.
-#:
-#: Issue #497 census note: these are deliberately UN-keyed process-lifetime
-#: state, NOT per-CR caches — they diagnose the Resque key layout (a
-#: Redis-server property, not a CR property) and the layout warning is
-#: one-shot PER PROCESS by design. :func:`reset_leg2_safeguard_state` is
-#: the existing test seam; a CR delete+recreate must not re-arm a
-#: process-level diagnostic.
-#:
-#: The Redis client cache that used to live here was retired in #235 — one
-#: ``lru_cache`` in :mod:`openstudio_operator.client_factory` now serves
-#: every callsite (this handler, the SLA monitor's escalation lookup and the
-#: boot-time key-layout probe), mirroring what #168 did for the REST client.
-_max_workers_seen: int = 0
-_empty_registry_since: datetime | None = None
-_resque_layout_warning_emitted: bool = False
+@dataclass
+class Leg2SafeguardState:
+    """Per-CR leg-2 safeguard state (issue #797).
 
+    Issue #797 — the three leg-2 safeguard fields are now keyed per CR
+    identity (``namespace, name``), replacing the pre-#797 process-level
+    globals. In a canary-testing or multi-CR scenario the same Redis
+    registry clock is no longer shared — a second CR in the namespace
+    earns its own grace tracking and cannot corrupt the first CR's
+    leg-2 window.
 
-def reset_leg2_safeguard_state() -> None:
-    """Test-only: clear the process-lifetime leg-2 safeguard state.
-
-    Also resets the monotonic :data:`RESQUE_WORKERS_SEEN_MAX` gauge so each
-    test starts at zero — the Gauge is process-level (Prometheus client
-    module-level singleton) and would otherwise bleed across tests.
+    The fields mirror the pre-#797 globals:
+    * ``max_workers_seen`` — high-water mark of distinct workers observed
+    * ``empty_registry_since`` — first tick the empty-registry state began
+    * ``layout_warning_emitted`` — one-shot warning emission flag
     """
-    global _max_workers_seen, _empty_registry_since, _resque_layout_warning_emitted
-    _max_workers_seen = 0
-    _empty_registry_since = None
-    _resque_layout_warning_emitted = False
-    RESQUE_WORKERS_SEEN_MAX.set(0)
+
+    max_workers_seen: int = 0
+    empty_registry_since: datetime | None = None
+    layout_warning_emitted: bool = False
 
 
 #: Issue #490 — when this module last re-ran the Redis key-layout
@@ -397,13 +384,6 @@ def _maybe_revalidate_redis_key_layout(
 
 
 _RUNNING = "Running"
-
-# Note: ``_max_workers_seen``, ``_empty_registry_since``, and
-# ``_resque_layout_warning_emitted`` live at the top of this module
-# alongside ``RESQUE_KEY_LAYOUT_UNKNOWN_EVENT`` — colocating the issue #44
-# safeguard state with the constants it gates keeps the leg-2 fix auditable
-# in one place.
-
 
 class StallWindowTracker:
     """In-memory sustained-window clock for one CR (cache, D04; #582).
@@ -561,6 +541,47 @@ def reset_per_cr_caches(namespace: str | None = None, name: str | None = None) -
     _tracker_cache.reset(namespace, name)
 
 
+#: Issue #797 — the leg-2 safeguard state cache. Each entry is keyed by
+#: ``(namespace, name)`` and uid-validated (issue #497). A delete+recreate
+#: of the CR (#364) starts a fresh state entry so the new CR doesn't
+#: inherit the deleted CR's worker observations or elapsed grace time.
+_leg2_cache: cr_cache.PerCRCache[Leg2SafeguardState] = cr_cache.PerCRCache(
+    stale_log=(
+        "Leg2SafeguardState cache entry for %s/%s belongs to a deleted "
+        "CR (recorded uid %r != observed %r) — starting a fresh "
+        "leg-2 safeguard state (#364 delete+recreate; #797 uid validation)"
+    ),
+    logger=logger,
+    on_fresh=_warn_singleton_guard_bypass,
+)
+
+
+def _get_leg2_state(
+    namespace: str, name: str, uid: str | None = None
+) -> Leg2SafeguardState:
+    """Return the per-CR leg-2 safeguard state, uid-validating the entry.
+
+    Issue #797 — the pre-#797 process-level globals are replaced by a
+    per-CR cache so multi-CR scenarios (canary testing, namespace
+    reuse) each earn independent grace tracking.
+    """
+    return _leg2_cache.get_or_create(namespace, name, uid, Leg2SafeguardState)
+
+
+def reset_leg2_safeguard_state(namespace: str | None = None, name: str | None = None) -> None:
+    """Test-only: clear the leg-2 safeguard state (per-CR cache or all entries).
+
+    Issue #797 — the per-CR cache replaces the pre-#797 process-level
+    globals. Pass both ``namespace`` and ``name`` to clear exactly one
+    CR's entry; pass neither to clear all entries (test isolation).
+    Also resets the monotonic :data:`RESQUE_WORKERS_SEEN_MAX` gauge so each
+    test starts at zero — the Gauge is process-level (Prometheus client
+    module-level singleton) and would bleed across tests.
+    """
+    _leg2_cache.reset(namespace, name)
+    RESQUE_WORKERS_SEEN_MAX.set(0)
+
+
 def _worker_pods_healthy(
     apps_api: DeploymentManager, pods_api: PodLister, *, namespace: str, deployment: str
 ) -> bool:
@@ -605,6 +626,7 @@ def _stall_condition_holds(
     apps_api: DeploymentManager,
     pods_api: PodLister,
     *,
+    leg2_state: Leg2SafeguardState,
     namespace: str,
     worker_deployment: str,
     stale_seconds: float,
@@ -636,8 +658,10 @@ def _stall_condition_holds(
     PRESERVED — the safeguard is purely additive (observability +
     one-shot warning). If a real worker heartbeat appears at any point
     during the grace window, the timer resets and no warning fires.
+
+    Issue #797 — leg-2 state is keyed per CR identity to prevent
+    cross-CR state corruption in multi-CR scenarios.
     """
-    global _max_workers_seen, _empty_registry_since
     # Issue #87 — unconditional worker observation: read the worker set on
     # EVERY tick that successfully reads Redis and advance the monotonic
     # gauge before any leg evaluation, so a healthy idle fleet (empty
@@ -647,9 +671,10 @@ def _stall_condition_holds(
     # unchanged).
     registered = redis_client.worker_heartbeats()
     # Track the high-water mark of distinct workers seen (#44 safeguard).
-    if len(registered) > _max_workers_seen:
-        _max_workers_seen = len(registered)
-        RESQUE_WORKERS_SEEN_MAX.set(_max_workers_seen)
+    # Issue #797 — per-CR state instead of process-level globals.
+    if len(registered) > leg2_state.max_workers_seen:
+        leg2_state.max_workers_seen = len(registered)
+        RESQUE_WORKERS_SEEN_MAX.set(leg2_state.max_workers_seen)
     # Leg A: work is queued (either managed Resque queue).
     # Issue #238 — surface the operator's authoritative LLEN reads as a
     # Prometheus Gauge before the leg evaluation runs, so the metric is
@@ -678,14 +703,15 @@ def _stall_condition_holds(
     # (vacuously true for an empty registry: no worker is processing either).
     # The #44 grace tracking stays leg-A-gated: the layout warning must only
     # ever fire under real load, never on an idle empty fleet.
+    # Issue #797 — per-CR state instead of process-level globals.
     if not registered:
-        if _empty_registry_since is None:
-            _empty_registry_since = now
+        if leg2_state.empty_registry_since is None:
+            leg2_state.empty_registry_since = now
         # An empty registry holds vacuously: the stall can still hold.
     else:
         # A worker appeared — clear the grace window so the safeguard
         # doesn't false-fire on a later transient empty period.
-        _empty_registry_since = None
+        leg2_state.empty_registry_since = None
     stale = redis_client.stale_workers(threshold_seconds=stale_seconds)
     if len(stale) < len(registered):
         return False
@@ -696,27 +722,28 @@ def _stall_condition_holds(
 
 
 def _maybe_warn_resque_layout_unknown(
-    *, now: datetime, emit: EventEmitter, logger: logging.Logger
+    *, leg2_state: Leg2SafeguardState, now: datetime, emit: EventEmitter, logger: logging.Logger
 ) -> None:
     """Emit :data:`RESQUE_KEY_LAYOUT_UNKNOWN_EVENT` once if the safeguard triggers.
 
     Trigger: empty registry has held for :data:`_LAYOUT_WARNING_GRACE_SECONDS`
-    AND ``_max_workers_seen == 0`` (never saw a worker heartbeat at all in
-    this process) AND the operator is in a real load (leg A held this tick
+    AND ``max_workers_seen == 0`` (never saw a worker heartbeat at all in
+    this CR) AND the operator is in a real load (leg A held this tick
     — the warn is gated on that so it doesn't fire on an idle cluster).
-    Once fired, never fires again in this process (gate flag below).
+    Once fired, never fires again for this CR (gate flag below).
+
+    Issue #797 — per-CR state instead of process-level globals.
     """
-    global _resque_layout_warning_emitted
-    if _resque_layout_warning_emitted:
+    if leg2_state.layout_warning_emitted:
         return
-    if _max_workers_seen > 0:
+    if leg2_state.max_workers_seen > 0:
         return  # we've seen workers before — empty registry is a transient cold start
-    if _empty_registry_since is None:
+    if leg2_state.empty_registry_since is None:
         return
-    if now - _empty_registry_since < _LAYOUT_WARNING_GRACE_SECONDS:
+    if now - leg2_state.empty_registry_since < _LAYOUT_WARNING_GRACE_SECONDS:
         return
-    _resque_layout_warning_emitted = True
-    elapsed = int((now - _empty_registry_since).total_seconds())
+    leg2_state.layout_warning_emitted = True
+    elapsed = int((now - leg2_state.empty_registry_since).total_seconds())
     message = (
         f"Resque worker registry has been empty for {elapsed}s while a "
         f"non-zero queue depth is observed. The centralized Resque key "
@@ -743,6 +770,7 @@ def run_stall_tick(
     now: datetime,
     emit: EventEmitter,
     tracker: StallWindowTracker,
+    leg2_state: Leg2SafeguardState,
 ) -> bool:
     """One stall evaluation. Returns whether a restart fired this tick.
 
@@ -792,6 +820,7 @@ def run_stall_tick(
             redis_client,
             apps_api,
             pods_api,
+            leg2_state=leg2_state,
             namespace=namespace,
             worker_deployment=config.target_worker_deployment or DEFAULT_WORKER_DEPLOYMENT,
             stale_seconds=DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS,
@@ -819,7 +848,7 @@ def run_stall_tick(
     # emit the warning must not skip the tick (it's diagnostic, not load-
     # bearing on the stall evaluation).
     try:
-        _maybe_warn_resque_layout_unknown(now=now, emit=emit, logger=logger)
+        _maybe_warn_resque_layout_unknown(leg2_state=leg2_state, now=now, emit=emit, logger=logger)
     except Exception as exc:  # noqa: BLE001 — defensive only (diagnostic emit)
         logger.debug("leg-2 safeguard emit failed: %s", exc)
 
@@ -994,6 +1023,7 @@ class _StallTimerClients:
     apps_api: DeploymentManager
     pods_api: PodLister
     tracker: StallWindowTracker
+    leg2_state: Leg2SafeguardState
 
 
 @kopf.timer(**CRD_SPEC, interval=POLL_INTERVAL_SECONDS)
@@ -1046,6 +1076,7 @@ def web_background_monitor(
             apps_api=operator_apps_api(),
             pods_api=operator_core_api(),
             tracker=_get_tracker(namespace, name, cr_cache.cr_uid(body)),
+            leg2_state=_get_leg2_state(namespace, name, cr_cache.cr_uid(body)),
         )
 
     def tick(
@@ -1072,6 +1103,7 @@ def web_background_monitor(
             now=now,
             emit=emit,
             tracker=deps.tracker,
+            leg2_state=deps.leg2_state,
         )
 
     fired = run_oscm_tick(

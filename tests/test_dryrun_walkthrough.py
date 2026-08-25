@@ -53,6 +53,7 @@ from openstudio_operator.handlers.datapoint_watchdog import (
 )
 from openstudio_operator.handlers.web_background_monitor import (
     WEB_BACKGROUND_RESTARTED_EVENT,
+    Leg2SafeguardState,
     StallWindowTracker,
     run_stall_tick,
 )
@@ -924,6 +925,7 @@ def _seed_stall(api: FakeCO, *, spec: dict, tracker: StallWindowTracker) -> None
     cfg = OperatorConfig.from_spec(spec)
     for offset in (0, 5):
         _events, emit = make_emit()
+        leg2_state = Leg2SafeguardState()
         run_stall_tick(
             _stall_redis(NOW + timedelta(minutes=offset)),
             store,
@@ -934,6 +936,7 @@ def _seed_stall(api: FakeCO, *, spec: dict, tracker: StallWindowTracker) -> None
             now=NOW + timedelta(minutes=offset),
             emit=emit,
             tracker=tracker,
+            leg2_state=leg2_state,
         )
 
 
@@ -953,6 +956,7 @@ def test_dryrun_web_background_restart_is_strict_suppression():
         store = StatusStore(NAMESPACE, NAME, api)
         cfg = OperatorConfig.from_spec(spec)
         events, emit = make_emit()
+        leg2_state = Leg2SafeguardState()
         run_stall_tick(
             _stall_redis(NOW + timedelta(minutes=10)),
             store,
@@ -963,6 +967,7 @@ def test_dryrun_web_background_restart_is_strict_suppression():
             now=NOW + timedelta(minutes=10),
             emit=emit,
             tracker=tracker,
+            leg2_state=leg2_state,
         )
         return apps, events, metric("openstudio_operator_web_background_restarts_total") - before, api
 
@@ -1272,6 +1277,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
     tracker = StallWindowTracker()
     for offset in (0, 5):
         events, emit = make_emit()
+        leg2_state = Leg2SafeguardState()
         run_stall_tick(
             _stall_redis(NOW + timedelta(minutes=offset)),
             store,
@@ -1282,8 +1288,10 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
             now=NOW + timedelta(minutes=offset),
             emit=emit,
             tracker=tracker,
+            leg2_state=leg2_state,
         )
     events, emit = make_emit()
+    leg2_state = Leg2SafeguardState()
     run_stall_tick(
         _stall_redis(NOW + timedelta(minutes=10)),
         store,
@@ -1294,6 +1302,7 @@ def test_dryrun_walkthrough_all_modules_suppress_mutations_only():
         now=NOW + timedelta(minutes=10),
         emit=emit,
         tracker=tracker,
+        leg2_state=leg2_state,
     )
     wbm_events = [e for e in events if e[1] == WEB_BACKGROUND_RESTARTED_EVENT]
     assert len(wbm_events) == 1
