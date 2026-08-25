@@ -1238,12 +1238,13 @@ def test_escalation_with_partial_pod_delete_failure_re_raises_and_retries():
     register_analyses_index("a1")
     register_analysis_status("a1")
     redis_client2 = FakeRedisClient({})
-    result2, _events2 = tick(
+    result2, events2 = tick(
         api2,
         pod_api=FakePodsCoreV1Api([]),
         redis_client=redis_client2,
     )
-    assert result2.escalated == []
+    assert result2.escalated == ["a1"]
+    assert events2[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
 
 
 @responses.activate
