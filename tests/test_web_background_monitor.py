@@ -35,8 +35,10 @@ from openstudio_operator.handlers.web_background_monitor import (
     RESQUE_KEY_LAYOUT_UNKNOWN_EVENT,
     WEB_BACKGROUND_RESTART_INEFFECTIVE_EVENT,
     WEB_BACKGROUND_RESTARTED_EVENT,
+    Leg2SafeguardState,
     StallWindowTracker,
     _backoff_windows,
+    _get_leg2_state,
     run_stall_tick,
 )
 from openstudio_operator.handlers.web_background_monitor import (
@@ -150,12 +152,15 @@ def tick(
     now=NOW,
     tracker=None,
     redis=None,
+    leg2_state=None,
 ):
     store = StatusStore(NAMESPACE, NAME, api)
     config = OperatorConfig.from_spec(spec if spec is not None else SPEC)
     events, emit = make_emit()
     if tracker is None:
         tracker = StallWindowTracker()
+    if leg2_state is None:
+        leg2_state = _get_leg2_state(NAMESPACE, NAME)
     fired = run_stall_tick(
         redis if redis is not None else stall_redis(now),
         store,
@@ -166,6 +171,7 @@ def tick(
         now=now,
         emit=emit,
         tracker=tracker,
+        leg2_state=leg2_state,
     )
     return fired, events
 
@@ -1760,13 +1766,16 @@ def test_resque_layout_warning_message_names_current_worker_registry_key(monkeyp
     live validation moved worker heartbeats once already), the message
     tracks it instead of silently naming a dead key.
     """
-    wbm_module.reset_leg2_safeguard_state()
-    # Grace window opened 61 s ago (past the 60 s grace), never saw a worker.
-    monkeypatch.setattr(wbm_module, "_empty_registry_since", NOW - timedelta(seconds=61))
+    leg2_state = Leg2SafeguardState(
+        empty_registry_since=NOW - timedelta(seconds=61),
+    )
     events, emit = make_emit()
 
     wbm_module._maybe_warn_resque_layout_unknown(
-        now=NOW, emit=emit, logger=_logging.getLogger(__name__)
+        leg2_state=leg2_state,
+        now=NOW,
+        emit=emit,
+        logger=_logging.getLogger(__name__),
     )
 
     assert len(events) == 1
@@ -2075,6 +2084,7 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
 
     # Two ticks: the first establishes the sustained window; the second fires
     # the restart Warning Event (the only emit path under full stall).
+    leg2_state = Leg2SafeguardState()
     fired1 = run_stall_tick(
         redis,
         store,
@@ -2085,7 +2095,9 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
         now=NOW,
         emit=emitter,
         tracker=tracker,
+        leg2_state=leg2_state,
     )
+    leg2_state2 = Leg2SafeguardState()
     fired2 = run_stall_tick(
         stall_redis(NOW + minute(10)),
         store,
@@ -2096,6 +2108,7 @@ def test_run_stall_tick_accepts_mappingview_body_in_event_emitter():
         now=NOW + minute(10),
         emit=emitter,
         tracker=tracker,
+        leg2_state=leg2_state2,
     )
 
     assert fired1 is False  # window accumulating, not yet sustained
