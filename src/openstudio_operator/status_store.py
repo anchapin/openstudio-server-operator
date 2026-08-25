@@ -33,7 +33,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kubernetes.client import ApiException, CustomObjectsApi
@@ -667,7 +667,7 @@ class StatusStore:
                 if ts is None:
                     continue
                 try:
-                    entry_time = parse_iso_utc(ts)
+                    entry_time = utc_parser(ts)
                     if entry_time < cutoff:
                         to_remove.append(key)
                 except (ValueError, TypeError):
