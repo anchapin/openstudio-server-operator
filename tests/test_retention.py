@@ -746,7 +746,7 @@ def test_archival_job_create_409_conflict_does_not_delete(caplog):
     register_datapoints([{"_id": "dp-1", "analysis_id": analysis_id}])
     stored = archiving_status(analysis_id, job_name)
 
-    result, events = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+    result, _ = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
 
     # Job already exists (409 case) — analysis not deleted
     assert result.deleted == []
@@ -769,9 +769,8 @@ def test_archival_job_delete_failure_on_respawn_raises(caplog):
     # Delete of failed job will fail
     batch.fail_with = ApiException(status=500, reason="Internal Server Error")
 
-    with caplog.at_level("WARNING"):
-        with pytest.raises(ApiException) as excinfo:
-            tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+    with caplog.at_level("WARNING"), pytest.raises(ApiException) as excinfo:
+        tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
 
     assert excinfo.value.status == 500
 
@@ -790,7 +789,7 @@ def test_archival_job_read_unexpected_condition_does_not_delete(caplog):
     stored = archiving_status(analysis_id, job_name)
 
     with caplog.at_level("WARNING"):
-        result, events = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+        result, _ = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
 
     # No delete issued — unexpected condition is skipped silently
     assert result.deleted == []
