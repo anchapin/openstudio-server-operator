@@ -6,6 +6,7 @@ configuration, never hardcoded constants in handlers (per AGENTS.md).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 #: Issue #116 — empty by design. The historical default
@@ -26,6 +27,29 @@ DEFAULT_REDIS_URL = ""
 #: NOT a CRD field — the v1alpha1 schema is fixed (#4) — so it lives here as
 #: a documented wiring default (same convention as DEFAULT_REDIS_URL).
 DEFAULT_WORKER_HEARTBEAT_STALE_SECONDS = 300.0
+
+_SPEC_TOP_LEVEL_FIELDS = (
+    "serverUrl",
+    "redisUrl",
+    "redisCredentials",
+    "dryRun",
+    "targetWorkerDeployment",
+    "targetWebBackgroundDeployment",
+    "analysisPolicy",
+    "datapointPolicy",
+    "workerPolicy",
+    "webBackgroundPolicy",
+    "storagePolicy",
+)
+
+_ANALYSIS_POLICY_FIELDS = (
+    "maxDurationMinutes",
+    "gracefulStopTimeoutMinutes",
+    "autoSoftStop",
+    "forceDeleteOnEscalation",
+)
+
+_from_spec_logger = logging.getLogger(__name__ + ".from_spec")
 
 
 class OperatorConfigError(Exception):
@@ -189,13 +213,27 @@ class OperatorConfig:
         required field must be checked in ``run_oscm_tick`` before returning
         the config to the handler, surfacing the gap as a Warning event rather
         than silently misconfiguring.
+
+        Issue #781 — per-field auditable log: each top-level spec field
+        present in the dict is logged with its parsed value so that a CR
+        typo (e.g. ``maxdurationMinutes`` instead of ``maxDurationMinutes``)
+        is visible as the expected field being absent from the log, not
+        silently replaced by the Python default.
         """
+        _from_spec_logger.info(
+            "config from_spec: top-level spec fields present: %s",
+            [k for k in _SPEC_TOP_LEVEL_FIELDS if k in spec],
+        )
         analysis = spec.get("analysisPolicy", {})
         datapoint = spec.get("datapointPolicy", {})
         worker = spec.get("workerPolicy", {})
         web_background = spec.get("webBackgroundPolicy", {})
         storage = spec.get("storagePolicy", {})
         redis_credentials = spec.get("redisCredentials") or {}
+        _from_spec_logger.debug(
+            "config from_spec: analysisPolicy fields present: %s",
+            [k for k in _ANALYSIS_POLICY_FIELDS if k in analysis] if analysis else [],
+        )
         return cls(
             server_url=spec.get("serverUrl", ""),
             redis_url=spec.get("redisUrl", DEFAULT_REDIS_URL),
