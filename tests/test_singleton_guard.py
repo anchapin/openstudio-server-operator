@@ -26,6 +26,7 @@ from openstudio_operator.singleton import (
     SINGLETON_CONFLICT_EVENT,
     SingletonGuard,
     SingletonGuardError,
+    _BoundedGuardCache,
     install_singleton_guard,
     is_active_cr,
     resolve_active_cr,
@@ -884,7 +885,7 @@ def _wire_guard_590(monkeypatch, log, items):
     monkeypatch.setattr(singleton, "emit_kopf_event", emit)
     monkeypatch.setattr(singleton, "_redis_url_warned", set())
     monkeypatch.setattr(singleton, "_redis_secret_ref_forbidden_warned", set())
-    monkeypatch.setattr(singleton, "_guard_last_seen_surface", {})
+    monkeypatch.setattr(singleton, "_guard_last_seen_surface", _BoundedGuardCache())
     return api, events
 
 
@@ -1014,7 +1015,7 @@ def test_guard_event_status_only_skip_fails_closed_until_state_resolved(caplog, 
     monkeypatch.setattr(singleton, "_process_guard", broken)
     _events, emit = make_sink()
     monkeypatch.setattr(singleton, "emit_kopf_event", emit)
-    monkeypatch.setattr(singleton, "_guard_last_seen_surface", {})
+    monkeypatch.setattr(singleton, "_guard_last_seen_surface", _BoundedGuardCache())
 
     # First event: the relist EXPLODES (swallowed warning), state unresolved,
     # but the surface IS recorded — the worst case for the skip gate.
