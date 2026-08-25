@@ -1175,11 +1175,13 @@ def test_auto_soft_stop_false_keeps_module_passive_even_with_old_anchor():
 
 
 @responses.activate
-def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_does_not_re_emit():
-    """Pod A evicts; Pod B raises on delete_namespaced_pod. The function must
-    (a) record the partial outcome, (b) stamp mark_soft_stop_escalated anyway,
-    (c) NOT re-emit ``AnalysisEscalated`` on the next tick (because
-    ``escalatedAt`` is now set on the anchor)."""
+def test_escalation_with_partial_pod_delete_failure_re_raises_and_retries():
+    """Pod A evicts; Pod B raises non-404 on delete_namespaced_pod.
+    Issue #779 fix: any per-pod non-404 ApiException causes the tick to
+    skip (re-raise), so the next poll retries the eviction. The partial
+    outcome is NOT stamped on the first tick — the re-raise blocks it.
+    When the second tick finds no workers (analysis completed), escalated
+    is a no-op."""
     api = FakeCustomObjectsApi(
         make_cr(
             status={
@@ -1194,7 +1196,7 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
     )
     register_analyses_index("a1")
     register_analysis_status("a1")
-    register_stop_analysis("a1")  # issue #707: new stop_analysis branch
+    register_stop_analysis("a1")
     pods = [make_pod("worker-1"), make_pod("worker-2")]
 
     class PartialPodApi(FakePodsCoreV1Api):
@@ -1206,8 +1208,6 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
             return super().delete_namespaced_pod(name, namespace, **kwargs)
 
     pod_api = PartialPodApi(pods)
-    # Two Resque workers currently processing the analysis — victims will
-    # be 2 entries, exercising the per-pod try/except in the loop.
     redis_client = FakeRedisClient(
         {
             "worker-1:1:requeued,simulations": ["a1"],
@@ -1215,25 +1215,14 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
         }
     )
 
-    result, events = tick(
-        api,
-        pod_api=pod_api,
-        redis_client=redis_client,
-    )
+    with pytest.raises(Exception, match="Internal Server Error"):
+        tick(
+            api,
+            pod_api=pod_api,
+            redis_client=redis_client,
+        )
+    assert api.obj["status"]["softStops"]["a1"].get("escalatedAt") is None
 
-    assert result.escalated == ["a1"]
-    # issue #707: two events — AnalysisStopped then AnalysisEscalated
-    assert len(events) == 2
-    assert events[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
-    # outcome recorded as partial
-    anchor = api.obj["status"]["softStops"]["a1"]
-    assert anchor["escalationOutcome"] == "evicted-partial"
-    assert anchor["escalatedAt"] is not None
-    # pod_api saw exactly one real delete call before the failure.
-    assert [d["name"] for d in pod_api.deletes] == ["worker-1"]
-
-    # Second tick — must be a no-op (anchor is pre-escalated). Resque and
-    # pod-side mocks must be re-supplied identically.
     api2 = FakeCustomObjectsApi(
         make_cr(
             status={
@@ -1241,28 +1230,21 @@ def test_escalation_with_partial_pod_delete_failure_stamps_partial_outcome_and_d
                     "a1": {
                         "issuedAt": PAST_GRACE.isoformat(),
                         "outcome": "issued",
-                        "escalatedAt": anchor["escalatedAt"],
-                        "escalationOutcome": "evicted-partial",
                     }
                 }
             }
         )
     )
-    register_analyses_index("a1")  # register on the new api
+    register_analyses_index("a1")
     register_analysis_status("a1")
-    redis_client2 = FakeRedisClient(
-        {
-            "worker-1:1:requeued,simulations": ["a1"],
-            "worker-2:1:requeued,simulations": ["a1"],
-        }
-    )
+    redis_client2 = FakeRedisClient({})
     result2, events2 = tick(
         api2,
-        pod_api=FakePodsCoreV1Api(pods),
+        pod_api=FakePodsCoreV1Api([]),
         redis_client=redis_client2,
     )
-    assert result2.escalated == []
-    assert events2 == []
+    assert result2.escalated == ["a1"]
+    assert events2[-1][:2] == ("Warning", ANALYSIS_ESCALATED_EVENT)
 
 
 @responses.activate
