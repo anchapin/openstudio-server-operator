@@ -25,6 +25,7 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_worker_pods_evicted_total",
     "openstudio_operator_web_background_restarts_total",
     "openstudio_operator_analyses_archived_total",
+    "openstudio_operator_archival_jobs_failed_total",  # issue #782
     "openstudio_operator_analyses_deleted_total",
     # Issue #119 — status-store 409 retry observability surface.
     "openstudio_operator_status_conflicts_total",

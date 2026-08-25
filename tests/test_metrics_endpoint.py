@@ -206,6 +206,10 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.WORKERS_RECYCLED_TOTAL.labels(trigger="__metrics_test_sentinel__").inc()
     metrics.WORKER_PODS_EVICTED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
     metrics.ANALYSES_DELETED_TOTAL.labels(outcome="__metrics_test_sentinel__").inc()
+    # Issue #782 — pre-touch the archival job failure counter. Labelled by
+    # ``namespace``; cardinality is bounded by the one-namespace-per-deploy
+    # model (D05) so the series vocabulary stays bounded.
+    metrics.ARCHIVAL_JOBS_FAILED_TOTAL.labels(namespace=SENTINEL_NAMESPACE).inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -381,6 +385,12 @@ def test_metrics_http_server_serves_all_declared_counters():
         elif name == "openstudio_operator_analyses_deleted_total":
             assert (
                 'openstudio_operator_analyses_deleted_total{outcome="__metrics_test_sentinel__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_archival_jobs_failed_total":
+            # Issue #782 — labelled by namespace; cardinality bounded by D05.
+            assert (
+                'openstudio_operator_archival_jobs_failed_total{namespace="__metrics_test_sentinel_ns__"}'
                 in response.text
             )
         elif name == "openstudio_operator_rest_retries_total":

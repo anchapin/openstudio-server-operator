@@ -648,6 +648,35 @@ spec:
               only (README #470).
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
+        # Issue #782 — KSM-independent sibling of OpenStudioOperatorPruneJobFailed.
+        # The PruneJobFailed alert above requires kube-state-metrics; if KSM is
+        # absent, that alert silently cannot fire even though the archival
+        # pipeline is wedged. This alert keys on the operator-scope counter
+        # openstudio_operator_archival_jobs_failed_total, incremented by the
+        # operator or prune entrypoint whenever a Failed archival Job is
+        # observed — in-process and KSM-independent. A rate window of 30m
+        # (6 missed */10 schedules, same window as the sibling above) filters
+        # transient noise while catching sustained archival failures.
+        - alert: OpenStudioOperatorArchivalJobFailedKSMIndependent
+          expr: rate(openstudio_operator_archival_jobs_failed_total{namespace="openstudio-server"}[30m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Archival Job failure observed (KSM-independent fallback, issue #782)
+            description: >-
+              openstudio_operator_archival_jobs_failed_total increased in the
+              last 30 minutes for namespace openstudio-server — an archival Job
+              was observed in Failed state by the operator or prune entrypoint.
+              This is the KSM-independent fallback alert: the sibling
+              OpenStudioOperatorPruneJobFailed (kube_job_status_failed-based)
+              cannot fire when kube-state-metrics is absent, but this counter
+              fires regardless. The storage-archival backlog grows while this
+              fires. Triage: kubectl get jobs -n openstudio-server -l
+              app.kubernetes.io/component=storage-pruner, then read the Job
+              pod logs.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
         # Issue #569 — the absence-of-success complement the #468 set
         # deferred (see the comment on the failed-Job alert above). Every
         # signal in this manifest's other groups belongs to the OPERATOR
