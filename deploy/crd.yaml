@@ -170,10 +170,11 @@ spec:
                           description: "Name of a Secret in this namespace. Must match the openstudio-redis* naming convention (issue #463). The DEFAULT operator Role (deploy/rbac.yaml) grants secrets:get only on the canonical name(s) via resourceNames (default: 'openstudio-redis', issue #606) — a custom name requires adding it there and fails at read time (403) until the Role is widened."
                         key:
                           type: string
-                          # Secret keys are [-._a-zA-Z0-9] per the K8s API; this
-                          # pattern rejects empty values and embedded whitespace.
                           maxLength: 253
                           pattern: '^[A-Za-z0-9][-A-Za-z0-9._]*$'
+                          x-kubernetes-validations:
+                            - rule: "self.size() > 0"
+                              message: "spec.redisCredentials.secretRef.key must be non-empty (issue #780)."
                           description: "Secret key holding the full redis:// URL (e.g. 'redis-url'). No default; always explicit."
                 dryRun:
                   type: boolean
