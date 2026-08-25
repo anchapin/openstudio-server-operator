@@ -687,15 +687,12 @@ def _escalate_analysis(
         outcome = ESCALATION_EVICTED
     if evicted_count > 0:
         WORKER_PODS_EVICTED_TOTAL.labels(outcome=outcome).inc(evicted_count)
-    if last_failure is not None:
+    if last_failure is not None and (last_failure.status != 404 or evicted_count == 0):
         # Non-None last_failure means at least one pod failed.
         # Re-raise non-404 failures so the tick skips and retries on next poll —
         # the same D12 posture as the API-server-outage case.
         # 404 means the pod is already gone (evicted by someone else), not a real error.
-        if last_failure.status != 404 or evicted_count == 0:
-            # All pods failed — re-raise so the wrapper's except branch can
-            # observe it (and the tick counter can record the failure).
-            raise last_failure
+        raise last_failure
     age_minutes = int((now - record.issued_at) // timedelta(minutes=1))
     message = (
         f"Analysis {analysis_id} still started {age_minutes}m after soft stop "
