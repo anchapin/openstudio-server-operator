@@ -577,6 +577,25 @@ class ExplodingAppsV1Api:
         raise ApiException(status=500, reason="Internal Server Error")
 
 
+class TimeoutAppsV1Api:
+    """``patch_namespaced_deployment`` always raises a timeout ApiException.
+
+    Issue #796 — the BoundedK8sRequest wrapper translates urllib3
+    timeout errors into ApiException(status=0, reason="K8s API request timed out").
+    This class simulates that path through the actual handler tick function.
+    """
+
+    def __init__(self) -> None:
+        self.patch_attempts = 0
+
+    def patch_namespaced_deployment(self, name, namespace, body, **kwargs):
+        self.patch_attempts += 1
+        raise ApiException(
+            status=0,
+            reason="K8s API request timed out (bounded at 15s by K8S_REQUEST_TIMEOUT_SECONDS, issue #579): ReadTimeoutError: HTTPConnectionPool(host='apiserver.incluster.example', port=6443): Read timed out. (read timeout=15)",
+        )
+
+
 def analyses_calls() -> int:
     return sum(
         1 for call in responses.calls if call.request.url.startswith(f"{BASE}/analyses.json")
@@ -692,6 +711,31 @@ def test_api_exception_from_deployment_patch_is_caught_by_wrapper(monkeypatch, c
     assert api.patch_calls == 0
     assert api.obj["status"] == {}
     assert workers_recycled_total() - metric_before == 0
+
+
+@responses.activate
+def test_timeout_api_exception_from_deployment_patch_is_caught_by_wrapper(monkeypatch, caplog):
+    """Issue #796 — integration test: timeout ApiException through the real tick function.
+
+    The BoundedK8sRequest wrapper translates urllib3 timeout errors into
+    ApiException(status=0, reason="K8s API request timed out..."). This test
+    verifies the full end-to-end path: a FakeAppsV1Api that raises this
+    timeout ApiException, called through the real run_recycler_tick function,
+    must result in the skip counter being incremented and no exception escaping.
+    """
+    register_analyses(analyses_payload("completed"))
+    apps = TimeoutAppsV1Api()
+    api = FakeCustomObjectsApi(make_cr())
+
+    before = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "ApiException")
+    result = call_wrapper(monkeypatch, api=api, apps=apps)
+    after = tick_failures_total(NAMESPACE, NAME, "worker_recycler", "ApiException")
+
+    assert result is None, "wrapper must swallow timeout ApiException and return None"
+    assert apps.patch_attempts == 1
+    assert after - before == 1.0, "HANDLER_TICK_FAILURES_TOTAL must be incremented for ApiException"
+    assert "worker recycler tick skipped, retrying next poll (ApiException" in caplog.text
+    assert "timed out" in caplog.text, "timeout reason must be logged"
 
 
 @responses.activate
