@@ -42,7 +42,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
 ruff check .     # lint (line-length 100; E402 enforced via [tool.ruff.lint] extend-select, #507; CI pins ruff>=0.16, pyproject floor matches)
-.venv/bin/pytest # 1270 tests across 57 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
+.venv/bin/pytest # 1258 tests across 58 files — use the venv pytest (system pytest won't resolve `openstudio_operator`)
 python -m openstudio_operator --namespace openstudio-server   # run (needs cluster + CRD) — programmatic entry (#681), NOT `kopf run`: the CLI cannot carry the persistence Settings
 ```
 
