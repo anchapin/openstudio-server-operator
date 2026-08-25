@@ -730,3 +730,68 @@ def test_shared_fake_fail_with_seam_raises_after_recording_one_shot():
     assert len(batch.creates) == 1 and batch.deletes == []
     assert batch.fail_with is None  # one-shot
     assert "oscm-archive-a1" not in batch.jobs  # raised before touching the store
+
+
+# --- K8s API error-path coverage (issue #794) --------------------------------
+
+
+@responses.activate
+def test_archival_job_create_409_conflict_does_not_delete(caplog):
+    """create_namespaced_job returns 409 — cardinal rule upheld, no delete."""
+    analysis_id = "a-conflict"
+    job_name = archival_job_name(analysis_id)
+    # Pre-populate the fake with the job so create raises 409
+    batch = FakeBatchV1Api([make_job(job_name)])
+    register_analyses(analysis(analysis_id))
+    register_datapoints([{"_id": "dp-1", "analysis_id": analysis_id}])
+    stored = archiving_status(analysis_id, job_name)
+
+    result, events = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+
+    # Job already exists (409 case) — analysis not deleted
+    assert result.deleted == []
+    assert calls_to(f"/analyses/{analysis_id}") == 0
+
+
+@responses.activate
+def test_archival_job_delete_failure_on_respawn_raises(caplog):
+    """delete_namespaced_job (failed job cleanup) raises ApiException — D12 skip."""
+    # Analysis past retention, due for archival, but job already exists in Failed state
+    analysis_id = "a-respawn-fail"
+    job_name = archival_job_name(analysis_id)
+    # Failed job already exists in the cluster
+    batch = FakeBatchV1Api([make_job(job_name, failed=True, running=False)])
+    register_analyses(analysis(analysis_id))  # due for archival
+    register_datapoints([{"_id": "dp-1", "analysis_id": analysis_id}])
+    # Analysis not yet tracked — will go through _spawn_archival
+    stored = {}
+
+    # Delete of failed job will fail
+    batch.fail_with = ApiException(status=500, reason="Internal Server Error")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ApiException) as excinfo:
+            tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+
+    assert excinfo.value.status == 500
+
+
+@responses.activate
+def test_archival_job_read_unexpected_condition_does_not_delete(caplog):
+    """read_namespaced_job returns job in unexpected Failed condition — no delete."""
+    analysis_id = "a-unexpected"
+    job_name = archival_job_name(analysis_id)
+    # Job in Failed state (unexpected for this path)
+    failed_job = make_job(job_name, failed=True, running=False)
+    failed_job.metadata.resource_version = "v1-failed"
+    batch = FakeBatchV1Api([failed_job])
+    register_analyses(analysis(analysis_id))
+    register_datapoints([{"_id": "dp-1", "analysis_id": analysis_id}])
+    stored = archiving_status(analysis_id, job_name)
+
+    with caplog.at_level("WARNING"):
+        result, events = tick(FakeCustomObjectsApi(make_cr(status=stored)), batch_api=batch)
+
+    # No delete issued — unexpected condition is skipped silently
+    assert result.deleted == []
+    assert calls_to(f"/analyses/{analysis_id}") == 0
