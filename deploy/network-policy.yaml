@@ -292,11 +292,12 @@ spec:
 #
 # This policy restricts who can reach port 9090 of the operator pod:
 #
-#   * `namespaceSelector.kubernetes.io/metadata.name: prometheus` — the
-#     cluster's Prometheus is expected to run in a namespace labeled
-#     exactly so. Cluster admins running a different scraper (e.g.
-#     `monitoring`, `kube-prometheus-stack`) MUST edit the label match
-#     below. This is the opt-in noted in AGENTS.md.
+#   * `namespaceSelector.kubernetes.io/metadata.name: monitoring-system` (issue #787) —
+#     the cluster's Prometheus is expected to run in a namespace labeled
+#     exactly so. Cluster admins running a differently-named scraper
+#     namespace (e.g. `prometheus`, `monitoring`, `kube-prometheus-stack`)
+#     MUST edit the label value below to match their environment.
+#     This is the opt-in noted in AGENTS.md.
 #   * `podSelector: {matchLabels: {app.kubernetes.io/component:
 #     metrics-scraper}}` — same-namespace peer that opted into being
 #     a scraper via the project label convention. The label is NOT a
@@ -325,10 +326,11 @@ metadata:
   annotations:
     energy.nrel.gov/description: |
       Restrict ingress to the operator's /metrics endpoint (port 9090).
-      Allows Prometheus-style scrapers: pods in a `prometheus`-labeled
-      namespace, plus any pod co-located in this namespace (sidecar).
-      Cluster admins running a different scraper namespace must edit
-      the `namespaceSelector` below — see AGENTS.md "Working rules".
+      Allows Prometheus-style scrapers: pods in a `monitoring-system`-
+      labeled namespace (issue #787), plus any pod co-located in this
+      namespace (sidecar). Cluster admins running a differently-named
+      scraper namespace must edit the `namespaceSelector` below — see
+      AGENTS.md "Working rules".
 spec:
   podSelector:
     matchLabels:
@@ -378,11 +380,12 @@ spec:
 # #478 (the pruner's policy was originally shipped with a bare
 # ``podSelector: {}`` same-namespace peer — exactly the regression shape
 # #295 fixed for the operator's policy):
-#   * ``namespaceSelector.kubernetes.io/metadata.name: prometheus`` — the
-#     cluster's Prometheus is expected to run in a namespace labeled
-#     exactly so. Cluster admins running a different scraper (e.g.
-#     ``monitoring``, ``kube-prometheus-stack``) MUST edit the label match
-#     below — same opt-in noted in AGENTS.md.
+#   * ``namespaceSelector.kubernetes.io/metadata.name: monitoring-system`` (issue #787) —
+#     the cluster's Prometheus is expected to run in a namespace labeled
+#     exactly so. Cluster admins running a differently-named scraper
+#     namespace (e.g. ``prometheus``, ``monitoring``) MUST edit the
+#     label value below to match their environment — same opt-in noted
+#     in AGENTS.md.
 #   * ``podSelector: {matchLabels: {app.kubernetes.io/component:
 #     metrics-scraper}}`` — same-namespace peer that opted into being
 #     a scraper via the project label convention (#295). No helm-chart
@@ -414,14 +417,14 @@ metadata:
       Restrict ingress to the storage-prune CronJob's /metrics endpoint
       (port 9090). Mirrors the operator's metrics-ingress policy (#166),
       hardened to the same bar by #478: allows Prometheus-style scrapers
-      (prometheus-labeled namespace + same-namespace peers opted in via
-      the app.kubernetes.io/component: metrics-scraper label, #295) and
-      pairs with the CronJob's OPENSTUDIO_METRICS_TOKEN_FILE bearer-token
-      opt-in (#401 parity). Issue #306 — the CronJob exposes
-      ANALYSES_ARCHIVED_TOTAL, ANALYSES_DELETED_TOTAL, and the new
-      PRUNE_TICK_FAILURES_TOTAL{reason} counter (bumped by the two
-      skip-tick branches and the exit-3 empty-redisUrl guard #392 in
-      prune_entrypoint.main()).
+      (monitoring-system-labeled namespace (issue #787) + same-namespace
+      peers opted in via the app.kubernetes.io/component: metrics-scraper
+      label, #295) and pairs with the CronJob's
+      OPENSTUDIO_METRICS_TOKEN_FILE bearer-token opt-in (#401 parity).
+      Issue #306 — the CronJob exposes ANALYSES_ARCHIVED_TOTAL,
+      ANALYSES_DELETED_TOTAL, and the new PRUNE_TICK_FAILURES_TOTAL{reason}
+      counter (bumped by the two skip-tick branches and the exit-3
+      empty-redisUrl guard #392 in prune_entrypoint.main()).
 spec:
   podSelector:
     matchLabels:
