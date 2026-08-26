@@ -221,6 +221,13 @@ def test_metrics_http_server_serves_all_declared_counters():
     # e.g. ``"analysis_sla-datapoint_watchdog"``); cardinality is bounded
     # by the 4 OSCM handler modules (≤15 non-empty subsets).
     metrics.HANDLER_CROSS_HANDLER_OUTAGE_TOTAL.labels(module_set="__metrics_test_sentinel__").inc()
+    # Issue #785 — pre-touch the Redis-unreachable counter. Labelled by
+    # ``namespace`` + ``name`` (CR identity, issue #311); the dedicated
+    # counter isolates connection/timeout/cluster errors from the broader
+    # ``error_type=RedisClientError`` label on ``handler_tick_failures_total``.
+    metrics.REDIS_UNREACHABLE_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE, name=SENTINEL_NAME
+    ).inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -417,6 +424,15 @@ def test_metrics_http_server_serves_all_declared_counters():
             # Issue #782 — labelled by namespace; cardinality bounded by D05.
             assert (
                 'openstudio_operator_archival_jobs_failed_total{namespace="__metrics_test_sentinel_ns__"}'
+                in response.text
+            )
+        elif name == "openstudio_operator_redis_unreachable_total":
+            # Issue #785 — labelled by namespace + name (CR identity).
+            assert (
+                'openstudio_operator_redis_unreachable_total{'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
                 in response.text
             )
         elif name == "openstudio_operator_rest_retries_total":
