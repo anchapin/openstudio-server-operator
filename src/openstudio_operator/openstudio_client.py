@@ -396,6 +396,33 @@ class OpenStudioClient:
         """
         self._request("GET", f"/analyses/{analysis_id}/soft_stop")
 
+    def stop_analysis(self, analysis_id: str) -> None:
+        """POST /analyses/{id}/action with body param ``analysis_action=stop``.
+
+        Verified semantics: set ``run_flag`` false and wait for in-flight runs. Chosen over
+        ``GET /analyses/{id}/stop`` ("stop waiting for last submitted run") because the
+        action endpoint carries the explicit run_flag/wait semantics the operator needs.
+        The route is POST only — ``PUT /analyses/{id}/action`` does not exist in v3.11.0,
+        and no ``kill``/``hard_stop`` action exists anywhere; escalation is Kubernetes-side
+        pod eviction.
+
+        RESERVED (issue #49): the method has zero call sites. The SLA flow uses
+        ``soft_stop_analysis`` (does not wait) and ``delete_analysis`` owns the
+        NFS-cascade cleanup path, so this waiting-variant stop is not currently wired.
+
+        Do NOT invoke from a handler without:
+
+        1. ``spec.dryRun`` gating (D11) — see
+           ``docs/audit-dryrun-idempotency.md`` §1.1 row R2.
+        2. A status-anchor idempotency design (D04) — a ``stoppedAt`` /
+           ``runFlagClearedAt`` record on the CR so a restarted operator does not
+           re-issue the POST and so flipping ``dryRun`` off cannot double-fire.
+
+        If you wire this method, add the mutation to the audit doc's table in the
+        same PR (replace DORMANT status with GATED and cite the gate line).
+        """
+        self._request("POST", f"/analyses/{analysis_id}/action", data={"analysis_action": "stop"})
+
     def requeue_datapoint(self, datapoint_id: str) -> None:
         """POST /data_points/{id}/requeue — 204 No Content.
 
