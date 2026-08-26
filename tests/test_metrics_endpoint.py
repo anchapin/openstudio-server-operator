@@ -130,6 +130,12 @@ def test_metrics_http_server_serves_all_declared_counters():
         module="__metrics_test_sentinel__",
         error_type="OpenStudioApiError",
     ).inc()
+    # Issue #783 — same pattern for the consecutive-failure streak counter.
+    metrics.HANDLER_CONSECUTIVE_FAILURE_STREAK_TOTAL.labels(
+        namespace=SENTINEL_NAMESPACE,
+        name=SENTINEL_NAME,
+        module="__metrics_test_sentinel__",
+    ).inc()
     # Issue #119 / #171 — same pattern for the status-store counters.
     # Issue #311 adds (namespace, name) labels so the family existence
     # check must include the full label set.
@@ -287,6 +293,15 @@ def test_metrics_http_server_serves_all_declared_counters():
             assert (
                 'openstudio_operator_handler_tick_failures_total{error_type="OpenStudioApiError",'
                 'module="__metrics_test_sentinel__",'
+                f'name="{SENTINEL_NAME}",'
+                f'namespace="{SENTINEL_NAMESPACE}"'
+                "}"
+                in response.text
+            )
+        elif name == "openstudio_operator_handler_consecutive_failure_streak_total":
+            assert (
+                'openstudio_operator_handler_consecutive_failure_streak_total{'
+                f'module="__metrics_test_sentinel__",'
                 f'name="{SENTINEL_NAME}",'
                 f'namespace="{SENTINEL_NAMESPACE}"'
                 "}"

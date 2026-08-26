@@ -977,6 +977,15 @@ HANDLER_TICK_FAILURES_TOTAL = Counter(
     labelnames=["namespace", "name", "module", "error_type"],
 )
 
+HANDLER_CONSECUTIVE_FAILURE_STREAK_TOTAL = Counter(
+    "openstudio_operator_handler_consecutive_failure_streak_total",
+    "Consecutive failure streak crossings for OSCM handlers (issue #783). "
+    "Labelled by ``namespace`` + ``name`` (CR identity, issue #311) + "
+    "``module`` (analysis_sla | datapoint_watchdog | worker_recycler | "
+    "web_background_monitor).",
+    labelnames=["namespace", "name", "module"],
+)
+
 # Issue #306 — observability surface for the storage-prune CronJob's
 # failure branches. The CronJob runs as a separate process from the
 # operator (deploy/storage-cronjob.yaml invoking
