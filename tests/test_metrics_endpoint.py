@@ -216,6 +216,11 @@ def test_metrics_http_server_serves_all_declared_counters():
     # ``namespace``; cardinality is bounded by the one-namespace-per-deploy
     # model (D05) so the series vocabulary stays bounded.
     metrics.ARCHIVAL_JOBS_FAILED_TOTAL.labels(namespace=SENTINEL_NAMESPACE).inc()
+    # Issue #784 — pre-touch the cross-handler composite outage counter.
+    # Labelled by ``module_set`` (a hyphenated string of 2+ failing modules,
+    # e.g. ``"analysis_sla-datapoint_watchdog"``); cardinality is bounded
+    # by the 4 OSCM handler modules (≤15 non-empty subsets).
+    metrics.HANDLER_CROSS_HANDLER_OUTAGE_TOTAL.labels(module_set="__metrics_test_sentinel__").inc()
     # Issue #238 — pre-touch the labelled ``resque_queue_depth`` Gauge
     # so the family line is exposed alongside the unlabelled #44, #253,
     # #254 gauges. The labelled form (``{queue="..."}``) is then asserted
@@ -305,6 +310,12 @@ def test_metrics_http_server_serves_all_declared_counters():
                 f'name="{SENTINEL_NAME}",'
                 f'namespace="{SENTINEL_NAMESPACE}"'
                 "}"
+                in response.text
+            )
+        elif name == "openstudio_operator_handler_cross_handler_outage_total":
+            assert (
+                'openstudio_operator_handler_cross_handler_outage_total{'
+                'module_set="__metrics_test_sentinel__"}'
                 in response.text
             )
         elif name == "openstudio_operator_status_conflicts_total":
