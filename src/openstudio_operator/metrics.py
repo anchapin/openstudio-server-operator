@@ -1010,6 +1010,37 @@ HANDLER_CROSS_HANDLER_OUTAGE_TOTAL = Counter(
     labelnames=["module_set"],
 )
 
+# Issue #785 — explicit Redis-unreachable counter. The
+# ``HANDLER_TICK_FAILURES_TOTAL`` counter (above) is labelled by
+# ``error_type=RedisClientError``, but that label value is shared with
+# all other Redis failures (wrong DB, wrong prefix, auth failure, and
+# unreachable all raise ``RedisClientError``). An SRE investigating a
+# Redis connectivity outage needs a dedicated signal that isolates
+# ``ConnectionError`` / ``TimeoutError`` / ``RedisClusterException`` from
+# the broader Redis error surface. This counter is incremented at the
+# Redis-unreachable catch sites in ``run_oscm_tick`` (the
+# ``RedisClientError`` branch of ``SKIP_TICK_EXCEPTIONS``) and in
+# ``web_background_monitor._stall_condition_holds`` (the
+# ``RedisClientError`` catch site that resets the stall tracker) so
+# both the handler-level skip-tick path and the stall-detection path
+# contribute to the same counter. Labelled by ``namespace`` + ``name``
+# (CR identity, issue #311) so the affected CR is identifiable during
+# a multi-CR incident.
+REDIS_UNREACHABLE_TOTAL = Counter(
+    "openstudio_operator_redis_unreachable_total",
+    "Redis unreachable events specifically (issue #785). Incremented when "
+    "a Redis client call raises ``RedisClientError`` due to a connection "
+    "failure, timeout, or cluster exception — distinct from other "
+    "``RedisClientError`` causes (wrong DB, auth failure, key-layout "
+    "drift). The dedicated counter isolates Redis connectivity outages "
+    "from the broader Redis error surface that ``error_type=RedisClient"
+    "Error`` on ``handler_tick_failures_total`` conflates. Labelled by "
+    "``namespace`` + ``name`` (CR identity, issue #311). Increment "
+    "sites: ``run_oscm_tick`` skip-tick handler and "
+    "``web_background_monitor._stall_condition_holds``.",
+    labelnames=["namespace", "name"],
+)
+
 # Issue #306 — observability surface for the storage-prune CronJob's
 # failure branches. The CronJob runs as a separate process from the
 # operator (deploy/storage-cronjob.yaml invoking

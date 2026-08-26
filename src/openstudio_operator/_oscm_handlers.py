@@ -478,6 +478,14 @@ def run_oscm_tick(
             _pruned: dict[str, float] = {m: ts for m, ts in _cross_handler_failures.items() if ts > cutoff}
             _cross_handler_failures.clear()
             _cross_handler_failures.update(_pruned)
+            # Issue #785 — Redis-unreachable counter: always increment on
+            # RedisClientError so the signal is explicit and not buried in
+            # the broader error_type=RedisClientError label on the general
+            # failure counter.
+            if isinstance(exc, RedisClientError):
+                from openstudio_operator.metrics import REDIS_UNREACHABLE_TOTAL
+
+                REDIS_UNREACHABLE_TOTAL.labels(namespace=namespace, name=name).inc()
             logger.warning(
                 "%s tick skipped, retrying next poll (%s: %s)",
                 tick_label,
