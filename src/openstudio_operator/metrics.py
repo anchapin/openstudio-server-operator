@@ -456,7 +456,27 @@ REDIS_KEY_LAYOUT_STATUS = Gauge(
     "instead of correlating logs. Set in "
     "``handlers.redis_layout_check._check_redis_key_layout_for_cr`` for every CR on every "
     "OSCM watch event (cluster-wide latest observation, not per-CR — "
-    "the validator outcome is process-wide).",
+    "the validator outcome is process-wide). The paired "
+    "``redis_key_layout_status_reason`` gauge (issue #789) carries the "
+    "failure-mode label so an SRE can disambiguate ``unreachable`` from "
+    "``layout_mismatch`` without examining logs.",
+)
+
+REDIS_KEY_LAYOUT_STATUS_REASON = Gauge(
+    "openstudio_operator_redis_key_layout_status_reason",
+    "Redis key-layout validation failure reason (issue #789). Set in "
+    "lockstep with ``REDIS_KEY_LAYOUT_STATUS`` in "
+    "``handlers.redis_layout_check._set_redis_key_layout_status`` on every "
+    "terminal path of ``_check_redis_key_layout_for_cr``. The ``ok`` value "
+    "is 1.0; each non-ok reason carries its own labelled series "
+    "``{reason=unreachable|layout_mismatch|error|skipped}``. The "
+    "``unreachable`` series fires when Redis connectivity fails "
+    "(``RedisClientError``, ``OSError``); ``layout_mismatch`` fires when "
+    "the Resque key constants do not match the live v3.11.0 layout "
+    "(``OperatorConfigError``); ``error`` fires on unexpected exceptions; "
+    "``skipped`` fires when the CR carries neither ``spec.redisUrl`` nor "
+    "``spec.redisCredentials.secretRef``.",
+    ["reason"],
 )
 
 # Issue #490 — paired freshness timestamp gauge for REDIS_KEY_LAYOUT_STATUS

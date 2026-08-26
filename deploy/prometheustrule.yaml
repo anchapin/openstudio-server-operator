@@ -432,6 +432,9 @@ spec:
 
         # metrics.py REDIS_KEY_LAYOUT_STATUS (#253) — 0.0 for every terminal
         # status other than ok (degraded | unreachable | error | skipped).
+        # The paired redis_key_layout_status_reason gauge (issue #789) carries
+        # {reason=unreachable|layout_mismatch|error|skipped} to disambiguate
+        # which failure mode is active without examining logs.
         - alert: OpenStudioOperatorRedisKeyLayoutInvalid
           expr: openstudio_operator_redis_key_layout_status == 0
           for: 5m
@@ -441,10 +444,33 @@ spec:
             summary: Redis key-layout validation is not ok
             description: >-
               openstudio_operator_redis_key_layout_status == 0 — the boot-time validator
-              (#163) did not return ok. The post-#44 failure mode follows: a live
-              v3.11.0 layout drift takes resque_workers_seen_max silent, the stall
-              condition fires vacuously, and the operator periodic-restarts
-              web_background while everything looks healthy.
+              (#163) did not return ok. The paired
+              openstudio_operator_redis_key_layout_status_reason gauge carries the
+              failure-mode label: ``unreachable`` (Redis connectivity failure),
+              ``layout_mismatch`` (Resque key constants drifted from live v3.11.0
+              layout, see issue #44), ``error`` (unexpected exception), or
+              ``skipped`` (no credentials configured). Check
+              ``redis_key_layout_status_reason{reason=...}`` to determine which
+              mode is firing before examining logs.
+            runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
+
+        # Issue #788 — redis_key_layout_status_fresh staleness alert. The
+        # REDIS_KEY_LAYOUT_REVALIDATION_INTERVAL is 5 minutes, so > 600s
+        # (2x the cadence) means the validator has not run and the status
+        # gauge may be holding a stale boot-time value.
+        - alert: OpenStudioOperatorRedisKeyLayoutStale
+          expr: time() - openstudio_operator_redis_key_layout_status_fresh > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Redis key-layout validation result is stale
+            description: >-
+              time() - openstudio_operator_redis_key_layout_status_fresh > 600 — the
+              key-layout validator has not run in the last 10 minutes. Either
+              the operator is not scheduling ticks or the periodic revalidation is
+              being suppressed. The paired openstudio_operator_redis_key_layout_status
+              gauge may be holding a stale boot-time value.
             runbook_url: https://github.com/anchapin/openstudio-server-operator#metrics
 
         # metrics.py RESQUE_WORKERS_SEEN_MAX (#44/#87) — 0 with a reachable
