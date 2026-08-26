@@ -183,16 +183,20 @@ spec:
 #     at policy creation time (it is selected by the CR's storagePolicy
 #     per-analysis) — the operator emits an `ipBlock: 0.0.0.0/0` egress with
 #     allow-lists of ports to the public HTTPS endpoint as a deliberate
-#     trade-off:
+#     trade-off (issue #790):
 #       * HTTPS (TCP 443) only — cleartext is rejected.
 #       * No SMTP / IMAP / arbitrary ports.
 #       * The destination is the storage backend's FQDN, resolved by the
 #         in-namespace kube-dns via the hostAliases path the Job inherits.
 #     This is the same allow as the chart already grants the helm install.
-#     If a deployment has stricter egress via a NetworkPolicy plugin
-#     (Calico/Cilium), the operator will receive the relevant policy update
-#     via a follow-up; the default install (kind-recipe `scripts/manifests/`)
-#     uses the standard k8s NetworkPolicy and the broad allow is necessary.
+#     A compromised rclone container CAN reach any public HTTPS endpoint —
+#     issue #790 assessed this risk against multi-cloud storage backend
+#     flexibility and the operational cost of maintaining per-endpoint IP
+#     allow-lists. Restricting to specific cloud-provider IP ranges is not
+#     feasible (endpoints vary by region, service, and cloud). Deployments
+#     requiring stricter egress should use a CNI plugin (Calico/Cilium)
+#     with per-pod egress filtering — the operator will receive policy
+#     updates via a follow-up issue.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
