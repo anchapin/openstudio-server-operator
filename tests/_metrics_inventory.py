@@ -32,6 +32,8 @@ EXPECTED_COUNTER_FAMILIES = (
     "openstudio_operator_status_conflict_retries_exhausted_total",
     # Issue #117 — handler tick failures (per module + error_type).
     "openstudio_operator_handler_tick_failures_total",
+    # Issue #783 — consecutive-failure streak crossing counter.
+    "openstudio_operator_handler_consecutive_failure_streak_total",
     # Issue #171 — defensive cap evictions on the CR .status maps.
     "openstudio_operator_status_map_caps_total",
     # Issue #237 — EventEmitter (#164) dry-run gate Prometheus surface
