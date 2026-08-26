@@ -212,6 +212,10 @@ EXPECTED_GAUGE_FAMILIES = (
     # lockstep at every _check_redis_key_layout_for_cr run; cadenced by the
     # 5-minute revalidation riding the web_background stall tick.
     "openstudio_operator_redis_key_layout_status_fresh",
+    # Issue #789 — reason label gauge to disambiguate 0.0 failure modes:
+    # {reason=unreachable|layout_mismatch|error|skipped}; set in lockstep
+    # with redis_key_layout_status by _set_redis_key_layout_status.
+    "openstudio_operator_redis_key_layout_status_reason",
     "openstudio_operator_stall_window_elapsed_seconds",
     "openstudio_operator_resque_queue_depth_fresh",
     "openstudio_operator_stall_window_fresh",

@@ -75,6 +75,7 @@ from openstudio_operator.events_sinks import get_default_sink
 from openstudio_operator.metrics import (
     REDIS_KEY_LAYOUT_STATUS,
     REDIS_KEY_LAYOUT_STATUS_FRESH,
+    REDIS_KEY_LAYOUT_STATUS_REASON,
 )
 from openstudio_operator.redis_client import RedisClientError
 
@@ -106,20 +107,30 @@ def _emit_redis_key_layout_event(
     )
 
 
-def _set_redis_key_layout_status(value: float) -> None:
-    """Set the #253 status gauge + its #490 freshness stamp in lockstep.
+_REASON_LABELS = {
+    "ok": "ok",
+    "degraded": "layout_mismatch",
+    "unreachable": "unreachable",
+    "error": "error",
+    "skipped": "skipped",
+}
 
-    Issue #490 — the status gauge alone is a blind-holds-value signal on
-    a steady-state cluster (no OSCM watch events → no revalidation), so
-    every terminal path of
-    :func:`_check_redis_key_layout_for_cr` goes through THIS helper: the
-    freshness timestamp proves the validator ran recently while the
-    status value carries the result. Centralizing the pair here keeps
-    the two gauges from drifting apart the way a hand-maintained second
-    ``.set(...)`` line at each of the eight branches eventually would.
+
+def _set_redis_key_layout_status(value: float, reason: str = "ok") -> None:
+    """Set the #253 status gauge + its #490 freshness stamp + #789 reason gauge.
+
+    Every terminal path of :func:`_check_redis_key_layout_for_cr` goes
+    through THIS helper: the freshness timestamp proves the validator
+    ran recently while the status value carries the result, and the reason
+    label disambiguates the failure mode (issue #789). Centralizing the
+    pair here keeps the two gauges from drifting apart the way a
+    hand-maintained second ``.set(...)`` line at each of the eight
+    branches eventually would.
     """
     REDIS_KEY_LAYOUT_STATUS.set(value)
     REDIS_KEY_LAYOUT_STATUS_FRESH.set(time.time())
+    reason_label = _REASON_LABELS.get(reason, reason)
+    REDIS_KEY_LAYOUT_STATUS_REASON.labels(reason=reason_label).set(1.0)
 
 
 def _validate_item_meta(
@@ -135,16 +146,16 @@ def _validate_item_meta(
     to ``0.0`` by this function).
     """
     if not isinstance(item, Mapping):
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="skipped")
         return None
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else item
     if not isinstance(meta, dict):
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="skipped")
         return None
     ns = str(meta.get("namespace") or "")
     nm = str(meta.get("name") or "")
     if not ns or not nm:
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="skipped")
         return None
     return (meta, ns, nm)
 
@@ -255,7 +266,7 @@ def _check_redis_key_layout_for_cr(
                 ns,
                 nm,
             )
-            _set_redis_key_layout_status(0.0)
+            _set_redis_key_layout_status(0.0, reason="skipped")
             return "skipped"
         get_read_only_redis_client(
             config.redis_url,
@@ -289,7 +300,7 @@ def _check_redis_key_layout_for_cr(
                 "the constants (see issue #44 / docs/kind-validation.md)."
             ),
         )
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="degraded")
         return "degraded"
     except (RedisClientError, OSError) as exc:
         # Redis connectivity failure (refused, DNS, timeout) — wire-level,
@@ -306,7 +317,7 @@ def _check_redis_key_layout_for_cr(
             nm,
             exc,
         )
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="unreachable")
         return "unreachable"
     except Exception as exc:  # noqa: BLE001 — defensive last-resort (see web_background_monitor.py)
         logger.warning(
@@ -316,14 +327,14 @@ def _check_redis_key_layout_for_cr(
             type(exc).__name__,
             exc,
         )
-        _set_redis_key_layout_status(0.0)
+        _set_redis_key_layout_status(0.0, reason="error")
         return "error"
     logger.info(
         "redis_key_layout=ok namespace=%s name=%s",
         ns,
         nm,
     )
-    _set_redis_key_layout_status(1.0)
+    _set_redis_key_layout_status(1.0, reason="ok")
     return "ok"
 
 

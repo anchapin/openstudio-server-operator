@@ -284,6 +284,11 @@ def test_metrics_http_server_serves_all_declared_counters():
     metrics.WARNINGS_DEFERRED_DROPPED_TOTAL.labels(
         reason="__metrics_test_sentinel__"
     ).inc()
+    # Issue #789 — pre-touch the labelled redis_key_layout_status_reason Gauge
+    # so the family line is exposed. Labelled by ``reason``
+    # (unreachable|layout_mismatch|error|skipped|ok). Pre-touch with "ok"
+    # since the sentinel check below asserts the labelled form regardless.
+    metrics.REDIS_KEY_LAYOUT_STATUS_REASON.labels(reason="ok").set(1)
 
     response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
@@ -510,6 +515,13 @@ def test_metrics_http_server_serves_all_declared_counters():
                 r"openstudio_operator_build_info"
                 r'\{python_version="[^"]+",version="[^"]+"\} 1\.0',
                 response.text,
+            )
+        elif name == "openstudio_operator_redis_key_layout_status_reason":
+            # Issue #789 — labelled by ``reason`` (unreachable|layout_mismatch|
+            # error|skipped|ok). Check the labelled form.
+            assert (
+                'openstudio_operator_redis_key_layout_status_reason{reason="ok"}'
+                in response.text
             )
         else:
             assert f"\n{name} " in response.text
