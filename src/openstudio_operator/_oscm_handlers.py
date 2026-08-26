@@ -61,6 +61,12 @@ from openstudio_operator.status_store import StatusStore, StatusStoreError
 #: after the signal arrives.
 _shutdown_requested = False
 
+#: Issue #784 — cross-handler failure tracking for composite outage detection.
+#: Maps ``module`` -> last failure timestamp (time.time()). Pruned to entries
+#: younger than OUTAGE_WINDOW_SECONDS on every tick so the window is exact.
+_OUTAGE_WINDOW_SECONDS = 60.0
+_cross_handler_failures: dict[str, float] = {}
+
 
 def is_shutdown_requested() -> bool:
     """Return whether SIGTERM has been received and graceful shutdown is in progress."""
@@ -447,7 +453,10 @@ def run_oscm_tick(
             deps = wire(config)
             return tick(config=config, store=store, emit=emit, deps=deps, now=now)
         except SKIP_TICK_EXCEPTIONS as exc:
-            from openstudio_operator.metrics import HANDLER_TICK_FAILURES_TOTAL
+            from openstudio_operator.metrics import (
+                HANDLER_CROSS_HANDLER_OUTAGE_TOTAL,
+                HANDLER_TICK_FAILURES_TOTAL,
+            )
 
             HANDLER_TICK_FAILURES_TOTAL.labels(
                 namespace=namespace,
@@ -455,6 +464,20 @@ def run_oscm_tick(
                 module=module,
                 error_type=type(exc).__name__,
             ).inc()
+            # Issue #784 — cross-handler composite outage detection.
+            now_ts = time.time()
+            _cross_handler_failures[module] = now_ts
+            cutoff = now_ts - _OUTAGE_WINDOW_SECONDS
+            recent_modules = [m for m, ts in _cross_handler_failures.items() if ts > cutoff]
+            if len(recent_modules) >= 2:
+                module_set = "-".join(sorted(recent_modules))
+                HANDLER_CROSS_HANDLER_OUTAGE_TOTAL.labels(module_set=module_set).inc()
+            # Prune stale entries (written to a temp var first to avoid
+            # F823 "referenced before assignment" from the self-ref
+            # comprehension on _cross_handler_failures).
+            _pruned: dict[str, float] = {m: ts for m, ts in _cross_handler_failures.items() if ts > cutoff}
+            _cross_handler_failures.clear()
+            _cross_handler_failures.update(_pruned)
             logger.warning(
                 "%s tick skipped, retrying next poll (%s: %s)",
                 tick_label,

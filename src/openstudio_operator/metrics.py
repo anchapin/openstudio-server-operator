@@ -986,6 +986,30 @@ HANDLER_CONSECUTIVE_FAILURE_STREAK_TOTAL = Counter(
     labelnames=["namespace", "name", "module"],
 )
 
+# Issue #784 — cross-handler composite outage counter. When two or more
+# different OSCM handlers fail within a short observation window
+# (OUTAGE_WINDOW_SECONDS = 60 s), the operator increments this counter.
+# The ``HANDLER_TICK_FAILURES_TOTAL`` counter (above) tells an SRE which
+# module failed; this counter tells them WHETHER the failure is isolated
+# to one handler or is a composite event affecting multiple handlers
+# simultaneously (e.g., a shared dependency outage — Redis unreachable,
+# REST API down, a kube-apiserver issue). Labelled by the set of
+# failing modules as a hyphenated string (e.g. ``"analysis_sla-datapoint_
+# watchdog"``); cardinality is bounded by the 4 handler modules
+# (at most 2^4 - 1 = 15 non-empty subsets). Fires once per composite
+# event onset, not on every tick within the event.
+HANDLER_CROSS_HANDLER_OUTAGE_TOTAL = Counter(
+    "openstudio_operator_handler_cross_handler_outage_total",
+    "Cross-handler composite outage events (issue #784). Incremented once "
+    "when 2+ different OSCM handlers fail within a 60-second window. "
+    "Labelled by the set of failing module names as a hyphenated string "
+    "(e.g. ``analysis_sla-datapoint_watchdog``). Distinguishes a "
+    "single-handler degradation from a shared-dependency outage "
+    "(Redis unreachable, REST API down, kube-apiserver issue). "
+    "Cardinality bounded: at most 15 non-empty subsets of 4 handlers.",
+    labelnames=["module_set"],
+)
+
 # Issue #306 — observability surface for the storage-prune CronJob's
 # failure branches. The CronJob runs as a separate process from the
 # operator (deploy/storage-cronjob.yaml invoking

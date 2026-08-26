@@ -89,6 +89,8 @@ EXPECTED_COUNTER_FAMILIES = (
     # increase(...[30m]) > 0 (shipped as
     # OpenStudioOperatorWebBackgroundRestartIneffective).
     "openstudio_operator_web_background_restarts_ineffective_total",
+    # Issue #784 — cross-handler composite outage counter.
+    "openstudio_operator_handler_cross_handler_outage_total",
 )
 
 #: Issue #44 — Resque key-layout leg-2 non-vacuity safeguard. Since #87
