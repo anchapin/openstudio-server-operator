@@ -22,7 +22,7 @@ dependencies = [
     # through the kubernetes client — a major-version bump could silently
     # remove or weaken the impersonation / SSRF guard rails without
     # crashing. Require a deliberate bump, mirroring the kopf gate above.
-    "kubernetes>=29.3.0,<37",
+    "kubernetes>=29.3.0,<38",
     "redis>=5.0", # read-only queue-fabric client (#12)
     "requests>=2.32.0",
     "prometheus-client>=0.20.0", # Phase 4: /metrics endpoint
