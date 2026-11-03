@@ -11,7 +11,7 @@
 #   docker buildx imagetools inspect python:3.12-slim-bookworm
 # and updating this line. (release.yml cosign signs the built image's own
 # digest — it carries no base-digest reference.)
-FROM python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134
+FROM python:3.15-slim-bookworm@sha256:4e03260adeeebafccd084f3584e6b84823aba5651cfb53ef8a078ed441ddf9cd
 
 WORKDIR /app
 
